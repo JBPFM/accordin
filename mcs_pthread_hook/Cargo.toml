@@ -1,0 +1,11 @@
+[package]
+name = "mcs_pthread_hook"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+redhook = "1"
+libc = "0.2"

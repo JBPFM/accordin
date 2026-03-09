@@ -905,6 +905,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 
 [[package]]
+name = "mcs_pthread_hook"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "redhook",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1194,6 +1202,15 @@ name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
+name = "redhook"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "258248256d99540861733079be41beee5c0014bb727de4245237b2c10a479735"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "redox_syscall"

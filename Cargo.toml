@@ -1,3 +1,7 @@
+[workspace]
+members = ["mcs_pthread_hook"]
+exclude = ["bench/mutexbench_rust"]
+
 [package]
 name = "lb_simple"
 version = "0.1.0"

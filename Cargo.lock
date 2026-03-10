@@ -815,7 +815,6 @@ dependencies = [
  "libbpf-rs",
  "libc",
  "log",
- "redhook",
  "scx_cargo",
  "scx_stats",
  "scx_stats_derive",
@@ -1195,15 +1194,6 @@ name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
-
-[[package]]
-name = "redhook"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6e109b8469dbbe6d7cbe18e5ebd65d4a134e2f4b91304ad9213984cad1d70a6"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "redox_syscall"

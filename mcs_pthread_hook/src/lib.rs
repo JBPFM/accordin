@@ -1,10 +1,12 @@
 mod arch;
+mod epoch;
 mod mcs_tas;
 
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use epoch::with_epoch;
 use mcs_tas::McsTasLockRaw;
 
 /// Sentinel value stored in mutex[0..8] while McsTasState is being initialized.
@@ -129,7 +131,19 @@ redhook::hook! {
     ) -> libc::c_int => hooked_pthread_mutex_lock {
         unsafe {
             let state = ensure_state(mutex);
-            (*state).lock.lock();
+
+            // Attempt the fast path first so we can record spin_start_ns BEFORE
+            // entering the slow path.  The extra try_lock() CAS has negligible
+            // overhead compared to the spin cost.
+            if (*state).lock.try_lock() {
+                // Uncontended: no wait, just record lock_start.
+                with_epoch(|ep| ep.on_lock_acquired(false));
+            } else {
+                // Contended: record the spin start timestamp, then block.
+                with_epoch(|ep| ep.on_contention_start());
+                (*state).lock.lock(); // blocks; returns true (contended)
+                with_epoch(|ep| ep.on_lock_acquired(true));
+            }
             0
         }
     }
@@ -158,6 +172,9 @@ redhook::hook! {
             let atomic = state_atomic(mutex);
             let val = atomic.load(Ordering::Acquire);
             if val > SENTINEL {
+                // Record hold_ns before releasing so the unlock timestamp is
+                // not inflated by another thread immediately re-acquiring.
+                with_epoch(|ep| ep.on_lock_released());
                 (*(val as *mut McsTasState)).lock.unlock();
             }
             0
@@ -214,11 +231,19 @@ redhook::hook! {
             // Lock the internal real_mutex before releasing the MCS lock so that
             // a racing signal cannot be lost in the window between the two.
             redhook::real!(pthread_mutex_lock)(real_mu);
+            with_epoch(|ep| ep.on_lock_released()); // MCS lock released
             (*state).lock.unlock();
+
+            with_epoch(|ep| ep.on_park_start()); // about to sleep in cond_wait
             let ret = redhook::real!(pthread_cond_wait)(cond, real_mu);
+            with_epoch(|ep| ep.on_park_end());   // woken from cond_wait
+
             // Returns with real_mu held.
             redhook::real!(pthread_mutex_unlock)(real_mu);
+            // Re-acquire MCS lock; treat as contended (we were parked).
+            with_epoch(|ep| ep.on_contention_start());
             (*state).lock.lock();
+            with_epoch(|ep| ep.on_lock_acquired(true));
             ret
         }
     }
@@ -235,10 +260,17 @@ redhook::hook! {
             let real_mu = (*state).real_mutex.get();
 
             redhook::real!(pthread_mutex_lock)(real_mu);
+            with_epoch(|ep| ep.on_lock_released());
             (*state).lock.unlock();
+
+            with_epoch(|ep| ep.on_park_start());
             let ret = redhook::real!(pthread_cond_timedwait)(cond, real_mu, abstime);
+            with_epoch(|ep| ep.on_park_end());
+
             redhook::real!(pthread_mutex_unlock)(real_mu);
+            with_epoch(|ep| ep.on_contention_start());
             (*state).lock.lock();
+            with_epoch(|ep| ep.on_lock_acquired(true));
             ret
         }
     }

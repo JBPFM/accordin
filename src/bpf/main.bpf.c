@@ -1,139 +1,328 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * scx_ulock BPF scheduler
+ *
+ * Scheduling plane for the user-space-lock-driven SSC scheduler.
+ *
+ * This BPF program is intentionally kept thin:
+ *   - Routes tasks to DSQ_SSC or DSQ_NORMAL based on task_class.
+ *   - SSC CPUs consume only DSQ_SSC; normal CPUs consume only DSQ_NORMAL.
+ *   - Implements lazy migration via ssc_gen / last_ssc_gen.
+ *   - Tracks per-task on-CPU time for controller use.
+ *
+ * All policy decisions (classification, SSC width search, topology) live in
+ * the user-space controller.  The BPF hot path reads already-computed results.
+ *
+ * NOT implemented here:
+ *   - Futex tracing or any hot-path lock instrumentation.
+ *   - Kernel lock contention tracking.
+ *   - Complex scheduling policy logic.
+ */
 #include "vmlinux.h"
 #include <scx/common.bpf.h>
+#include "intf.h"
 
 char _license[] SEC("license") = "GPL";
 
-const volatile pid_t pid_filter;
-
 UEI_DEFINE(uei);
 
-#define SHARED_DSQ 0
+/* Shared DSQ identifiers.  SSC CPUs consume DSQ_SSC; others consume DSQ_NORMAL. */
+#define DSQ_SSC    1ULL
+#define DSQ_NORMAL 2ULL
 
-// lock_addr -> last_run_cpu
+/* --------------------------------------------------------------------------
+ * BPF Maps
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Global scheduler configuration.
+ * Written by the controller; read by BPF callbacks.
+ * Single-element array so the controller can do a simple map_update_elem.
+ */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, u64);   /* lock_addr */
-  __type(value, u32); /* last_run_cpu */
-  __uint(max_entries, 10000);
-} lock_owners SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct ulock_config);
+	__uint(max_entries, 1);
+} ulock_config_map SEC(".maps");
 
-// tid -> lock_addr
+/*
+ * SSC CPU bitmask.
+ * Written by the controller after each SSC width change.
+ * BPF dispatch and select_cpu use this to determine SSC membership.
+ */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, u32);   /* tid */
-  __type(value, u64); /* lock_addr */
-  __uint(max_entries, 10000);
-} thread_stats SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct ulock_cpumask);
+	__uint(max_entries, 1);
+} ssc_cpumask SEC(".maps");
 
-// 统计信息
+/*
+ * Task classification result.
+ * Written by the controller after each control period.
+ * BPF reads this in enqueue to route the task to the correct DSQ.
+ * Keyed by pid (u32).
+ */
 struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __type(key, u32);
-  __type(value, u64);
-  __uint(max_entries, 2); /* [futex_wait_count, futex_wake_count] */
-} stats SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);
+	__type(value, u32); /* enum task_class */
+	__uint(max_entries, 32768);
+} task_class_map SEC(".maps");
 
-static void stat_inc(u32 idx) {
-  u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
-  if (cnt_p)
-    (*cnt_p)++;
+/*
+ * Per-task context stored in BPF task storage.
+ * Allocated at init_task; freed automatically at task exit.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct task_ctx);
+} task_ctx_map SEC(".maps");
+
+/*
+ * Per-thread epoch aggregate slots.
+ * Written by the user-space lock library (mcs_pthread_hook).
+ * Read by the controller to compute wait_ratio and classify tasks.
+ * BPF_F_MMAPABLE allows the controller to access the array via mmap
+ * without going through syscalls on every read.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct epoch_slot);
+	__uint(max_entries, MAX_SLOTS);
+	__uint(map_flags, BPF_F_MMAPABLE);
+} epoch_slots SEC(".maps");
+
+/* --------------------------------------------------------------------------
+ * Helpers
+ * -------------------------------------------------------------------------- */
+
+/* Fetch the global configuration.  Returns NULL if the map is missing. */
+static __always_inline struct ulock_config *get_config(void)
+{
+	u32 key = 0;
+	return bpf_map_lookup_elem(&ulock_config_map, &key);
 }
 
-// 查询thread_stats中的lock_addr，返回指针以区分"未找到"和"值为0"
-static inline u64 *get_lock_addr_ptr(u32 tid) {
-  return bpf_map_lookup_elem(&thread_stats, &tid);
+/*
+ * Check whether @cpu belongs to the current SSC.
+ * Returns false if the config or mask is unavailable, treating all CPUs as
+ * non-SSC until the controller publishes a mask.
+ */
+static __always_inline bool cpu_in_ssc(u32 cpu)
+{
+	u32 key = 0;
+	struct ulock_cpumask *mask;
+
+	if (cpu >= MAX_CPUS)
+		return false;
+
+	mask = bpf_map_lookup_elem(&ssc_cpumask, &key);
+	if (!mask)
+		return false;
+
+	return !!(mask->bits[cpu / 64] & (1ULL << (cpu % 64)));
 }
 
-// 查询lock_owners中的last_run_cpu，返回指针以区分"未找到"和"值为0"
-static inline u32 *get_last_run_cpu_ptr(u64 lock_addr) {
-  return bpf_map_lookup_elem(&lock_owners, &lock_addr);
+/*
+ * Refresh the task class from task_class_map if the SSC generation has
+ * changed.  This implements lazy migration: tasks update their routing
+ * one at a time at their next scheduling event rather than all at once.
+ *
+ * Must be called with a valid tctx and cfg.
+ */
+static __always_inline void refresh_task_cls(struct task_ctx *tctx,
+					     struct task_struct *p,
+					     const struct ulock_config *cfg)
+{
+	u32 pid;
+	u32 *cls_p;
+
+	if (tctx->last_ssc_gen == cfg->ssc_gen)
+		return;
+
+	pid = p->pid;
+	cls_p = bpf_map_lookup_elem(&task_class_map, &pid);
+	tctx->cls = cls_p ? *cls_p : TASK_NORMAL;
+	tctx->last_ssc_gen = cfg->ssc_gen;
 }
 
-s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
-                   u64 wake_flags) {
-  bool is_idle = false;
-  s32 cpu;
-  u32 tid = p->pid;
-  u64 *lock_addr_p;
-  u32 *target_cpu_p;
+/* --------------------------------------------------------------------------
+ * Scheduler callbacks
+ * -------------------------------------------------------------------------- */
 
-  /* 查询当前线程是否持有锁 */
-  lock_addr_p = get_lock_addr_ptr(tid);
+/*
+ * select_cpu - Hint at a CPU for the waking task.
+ *
+ * We let the kernel's default heuristic pick the CPU.  Routing is done in
+ * enqueue / dispatch, not here, to ensure tasks always land in the correct DSQ.
+ *
+ * We intentionally do NOT insert into SCX_DSQ_LOCAL here because that would
+ * bypass enqueue and break DSQ separation.
+ */
+s32 BPF_STRUCT_OPS(ulock_select_cpu, struct task_struct *p, s32 prev_cpu,
+		   u64 wake_flags)
+{
+	bool is_idle = false;
 
-  /* 删除 thread_stats 中当前 tid 的表项 */
-  bpf_map_delete_elem(&thread_stats, &tid);
-
-  if (lock_addr_p) {
-    /* 线程持有锁，查询锁的 last_run_cpu */
-    target_cpu_p = get_last_run_cpu_ptr(*lock_addr_p);
-    if (target_cpu_p) {
-      u32 target_cpu = *target_cpu_p;
-
-      /* 验证 target_cpu 是否在允许的 CPU 集合中 */
-      if (bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr)) {
-        /* 检查 CPU 是否空闲 */
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | target_cpu, SCX_SLICE_DFL, 0);
-        return target_cpu;
-        /* CPU 不空闲，但仍然倾向于使用它（通过返回它作为建议） */
-        /* 任务会进入 enqueue，最终可能在该 CPU 上运行 */
-      }
-    }
-  }
-
-  /* 没有锁或无法使用 last_run_cpu，使用默认策略 */
-  cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-  if (is_idle) {
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-  }
-
-  return cpu;
+	return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) {
-  return scx_bpf_create_dsq(SHARED_DSQ, -1);
+/*
+ * enqueue - Place the task in the correct shared DSQ.
+ *
+ * LOCK_INTENSIVE tasks go to DSQ_SSC; all others go to DSQ_NORMAL.
+ * Refreshes the task class if ssc_gen has advanced (lazy migration).
+ */
+void BPF_STRUCT_OPS(ulock_enqueue, struct task_struct *p, u64 enq_flags)
+{
+	struct task_ctx *tctx;
+	struct ulock_config *cfg;
+	u32 cls = TASK_NORMAL;
+
+	tctx = bpf_task_storage_get(&task_ctx_map, p, NULL, 0);
+	cfg  = get_config();
+
+	if (tctx && cfg) {
+		refresh_task_cls(tctx, p, cfg);
+		cls = tctx->cls;
+	}
+
+	if (cls == TASK_LOCK_INTENSIVE)
+		scx_bpf_dsq_insert(p, DSQ_SSC, SCX_SLICE_DFL, enq_flags);
+	else
+		scx_bpf_dsq_insert(p, DSQ_NORMAL, SCX_SLICE_DFL, enq_flags);
 }
 
-void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei) {
-  UEI_RECORD(uei, ei);
+/*
+ * dispatch - Move tasks from shared DSQs to the CPU's local DSQ.
+ *
+ * SSC CPUs pull exclusively from DSQ_SSC.
+ * Normal CPUs pull exclusively from DSQ_NORMAL.
+ * Cross-stealing is intentionally disabled (v1 requirement).
+ */
+void BPF_STRUCT_OPS(ulock_dispatch, s32 cpu, struct task_struct *prev)
+{
+	if (cpu_in_ssc((u32)cpu))
+		scx_bpf_dsq_move_to_local(DSQ_SSC);
+	else
+		scx_bpf_dsq_move_to_local(DSQ_NORMAL);
 }
 
-/* Tracepoint: sys_enter_futex - 捕获 futex wait 和 wake 操作 */
-SEC("tp/syscalls/sys_enter_futex")
-int trace_futex(struct trace_event_raw_sys_enter *ctx) {
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  u32 tid = (u32)pid_tgid;
-  u32 pid = pid_tgid >> 32;
-  u32 op;
-  u64 lock_addr;
+/*
+ * running - Record the wall-clock time when the task starts running.
+ * Used by the controller to compute epoch_runtime_ns.
+ */
+void BPF_STRUCT_OPS(ulock_running, struct task_struct *p)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_map, p, NULL, 0);
 
-  /* 如果设置了 pid_filter，只监测指定的进程 */
-  if (pid_filter != 0 && pid != pid_filter)
-    return 0;
-
-  /* 读取 futex 操作类型（第二个参数） */
-  bpf_probe_read_kernel(&op, sizeof(op), &ctx->args[1]);
-
-  /* 获取 futex 地址（锁地址） */
-  lock_addr = ctx->args[0];
-
-  /* 提取操作类型（低 7 位） */
-  u32 futex_op = op & 0x7f;
-
-  if (futex_op == 0) {
-    /* FUTEX_WAIT: 记录 tid -> lock_addr 映射 */
-    bpf_map_update_elem(&thread_stats, &tid, &lock_addr, BPF_ANY);
-    stat_inc(0); /* futex_wait 计数 */
-  } else if (futex_op == 1) {
-    /* FUTEX_WAKE: 记录 lock_addr -> last_run_cpu 映射 */
-    u32 cpu = bpf_get_smp_processor_id();
-    bpf_map_update_elem(&lock_owners, &lock_addr, &cpu, BPF_ANY);
-    stat_inc(1); /* futex_wake 计数 */
-  }
-
-  return 0;
+	if (tctx)
+		tctx->runnable_ns = bpf_ktime_get_ns();
 }
 
-SCX_OPS_DEFINE(lb_simple_ops, .select_cpu = (void *)lb_simple_select_cpu,
-               .init = (void *)lb_simple_init, .exit = (void *)lb_simple_exit,
-               .name = "lb_simple");
+/*
+ * stopping - Accumulate on-CPU time when the task stops running.
+ */
+void BPF_STRUCT_OPS(ulock_stopping, struct task_struct *p, bool runnable)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_map, p, NULL, 0);
+
+	if (tctx && tctx->runnable_ns) {
+		tctx->run_ns += bpf_ktime_get_ns() - tctx->runnable_ns;
+		tctx->runnable_ns = 0;
+	}
+}
+
+/*
+ * init_task - Allocate and zero-initialise the per-task context.
+ * If the controller has already registered a class for this pid, adopt it.
+ */
+s32 BPF_STRUCT_OPS(ulock_init_task, struct task_struct *p,
+		   struct scx_init_task_args *args)
+{
+	struct task_ctx *tctx;
+	u32 pid = p->pid;
+	u32 *cls_p;
+
+	tctx = bpf_task_storage_get(&task_ctx_map, p, NULL,
+				     BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!tctx)
+		return -ENOMEM;
+
+	tctx->pid          = pid;
+	tctx->tgid         = p->tgid;
+	tctx->cls          = TASK_NORMAL;
+	tctx->epoch_id     = 0;
+	tctx->run_ns       = 0;
+	tctx->runnable_ns  = 0;
+	tctx->mig_count    = 0;
+	tctx->lock_domain_id = 0;
+	tctx->last_ssc_gen = 0;
+	tctx->hot_epochs   = 0;
+	tctx->cool_epochs  = 0;
+	tctx->hotness_score = 0;
+	tctx->_pad         = 0;
+
+	/* Inherit class if controller already knows about this task. */
+	cls_p = bpf_map_lookup_elem(&task_class_map, &pid);
+	if (cls_p)
+		tctx->cls = *cls_p;
+
+	return 0;
+}
+
+/*
+ * exit_task - Remove the controller-side classification entry.
+ * task_storage is freed automatically by the kernel.
+ */
+void BPF_STRUCT_OPS(ulock_exit_task, struct task_struct *p,
+		    struct scx_exit_task_args *args)
+{
+	u32 pid = p->pid;
+
+	bpf_map_delete_elem(&task_class_map, &pid);
+}
+
+/*
+ * init - Create the two shared DSQs at scheduler load time.
+ */
+s32 BPF_STRUCT_OPS_SLEEPABLE(ulock_init)
+{
+	s32 ret;
+
+	ret = scx_bpf_create_dsq(DSQ_SSC, -1);
+	if (ret < 0)
+		return ret;
+
+	return scx_bpf_create_dsq(DSQ_NORMAL, -1);
+}
+
+/*
+ * exit - Record exit information for the user-exit-info subsystem.
+ */
+void BPF_STRUCT_OPS(ulock_exit, struct scx_exit_info *ei)
+{
+	UEI_RECORD(uei, ei);
+}
+
+/*
+ * Scheduler ops definition.
+ * SCX_OPS_SWITCH_PARTIAL: only tasks that opt-in via SCHED_EXT are managed.
+ */
+SCX_OPS_DEFINE(ulock_ops,
+	       .select_cpu = (void *)ulock_select_cpu,
+	       .enqueue    = (void *)ulock_enqueue,
+	       .dispatch   = (void *)ulock_dispatch,
+	       .running    = (void *)ulock_running,
+	       .stopping   = (void *)ulock_stopping,
+	       .init_task  = (void *)ulock_init_task,
+	       .exit_task  = (void *)ulock_exit_task,
+	       .init       = (void *)ulock_init,
+	       .exit       = (void *)ulock_exit,
+	       .flags      = SCX_OPS_SWITCH_PARTIAL,
+	       .name       = "ulock");

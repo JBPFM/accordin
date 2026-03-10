@@ -41,10 +41,12 @@ impl McsTasLockRaw {
         THREAD_NODE.with(|node| node.get())
     }
 
+    /// Acquire the lock.  Returns `true` if contention was observed (slow path),
+    /// `false` if the lock was acquired on the fast path without contention.
     #[inline(always)]
-    pub fn lock(&self) {
+    pub fn lock(&self) -> bool {
         if !self.locked.swap(true, Ordering::Acquire) {
-            return;
+            return false; // fast path: no contention
         }
 
         let my_node = Self::thread_node();
@@ -93,6 +95,8 @@ impl McsTasLockRaw {
                 (*succ).waiting.store(false, Ordering::Release);
             }
         }
+
+        true // contended: slow path was taken
     }
 
     /// Returns true if the lock was acquired, false if it was already held.

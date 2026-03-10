@@ -4,13 +4,13 @@
 
 mod bpf_skel;
 pub use bpf_skel::*;
+mod arch;
 pub mod bpf_intf;
+mod mcs_tas;
 mod mutex_hook;
 
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::OnceLock;
-use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use libbpf_rs::Link;
@@ -19,8 +19,6 @@ use log::info;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
-
-use crate::mutex_hook::{YIELD_ADDR_MAP_FD, yield_stats_snapshot};
 
 const SCHEDULER_NAME: &str = "lb_simple";
 
@@ -51,10 +49,6 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
     // Load the BPF program
     let mut skel = scx_ops_load!(skel, lb_simple_ops, uei)?;
 
-    // Expose map FD to mutex hook code.
-    let map_fd = skel.maps.yield_addr_map.as_fd().as_raw_fd();
-    YIELD_ADDR_MAP_FD.store(map_fd, Ordering::Release);
-
     // Attach the scheduler
     let link = scx_ops_attach!(skel, lb_simple_ops)?;
 
@@ -67,31 +61,6 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
 
 impl Drop for SchedulerState {
     fn drop(&mut self) {
-        let stats = yield_stats_snapshot();
-        info!(
-            "yield stats: lock_acquire={} contention_yield={} requeue_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
-            stats.lock_acquire,
-            stats.contention_yield,
-            stats.requeue_yield,
-            stats.handoff_yield,
-            stats.fallback_yield,
-            stats.handoff_taken,
-            stats.handoff_miss
-        );
-        eprintln!(
-            "[lb_simple] yield stats: lock_acquire={} contention_yield={} requeue_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
-            stats.lock_acquire,
-            stats.contention_yield,
-            stats.requeue_yield,
-            stats.handoff_yield,
-            stats.fallback_yield,
-            stats.handoff_taken,
-            stats.handoff_miss
-        );
-
-        // Prevent late TLS destructors from using a stale map fd.
-        YIELD_ADDR_MAP_FD.store(-1, Ordering::Release);
-
         // Drop link first, then skeleton.
         let _ = self._link.take();
         let _ = self._skel.take();
@@ -102,6 +71,10 @@ impl Drop for SchedulerState {
 
 /// 初始化 eBPF 调度器
 fn init_ebpf() {
+    if cfg!(test) {
+        return;
+    }
+
     // 初始化日志
     let _ = simplelog::TermLogger::init(
         simplelog::LevelFilter::Info,
@@ -131,24 +104,4 @@ static INIT: extern "C" fn() = {
         init_ebpf();
     }
     init
-};
-
-// 库卸载/进程退出时打印一次统计，避免 static OnceLock 不触发 Drop 导致无输出。
-#[unsafe(link_section = ".fini_array")]
-#[used]
-static FINI: extern "C" fn() = {
-    extern "C" fn fini() {
-        let stats = yield_stats_snapshot();
-        eprintln!(
-            "[lb_simple] yield stats: lock_acquire={} contention_yield={} requeue_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
-            stats.lock_acquire,
-            stats.contention_yield,
-            stats.requeue_yield,
-            stats.handoff_yield,
-            stats.fallback_yield,
-            stats.handoff_taken,
-            stats.handoff_miss
-        );
-    }
-    fini
 };

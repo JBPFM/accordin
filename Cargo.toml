@@ -1,5 +1,4 @@
 [workspace]
-members = ["mcs_pthread_hook"]
 exclude = ["bench/mutexbench_rust"]
 
 [package]

@@ -1,0 +1,9 @@
+[submodule "bench/flexguard"]
+	path = bench/flexguard
+	url = git@github.com:JerryMouseZ/flexguard.git
+[submodule "bench/mutexbench"]
+	path = bench/mutexbench
+	url = git@github.com:JerryMouseZ/mutexbench.git
+[submodule "bench/mutexbench_rust"]
+	path = bench/mutexbench_rust
+	url = git@github.com:JerryMouseZ/mutexbench_rust.git

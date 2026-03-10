@@ -3,3 +3,5 @@
 .clangd
 compile_commands.json
 .spec-workflow
+.codex/worktree
+.claude/worktrees

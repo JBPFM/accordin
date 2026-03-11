@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::arch::pause;
 
+#[repr(align(64))]
+struct CacheAligned<T>(T);
+
 #[repr(C, align(64))]
 pub struct Node {
     next: AtomicPtr<Node>,
@@ -23,17 +26,17 @@ thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
 }
 
-/// Compact MCS-TAS lock without CachePadded padding.
+/// MCS-TAS lock with cache-aligned state variables.
 pub struct McsTasLockRaw {
-    tail: AtomicPtr<Node>,
-    locked: AtomicBool,
+    tail: CacheAligned<AtomicPtr<Node>>,
+    locked: CacheAligned<AtomicBool>,
 }
 
 impl McsTasLockRaw {
     pub const fn new() -> Self {
         Self {
-            tail: AtomicPtr::new(ptr::null_mut()),
-            locked: AtomicBool::new(false),
+            tail: CacheAligned(AtomicPtr::new(ptr::null_mut())),
+            locked: CacheAligned(AtomicBool::new(false)),
         }
     }
 
@@ -43,7 +46,7 @@ impl McsTasLockRaw {
 
     #[inline(always)]
     pub fn lock(&self) {
-        if !self.locked.swap(true, Ordering::Acquire) {
+        if !self.locked.0.swap(true, Ordering::Acquire) {
             return;
         }
 
@@ -53,7 +56,7 @@ impl McsTasLockRaw {
             (*my_node).waiting.store(false, Ordering::Relaxed);
         }
 
-        let pred = self.tail.swap(my_node, Ordering::AcqRel);
+        let pred = self.tail.0.swap(my_node, Ordering::AcqRel);
         if !pred.is_null() {
             unsafe {
                 (*my_node).waiting.store(true, Ordering::Relaxed);
@@ -64,14 +67,15 @@ impl McsTasLockRaw {
             }
         }
 
-        while self.locked.swap(true, Ordering::Acquire) {
+        while self.locked.0.swap(true, Ordering::Acquire) {
             pause();
         }
 
         let mut succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
-        if succ.is_null() {
-            if self
+        if succ.is_null()
+            && self
                 .tail
+                .0
                 .compare_exchange(
                     my_node,
                     ptr::null_mut(),
@@ -87,7 +91,6 @@ impl McsTasLockRaw {
                     pause();
                 }
             }
-        }
         if !succ.is_null() {
             unsafe {
                 (*succ).waiting.store(false, Ordering::Release);
@@ -98,11 +101,11 @@ impl McsTasLockRaw {
     /// Returns true if the lock was acquired, false if it was already held.
     #[inline(always)]
     pub fn try_lock(&self) -> bool {
-        !self.locked.swap(true, Ordering::Acquire)
+        !self.locked.0.swap(true, Ordering::Acquire)
     }
 
     #[inline(always)]
     pub fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
+        self.locked.0.store(false, Ordering::Release);
     }
 }

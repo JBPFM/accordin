@@ -16,8 +16,7 @@ macro_rules! real {
     ($name:ident) => {{
         #[allow(unused_unsafe)]
         {
-            static REAL: AtomicPtr<std::ffi::c_void> =
-                AtomicPtr::new(std::ptr::null_mut());
+            static REAL: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
             let mut ptr = REAL.load(Ordering::Relaxed);
             if ptr.is_null() {
                 ptr = unsafe {
@@ -26,7 +25,10 @@ macro_rules! real {
                         concat!(stringify!($name), "\0").as_ptr() as *const libc::c_char,
                     )
                 };
-                assert!(!ptr.is_null(), concat!("dlsym failed for ", stringify!($name)));
+                assert!(
+                    !ptr.is_null(),
+                    concat!("dlsym failed for ", stringify!($name))
+                );
                 REAL.store(ptr, Ordering::Release);
             }
             unsafe { std::mem::transmute::<*mut std::ffi::c_void, _>(ptr) }
@@ -161,16 +163,18 @@ pub unsafe extern "C" fn pthread_mutex_init(
             return ret;
         }
 
-        std::ptr::write_bytes(mutex as *mut u8, 0, std::mem::size_of::<libc::pthread_mutex_t>());
+        std::ptr::write_bytes(
+            mutex as *mut u8,
+            0,
+            std::mem::size_of::<libc::pthread_mutex_t>(),
+        );
         (*(mutex as *mut usize)) = ptr as usize;
         0
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_destroy(
-    mutex: *mut libc::pthread_mutex_t,
-) -> libc::c_int {
+pub unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
     unsafe {
         if mutex.is_null() {
             return libc::EINVAL;
@@ -180,9 +184,8 @@ pub unsafe extern "C" fn pthread_mutex_destroy(
         let val = atomic.load(Ordering::Acquire);
         if val > SENTINEL {
             let ptr = val as *mut McsTasState;
-            let real_destroy: unsafe extern "C" fn(
-                *mut libc::pthread_mutex_t,
-            ) -> libc::c_int = real!(pthread_mutex_destroy);
+            let real_destroy: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
+                real!(pthread_mutex_destroy);
             let ret = real_destroy((*ptr).real_mutex.get());
             if ret != 0 {
                 return ret;
@@ -195,9 +198,7 @@ pub unsafe extern "C" fn pthread_mutex_destroy(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_lock(
-    mutex: *mut libc::pthread_mutex_t,
-) -> libc::c_int {
+pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
     unsafe {
         let state = match ensure_state(mutex) {
             Ok(state) => state,
@@ -209,9 +210,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_trylock(
-    mutex: *mut libc::pthread_mutex_t,
-) -> libc::c_int {
+pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
     unsafe {
         let state = match ensure_state(mutex) {
             Ok(state) => state,
@@ -226,9 +225,7 @@ pub unsafe extern "C" fn pthread_mutex_trylock(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_unlock(
-    mutex: *mut libc::pthread_mutex_t,
-) -> libc::c_int {
+pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
     unsafe {
         if mutex.is_null() {
             return libc::EINVAL;
@@ -288,12 +285,10 @@ pub unsafe extern "C" fn pthread_cond_wait(
         };
         let real_mu = (*state).real_mutex.get();
 
-        let real_lock: unsafe extern "C" fn(
-            *mut libc::pthread_mutex_t,
-        ) -> libc::c_int = real!(pthread_mutex_lock);
-        let real_unlock: unsafe extern "C" fn(
-            *mut libc::pthread_mutex_t,
-        ) -> libc::c_int = real!(pthread_mutex_unlock);
+        let real_lock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
+            real!(pthread_mutex_lock);
+        let real_unlock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
+            real!(pthread_mutex_unlock);
         let real_wait: unsafe extern "C" fn(
             *mut libc::pthread_cond_t,
             *mut libc::pthread_mutex_t,
@@ -324,12 +319,10 @@ pub unsafe extern "C" fn pthread_cond_timedwait(
         };
         let real_mu = (*state).real_mutex.get();
 
-        let real_lock: unsafe extern "C" fn(
-            *mut libc::pthread_mutex_t,
-        ) -> libc::c_int = real!(pthread_mutex_lock);
-        let real_unlock: unsafe extern "C" fn(
-            *mut libc::pthread_mutex_t,
-        ) -> libc::c_int = real!(pthread_mutex_unlock);
+        let real_lock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
+            real!(pthread_mutex_lock);
+        let real_unlock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
+            real!(pthread_mutex_unlock);
         let real_timedwait: unsafe extern "C" fn(
             *mut libc::pthread_cond_t,
             *mut libc::pthread_mutex_t,

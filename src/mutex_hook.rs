@@ -27,9 +27,9 @@ macro_rules! real {
                     )
                 };
                 assert!(!ptr.is_null(), concat!("dlsym failed for ", stringify!($name)));
-                REAL.store(ptr, Ordering::Relaxed);
+                REAL.store(ptr, Ordering::Release);
             }
-            unsafe { std::mem::transmute::<_, _>(ptr) }
+            unsafe { std::mem::transmute::<*mut std::ffi::c_void, _>(ptr) }
         }
     }};
 }
@@ -183,7 +183,10 @@ pub unsafe extern "C" fn pthread_mutex_destroy(
             let real_destroy: unsafe extern "C" fn(
                 *mut libc::pthread_mutex_t,
             ) -> libc::c_int = real!(pthread_mutex_destroy);
-            real_destroy((*ptr).real_mutex.get());
+            let ret = real_destroy((*ptr).real_mutex.get());
+            if ret != 0 {
+                return ret;
+            }
             drop(Box::from_raw(ptr));
             atomic.store(0, Ordering::Release);
         }
@@ -245,47 +248,33 @@ pub unsafe extern "C" fn pthread_mutex_unlock(
 // Condvar hooks
 // ---------------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_cond_init(
+/// Generate a passthrough hook that forwards directly to the real symbol.
+macro_rules! passthrough_hook {
+    ($sym:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $sym($($arg: $ty),*) -> $ret {
+            let f: unsafe extern "C" fn($($ty),*) -> $ret = real!($sym);
+            unsafe { f($($arg),*) }
+        }
+    };
+}
+
+passthrough_hook!(pthread_cond_init(
     cond: *mut libc::pthread_cond_t,
     attr: *const libc::pthread_condattr_t,
-) -> libc::c_int {
-    let real_fn: unsafe extern "C" fn(
-        *mut libc::pthread_cond_t,
-        *const libc::pthread_condattr_t,
-    ) -> libc::c_int = real!(pthread_cond_init);
-    unsafe { real_fn(cond, attr) }
-}
+) -> libc::c_int);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_cond_destroy(
+passthrough_hook!(pthread_cond_destroy(
     cond: *mut libc::pthread_cond_t,
-) -> libc::c_int {
-    let real_fn: unsafe extern "C" fn(
-        *mut libc::pthread_cond_t,
-    ) -> libc::c_int = real!(pthread_cond_destroy);
-    unsafe { real_fn(cond) }
-}
+) -> libc::c_int);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_cond_signal(
+passthrough_hook!(pthread_cond_signal(
     cond: *mut libc::pthread_cond_t,
-) -> libc::c_int {
-    let real_fn: unsafe extern "C" fn(
-        *mut libc::pthread_cond_t,
-    ) -> libc::c_int = real!(pthread_cond_signal);
-    unsafe { real_fn(cond) }
-}
+) -> libc::c_int);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_cond_broadcast(
+passthrough_hook!(pthread_cond_broadcast(
     cond: *mut libc::pthread_cond_t,
-) -> libc::c_int {
-    let real_fn: unsafe extern "C" fn(
-        *mut libc::pthread_cond_t,
-    ) -> libc::c_int = real!(pthread_cond_broadcast);
-    unsafe { real_fn(cond) }
-}
+) -> libc::c_int);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_cond_wait(

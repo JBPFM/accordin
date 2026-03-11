@@ -2,15 +2,20 @@ use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use crate::arch::pause;
+use crate::arch::{pause, read_tsc};
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
+
+const WAIT_TSC_SAMPLE_STRIDE: u8 = 8;
 
 #[repr(C, align(64))]
 pub struct Node {
     next: AtomicPtr<Node>,
     waiting: AtomicBool,
+    wait_sample_countdown: u8,
+    sampled_wait_tsc_cycles: u64,
+    sampled_wait_tsc_samples: u64,
 }
 
 impl Node {
@@ -18,6 +23,9 @@ impl Node {
         Self {
             next: AtomicPtr::new(ptr::null_mut()),
             waiting: AtomicBool::new(false),
+            wait_sample_countdown: 0,
+            sampled_wait_tsc_cycles: 0,
+            sampled_wait_tsc_samples: 0,
         }
     }
 }
@@ -45,6 +53,28 @@ impl McsTasLockRaw {
     }
 
     #[inline(always)]
+    fn should_sample_wait(my_node: *mut Node) -> bool {
+        unsafe {
+            let countdown = (*my_node).wait_sample_countdown;
+            if countdown == 0 {
+                (*my_node).wait_sample_countdown = WAIT_TSC_SAMPLE_STRIDE.saturating_sub(1);
+                true
+            } else {
+                (*my_node).wait_sample_countdown = countdown - 1;
+                false
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn record_sampled_wait(my_node: *mut Node, cycles: u64) {
+        unsafe {
+            (*my_node).sampled_wait_tsc_cycles += cycles;
+            (*my_node).sampled_wait_tsc_samples += 1;
+        }
+    }
+
+    #[inline(always)]
     pub fn lock(&self) {
         if !self.locked.0.swap(true, Ordering::Acquire) {
             return;
@@ -56,6 +86,8 @@ impl McsTasLockRaw {
             (*my_node).waiting.store(false, Ordering::Relaxed);
         }
 
+        let sample_wait = Self::should_sample_wait(my_node);
+        let wait_start = if sample_wait { read_tsc() } else { 0 };
         let pred = self.tail.0.swap(my_node, Ordering::AcqRel);
         if !pred.is_null() {
             unsafe {
@@ -70,6 +102,9 @@ impl McsTasLockRaw {
         while self.locked.0.swap(true, Ordering::Acquire) {
             pause();
         }
+        if sample_wait {
+            Self::record_sampled_wait(my_node, read_tsc().saturating_sub(wait_start));
+        }
 
         let mut succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
         if succ.is_null()
@@ -83,14 +118,14 @@ impl McsTasLockRaw {
                     Ordering::Acquire,
                 )
                 .is_err()
-            {
-                while {
-                    succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
-                    succ.is_null()
-                } {
-                    pause();
-                }
+        {
+            while {
+                succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
+                succ.is_null()
+            } {
+                pause();
             }
+        }
         if !succ.is_null() {
             unsafe {
                 (*succ).waiting.store(false, Ordering::Release);

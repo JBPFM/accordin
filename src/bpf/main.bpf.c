@@ -53,7 +53,7 @@ void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
-	if (tc->admitted) {
+	if (stats_only_mode || tc->admitted) {
 		scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
 		return;
 	}
@@ -65,6 +65,11 @@ void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev)
 {
+	if (stats_only_mode) {
+		scx_bpf_dsq_move_to_local(READY_DSQ_ID);
+		return;
+	}
+
 	__s64 al = active_local;
 	__s64 ar = active_remote;
 	__s64 tl = target_local;
@@ -165,6 +170,9 @@ void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)
 	/* Try to advance window (stopping path) */
 	try_advance_window(now);
 
+	if (stats_only_mode)
+		return;
+
 	/* Self-parking decision */
 	__s64 al2 = active_local;
 	__s64 ar2 = active_remote;
@@ -208,6 +216,9 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p)
 		account_task_activity(tc, pid, now);
 
 	try_advance_window(now);
+
+	if (stats_only_mode)
+		return;
 
 	/*
 	 * If active count is above target, force a reschedule so the

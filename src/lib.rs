@@ -25,6 +25,8 @@ use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
 
 const SCHEDULER_NAME: &str = "lb_simple";
+const DISABLE_BPF_ENV: &str = "LB_SIMPLE_DISABLE_BPF";
+const STATS_ONLY_ENV: &str = "LB_SIMPLE_STATS_ONLY";
 
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
@@ -163,7 +165,7 @@ fn configure_scheduler_topology(skel: &mut OpenBpfSkel<'_>, topology: &NumaTopol
 }
 
 /// Populate cpu_to_node BPF map and publish NUMA defaults.
-fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology) {
+fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, stats_only: bool) {
     for (cpu, node_id) in &topology.cpu_to_node {
         let _ =
             skel.maps
@@ -173,15 +175,16 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology) {
 
     if let Some(bss) = skel.maps.bss_data.as_mut() {
         bss.dominant_node = topology.dominant_node;
+        bss.stats_only_mode = u32::from(stats_only);
     }
 
     info!(
-        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={}",
-        topology.dominant_node, topology.local_cpu_count, topology.remote_cpu_count
+        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} stats_only={}",
+        topology.dominant_node, topology.local_cpu_count, topology.remote_cpu_count, stats_only
     );
 }
 
-fn init_scheduler(debug: bool) -> Result<SchedulerState> {
+fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
     let topology = detect_numa_topology();
     let mut skel_builder = BpfSkelBuilder::default();
     skel_builder.obj_builder.debug(debug);
@@ -208,7 +211,7 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
     mutex_hook::THREAD_CTX_MAP_FD.store(map_fd, Ordering::Release);
 
     // Publish cpu_to_node map and NUMA defaults after load.
-    publish_scheduler_topology(&mut skel, &topology);
+    publish_scheduler_topology(&mut skel, &topology, stats_only);
 
     // Attach the scheduler
     let link = scx_ops_attach!(skel, lb_simple_ops)?;
@@ -230,6 +233,19 @@ impl Drop for SchedulerState {
     }
 }
 
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim();
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
 /// 初始化 eBPF 调度器
 fn init_ebpf() {
     if cfg!(test) {
@@ -244,9 +260,31 @@ fn init_ebpf() {
         simplelog::ColorChoice::Auto,
     );
 
+    if env_flag(DISABLE_BPF_ENV) {
+        mutex_hook::THREAD_CTX_MAP_FD.store(-1, Ordering::Release);
+        info!(
+            "{SCHEDULER_NAME} scheduler disabled by env {}",
+            DISABLE_BPF_ENV
+        );
+        eprintln!("[lb_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
+        return;
+    }
+
+    let stats_only = env_flag(STATS_ONLY_ENV);
+
     // 初始化调度器（只执行一次）
-    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false) {
+    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false, stats_only) {
         Ok(state) => {
+            if stats_only {
+                info!(
+                    "{SCHEDULER_NAME} scheduler running in stats-only mode via env {}",
+                    STATS_ONLY_ENV
+                );
+                eprintln!(
+                    "[lb_simple] eBPF scheduler stats-only mode enabled by {}",
+                    STATS_ONLY_ENV
+                );
+            }
             eprintln!("[lb_simple] eBPF scheduler loaded successfully");
             state
         }

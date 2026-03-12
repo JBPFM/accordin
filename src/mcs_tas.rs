@@ -1,8 +1,12 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use crate::arch::{clock_gettime_ns, pause};
+use crate::arch::{pause, wait_time_elapsed_ns, wait_time_start};
+
+// Keep in sync with WAIT_TIME_SAMPLE_STRIDE in src/bpf/intf.h.
+const WAIT_TIME_SAMPLE_STRIDE: u32 = 8;
+const WAIT_TIME_SAMPLE_MASK: u32 = WAIT_TIME_SAMPLE_STRIDE - 1;
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
@@ -39,17 +43,17 @@ impl LockSchedThreadCtx {
         }
     }
 
-    #[inline(always)]
-    fn seq_begin(&mut self) {
-        self.seq = self.seq.wrapping_add(1); // odd = writing
-        std::sync::atomic::fence(Ordering::Release);
-    }
-
-    #[inline(always)]
-    fn seq_end(&mut self) {
-        std::sync::atomic::fence(Ordering::Release);
-        self.seq = self.seq.wrapping_add(1); // even = committed
-    }
+    // #[inline(always)]
+    // fn seq_begin(&mut self) {
+    //     self.seq = self.seq.wrapping_add(1); // odd = writing
+    //     std::sync::atomic::fence(Ordering::Release);
+    // }
+    //
+    // #[inline(always)]
+    // fn seq_end(&mut self) {
+    //     std::sync::atomic::fence(Ordering::Release);
+    //     self.seq = self.seq.wrapping_add(1); // even = committed
+    // }
 
     #[inline(always)]
     fn set_role_owner(&mut self) {
@@ -69,11 +73,21 @@ impl LockSchedThreadCtx {
 thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
     static THREAD_CTX: UnsafeCell<LockSchedThreadCtx> = const { UnsafeCell::new(LockSchedThreadCtx::new()) };
+    static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Returns a pointer to the current thread's LockSchedThreadCtx.
 pub fn thread_ctx() -> *mut LockSchedThreadCtx {
     THREAD_CTX.with(|ctx| ctx.get())
+}
+
+#[inline(always)]
+fn should_sample_wait() -> bool {
+    WAIT_SAMPLE_COUNTER.with(|counter| {
+        let next = counter.get().wrapping_add(1);
+        counter.set(next);
+        (next & WAIT_TIME_SAMPLE_MASK) == 0
+    })
 }
 
 /// MCS-TAS lock with cache-aligned state variables.
@@ -105,7 +119,8 @@ impl McsTasLockRaw {
         }
 
         // Slow path: MCS queue + TAS
-        let wait_start = clock_gettime_ns();
+        let sample_wait = should_sample_wait();
+        let wait_start = if sample_wait { wait_time_start() } else { 0 };
 
         let my_node = Self::thread_node();
         unsafe {
@@ -154,11 +169,12 @@ impl McsTasLockRaw {
             }
         }
 
-        // Acquired after contention — accumulate wait time, set ROLE_OWNER
-        let wait_end = clock_gettime_ns();
+        // Acquired after contention — accumulate sampled wait time, set ROLE_OWNER
         let ctx = thread_ctx();
         unsafe {
-            (*ctx).wait_ns_total += wait_end - wait_start;
+            if sample_wait {
+                (*ctx).wait_ns_total += wait_time_elapsed_ns(wait_start);
+            }
             (*ctx).set_role_owner();
         }
     }

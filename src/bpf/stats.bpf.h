@@ -60,6 +60,17 @@ static __always_inline void update_stat(__u32 key, __u64 val)
 		*sp = val;
 }
 
+static __always_inline __u64 scale_sampled_wait_ns(__u64 sampled_wait_ns)
+{
+#if WAIT_TIME_SAMPLE_STRIDE > 1
+	if (sampled_wait_ns > (~0ULL / WAIT_TIME_SAMPLE_STRIDE))
+		return ~0ULL;
+	return sampled_wait_ns * WAIT_TIME_SAMPLE_STRIDE;
+#else
+	return sampled_wait_ns;
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /*  Per-task activity accounting                                       */
 /* ------------------------------------------------------------------ */
@@ -84,7 +95,7 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
 		if (read_thread_ctx(*user_ptr_p, &uctx)) {
 			tc->role = uctx.state;
 			if (uctx.wait_ns_total >= tc->last_wait_ns) {
-				wait_delta = uctx.wait_ns_total - tc->last_wait_ns;
+				wait_delta = scale_sampled_wait_ns(uctx.wait_ns_total - tc->last_wait_ns);
 				tc->last_wait_ns = uctx.wait_ns_total;
 			}
 		}

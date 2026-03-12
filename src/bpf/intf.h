@@ -11,6 +11,7 @@
 #define MAX_TASKS       65536U
 #define MAX_CPUS        256U
 #define MAX_NODES       8U
+#define WAIT_TIME_SAMPLE_STRIDE 8U
 
 enum thread_role {
     ROLE_NONE  = 0,
@@ -19,7 +20,7 @@ enum thread_role {
 
 /* Stored in user thread-local memory and read from BPF via bpf_probe_read_user. */
 struct lock_sched_thread_ctx {
-    unsigned long long wait_ns_total;  /* monotonic cumulative */
+    unsigned long long wait_ns_total;  /* cumulative sampled wait time */
     unsigned int       state;          /* enum thread_role */
     unsigned int       seq;            /* seqcount (odd=writing) */
 };

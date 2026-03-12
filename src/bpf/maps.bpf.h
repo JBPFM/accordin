@@ -80,5 +80,6 @@ volatile __s32 dominant_node = 0;
 
 /* Stats */
 volatile __u64 forced_release_cnt = 0;
+volatile __u32 stats_only_mode = 0;
 
 #endif /* __MAPS_BPF_H */

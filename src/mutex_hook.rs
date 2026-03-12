@@ -2,11 +2,117 @@
 //
 // Interpose pthread mutex/cond and back them with an MCS-TAS lock.
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::hint::spin_loop;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 
-use crate::mcs_tas::McsTasLockRaw;
+use crate::mcs_tas::{McsTasLockRaw, thread_ctx};
+
+/// BPF map FD for thread_ctx_addr_map, set by lib.rs after BPF load.
+pub static THREAD_CTX_MAP_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Register the current thread's LockSchedThreadCtx pointer into the BPF map.
+/// Called once per thread on first pthread_mutex_lock.
+fn register_thread_ctx() {
+    let fd = THREAD_CTX_MAP_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+    let ctx_ptr = thread_ctx() as u64;
+
+    // BPF_MAP_UPDATE_ELEM via raw syscall
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct bpf_attr_map_elem {
+        map_fd: u32,
+        _pad0: u32,
+        key: u64,
+        value_or_next: u64,
+        flags: u64,
+    }
+
+    let attr = bpf_attr_map_elem {
+        map_fd: fd as u32,
+        _pad0: 0,
+        key: &tid as *const u32 as u64,
+        value_or_next: &ctx_ptr as *const u64 as u64,
+        flags: 0, // BPF_ANY
+    };
+
+    unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            2i32, // BPF_MAP_UPDATE_ELEM
+            &attr as *const _ as *const libc::c_void,
+            std::mem::size_of::<bpf_attr_map_elem>() as u32,
+        );
+    }
+}
+
+/// Delete the current thread's entry from the BPF map.
+fn unregister_thread_ctx() {
+    let fd = THREAD_CTX_MAP_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct bpf_attr_map_elem {
+        map_fd: u32,
+        _pad0: u32,
+        key: u64,
+        value_or_next: u64,
+        flags: u64,
+    }
+
+    let attr = bpf_attr_map_elem {
+        map_fd: fd as u32,
+        _pad0: 0,
+        key: &tid as *const u32 as u64,
+        value_or_next: 0,
+        flags: 0,
+    };
+
+    unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            3i32, // BPF_MAP_DELETE_ELEM
+            &attr as *const _ as *const libc::c_void,
+            std::mem::size_of::<bpf_attr_map_elem>() as u32,
+        );
+    }
+}
+
+/// Thread-local guard that unregisters from the BPF map on thread exit.
+struct ThreadCtxGuard;
+
+impl Drop for ThreadCtxGuard {
+    fn drop(&mut self) {
+        unregister_thread_ctx();
+    }
+}
+
+thread_local! {
+    static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    static _GUARD: UnsafeCell<Option<ThreadCtxGuard>> = const { UnsafeCell::new(None) };
+}
+
+/// Ensure the current thread is registered in the BPF map (idempotent).
+#[inline(always)]
+fn ensure_registered() {
+    REGISTERED.with(|r| {
+        if !r.get() {
+            register_thread_ctx();
+            _GUARD.with(|g| unsafe { *g.get() = Some(ThreadCtxGuard) });
+            r.set(true);
+        }
+    });
+}
 
 /// Resolve the real (next) symbol via `dlsym(RTLD_NEXT, name)`.
 ///
@@ -199,6 +305,7 @@ pub unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut libc::pthread_mutex_t
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
+    ensure_registered();
     unsafe {
         let state = match ensure_state(mutex) {
             Ok(state) => state,
@@ -211,6 +318,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut libc::pthread_mutex_t) -
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
+    ensure_registered();
     unsafe {
         let state = match ensure_state(mutex) {
             Ok(state) => state,

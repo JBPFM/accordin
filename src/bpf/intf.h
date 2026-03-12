@@ -37,6 +37,7 @@ struct task_scx_ctx {
     unsigned int       counted_local; /* 1 if counted in active_local */
     int                last_node;
     unsigned long long ssc_enter_ts;
+    unsigned long long user_ctx_ptr; /* cached pointer to user-space lock_sched_thread_ctx */
 };
 
 /* Stats exported via stats_map for userspace monitoring. */

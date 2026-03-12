@@ -21,32 +21,20 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * Read a user-space lock_sched_thread_ctx with seqcount protection.
+ * Read a user-space lock_sched_thread_ctx.
+ *
+ * The seqcount write-side is currently disabled in userspace (mcs_tas.rs),
+ * so we skip the seq validation and do a single bpf_probe_read_user.
  * Returns true on success.
  */
 static __always_inline bool read_thread_ctx(__u64 user_ptr,
 					    struct lock_sched_thread_ctx *out)
 {
-	__u32 seq1 = 0, seq2 = 0;
-	__u64 seq_addr = user_ptr + offsetof(struct lock_sched_thread_ctx, seq);
-
 	if (!user_ptr)
 		return false;
 
-	if (bpf_probe_read_user(&seq1, sizeof(seq1), (void *)(unsigned long)seq_addr))
-		return false;
-	if (seq1 & 1)
-		return false;  /* writer active */
-
-	if (bpf_probe_read_user(out, sizeof(*out), (void *)(unsigned long)user_ptr))
-		return false;
-
-	if (bpf_probe_read_user(&seq2, sizeof(seq2), (void *)(unsigned long)seq_addr))
-		return false;
-	if ((seq2 & 1) || seq1 != seq2)
-		return false;  /* torn read */
-
-	return true;
+	return bpf_probe_read_user(out, sizeof(*out),
+				   (void *)(unsigned long)user_ptr) == 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -89,10 +77,10 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
 	if (now > tc->run_start_ns)
 		run_delta = now - tc->run_start_ns;
 
-	__u64 *user_ptr_p = bpf_map_lookup_elem(&thread_ctx_addr_map, &pid);
-	if (user_ptr_p) {
+	/* Use cached user_ctx_ptr instead of map lookup */
+	if (tc->user_ctx_ptr) {
 		struct lock_sched_thread_ctx uctx = {};
-		if (read_thread_ctx(*user_ptr_p, &uctx)) {
+		if (read_thread_ctx(tc->user_ctx_ptr, &uctx)) {
 			tc->role = uctx.state;
 			if (uctx.wait_ns_total >= tc->last_wait_ns) {
 				wait_delta = scale_sampled_wait_ns(uctx.wait_ns_total - tc->last_wait_ns);
@@ -185,8 +173,15 @@ static __always_inline bool try_advance_window(__u64 now)
 		ch = 0;
 	}
 	if (cl >= lp) {
-		/* Expand: prefer expanding local first */
-		tl++;
+		/* Expand: choose node based on current active ratio.
+		 * If remote is further below its target, expand remote;
+		 * otherwise expand local. */
+		__s64 local_headroom = tl - active_local;
+		__s64 remote_headroom = tr - active_remote;
+		if (remote_headroom > local_headroom && tr < max_target_remote)
+			tr++;
+		else
+			tl++;
 		cl = 0;
 	}
 

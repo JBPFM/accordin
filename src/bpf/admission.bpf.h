@@ -37,12 +37,14 @@ static __always_inline struct task_scx_ctx *get_or_create_task_ctx(__u32 pid)
 	 * Counting every sched_ext task in the machine dilutes wait ratio
 	 * and prevents SSC admission from converging for the benchmark.
 	 */
-	if (!bpf_map_lookup_elem(&thread_ctx_addr_map, &pid))
+	__u64 *user_ptr_p = bpf_map_lookup_elem(&thread_ctx_addr_map, &pid);
+	if (!user_ptr_p)
 		return NULL;
 
 	struct task_scx_ctx new_ctx = {
 		.admitted = 1,
 		.last_node = -1,
+		.user_ctx_ptr = *user_ptr_p,
 	};
 	bpf_map_update_elem(&task_ctx_map, &pid, &new_ctx, BPF_NOEXIST);
 	return bpf_map_lookup_elem(&task_ctx_map, &pid);

@@ -39,8 +39,9 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	__u32 pid = p->pid;
-	struct task_scx_ctx *tc = get_or_create_task_ctx(pid);
+	struct task_scx_ctx *tc = bpf_map_lookup_elem(&task_ctx_map, &pid);
 	if (!tc) {
+		/* Untracked task (not yet seen in running()) — let it run. */
 		scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
 		return;
 	}
@@ -148,13 +149,8 @@ void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p)
 		admit_task(tc);
 	}
 
-	/* Read user-space role */
-	__u64 *user_ptr_p = bpf_map_lookup_elem(&thread_ctx_addr_map, &pid);
-	if (user_ptr_p) {
-		struct lock_sched_thread_ctx uctx = {};
-		if (read_thread_ctx(*user_ptr_p, &uctx))
-			tc->role = uctx.state;
-	}
+	/* Role is read in stopping() via account_task_activity() using
+	 * the cached user_ctx_ptr — no need to duplicate here. */
 }
 
 void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)

@@ -2,6 +2,12 @@
 #ifndef __ADMISSION_BPF_H
 #define __ADMISSION_BPF_H
 
+/* Keep this header self-contained for standalone clangd parsing. */
+#include <scx/common.bpf.h>
+
+#include "intf.h"
+#include "maps.bpf.h"
+
 /*
  * Admission control and NUMA helpers.
  *

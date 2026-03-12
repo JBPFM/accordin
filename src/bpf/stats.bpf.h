@@ -2,6 +2,12 @@
 #ifndef __STATS_BPF_H
 #define __STATS_BPF_H
 
+/* Keep this header self-contained for standalone clangd parsing. */
+#include <scx/common.bpf.h>
+
+#include "intf.h"
+#include "maps.bpf.h"
+
 /*
  * Statistics layer: window-based EWMA wait ratio computation.
  *

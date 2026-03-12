@@ -2,6 +2,11 @@
 #ifndef __MAPS_BPF_H
 #define __MAPS_BPF_H
 
+/* Keep this header self-contained for standalone clangd parsing. */
+#include <scx/common.bpf.h>
+
+#include "intf.h"
+
 /* ------------------------------------------------------------------ */
 /*  Maps                                                               */
 /* ------------------------------------------------------------------ */

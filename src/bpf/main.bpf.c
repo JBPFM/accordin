@@ -30,16 +30,25 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 	s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
 	/*
-	 * Do NOT insert into SCX_DSQ_LOCAL here - all tasks must go through
-	 * enqueue() -> dispatch() so SSC admission control is not bypassed.
+	 * Fast path: if an idle CPU was found and the task is already
+	 * admitted (or is a lock owner), dispatch directly to the local
+	 * DSQ.  sched_ext will skip enqueue() entirely, avoiding the
+	 * global READY_DSQ lock.  Correctness is preserved because
+	 * stopping() still runs self-parking logic.
 	 */
+	if (is_idle) {
+		struct task_scx_ctx *tc = lookup_task_ctx(p);
+		if (tc && (tc->admitted || tc->role == ROLE_OWNER))
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		/* Untracked or suppressed tasks fall through to enqueue() */
+	}
+
 	return cpu;
 }
 
 void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	__u32 pid = p->pid;
-	struct task_scx_ctx *tc = bpf_map_lookup_elem(&task_ctx_map, &pid);
+	struct task_scx_ctx *tc = lookup_task_ctx(p);
 	if (!tc) {
 		/* Untracked task (not yet seen in running()) — let it run. */
 		scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
@@ -113,8 +122,7 @@ void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev)
 
 void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p)
 {
-	__u32 pid = p->pid;
-	struct task_scx_ctx *tc = get_or_create_task_ctx(pid);
+	struct task_scx_ctx *tc = get_or_create_task_ctx(p);
 	if (!tc)
 		return;
 
@@ -156,15 +164,14 @@ void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p)
 void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)
 {
 	__u32 pid = p->pid;
-	struct task_scx_ctx *tc = bpf_map_lookup_elem(&task_ctx_map, &pid);
+	struct task_scx_ctx *tc = lookup_task_ctx(p);
 	if (!tc)
 		return;
 
 	__u64 now = bpf_ktime_get_ns();
 	account_task_activity(tc, pid, now);
 
-	/* Try to advance window (stopping path) */
-	try_advance_window(now);
+	/* Window advance moved to tick() — only CPU 0 advances */
 
 	if (stats_only_mode)
 		return;
@@ -205,7 +212,7 @@ void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)
 void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p)
 {
 	__u32 pid = p->pid;
-	struct task_scx_ctx *tc = bpf_map_lookup_elem(&task_ctx_map, &pid);
+	struct task_scx_ctx *tc = lookup_task_ctx(p);
 	__u64 now = bpf_ktime_get_ns();
 
 	if (tc)
@@ -232,7 +239,7 @@ void BPF_STRUCT_OPS(lb_simple_exit_task, struct task_struct *p,
 		    struct scx_exit_task_args *args)
 {
 	__u32 pid = p->pid;
-	struct task_scx_ctx *tc = bpf_map_lookup_elem(&task_ctx_map, &pid);
+	struct task_scx_ctx *tc = lookup_task_ctx(p);
 
 	/* Adjust active counts only if task was actually counted */
 	if (tc && tc->counted) {
@@ -242,7 +249,7 @@ void BPF_STRUCT_OPS(lb_simple_exit_task, struct task_struct *p,
 			__sync_fetch_and_sub((volatile __s64 *)&active_remote, 1);
 	}
 
-	bpf_map_delete_elem(&task_ctx_map, &pid);
+	bpf_task_storage_delete(&task_ctx_map, p);
 	bpf_map_delete_elem(&thread_ctx_addr_map, &pid);
 }
 

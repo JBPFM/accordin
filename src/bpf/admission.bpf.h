@@ -21,33 +21,46 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * Lookup or create a per-task scheduling context.
- * New tasks start admitted.
+ * Lookup the per-task scheduling context via task local storage.
+ * Returns NULL for tasks without a context.
  */
-static __always_inline struct task_scx_ctx *get_or_create_task_ctx(__u32 pid)
+static __always_inline struct task_scx_ctx *lookup_task_ctx(struct task_struct *p)
+{
+	return bpf_task_storage_get(&task_ctx_map, p, 0, 0);
+}
+
+/*
+ * Lookup or create a per-task scheduling context via task local storage.
+ * Only creates for threads that registered a userspace lock context.
+ * New tasks start admitted.
+ *
+ * Uses BPF_LOCAL_STORAGE_GET_F_CREATE for atomic create-if-absent,
+ * replacing the old lookup+insert+lookup triple with a single call.
+ */
+static __always_inline struct task_scx_ctx *get_or_create_task_ctx(
+	struct task_struct *p)
 {
 	struct task_scx_ctx *tc;
 
-	tc = bpf_map_lookup_elem(&task_ctx_map, &pid);
+	tc = bpf_task_storage_get(&task_ctx_map, p, 0, 0);
 	if (tc)
 		return tc;
 
-	/*
-	 * Only track threads that registered a userspace lock context.
-	 * Counting every sched_ext task in the machine dilutes wait ratio
-	 * and prevents SSC admission from converging for the benchmark.
-	 */
+	__u32 pid = p->pid;
 	__u64 *user_ptr_p = bpf_map_lookup_elem(&thread_ctx_addr_map, &pid);
 	if (!user_ptr_p)
 		return NULL;
 
-	struct task_scx_ctx new_ctx = {
-		.admitted = 1,
-		.last_node = -1,
-		.user_ctx_ptr = *user_ptr_p,
-	};
-	bpf_map_update_elem(&task_ctx_map, &pid, &new_ctx, BPF_NOEXIST);
-	return bpf_map_lookup_elem(&task_ctx_map, &pid);
+	tc = bpf_task_storage_get(&task_ctx_map, p, 0,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!tc)
+		return NULL;
+
+	tc->admitted = 1;
+	tc->last_node = -1;
+	tc->user_ctx_ptr = *user_ptr_p;
+
+	return tc;
 }
 
 /* ------------------------------------------------------------------ */

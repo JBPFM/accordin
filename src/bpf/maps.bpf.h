@@ -12,9 +12,9 @@
 /* ------------------------------------------------------------------ */
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_TASKS);
-	__type(key, __u32);   /* pid (tid) */
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
 	__type(value, struct task_scx_ctx);
 } task_ctx_map SEC(".maps");
 
@@ -44,14 +44,14 @@ struct {
 /* ------------------------------------------------------------------ */
 
 /* Window parameters */
-volatile __u64 window_ns       = 4000000ULL;  /* 4ms */
+volatile __u64 window_ns       = 200000000ULL;  /* 200ms */
 volatile __u64 window_start_ns = 0;
 
 /* Thresholds (x1000 fixed-point, e.g. 350 = 0.35) */
 volatile __u32 p_high     = 350;
 volatile __u32 p_low      = 200;
 volatile __u32 p_w_ewma   = 0;
-volatile __u32 ewma_alpha = 200;  /* 0.2 x 1000 */
+volatile __u32 ewma_alpha = 300;  /* 0.3 x 1000 */
 
 /* Admission targets */
 volatile __s64 target_local  = 1024;
@@ -65,15 +65,27 @@ volatile __s64 active_remote = 0;
 volatile __u64 max_ssc_wait_ns  = 50000000ULL;  /* 50ms */
 volatile __u64 min_ssc_dwell_ns = 1000000ULL;   /* 1ms */
 
-/* Aggregation accumulators (fed by stopping(), consumed by window rollover) */
-volatile __u64 agg_run_ns  = 0;
-volatile __u64 agg_wait_ns = 0;
+/*
+ * Per-CPU aggregation accumulators — eliminates cross-core atomic
+ * contention on every stopping()/tick().
+ */
+struct agg_percpu {
+	__u64 run_ns;
+	__u64 wait_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct agg_percpu);
+} agg_percpu_map SEC(".maps");
 
 /* Hysteresis counters */
 volatile __u32 consec_high  = 0;
 volatile __u32 consec_low   = 0;
 volatile __u32 H_persist    = 2;
-volatile __u32 L_persist    = 2;
+volatile __u32 L_persist    = 3;
 
 /* NUMA */
 volatile __s32 dominant_node = 0;
@@ -81,5 +93,13 @@ volatile __s32 dominant_node = 0;
 /* Stats */
 volatile __u64 forced_release_cnt = 0;
 volatile __u32 stats_only_mode = 0;
+
+/* Per-window debug stats */
+volatile __u64 dbg_win_run = 0;
+volatile __u64 dbg_win_wait = 0;
+volatile __u64 dbg_acct_calls = 0;     /* total account_task_activity calls */
+volatile __u64 dbg_acct_has_uptr = 0;  /* calls with user_ctx_ptr != 0 */
+volatile __u64 dbg_acct_read_ok = 0;   /* bpf_probe_read_user succeeded */
+volatile __u64 dbg_acct_wait_nz = 0;   /* wait_delta > 0 */
 
 #endif /* __MAPS_BPF_H */

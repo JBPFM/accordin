@@ -51,7 +51,14 @@ enum stat_key {
     STAT_CONSEC_HIGH     = 6,
     STAT_CONSEC_LOW      = 7,
     STAT_FORCED_RELEASE  = 8,
-    STAT_NR              = 9,
+    STAT_DBG_WIN_RUN     = 9,   /* last window total_run (us) */
+    STAT_DBG_WIN_WAIT    = 10,  /* last window total_wait (us) */
+    STAT_DBG_WIN_PW      = 11,  /* last window p_w_sample */
+    STAT_DBG_ACCT_CALLS  = 12,
+    STAT_DBG_ACCT_UPTR   = 13,
+    STAT_DBG_ACCT_READOK = 14,
+    STAT_DBG_ACCT_WAITNZ = 15,
+    STAT_NR              = 16,
 };
 
 #endif

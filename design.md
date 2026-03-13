@@ -313,13 +313,15 @@ struct cpu_sched_ctx {
 
 对线程：
 
-`p_t = wait_ns_window / (wait_ns_window + run_ns_window + epsilon)`
+`p_t = wait_ns_window / run_ns_window`
+
+注意：wait_ns 是 run_ns 的**子集**（线程在 CPU 上自旋等锁时同时计入 run 和 wait），因此正确公式是 `wait/run`，而非 `wait/(run+wait)`（后者会双重计数并将信号减半）。
 
 对 workload：
 
 `p_w = EWMA(aggregate of p_t)`
 
-即对受控线程集合的等待占比进行聚合，作为 active set 调整信号。
+即对受控线程集合的等待占比进行聚合（使用 per-CPU 累加器求和），作为 active set 调整信号。当 `total_wait==0`（信号缺失窗口）时使用缓慢线性衰减而非标准 EWMA 更新，避免信号缺失被误判为低竞争。
 
 ## 9.4 额外统计量
 
@@ -417,20 +419,32 @@ raw_target = clamp(round((1 - p_w) * n_eff), min_active, max_active)
 
 ## 12. 控制律
 
-## 12.1 双阈值
+## 12.1 双阈值与 drought-safe 迟滞
 
 对 workload 定义：
 
-* `P_high`：高等待阈值
-* `P_low`：低等待阈值，且 `P_low < P_high`
+* `P_high`：高等待阈值（默认 0.35）
+* `P_low`：低等待阈值（默认 0.20），且 `P_low < P_high`
 
 控制规则：
 
 * 若 `p_w > P_high` 且持续 H 个窗口：收缩 active set
-* 若 `p_w < P_low` 且持续 L 个窗口：扩张 active set
+* 若 `p_w < P_low` 且持续 L 个窗口 **且窗口内有实际 wait 数据**：扩张 active set
 * 介于两者之间：保持不动
 
-## 12.2 收缩顺序
+**drought-safe 扩张**：当窗口内 `total_wait==0`（信号缺失），即使 EWMA 低于 P_low，也不累加 consec_low。信号缺失不等于低竞争，不应触发扩张。这防止低 target 时采样稀疏导致的振荡。
+
+## 12.2 收缩策略：二分法
+
+收缩采用**二分法（bisection）**：每次将 total target 减半，而非线性步进。
+
+理由：
+* 高竞争是主动有害的（CPU 浪费、cache thrashing），应尽快消除
+* 过度收缩代价低 — target 下限（`target_local >= 2`）兜底，吞吐降低但系统稳定
+* 扩张侧保持保守（比例步长 + drought-safe），会缓慢恢复到最优点
+* 从 TGT=96 收敛到 TGT=2 仅需 ~6 步（~2.4s），比比例步长（~10s）快 5x
+
+减半后按 NUMA 分配缩减量：
 
 1. remote 线程优先进入 SSC
 2. local 普通线程进入 SSC
@@ -448,7 +462,11 @@ raw_target = clamp(round((1 - p_w) * n_eff), min_active, max_active)
 
 * **最小驻留时间**：线程进入 SSC 后至少停留一段时间才允许再次 admission。
 * **最大滞留时间**：线程在 SSC 中不可无限等待。
-* **单窗口步长限制**：每次 active set 仅 ±1 或小步变化。
+* **收缩二分法**：收缩方向每次将 total target 减半，~6 步可从满配收敛到下限。高竞争主动有害，应尽快消除。
+* **扩张比例步长 + 上限**：扩张步长与 EWMA 偏离阈值的程度成正比（`delta / 50`），上限为当前 total target 的 25%。扩张方向保持保守，避免反弹。
+* **Drought-safe 扩张**：信号缺失窗口不触发扩张（见 §12.1）。
+* **Target 下限**：`target_local >= 2`，保证 N=2 时 p_w=(N-1)/(N+1)=1/3 位于 P_low 和 P_high 之间，形成自然均衡点。
+* **扩张步长基于当前值**：扩张上限为 `cur_total / 4`（非剩余空间 / 4），防止从近零快速扩张。
 
 ---
 
@@ -460,12 +478,12 @@ raw_target = clamp(round((1 - p_w) * n_eff), min_active, max_active)
 
 * 提供 CPU 选择 hint。
 * 如果发现首选 NUMA 节点存在空闲 CPU，优先 hint 到该节点。
-* 不做最终 admission 决策。
+* **快路径分发**：若找到 idle CPU 且任务已 admitted 或是 OWNER，直接 `scx_bpf_dsq_insert(SCX_DSQ_LOCAL)`，sched_ext 核心跳过 `enqueue()`，降低 wakeup-to-running 延迟。
 
 原则：
 
-* 不能将其作为强绑定机制。
-* 不依赖其保证严格的线程交接局部性。
+* 快路径分发仅是性能优化，不影响正确性。`stopping()` 仍会执行 self-parking 判断。
+* 未 admitted 或 suppressed 的任务仍走 `enqueue()` → SSC 路径。
 
 ## 13.2 `enqueue()`
 
@@ -603,17 +621,50 @@ sched-ext 对长期 runnable 但未被调度的线程存在 watchdog 约束。�
 
 第一版建议从保守参数开始：
 
-* `window_ns`: 2ms ~ 8ms
-* `P_high`: 0.35 ~ 0.50
-* `P_low`: 0.15 ~ 0.25
-* `min_active_local`: 2
+* `window_ns`: 200ms（见下方 §17.1 窗口长度选择依据）
+* `P_high`: 0.35（x1000 = 350）
+* `P_low`: 0.20（x1000 = 200）
+* `ewma_alpha`: 0.30（x1000 = 300）
+* `min_active_local`: 2（均衡点 p_w=1/3 在双阈值之间）
 * `min_active_remote`: 0
-* `max_step_per_window`: 1
+* `H_persist`: 2（收缩触发窗口数）
+* `L_persist`: 3（扩张触发窗口数，比收缩更保守）
+* `max_step_per_window`: 比例步长，上限为 total target 的 25%
 * `max_ssc_wait_ms`: 显著小于 sched-ext timeout
+* `WAIT_TIME_SAMPLE_STRIDE`: 8（用户态 1/8 采样，BPF 侧 8x 还原）
 
 说明：
 
 * 这些值不应硬编码为论文式常数，应允许在线调参与 profiling。
+
+### 17.1 窗口长度选择依据
+
+`window_ns` 从最初的 4ms 增大到 200ms，原因是 **wait 信号的稀疏性与控制环路振荡**。
+
+**信号稀疏的来源：**
+1. 用户态锁库使用 1/8 采样步幅（`WAIT_TIME_SAMPLE_STRIDE=8`），每 8 次慢路径仅记录 1 次等待时间，降低热路径开销。
+2. `wait_ns_total` 仅在线程**获取锁后**才更新，自旋期间不写入。BPF 在 `stopping()/tick()` 读取时看到的是"上次获取锁时的累计值"，两次读取之间可能没有新的锁获取事件。
+3. 实测每次 `account_task_activity` 调用中仅约 1.5–5% 观测到非零 `wait_delta`。
+
+**短窗口的问题（4ms 时的实际表现）：**
+
+```
+4ms 窗口 → 每秒 250 个控制决策
+→ target 收敛到低值后，活跃线程少、lock 操作少、采样命中更少
+→ 大多数窗口 total_wait == 0（drought 窗口）
+→ p_w_sample = 0 → EWMA 被拉向 0 → 跌破 P_low → 触发扩张
+→ 扩张后线程增多 → 竞争升高 → p_w 飙升 → 触发收缩
+→ 回到低 target → 又 drought → 再扩张...
+→ 无法收敛，target 在 2 ↔ 48 之间持续振荡
+```
+
+**200ms 窗口的效果：**
+- 给出足够时间积累采样：即使只有 2 个活跃线程，200ms 内有数十万次 `account_task_activity` 调用，wait 信号有机会被捕获。
+- 控制决策频率从 250/sec 降到 5/sec，减少过度反应。
+- 配合 drought-safe 扩张机制（§12.1），系统可在 TGT=2 处稳定 50+ 秒无振荡。
+
+**窗口长度与采样步幅的关系：**
+`window_ns` 和 `WAIT_TIME_SAMPLE_STRIDE` 存在耦合。若降低采样步幅（如从 1/8 改为 1/2），每窗口内有效采样数增加 4 倍，`window_ns` 可相应缩短（如 50ms），在保持信号质量的同时加快控制响应。
 
 ---
 

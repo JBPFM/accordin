@@ -8,6 +8,7 @@ mod arch;
 pub mod bpf_intf;
 mod mcs_tas;
 mod mutex_hook;
+mod timeslice_extension;
 
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;

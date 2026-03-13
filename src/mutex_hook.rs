@@ -7,7 +7,7 @@ use std::hint::spin_loop;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::mcs_tas::{McsTasLockRaw, thread_ctx};
+use crate::mcs_tas::{McsTasLockRaw, prepare_thread_timeslice, thread_ctx};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 /// BPF map handle for thread_ctx_addr_map, set by lib.rs after BPF load.
@@ -91,6 +91,7 @@ fn ensure_registered() {
     REGISTERED.with(|r| {
         if !r.get() {
             register_thread_ctx();
+            prepare_thread_timeslice();
             _GUARD.with(|g| unsafe { *g.get() = Some(ThreadCtxGuard) });
             r.set(true);
         }

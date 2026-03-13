@@ -3,6 +3,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::arch::{pause, wait_time_elapsed_ns, wait_time_start};
+use crate::timeslice_extension;
 
 // Keep in sync with WAIT_TIME_SAMPLE_STRIDE in src/bpf/intf.h.
 const WAIT_TIME_SAMPLE_STRIDE: u32 = 8;
@@ -74,11 +75,17 @@ thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
     static THREAD_CTX: UnsafeCell<LockSchedThreadCtx> = const { UnsafeCell::new(LockSchedThreadCtx::new()) };
     static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
+    static TIMESLICE_REQUESTED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Returns a pointer to the current thread's LockSchedThreadCtx.
 pub fn thread_ctx() -> *mut LockSchedThreadCtx {
     THREAD_CTX.with(|ctx| ctx.get())
+}
+
+/// Prepare timeslice extension for the current thread. Call once per thread.
+pub fn prepare_thread_timeslice() {
+    timeslice_extension::prepare_thread();
 }
 
 #[inline(always)]
@@ -143,6 +150,10 @@ impl McsTasLockRaw {
             pause();
         }
 
+        // Request timeslice extension after getting lock.
+        let tse_requested = timeslice_extension::on_contended_lock_enter();
+        TIMESLICE_REQUESTED.with(|cell| cell.set(tse_requested));
+
         let mut succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
         if succ.is_null()
             && self
@@ -204,5 +215,12 @@ impl McsTasLockRaw {
         // Then clear role — brief "dual OWNER" is a conservative protective bias
         let ctx = thread_ctx();
         unsafe { (*ctx).set_role_none() };
+        // Yield extended timeslice if one was granted
+        TIMESLICE_REQUESTED.with(|cell| {
+            if cell.get() {
+                cell.set(false);
+                timeslice_extension::on_critical_section_exit();
+            }
+        });
     }
 }

@@ -10,14 +10,13 @@ mod mcs_tas;
 mod mutex_hook;
 
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::OnceLock;
-use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use libbpf_rs::Link;
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
+use libbpf_rs::MapHandle;
 use libbpf_rs::OpenObject;
 use log::info;
 use scx_utils::scx_ops_attach;
@@ -206,9 +205,9 @@ fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
     // Load the BPF program
     let mut skel = scx_ops_load!(skel, lb_simple_ops, uei)?;
 
-    // Extract thread_ctx_addr_map FD and store for mutex_hook
-    let map_fd = skel.maps.thread_ctx_addr_map.as_fd().as_raw_fd();
-    mutex_hook::THREAD_CTX_MAP_FD.store(map_fd, Ordering::Release);
+    // Duplicate the map handle so mutex hooks can use libbpf helpers directly.
+    let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
+    mutex_hook::set_thread_ctx_map(thread_ctx_map);
 
     // Publish cpu_to_node map and NUMA defaults after load.
     publish_scheduler_topology(&mut skel, &topology, stats_only);
@@ -261,7 +260,6 @@ fn init_ebpf() {
     );
 
     if env_flag(DISABLE_BPF_ENV) {
-        mutex_hook::THREAD_CTX_MAP_FD.store(-1, Ordering::Release);
         info!(
             "{SCHEDULER_NAME} scheduler disabled by env {}",
             DISABLE_BPF_ENV

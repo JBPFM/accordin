@@ -94,7 +94,8 @@ volatile __s32 dominant_node = 0;
 volatile __u64 forced_release_cnt = 0;
 volatile __u32 stats_only_mode = 0;
 
-/* Per-window debug stats */
+/* Per-window debug stats — updated only when dbg_counters_enabled=1 */
+volatile __u32 dbg_counters_enabled = 0; /* 0=off (production), 1=on (debug) */
 volatile __u64 dbg_win_run = 0;
 volatile __u64 dbg_win_wait = 0;
 volatile __u64 dbg_acct_calls = 0;     /* total account_task_activity calls */

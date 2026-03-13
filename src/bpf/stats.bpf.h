@@ -84,18 +84,22 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
 		run_delta = now - tc->run_start_ns;
 
 	/* Read user-space lock context */
-	__sync_fetch_and_add((volatile __u64 *)&dbg_acct_calls, 1);
+	bool _dbg = dbg_counters_enabled;
+	if (_dbg)
+		__sync_fetch_and_add((volatile __u64 *)&dbg_acct_calls, 1);
 	if (tc->user_ctx_ptr) {
-		__sync_fetch_and_add((volatile __u64 *)&dbg_acct_has_uptr, 1);
+		if (_dbg)
+			__sync_fetch_and_add((volatile __u64 *)&dbg_acct_has_uptr, 1);
 		struct lock_sched_thread_ctx uctx = {};
 		if (read_thread_ctx(tc->user_ctx_ptr, &uctx)) {
-			__sync_fetch_and_add((volatile __u64 *)&dbg_acct_read_ok, 1);
+			if (_dbg)
+				__sync_fetch_and_add((volatile __u64 *)&dbg_acct_read_ok, 1);
 			tc->role = uctx.state;
 			if (uctx.wait_ns_total >= tc->last_wait_ns) {
 				wait_delta = scale_sampled_wait_ns(
 					uctx.wait_ns_total - tc->last_wait_ns);
 				tc->last_wait_ns = uctx.wait_ns_total;
-				if (wait_delta > 0)
+				if (_dbg && wait_delta > 0)
 					__sync_fetch_and_add((volatile __u64 *)&dbg_acct_wait_nz, 1);
 			}
 		}
@@ -280,16 +284,16 @@ static __always_inline bool try_advance_window(__u64 now)
 			__s64 remote_headroom = tr - active_remote;
 			__s64 expand_remote, expand_local;
 
+			/* ~3/4 to the side with more headroom, ~1/4 to the other */
+			__s64 major = (__s64)step - ((__s64)step >> 2);
+			if (major < 1) major = 1;
+			__s64 minor = (__s64)step - major;
 			if (remote_headroom > local_headroom) {
-				/* Remote needs more — give it ~2/3 via shift */
-				expand_remote = (__s64)step - ((__s64)step >> 2);
-				if (expand_remote < 1) expand_remote = 1;
-				expand_local = (__s64)step - expand_remote;
+				expand_remote = major;
+				expand_local  = minor;
 			} else {
-				/* Local needs more — give it ~2/3 via shift */
-				expand_local = (__s64)step - ((__s64)step >> 2);
-				if (expand_local < 1) expand_local = 1;
-				expand_remote = (__s64)step - expand_local;
+				expand_local  = major;
+				expand_remote = minor;
 			}
 
 			/* Clamp to max */

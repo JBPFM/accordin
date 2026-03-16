@@ -305,7 +305,7 @@ score = ssc_active_count * useful_run / ssc_vote_sum_run * 1024
 
 ## 8. 当前实验快照
 
-2026-03-16 在当前 40 CPU 机器上，使用 `bench/mutexbench` 跑了 fresh breakdown：
+2026-03-16 在当前 40 CPU 机器上，使用 `bench/mutexbench` 对同一组参数做了两次四模式拆分复测：
 
 - `threads=32`
 - `critical_ns=350`
@@ -313,22 +313,50 @@ score = ssc_active_count * useful_run / ssc_vote_sum_run * 1024
 - `duration_ms=3000`
 - `warmup_duration_ms=1000`
 - `repeats=3`
+- `timeslice_extension=off`
+  - 结果目录：`bench/mutexbench/results/cpu_breakdown_20260316T121714Z`
+- `timeslice_extension=require`
+  - 结果目录：`bench/mutexbench/results/cpu_breakdown_20260316T122557Z`
+  - 该 run 以 `require` 模式完整跑通，说明当前机器上的 timeslice extension 可用；否则 benchmark 会直接失败。
 
-结果如下：
+`timeslice_extension=off` 结果如下：
 
 | 模式 | 吞吐量 | ns/op | 平均等待 | handoff | steady CPU | steady cores |
 |---|---:|---:|---:|---:|---:|---:|
-| `mcs-tas` | 1.638M ops/s | 610.52 | 19.13us | 208.89ns | 3196.88% | 31.97 |
-| `lb_simple_no_bpf` | 1.656M ops/s | 603.95 | 18.95us | 220.00ns | 3189.00% | 31.89 |
-| `lb_simple_stats_only` | 1.585M ops/s | 630.94 | 19.80us | 236.70ns | 3186.30% | 31.86 |
-| `lb_simple_full` | 0.784M ops/s | 1275.60 | 87.72us | 532.89ns | 401.59% | 4.02 |
+| `mcs-tas` | 1.707M ops/s | 585.76 | 18.36us | 194.37ns | 3195.33% | 31.95 |
+| `lb_simple_no_bpf` | 1.655M ops/s | 604.23 | 18.95us | 218.83ns | 3192.33% | 31.92 |
+| `lb_simple_stats_only` | 1.610M ops/s | 620.96 | 19.48us | 227.39ns | 3198.67% | 31.99 |
+| `lb_simple_full` | 0.567M ops/s | 1763.63 | 112.15us | 2536.51ns | 596.63% | 5.97 |
+
+对应拆分：
+
+- 总额外开销：`1177.88ns/op`
+- 用户态开销：`18.47ns/op`
+- BPF 统计开销：`16.73ns/op`
+- 剩余调度器开销：`1142.68ns/op`
+
+`timeslice_extension=require` 结果如下：
+
+| 模式 | 吞吐量 | ns/op | 平均等待 | handoff | steady CPU | steady cores |
+|---|---:|---:|---:|---:|---:|---:|
+| `mcs-tas` | 1.645M ops/s | 607.99 | 19.05us | 211.03ns | 3195.75% | 31.96 |
+| `lb_simple_no_bpf` | 1.624M ops/s | 615.93 | 19.33us | 228.39ns | 3196.89% | 31.97 |
+| `lb_simple_stats_only` | 1.609M ops/s | 621.56 | 19.49us | 228.00ns | 3189.90% | 31.90 |
+| `lb_simple_full` | 1.558M ops/s | 642.00 | 19.86us | 297.03ns | 642.13% | 6.42 |
+
+对应拆分：
+
+- 总额外开销：`34.00ns/op`
+- 用户态开销：`7.93ns/op`
+- BPF 统计开销：`5.63ns/op`
+- 剩余调度器开销：`20.44ns/op`
 
 当前可得出的结论：
 
-- 纯用户态锁替换基本没有额外成本；`lb_simple_no_bpf` 与 `mcs-tas` 处于同一量级。
-- 统计路径本身只引入约 `26.99ns/op`，约占总额外开销的 `4.06%`。
-- 完整调度路径额外引入约 `644.67ns/op`，约占总额外开销的 `96.93%`。
-- 默认模式确实观察到了明显 CPU limiting，但当前参数下吞吐回退仍然较大。
+- 纯用户态锁替换依然基本没有额外成本；`lb_simple_no_bpf` 与 `mcs-tas` 保持同一量级。
+- 开启 timeslice extension 后，`lb_simple_full` 吞吐从 `0.567M` 提升到 `1.558M ops/s`，`ns/op` 从 `1763.63` 降到 `642.00`。
+- 总额外开销从 `1177.88ns/op` 降到 `34.00ns/op`，其中剩余调度器开销从 `1142.68ns/op` 降到 `20.44ns/op`。
+- full mode 仍然观察到明显 CPU limiting，但与基线相比的吞吐差距已经缩小到约 `5.30%`，不再是原来那种吞吐塌陷。
 
 ---
 

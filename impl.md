@@ -302,7 +302,7 @@ score = active_count * max(run - wait, 0) / run * 1024
 - 当前 full mode 明确观察到了 CPU limiting。
 - 但吞吐仍比 `mcs-tas` 低约 `46.12%`。
 
-### 5.2 四模式拆分
+### 5.2 四模式拆分（`timeslice_extension=off`）
 
 命令：
 
@@ -321,30 +321,79 @@ score = active_count * max(run - wait, 0) / run * 1024
 
 结果目录：
 
-- `bench/mutexbench/results/cpu_breakdown_20260316T120241Z`
+- `bench/mutexbench/results/cpu_breakdown_20260316T121714Z`
 
 结果：
 
 | 模式 | 吞吐量 | ns/op | 等待 | handoff | steady CPU | steady cores |
 |---|---:|---:|---:|---:|---:|---:|
-| `mcs-tas` | 1,637,951 ops/s | 610.52 | 19.13us | 208.89ns | 3196.88% | 31.97 |
-| `lb_simple_no_bpf` | 1,655,771 ops/s | 603.95 | 18.95us | 220.00ns | 3189.00% | 31.89 |
-| `lb_simple_stats_only` | 1,584,943 ops/s | 630.94 | 19.80us | 236.70ns | 3186.30% | 31.86 |
-| `lb_simple_full` | 783,943 ops/s | 1275.60 | 87.72us | 532.89ns | 401.59% | 4.02 |
+| `mcs-tas` | 1,707,193 ops/s | 585.76 | 18.36us | 194.37ns | 3195.33% | 31.95 |
+| `lb_simple_no_bpf` | 1,654,998 ops/s | 604.23 | 18.95us | 218.83ns | 3192.33% | 31.92 |
+| `lb_simple_stats_only` | 1,610,419 ops/s | 620.96 | 19.48us | 227.39ns | 3198.67% | 31.99 |
+| `lb_simple_full` | 567,012 ops/s | 1763.63 | 112.15us | 2536.51ns | 596.63% | 5.97 |
 
 拆分结论：
 
 - 用户态锁替换开销：
-  - `lb_simple_no_bpf - mcs-tas = -6.57ns/op`
-  - 落在噪声范围内，可视作“几乎没有额外成本”
+  - `lb_simple_no_bpf - mcs-tas = 18.47ns/op`
+  - 仍然很小，但当前 run 不再是负值
 - BPF 统计路径开销：
-  - `lb_simple_stats_only - lb_simple_no_bpf = 26.99ns/op`
-  - 约占 full mode 总额外开销的 `4.06%`
+  - `lb_simple_stats_only - lb_simple_no_bpf = 16.73ns/op`
+  - 约占 full mode 总额外开销的 `1.42%`
 - 完整调度路径剩余开销：
-  - `lb_simple_full - lb_simple_stats_only = 644.67ns/op`
-  - 约占 total overhead 的 `96.93%`
+  - `lb_simple_full - lb_simple_stats_only = 1142.68ns/op`
+  - 约占 total overhead 的 `97.01%`
 
 当前代码最重的成本不在 interpose，也不在 BPF 读统计，而在完整的自 parking + `SSC_DSQ` + `SSC core` 控制路径。
+
+### 5.3 四模式拆分（`timeslice_extension=require`）
+
+命令：
+
+```bash
+/home/jz/.codex/skills/analyze-lb-simple-cpu-limit/scripts/run_breakdown_with_pidstat.sh \
+  --repo /home/jz/Projects/lb_simple \
+  --sudo-mode auto \
+  -- \
+  --timeslice-extension require \
+  --threads 32 \
+  --critical-ns 350 \
+  --outside-ns 350 \
+  --duration-ms 3000 \
+  --warmup-duration-ms 1000 \
+  --repeats 3
+```
+
+结果目录：
+
+- `bench/mutexbench/results/cpu_breakdown_20260316T122557Z`
+
+结果：
+
+| 模式 | 吞吐量 | ns/op | 等待 | handoff | steady CPU | steady cores |
+|---|---:|---:|---:|---:|---:|---:|
+| `mcs-tas` | 1,644,751 ops/s | 607.99 | 19.05us | 211.03ns | 3195.75% | 31.96 |
+| `lb_simple_no_bpf` | 1,623,566 ops/s | 615.93 | 19.33us | 228.39ns | 3196.89% | 31.97 |
+| `lb_simple_stats_only` | 1,608,856 ops/s | 621.56 | 19.49us | 228.00ns | 3189.90% | 31.90 |
+| `lb_simple_full` | 1,557,635 ops/s | 642.00 | 19.86us | 297.03ns | 642.13% | 6.42 |
+
+拆分结论：
+
+- 用户态锁替换开销：
+  - `lb_simple_no_bpf - mcs-tas = 7.93ns/op`
+- BPF 统计路径开销：
+  - `lb_simple_stats_only - lb_simple_no_bpf = 5.63ns/op`
+- 完整调度路径剩余开销：
+  - `lb_simple_full - lb_simple_stats_only = 20.44ns/op`
+
+和 `timeslice_extension=off` 相比：
+
+- `lb_simple_full` 吞吐从 `567,012` 提升到 `1,557,635 ops/s`
+- `lb_simple_full` 的 `ns/op` 从 `1763.63` 降到 `642.00`
+- 总额外开销从 `1177.88ns/op` 降到 `34.00ns/op`
+- 剩余调度器开销从 `1142.68ns/op` 降到 `20.44ns/op`
+
+`require` 模式完整跑通也说明当前机器上的 timeslice extension 可用；否则 benchmark 会在初始化或 yield 路径直接退出。
 
 ---
 

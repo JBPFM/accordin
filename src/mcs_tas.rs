@@ -5,9 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use crate::arch::{pause, wait_time_elapsed_ns, wait_time_start};
 use crate::timeslice_extension;
 
-// Keep in sync with WAIT_TIME_SAMPLE_STRIDE in src/bpf/intf.h.
-const WAIT_TIME_SAMPLE_STRIDE: u32 = 8;
-const WAIT_TIME_SAMPLE_MASK: u32 = WAIT_TIME_SAMPLE_STRIDE - 1;
+// we remove sample cause in some high contention env wait can occupy full timeslice
+// or we can reserve a fast path in low contention
+// // Keep in sync with WAIT_TIME_SAMPLE_STRIDE in src/bpf/intf.h.
+// const WAIT_TIME_SAMPLE_STRIDE: u32 = 8;
+// const WAIT_TIME_SAMPLE_MASK: u32 = WAIT_TIME_SAMPLE_STRIDE - 1;
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
@@ -42,7 +44,7 @@ impl LockSchedThreadCtx {
 thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
     static THREAD_CTX: UnsafeCell<LockSchedThreadCtx> = const { UnsafeCell::new(LockSchedThreadCtx::new()) };
-    static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
+    // static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
     static TIMESLICE_REQUESTED: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -56,14 +58,15 @@ pub fn prepare_thread_timeslice() {
     timeslice_extension::prepare_thread();
 }
 
-#[inline(always)]
-fn should_sample_wait() -> bool {
-    WAIT_SAMPLE_COUNTER.with(|counter| {
-        let next = counter.get().wrapping_add(1);
-        counter.set(next);
-        (next & WAIT_TIME_SAMPLE_MASK) == 0
-    })
-}
+// #[inline(always)]
+// fn should_sample_wait() -> bool {
+//     WAIT_SAMPLE_COUNTER.with(|counter| {
+//         let next = counter.get().wrapping_add(1);
+//         counter.set(next);
+//         (next & WAIT_TIME_SAMPLE_MASK) == 0
+//     })
+// }
+//
 
 /// MCS-TAS lock with cache-aligned state variables.
 pub struct McsTasLockRaw {
@@ -91,8 +94,7 @@ impl McsTasLockRaw {
         }
 
         // Slow path: MCS queue + TAS
-        let sample_wait = should_sample_wait();
-        let wait_start = if sample_wait { wait_time_start() } else { 0 };
+        let wait_start = wait_time_start();
 
         let my_node = Self::thread_node();
         unsafe {
@@ -148,9 +150,7 @@ impl McsTasLockRaw {
         // Acquired after contention — accumulate sampled wait time, set ROLE_OWNER
         let ctx = thread_ctx();
         unsafe {
-            if sample_wait {
-                (*ctx).wait_ns_total += wait_time_elapsed_ns(wait_start);
-            }
+            (*ctx).wait_ns_total += wait_time_elapsed_ns(wait_start);
         }
     }
 

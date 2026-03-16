@@ -1,9 +1,3 @@
-#[allow(dead_code)]
-#[inline(always)]
-pub(crate) const fn compile_time_supported() -> bool {
-    cfg!(lb_simple_tse_available)
-}
-
 #[inline(always)]
 pub(crate) fn prepare_thread() {
     imp::prepare_thread();
@@ -11,29 +5,12 @@ pub(crate) fn prepare_thread() {
 
 #[inline(always)]
 pub(crate) fn on_contended_lock_enter() -> bool {
-    #[cfg(test)]
-    if let Some(forced) = test_support::forced_request() {
-        if forced {
-            test_support::record_enter();
-        }
-        return forced;
-    }
-
-    let requested = imp::on_contended_lock_enter();
-    #[cfg(test)]
-    if requested {
-        test_support::record_enter();
-    }
-    requested
+    imp::on_contended_lock_enter()
 }
 
 #[inline(always)]
 pub(crate) fn on_critical_section_exit() {
     imp::on_critical_section_exit();
-    #[cfg(test)]
-    {
-        test_support::record_exit();
-    }
 }
 
 #[cfg(lb_simple_tse_available)]
@@ -283,52 +260,4 @@ mod imp {
 
     #[inline(always)]
     pub(crate) fn on_critical_section_exit() {}
-}
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
-
-    static FORCED_REQUEST: AtomicI8 = AtomicI8::new(-1);
-    static ENTER_COUNT: AtomicU32 = AtomicU32::new(0);
-    static EXIT_COUNT: AtomicU32 = AtomicU32::new(0);
-
-    pub(crate) fn reset() {
-        FORCED_REQUEST.store(-1, Ordering::Relaxed);
-        ENTER_COUNT.store(0, Ordering::Relaxed);
-        EXIT_COUNT.store(0, Ordering::Relaxed);
-    }
-
-    pub(crate) fn force_request(requested: Option<bool>) {
-        let value = match requested {
-            Some(true) => 1,
-            Some(false) => 0,
-            None => -1,
-        };
-        FORCED_REQUEST.store(value, Ordering::Relaxed);
-    }
-
-    pub(crate) fn forced_request() -> Option<bool> {
-        match FORCED_REQUEST.load(Ordering::Relaxed) {
-            1 => Some(true),
-            0 => Some(false),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn record_enter() {
-        ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_exit() {
-        EXIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn enter_count() -> u32 {
-        ENTER_COUNT.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn exit_count() -> u32 {
-        EXIT_COUNT.load(Ordering::Relaxed)
-    }
 }

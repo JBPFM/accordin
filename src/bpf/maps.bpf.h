@@ -89,8 +89,10 @@ volatile __u32 L_persist = 3;
 
 /* NUMA */
 volatile __s32 dominant_node = 0;
+volatile __u32 ssc_active_count = 2;
 volatile __u32 ssc_cpu_count = 0;
 volatile __u32 ssc_cpu_list[MAX_CPUS] = {};
+volatile __u16 ssc_cpu_rank[MAX_CPUS] = {};
 
 /* Stats */
 volatile __u64 forced_release_cnt = 0;
@@ -100,9 +102,7 @@ volatile __u32 stats_only_mode = 0;
 volatile __u32 dbg_counters_enabled = 0; /* 0=off (production), 1=on (debug) */
 volatile __u64 dbg_win_run = 0;
 volatile __u64 dbg_win_wait = 0;
-volatile __u64 dbg_acct_calls = 0;    /* total account_task_activity calls */
-volatile __u64 dbg_acct_has_uptr = 0; /* calls with user_ctx_ptr != 0 */
-volatile __u64 dbg_acct_read_ok = 0;  /* bpf_probe_read_user succeeded */
-volatile __u64 dbg_acct_wait_nz = 0;  /* wait_delta > 0 */
+volatile __u64 dbg_acct_calls = 0;   /* total account_task_activity calls */
+volatile __u64 dbg_acct_read_ok = 0; /* bpf_probe_read_user succeeded */
 
 #endif /* __MAPS_BPF_H */

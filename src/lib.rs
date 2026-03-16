@@ -171,20 +171,28 @@ fn detect_numa_topology() -> NumaTopology {
 fn configure_scheduler_topology(_skel: &mut OpenBpfSkel<'_>, _topology: &NumaTopology) {}
 
 fn publish_ssc_cpu_topology(
+    ssc_active_count: &mut u32,
     ssc_cpu_count: &mut u32,
     ssc_cpu_list: &mut [u32; SSC_CPU_CAP],
+    ssc_cpu_rank: &mut [u16; SSC_CPU_CAP],
     topology: &NumaTopology,
 ) {
+    *ssc_active_count = 2;
     ssc_cpu_list.fill(0);
+    ssc_cpu_rank.fill(SSC_CPU_CAP as u16);
 
-    let count = topology.first_socket_cpus.len().min(ssc_cpu_list.len());
-    *ssc_cpu_count = count as u32;
-    for (slot, cpu) in ssc_cpu_list
-        .iter_mut()
-        .zip(topology.first_socket_cpus.iter().copied())
-    {
-        *slot = cpu;
+    let mut count = 0usize;
+    for cpu in topology.first_socket_cpus.iter().copied() {
+        let cpu_idx = cpu as usize;
+        if cpu_idx >= SSC_CPU_CAP || count >= SSC_CPU_CAP {
+            continue;
+        }
+
+        ssc_cpu_list[count] = cpu;
+        ssc_cpu_rank[cpu_idx] = count as u16;
+        count += 1;
     }
+    *ssc_cpu_count = count as u32;
 }
 
 /// Populate cpu_to_node BPF map and publish NUMA defaults.
@@ -199,7 +207,13 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
     if let Some(bss) = skel.maps.bss_data.as_mut() {
         bss.dominant_node = topology.dominant_node;
         bss.stats_only_mode = u32::from(stats_only);
-        publish_ssc_cpu_topology(&mut bss.ssc_cpu_count, &mut bss.ssc_cpu_list, topology);
+        publish_ssc_cpu_topology(
+            &mut bss.ssc_active_count,
+            &mut bss.ssc_cpu_count,
+            &mut bss.ssc_cpu_list,
+            &mut bss.ssc_cpu_rank,
+            topology,
+        );
     }
 
     info!(
@@ -398,6 +412,14 @@ mod tests {
             "BPF globals should expose SSC CPU list",
         );
         assert!(
+            maps.contains("ssc_active_count"),
+            "BPF globals should expose active SSC CPU count",
+        );
+        assert!(
+            maps.contains("ssc_cpu_rank"),
+            "BPF globals should expose SSC CPU rank table",
+        );
+        assert!(
             admission.contains("get_ssc_cpu_by_index"),
             "BPF helpers should expose indexed SSC CPU lookup",
         );
@@ -414,6 +436,14 @@ mod tests {
         assert!(
             admission.contains("is_task_on_ssc_core"),
             "BPF helpers should expose task-level SSC-core membership checks",
+        );
+        assert!(
+            admission.contains("ssc_cpu_rank[cpu]"),
+            "CPU-level SSC-core checks should read per-CPU SSC rank",
+        );
+        assert!(
+            admission.contains("rank < ssc_active_count"),
+            "CPU-level SSC-core checks should clamp membership by active count",
         );
     }
 }

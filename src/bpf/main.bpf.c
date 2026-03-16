@@ -15,9 +15,9 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+#include "admission.bpf.h"
 #include "maps.bpf.h"
 #include "stats.bpf.h"
-#include "admission.bpf.h"
 
 /* ------------------------------------------------------------------ */
 /*  Callbacks                                                          */
@@ -36,18 +36,13 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
   struct task_scx_ctx *tc = lookup_task_ctx(p);
-  if (!tc) {
+  if (!tc || tc->admitted) {
     /* Untracked task (not yet seen in running()) — let it run. */
     scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
     return;
   }
 
-  // if the task is lock contention, it should enter SSC DSQ
-  /* Owner is always admitted */
-  if (tc) {
-    scx_bpf_dsq_insert(p, SSC_DSQ_ID, SCX_SLICE_DFL, enq_flags);
-    return;
-  }
+  scx_bpf_dsq_insert(p, SSC_DSQ_ID, SCX_SLICE_DFL, enq_flags);
 }
 
 void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev) {
@@ -79,27 +74,28 @@ void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p) {
   tc->run_start_ns = scx_bpf_now();
 }
 
-void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable) {
-  __u32 pid = p->pid;
-  struct task_scx_ctx *tc = lookup_task_ctx(p);
-  if (!tc)
-    return;
-
-  /* Window advance moved to tick() — only CPU 0 advances */
-
-  if (stats_only_mode)
-    return;
-
-  // we should determine if the task should be parked (i.e. move to SSC) based
-  // on its context and current state
-}
+// void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)
+// {
+//   __u32 pid = p->pid;
+//   struct task_scx_ctx *tc = lookup_task_ctx(p);
+//   if (!tc)
+//     return;
+//
+//   /* Window advance moved to tick() — only CPU 0 advances */
+//
+//   if (stats_only_mode)
+//     return;
+//
+//   // we should determine if the task should be parked (i.e. move to SSC)
+//   based
+//   // on its context and current state
+// }
 
 void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   __u32 pid = p->pid;
   struct task_scx_ctx *tc = lookup_task_ctx(p);
   // scx_bpf_now is efficient than bpf_task_storage_delete
   __u64 now = scx_bpf_now();
-  __s32 cpu = scx_bpf_task_cpu(p);
 
   if (tc) {
     account_task_activity(tc, pid, now);
@@ -108,12 +104,19 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   if (stats_only_mode)
     return;
 
-  // try_advance_window(now);
-  /*
-   * If active count is above target, force a reschedule so the
-   * current task enters stopping() -> self-parking sooner.
-   */
-  // p->scx.slice = 0;
+  if (is_task_on_ssc_core(p)) {
+    // publish to global data
+
+  } else {
+    /*
+     * If active count is above target, force a reschedule so the
+     * current task enters stopping() -> self-parking sooner.
+     */
+    if (tc->run_ns_window / 10 < tc->wait_ns_window) {
+      tc->admitted = 0;
+      p->scx.slice = 0;
+    }
+  }
 }
 
 void BPF_STRUCT_OPS(lb_simple_exit_task, struct task_struct *p,
@@ -148,7 +151,7 @@ SCX_OPS_DEFINE(lb_simple_ops, .select_cpu = (void *)lb_simple_select_cpu,
                .enqueue = (void *)lb_simple_enqueue,
                .dispatch = (void *)lb_simple_dispatch,
                .running = (void *)lb_simple_running,
-               .stopping = (void *)lb_simple_stopping,
+               // .stopping = (void *)lb_simple_stopping,
                .tick = (void *)lb_simple_tick,
                .exit_task = (void *)lb_simple_exit_task,
                .init = (void *)lb_simple_init, .exit = (void *)lb_simple_exit,

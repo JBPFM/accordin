@@ -56,7 +56,6 @@ get_or_create_task_ctx(struct task_struct *p) {
     return NULL;
 
   tc->admitted = 1;
-  tc->last_node = -1;
   tc->user_ctx_ptr = *user_ptr_p;
 
   return tc;
@@ -86,30 +85,15 @@ static __always_inline __s32 get_ssc_cpu_by_index(__u32 idx) {
 }
 
 static __always_inline bool is_cpu_ssc_core(__s32 cpu) {
-  __u32 limit = ssc_cpu_count;
+  if (cpu < 0 || cpu >= MAX_CPUS)
+    return false;
 
-  if (limit > MAX_CPUS)
-    limit = MAX_CPUS;
-
-#pragma unroll
-  for (__u32 i = 0; i < MAX_CPUS; i++) {
-    if (i >= limit)
-      break;
-    if ((__s32)ssc_cpu_list[i] == cpu)
-      return true;
-  }
-
-  return false;
+  __u16 rank = ssc_cpu_rank[cpu];
+  return rank < ssc_active_count && rank < ssc_cpu_count;
 }
 
 static __always_inline bool is_task_on_ssc_core(struct task_struct *p) {
   return is_cpu_ssc_core(scx_bpf_task_cpu(p));
 }
-
-/* ------------------------------------------------------------------ */
-/*  Admission                                                          */
-/* ------------------------------------------------------------------ */
-
-static __always_inline void admit_task(struct task_scx_ctx *tc) {}
 
 #endif /* __ADMISSION_BPF_H */

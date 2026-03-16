@@ -60,6 +60,10 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
                                                   __u32 pid, __u64 now) {
   __u64 run_delta = 0;
   __u64 wait_delta = 0;
+  struct lock_sched_thread_ctx uctx = {};
+
+  (void)pid;
+  dbg_acct_calls++;
 
   if (!tc->run_start_ns) {
     tc->run_start_ns = now;
@@ -70,17 +74,32 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
     run_delta = now - tc->run_start_ns;
 
   tc->run_start_ns = now;
+
+  if (tc->user_ctx_ptr) {
+    if (read_thread_ctx(tc->user_ctx_ptr, &uctx)) {
+      if (uctx.wait_ns_total >= tc->last_wait_ns) {
+        wait_delta = uctx.wait_ns_total - tc->last_wait_ns;
+        tc->last_wait_ns = uctx.wait_ns_total;
+      }
+
+      if (uctx.wait_end_ns < uctx.wait_start_ns && now > uctx.wait_start_ns) {
+        __u64 pending_wait = now - uctx.wait_start_ns;
+        __u64 *wait_start_ptr =
+            (__u64 *)(unsigned long)(tc->user_ctx_ptr +
+                                     __builtin_offsetof(
+                                         struct lock_sched_thread_ctx,
+                                         wait_start_ns));
+
+        if (bpf_probe_write_user(wait_start_ptr, &now, sizeof(now)) == 0)
+          wait_delta += pending_wait;
+      }
+    }
+  }
+
+  tc->run_ns_window += run_delta;
+  tc->wait_ns_window += wait_delta;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Window rollover and EWMA                                           */
-/* ------------------------------------------------------------------ */
-
-/*
- * Try to advance the aggregation window.  Uses cmpxchg to elect a single
- * leader across all CPUs.  The winner computes EWMA, updates targets, and
- * resets accumulators.
- */
 static __always_inline bool try_advance_window(__u64 now) { return false; }
 
 #endif /* __STATS_BPF_H */

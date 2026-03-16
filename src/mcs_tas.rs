@@ -2,7 +2,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use crate::arch::{pause, wait_time_elapsed_ns, wait_time_start};
+use crate::arch::{pause, wait_time_elapsed_ns, wait_time_now_ns, wait_time_start};
 use crate::timeslice_extension;
 
 // we remove sample cause in some high contention env wait can occupy full timeslice
@@ -33,11 +33,17 @@ impl Node {
 #[repr(C)]
 pub struct LockSchedThreadCtx {
     pub wait_ns_total: u64,
+    pub wait_start_ns: u64,
+    pub wait_end_ns: u64,
 }
 
 impl LockSchedThreadCtx {
     const fn new() -> Self {
-        Self { wait_ns_total: 0 }
+        Self {
+            wait_ns_total: 0,
+            wait_start_ns: 0,
+            wait_end_ns: 0,
+        }
     }
 }
 
@@ -95,6 +101,11 @@ impl McsTasLockRaw {
 
         // Slow path: MCS queue + TAS
         let wait_start = wait_time_start();
+        let wait_start_ns = wait_time_now_ns();
+        let ctx = thread_ctx();
+        unsafe {
+            (*ctx).wait_start_ns = wait_start_ns;
+        }
 
         let my_node = Self::thread_node();
         unsafe {
@@ -148,9 +159,10 @@ impl McsTasLockRaw {
         }
 
         // Acquired after contention — accumulate sampled wait time, set ROLE_OWNER
-        let ctx = thread_ctx();
+        let wait_end_ns = wait_time_now_ns();
         unsafe {
             (*ctx).wait_ns_total += wait_time_elapsed_ns(wait_start);
+            (*ctx).wait_end_ns = wait_end_ns;
         }
     }
 

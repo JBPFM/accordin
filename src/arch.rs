@@ -13,6 +13,11 @@ fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+#[inline(always)]
+pub fn wait_time_now_ns() -> u64 {
+    monotonic_ns()
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdtsc() -> u64 {

@@ -70,6 +70,7 @@ struct {
  * contention on every stopping()/tick().
  */
 struct agg_percpu {
+  __u64 epoch;
   __u64 run_ns;
   __u64 wait_ns;
 };
@@ -81,11 +82,19 @@ struct {
   __type(value, struct agg_percpu);
 } agg_percpu_map SEC(".maps");
 
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, MAX_CPUS);
+  __type(key, __u32);
+  __type(value, struct ssc_vote_slot);
+} ssc_vote_slot_map SEC(".maps");
+
 /* Hysteresis counters */
 volatile __u32 consec_high = 0;
 volatile __u32 consec_low = 0;
 volatile __u32 H_persist = 2;
 volatile __u32 L_persist = 3;
+volatile __u64 ssc_vote_window_ns = 200000000ULL;
 
 /* NUMA */
 volatile __s32 dominant_node = 0;
@@ -97,6 +106,15 @@ volatile __u16 ssc_cpu_rank[MAX_CPUS] = {};
 /* Stats */
 volatile __u64 forced_release_cnt = 0;
 volatile __u32 stats_only_mode = 0;
+volatile __u64 ssc_vote_epoch = 0;
+volatile __u64 ssc_vote_start_ns = 0;
+volatile __u64 ssc_vote_sum_run = 0;
+volatile __u64 ssc_vote_sum_wait = 0;
+volatile __u32 ssc_vote_publish_count = 0;
+volatile __u64 ssc_vote_last_score = 0;
+volatile __u64 ssc_vote_last_effective_score = 0;
+volatile __u32 ssc_vote_consec_grow = 0;
+volatile __u32 ssc_vote_consec_shrink = 0;
 
 /* Per-window debug stats — updated only when dbg_counters_enabled=1 */
 volatile __u32 dbg_counters_enabled = 0; /* 0=off (production), 1=on (debug) */

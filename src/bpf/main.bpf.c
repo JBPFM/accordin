@@ -97,6 +97,8 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   // scx_bpf_now is efficient than bpf_task_storage_delete
   __u64 now = scx_bpf_now();
 
+  maybe_rotate_ssc_vote_window(now);
+
   if (tc) {
     account_task_activity(tc, pid, now);
   }
@@ -105,14 +107,49 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
     return;
 
   if (is_task_on_ssc_core(p)) {
-    // publish to global data
+    publish_ssc_core_vote(tc, p, now);
+
+    if (ssc_vote_publish_count * 2 > ssc_active_count) {
+      __u64 score = compute_ssc_vote_score(ssc_active_count);
+
+      if (!ssc_vote_last_effective_score)
+        ssc_vote_last_effective_score = score;
+
+      if (ssc_vote_last_score) {
+        if (score > ssc_vote_last_score)
+          ssc_vote_consec_grow++;
+        else
+          ssc_vote_consec_grow = 0;
+
+        if (score < ssc_vote_last_effective_score)
+          ssc_vote_consec_shrink++;
+        else
+          ssc_vote_consec_shrink = 0;
+      }
+
+      ssc_vote_last_score = score;
+
+      if (ssc_vote_consec_grow >= 2) {
+        ssc_active_count = clamp_ssc_active_count(ssc_active_count << 1);
+        ssc_vote_last_effective_score = score;
+        ssc_vote_consec_grow = 0;
+        ssc_vote_consec_shrink = 0;
+      } else if (ssc_vote_consec_shrink >= 2) {
+        ssc_active_count = clamp_ssc_active_count(ssc_active_count >> 1);
+        ssc_vote_last_effective_score = score;
+        ssc_vote_consec_grow = 0;
+        ssc_vote_consec_shrink = 0;
+      }
+
+      rotate_ssc_vote_window(now);
+    }
 
   } else {
     /*
      * If active count is above target, force a reschedule so the
      * current task enters stopping() -> self-parking sooner.
      */
-    if (tc->run_ns_window / 10 < tc->wait_ns_window) {
+    if (tc && tc->run_ns_window / 10 < tc->wait_ns_window) {
       tc->admitted = 0;
       p->scx.slice = 0;
     }
@@ -123,7 +160,6 @@ void BPF_STRUCT_OPS(lb_simple_exit_task, struct task_struct *p,
                     struct scx_exit_task_args *args) {
   // do some cleanup if needed
   __u32 pid = p->pid;
-  struct task_scx_ctx *tc = lookup_task_ctx(p);
 
   bpf_task_storage_delete(&task_ctx_map, p);
   bpf_map_delete_elem(&thread_ctx_addr_map, &pid);

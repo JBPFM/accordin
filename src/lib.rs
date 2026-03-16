@@ -171,13 +171,11 @@ fn detect_numa_topology() -> NumaTopology {
 fn configure_scheduler_topology(_skel: &mut OpenBpfSkel<'_>, _topology: &NumaTopology) {}
 
 fn publish_ssc_cpu_topology(
-    ssc_active_count: &mut u32,
     ssc_cpu_count: &mut u32,
     ssc_cpu_list: &mut [u32; SSC_CPU_CAP],
     ssc_cpu_rank: &mut [u16; SSC_CPU_CAP],
     topology: &NumaTopology,
 ) {
-    *ssc_active_count = 2;
     ssc_cpu_list.fill(0);
     ssc_cpu_rank.fill(SSC_CPU_CAP as u16);
 
@@ -208,12 +206,15 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
         bss.dominant_node = topology.dominant_node;
         bss.stats_only_mode = u32::from(stats_only);
         publish_ssc_cpu_topology(
-            &mut bss.ssc_active_count,
             &mut bss.ssc_cpu_count,
             &mut bss.ssc_cpu_list,
             &mut bss.ssc_cpu_rank,
             topology,
         );
+    }
+
+    if let Some(data) = skel.maps.data_data.as_mut() {
+        data.ssc_active_count = 2;
     }
 
     info!(
@@ -315,7 +316,7 @@ fn init_ebpf() {
     let stats_only = env_flag(STATS_ONLY_ENV);
 
     // 初始化调度器（只执行一次）
-    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false, stats_only) {
+    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(true, stats_only) {
         Ok(state) => {
             if stats_only {
                 info!(
@@ -444,6 +445,90 @@ mod tests {
         assert!(
             admission.contains("rank < ssc_active_count"),
             "CPU-level SSC-core checks should clamp membership by active count",
+        );
+    }
+
+    #[test]
+    fn ssc_vote_headers_define_epoch_and_score_state() {
+        let intf = include_str!("bpf/intf.h");
+        let maps = include_str!("bpf/maps.bpf.h");
+        let stats = include_str!("bpf/stats.bpf.h");
+
+        assert!(
+            intf.contains("struct ssc_vote_slot"),
+            "BPF interface should define per-SSC-core vote slots",
+        );
+        assert!(
+            maps.contains("ssc_vote_epoch"),
+            "BPF globals should expose the current SSC vote epoch",
+        );
+        assert!(
+            maps.contains("ssc_vote_window_ns"),
+            "BPF globals should expose the SSC vote timeout window",
+        );
+        assert!(
+            maps.contains("ssc_vote_publish_count"),
+            "BPF globals should expose the SSC vote publish count",
+        );
+        assert!(
+            maps.contains("ssc_vote_last_effective_score"),
+            "BPF globals should expose the last effective SSC score",
+        );
+        assert!(
+            maps.contains("ssc_vote_consec_grow"),
+            "BPF globals should track consecutive score growth",
+        );
+        assert!(
+            stats.contains("rotate_ssc_vote_window"),
+            "BPF stats helpers should rotate stale SSC vote epochs",
+        );
+        assert!(
+            maps.contains("ssc_vote_slot_map"),
+            "BPF maps should expose per-core SSC vote slots",
+        );
+    }
+
+    #[test]
+    fn tick_quorum_logic_requires_majority_before_adjusting_active_count() {
+        let main = compact(include_str!("bpf/main.bpf.c"));
+
+        assert!(
+            main.contains("publish_ssc_core_vote(tc,p,now);"),
+            "simple_tick should publish SSC-core samples into the vote state",
+        );
+        assert!(
+            main.contains("ssc_vote_publish_count*2>ssc_active_count"),
+            "simple_tick should require a strict majority quorum",
+        );
+        assert!(
+            main.contains("ssc_vote_consec_grow>=2"),
+            "simple_tick should only double active_count after two consecutive increases",
+        );
+        assert!(
+            main.contains("ssc_vote_consec_shrink>=2"),
+            "simple_tick should only halve active_count after two consecutive drops below the effective score",
+        );
+        assert!(
+            main.contains("ssc_active_count=clamp_ssc_active_count(ssc_active_count<<1);"),
+            "simple_tick should clamp doubled active_count",
+        );
+        assert!(
+            main.contains("ssc_active_count=clamp_ssc_active_count(ssc_active_count>>1);"),
+            "simple_tick should clamp halved active_count",
+        );
+    }
+
+    #[test]
+    fn ssc_active_count_clamp_keeps_a_floor_of_two() {
+        let stats = compact(include_str!("bpf/stats.bpf.h"));
+
+        assert!(
+            stats.contains("if(active_count<2)active_count=2;"),
+            "SSC active-count clamp should keep a minimum of 2",
+        );
+        assert!(
+            !stats.contains("if(ssc_cpu_count<2)returnssc_cpu_count;"),
+            "SSC active-count clamp should not drop below 2 when CPU count is smaller",
         );
     }
 }

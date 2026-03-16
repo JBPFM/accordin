@@ -26,6 +26,7 @@ struct lock_sched_thread_ctx {
 
 /* Per-task scheduling context stored in BPF task_ctx_map. */
 struct task_scx_ctx {
+  unsigned long long window_epoch;
   unsigned long long last_wait_ns;
   unsigned long long run_start_ns;
   unsigned long long run_ns_window;
@@ -33,6 +34,12 @@ struct task_scx_ctx {
   unsigned int admitted;
   unsigned long long
       user_ctx_ptr; /* cached pointer to user-space lock_sched_thread_ctx */
+};
+
+struct ssc_vote_slot {
+  unsigned long long epoch;
+  unsigned long long last_run_ns;
+  unsigned long long last_wait_ns;
 };
 
 /* Stats exported via stats_map for userspace monitoring. */

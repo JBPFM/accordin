@@ -1,278 +1,405 @@
 # lb_simple 实现状态文档
 
-本文档对照 `design.md` 描述当前代码的实际实现情况，记录已完成功能、偏离点和已知缺口。
+本文档记录当前代码的真实实现状态，并附上 2026-03-16 重新验证后的 benchmark 数据。
 
 ---
 
-## 1. 整体架构
+## 1. 实现摘要
 
-lb_simple 以 **cdylib（LD_PRELOAD 动态库）** 的形式交付：
+`lb_simple` 当前是一个“用户态锁替换 + sched-ext 锁感知调度器”的组合实现：
 
-- 库加载时（`.init_array` 构造函数）启动 eBPF 调度器并 attach。
-- 通过 `dlsym(RTLD_NEXT, ...)` 拦截 pthread mutex / cond 接口，将其替换为 MCS-TAS 路径。
-- BPF 程序以 **全局接管（非 SWITCH_PARTIAL）** 方式运行；admission 计数仅对注册了 `thread_ctx_addr_map` 的线程有效，从而避免系统其他任务稀释 wait ratio。
-- 支持 `stats_only_mode`（`LB_SIMPLE_STATS_ONLY=1`）：加载 BPF 但禁用 admission control，用于性能分解测试。
-- 支持 `LB_SIMPLE_DISABLE_BPF=1`：完全禁用 BPF 加载，仅使用 MCS-TAS 锁替换。
+- 以 `cdylib` 形式通过 `LD_PRELOAD` 拦截 `pthread_mutex_*` / `pthread_cond_*`。
+- 用户态锁使用 MCS-TAS。
+- BPF 调度器是全局 sched-ext，而不是 partial switch。
+- 调度控制不是早期文档里的 `target_local / target_remote`，而是：
+  - 线程在 `tick()` 中根据等待占比自 parking。
+  - 被 parking 的线程重新入队时进入 `SSC_DSQ`。
+  - 一组会动态伸缩的 `SSC core` 专门从 `SSC_DSQ` 消费任务。
+- 支持两个实验模式：
+  - `LB_SIMPLE_STATS_ONLY=1`
+  - `LB_SIMPLE_DISABLE_BPF=1`
 
 ---
 
-## 2. 锁侧（userspace）
+## 2. 用户态部分
 
-### 2.1 MCS-TAS（`src/mcs_tas.rs`）
+## 2.1 MCS-TAS（`src/mcs_tas.rs`）
 
-| 设计要求 | 实现状态 |
+当前锁实现和文档中的旧版本相比，有三个关键变化：
+
+1. 不再导出 `OWNER` / `role`。
+2. 不再使用 seqcount。
+3. 不再做 1/8 等待采样，而是每次慢路径都更新等待时间。
+
+当前线程本地导出结构为：
+
+```c
+struct LockSchedThreadCtx {
+    u64 wait_ns_total;
+    u64 wait_start_ns;
+    u64 wait_end_ns;
+};
+```
+
+行为如下：
+
+| 功能 | 当前状态 |
 |---|---|
-| TAS 快路径 | ✅ `lock()` 首先 `swap(true, Acquire)`，成功即返回 |
-| MCS 慢路径队列等待 | ✅ 入队、等待 `waiting` 标志、MCS 传递逻辑均已实现 |
-| `try_lock()` 使用 CAS | ✅ `compare_exchange(false, true, ...)` |
-| 导出 `wait_ns_total` | ✅ 慢路径结束后累加 `wait_end - wait_start`，1/8 采样步幅 |
-| 导出 `state`（NONE / OWNER） | ✅ lock 后设 `ROLE_OWNER`，unlock 后设 `ROLE_NONE` |
-| Seqcount 写侧保护 | ⚠️ `seq_begin()` / `seq_end()` 调用已**注释掉**；BPF 读侧跳过 seq 检查，直接做单次 `bpf_probe_read_user` |
+| TAS 快路径 | ✅ `swap(true, Acquire)` 成功即返回 |
+| MCS 慢路径 | ✅ 入队、等待前驱、handoff 全部实现 |
+| `try_lock()` | ✅ 使用 `compare_exchange(false, true, ...)` |
+| 已完成等待累计 | ✅ 慢路径成功获取锁后累加到 `wait_ns_total` |
+| 正在等待中的时间 | ✅ 通过 `wait_start_ns` / `wait_end_ns` 让 BPF 推断 |
+| timeslice extension | ✅ contended lock 成功后申请，unlock 时归还 |
 
-- `unlock()` 先释放锁再清 role，短暂存在两线程都为 OWNER 的窗口，符合设计"保守性保护偏置"的意图。
-- 等待时间采样步幅 `WAIT_TIME_SAMPLE_STRIDE=8`：每 8 次慢路径仅记录 1 次 wait_ns，BPF 侧用 8x 乘法还原。降低用户态热路径开销。
+需要注意：
 
-### 2.2 线程注册（`src/mutex_hook.rs`）
+- 快路径不会更新 `wait_*` 字段。
+- 慢路径开始时先写 `wait_start_ns`，完成获取后再写 `wait_end_ns`。
+- BPF 侧把 `wait_end_ns < wait_start_ns` 当作“此刻仍在等锁”。
 
-| 设计要求 | 实现状态 |
-|---|---|
-| 首次进锁时向 BPF map 注册共享上下文指针 | ✅ `ensure_registered()` 在每次 `pthread_mutex_lock` 时检查并注册 |
-| 线程退出时注销 | ✅ `ThreadCtxGuard::drop()` 调用 `unregister_thread_ctx()` |
-| pthread_cond_wait 正确桥接 | ✅ 内部 real_mutex + MCS lock 双重协议，避免信号丢失 |
+## 2.2 线程注册与 cond 桥接（`src/mutex_hook.rs`）
+
+`mutex_hook.rs` 负责两件事：
+
+1. 线程第一次进入拦截后的 `pthread_mutex_lock()` 时，把 `tid -> thread_ctx()` 注册到 `thread_ctx_addr_map`。
+2. 在线程退出时通过 TLS guard 自动注销。
+
+`pthread_cond_wait()` 仍然通过内部 `real_mutex + MCS-TAS` 双协议桥接，避免信号丢失。
 
 ---
 
 ## 3. BPF 侧
 
-### 3.1 数据结构（`src/bpf/intf.h`）
+## 3.1 核心数据结构（`src/bpf/intf.h`）
+
+当前导出头文件如下：
 
 ```c
 struct lock_sched_thread_ctx {
-    u64 wait_ns_total;   // 单调递增累计采样等待时间
-    u32 state;           // ROLE_NONE / ROLE_OWNER
-    u32 seq;             // seqcount（写侧未使用）
+  unsigned long long wait_ns_total;
+  unsigned long long wait_start_ns;
+  unsigned long long wait_end_ns;
 };
 
 struct task_scx_ctx {
-    u64 last_wait_ns;     // 上次读取到的 wait_ns_total
-    u64 run_start_ns;     // 本次 running 开始时间戳
-    u64 run_ns_window;    // 当前窗口累计运行时间
-    u64 wait_ns_window;   // 当前窗口累计锁等待时间
-    u32 role;             // NONE / OWNER
-    u32 admitted;         // 当前是否处于 active set
-    u32 counted;          // 是否已计入 active_local/remote
-    u32 counted_local;    // 若 counted=1，是计入 local(1) 还是 remote(0)
-    s32 last_node;        // 线程最近一次运行所在 NUMA 节点
-    u64 ssc_enter_ts;     // 进入 SSC 的时间戳
-    u64 user_ctx_ptr;     // 缓存的用户态 lock_sched_thread_ctx 指针
+  unsigned long long window_epoch;
+  unsigned long long last_wait_ns;
+  unsigned long long pending_wait_ns;
+  unsigned long long run_start_ns;
+  unsigned long long run_ns_window;
+  unsigned long long wait_ns_window;
+  unsigned int admitted;
+  unsigned long long user_ctx_ptr;
+};
+
+struct ssc_vote_slot {
+  unsigned long long epoch;
+  unsigned long long last_run_ns;
+  unsigned long long last_wait_ns;
 };
 ```
 
-与 design.md §7.1 对齐。额外字段说明：
-- `counted` / `counted_local`：跟踪任务是否已被计入 `active_local/remote`，避免重复计数。
-- `user_ctx_ptr`：创建 task ctx 时从 `thread_ctx_addr_map` 缓存，避免后续每次回调都查 hash map。
+这组结构已经不包含：
 
-### 3.2 Maps 与全局变量（`src/bpf/maps.bpf.h`）
+- `role`
+- `last_node`
+- `active_local / active_remote`
+- `target_local / target_remote`
 
-**Maps：**
+## 3.2 Maps 与全局变量（`src/bpf/maps.bpf.h`）
 
-| Map | 类型 | 说明 |
-|---|---|---|
-| `task_ctx_map` | `BPF_MAP_TYPE_TASK_STORAGE` | per-task 调度上下文，通过 `bpf_task_storage_get` 直接访问 |
-| `thread_ctx_addr_map` | `BPF_MAP_TYPE_HASH` | pid → 用户态 `lock_sched_thread_ctx` 地址映射 |
-| `stats_map` | `BPF_MAP_TYPE_ARRAY` | 16 个统计量，供用户态监控 |
-| `cpu_to_node` | `BPF_MAP_TYPE_ARRAY` | CPU → NUMA node 映射 |
-| `agg_percpu_map` | `BPF_MAP_TYPE_PERCPU_ARRAY` | per-CPU run_ns/wait_ns 累加器 |
+当前真正使用的 maps：
 
-**全局变量：**
+| Map | 用途 |
+|---|---|
+| `task_ctx_map` | per-task `task_scx_ctx` |
+| `thread_ctx_addr_map` | `tid -> user_ctx_ptr` |
+| `stats_map` | 导出统计量 |
+| `cpu_to_node` | CPU -> NUMA node |
+| `agg_percpu_map` | 每 CPU 的 `run_ns/wait_ns` 聚合 |
+| `ssc_vote_slot_map` | 每个 active `SSC core` 的窗口投票槽 |
+
+当前关键全局变量：
 
 | 变量 | 默认值 | 说明 |
-|---|---|---|
-| `window_ns` | 200ms | 统计窗口长度 |
-| `p_high` | 350 (0.35) | 收缩阈值（x1000 定点） |
-| `p_low` | 200 (0.20) | 扩张阈值（x1000 定点） |
-| `ewma_alpha` | 300 (0.30) | EWMA 平滑系数 |
-| `H_persist` | 2 | 连续高于 p_high 触发收缩的窗口数 |
-| `L_persist` | 3 | 连续低于 p_low 触发扩张的窗口数 |
-| `max_ssc_wait_ns` | 50ms | SSC 最大滞留时间（定义，部分执行） |
-| `min_ssc_dwell_ns` | 1ms | 最小驻留时间（定义，**未被 dispatch 使用**） |
-| `target_local/remote` | 各 NUMA 节点 CPU 数 | 初始宽松上限 |
-| `stats_only_mode` | 0 | 1 时禁用 admission，仅收集统计 |
+|---|---:|---|
+| `ssc_vote_window_ns` | 200ms | 控制窗口长度 |
+| `ssc_active_count` | 2 | 当前活跃 `SSC core` 数 |
+| `ssc_cpu_count` | 运行时写入 | `SSC` 候选 CPU 数 |
+| `ssc_cpu_list[]` | 运行时写入 | 候选 CPU 列表 |
+| `ssc_cpu_rank[]` | 运行时写入 | 每个 CPU 在候选列表中的排名 |
+| `stats_only_mode` | 0 | 统计模式开关 |
 
-所有控制参数均为 `volatile` 全局变量，支持从用户态运行时调整。
+还保留了 `dominant_node`、`forced_release_cnt`、调试计数等变量，但它们当前不是主控制环路的核心。
 
-### 3.3 统计层（`src/bpf/stats.bpf.h`）
+## 3.3 统计与投票（`src/bpf/stats.bpf.h`）
 
-**per-task 记账（`account_task_activity`）：**
-- `stopping()` 和 `tick()` 均调用此函数，对称处理 run_ns 和 wait_ns。
-- 计算 `run_delta = now - run_start_ns`。
-- 通过 `bpf_probe_read_user` 读取用户态 `wait_ns_total`，计算 `wait_delta`，用 `WAIT_TIME_SAMPLE_STRIDE` (8x) 还原采样。
-- 同时更新 `tc->role`（从 `uctx.state`）。
-- 累加到 **per-CPU `agg_percpu_map`**，无需原子操作（消除跨核缓存行争用）。
-- 窗口切换时清零 per-task `run_ns_window` / `wait_ns_window`。
+### `account_task_activity()`
 
-**窗口滚动（`try_advance_window`）：**
-- 使用 **CAS（cmpxchg）** 选出唯一 leader，多 CPU 安全。
-- Leader 遍历所有 per-CPU slot 求和并清零 `agg_percpu_map`。
-- 计算 `p_w = wait/run`（x1000 定点），注意 wait_ns 是 run_ns 的子集（线程在 CPU 上自旋等锁），不是独立时间。
-- **EWMA 更新**：
-  - 正常窗口：`new_ewma = alpha * sample + (1-alpha) * old_ewma`
-  - **drought 窗口**（total_wait==0）：缓慢线性衰减 `EWMA -= 2`，不急速归零。这防止信号缺失被误判为低竞争。
-- **双阈值 + 迟滞**：
-  - `p_w > p_high`：累加 `consec_high`
-  - `p_w < p_low` **且 total_wait > 0**：累加 `consec_low`（**drought-safe**：信号缺失时不触发扩张）
-  - 介于两者之间：清零两个计数器
-- **非对称 target 调整**：
-  - **收缩（二分法）**：`step = total_target / 2`，每次减半。高竞争主动有害，应尽快消除。从 TGT=96 到 TGT=2 仅需 ~6 步（~2.4s）。先减 remote 再减 local。
-  - **扩张（比例步长）**：`step = max(1, (p_low - ewma) / 50)`，上限 `cur_total / 4`（基于当前值，非剩余空间，防止从近零快速扩张）。按 local/remote headroom 比例分配。扩张保持保守，避免反弹。
-  - Target 下限：`target_local >= 2`（N=2 时 p_w=(N-1)/(N+1)=1/3=333 在 p_low 和 p_high 之间，是自然均衡点）。
-- 将 16 个统计量（含调试计数器）写入 `stats_map`。
+当前记账完全由 `tick()` 驱动：
 
-### 3.4 Admission（`src/bpf/admission.bpf.h`）
+- 如果 `run_start_ns == 0`，先初始化后返回。
+- 之后每次 `tick()`：
+  - 用 `now - run_start_ns` 结算 `run_delta`
+  - 读取用户态 `lock_sched_thread_ctx`
+  - 结算已完成等待：`wait_ns_total - last_wait_ns`
+  - 结算正在进行中的等待：`now - wait_start_ns`
+  - 用 `pending_wait_ns` 避免重复累加
+  - 同时写 task-local 和 per-CPU 聚合器
 
-- **Task Context 管理**：使用 `BPF_MAP_TYPE_TASK_STORAGE` 实现 per-task 存储。
-  - `lookup_task_ctx()`：`bpf_task_storage_get(&task_ctx_map, p, 0, 0)` — O(1) 直接访问，无 hash 计算。
-  - `get_or_create_task_ctx()`：先查 task storage，无则查 `thread_ctx_addr_map`（hash map，仅在创建时读一次），若已注册则用 `BPF_LOCAL_STORAGE_GET_F_CREATE` 原子创建。新任务默认 `admitted=1`。
-- `admit_task()`：设 `admitted=1, counted=1`，按 `is_local_node(last_node)` 选择递增 `active_local` 或 `active_remote`。
-- `is_local_node()`：与 `dominant_node` 比较。
+### `publish_ssc_core_vote()`
 
-### 3.5 主回调（`src/bpf/main.bpf.c`）
+只有 active `SSC core` 才会上报投票。
 
-**`select_cpu`：**
-- 调用 `scx_bpf_select_cpu_dfl` 获取 idle CPU hint。
-- **快路径直接分发**：若找到 idle CPU 且任务已 admitted 或是 OWNER，直接 `scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, ...)`。sched_ext 核心跳过 `enqueue()`，降低 wakeup-to-running 延迟和 READY_DSQ 锁争用。
+投票统计：
 
-**`enqueue`：**
-- OWNER → 直接入 READY_DSQ（若尚未 admitted 则先 admit）。
-- `stats_only_mode` 或 admitted → 入 READY_DSQ。
-- 其余 → 记录 `ssc_enter_ts`，入 SSC_DSQ。
+- `ssc_vote_sum_run`
+- `ssc_vote_sum_wait`
+- `ssc_vote_publish_count`
 
-**`dispatch`：**
-- `stats_only_mode`：直接消费 READY_DSQ。
-- 若 SSC 有等待者且 `(al+ar) < (tl+tr)`（under target）：`move_to_local(SSC_DSQ_ID)`。
-- Safety valve：若 `(al+ar) <= 0` 且 READY 为空：强制 `move_to_local(SSC_DSQ_ID)`。
-- 否则：`move_to_local(READY_DSQ_ID)`。
+评分函数：
 
-**`running`：**
-- 设置 `run_start_ns`。
-- 读取当前 CPU 所在 NUMA 节点，若与 `counted_local` 不符则做 active 计数迁移（local↔remote）。
-- 若 `admitted=0` 或 `counted=0` 则调用 `admit_task()`（处理从 SSC 释放后的首次运行）。
+```text
+score = active_count * max(run - wait, 0) / run * 1024
+```
 
-**`stopping`：**
-- 调用 `account_task_activity` 记账（对称读取 run_ns + wait_ns）。
-- `stats_only_mode` 下直接返回。
-- 自主 parking 决策：`role != OWNER` 且 `admitted` 时，按 NUMA 判断 over_local / over_remote / over_total，满足则清 `admitted`，减 active 计数。Remote 任务在 over_remote 或 over_total 时 park，local 任务在 over_local 或 over_total 时 park。
+控制规则：
 
-**`tick`：**
-- 调用 `account_task_activity`。
-- 调用 `try_advance_window`（CAS 选举，所有 CPU 可参与）。
-- `stats_only_mode` 下直接返回。
-- 若 `(al+ar) > (tl+tr) || al > tl || ar > tr` 则置 `slice=0`，加速让出 CPU。
+- 连续两个窗口更好：`ssc_active_count <<= 1`
+- 连续两个窗口更差：`ssc_active_count >>= 1`
+- clamp 到 `[2, ssc_cpu_count]`
 
-**`exit_task`：** 减 active 计数，清理 `task_ctx_map`（`bpf_task_storage_delete`）和 `thread_ctx_addr_map`。
+### `try_advance_window()`
 
-**`init`：** 创建 READY_DSQ 和 SSC_DSQ，初始化 `window_start_ns`。
+当前实现中 `try_advance_window()` 是空函数，旧文档里那套 EWMA / `p_high` / `p_low` / `drought-safe` 逻辑已经不在代码里。
+
+## 3.4 admission / 拓扑辅助（`src/bpf/admission.bpf.h`）
+
+这里主要负责：
+
+- `lookup_task_ctx()`
+- `get_or_create_task_ctx()`
+- `get_cpu_node()`
+- `is_cpu_ssc_core()`
+- `is_task_on_ssc_core()`
+
+当前 `get_or_create_task_ctx()` 的默认行为是：
+
+- 只有注册了 `thread_ctx_addr_map` 的线程才创建 `task_scx_ctx`
+- 新 task 默认 `admitted = 1`
+
+## 3.5 主回调（`src/bpf/main.bpf.c`）
+
+### `select_cpu`
+
+- 调用 `scx_bpf_select_cpu_dfl()`
+- 如果返回 idle CPU，直接 `scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, ...)`
+
+这里没有 admission 检查；真正的收敛发生在后续 `tick()` 和 `enqueue()`。
+
+### `enqueue`
+
+- `!tc || tc->admitted` -> `READY_DSQ`
+- `tc && !tc->admitted` -> `SSC_DSQ`
+
+### `dispatch`
+
+- `stats_only_mode`：只消费 `READY_DSQ`
+- 默认模式：
+  - active `SSC core` 且 `SSC_DSQ` 非空 -> 先搬一个 `SSC_DSQ`
+  - 然后再搬 `READY_DSQ`
+
+### `running`
+
+- 通过 `get_or_create_task_ctx()` 懒创建 task-local 状态
+- 写入 `run_start_ns`
+
+### `tick`
+
+当前完整控制逻辑都在这里：
+
+1. `maybe_rotate_ssc_vote_window(now)`
+2. `account_task_activity(tc, pid, now)`
+3. 如果当前 task 在 active `SSC core` 上：
+   - `publish_ssc_core_vote()`
+   - 根据评分增长/收缩 `ssc_active_count`
+4. 否则：
+   - 若 `wait_ns_window > run_ns_window / 10`
+   - 则 `tc->admitted = 0` 且 `p->scx.slice = 0`
+
+### `stopping`
+
+当前未启用；旧实现文档里依赖 `stopping()` 的逻辑已经失效。
+
+### `exit_task`
+
+- 删除 `task_ctx_map`
+- 删除 `thread_ctx_addr_map` 对应项
 
 ---
 
 ## 4. 用户态初始化（`src/lib.rs`）
 
-- 检测 NUMA 拓扑（`/sys/devices/system/node/nodeN/cpulist`），找出 CPU 最多的节点作为 `dominant_node`。
-- `target_local = local_cpu_count`, `target_remote = remote_cpu_count`（初始宽松上限）。
-- 写入 `cpu_to_node` BPF map，设置 `dominant_node` BSS 变量。
-- 提取 `thread_ctx_addr_map` FD 存入 `THREAD_CTX_MAP_FD`，供 mutex_hook 注册线程时使用。
-- 检查 `LB_SIMPLE_STATS_ONLY` / `LB_SIMPLE_DISABLE_BPF` 环境变量。
+初始化流程如下：
+
+1. 探测 NUMA 拓扑。
+2. 计算：
+   - `dominant_node`
+   - `first_socket_node`
+   - `first_socket_cpus`
+3. 把 `cpu_to_node` 写入 BPF map。
+4. 把 `dominant_node`、`stats_only_mode` 写入 BSS。
+5. 用 `first_socket_cpus` 填充：
+   - `ssc_cpu_list[]`
+   - `ssc_cpu_rank[]`
+   - `ssc_cpu_count`
+6. 把 `ssc_active_count` 初始化为 2。
+7. 导出 `thread_ctx_addr_map` 的 `MapHandle`，供 `mutex_hook.rs` 做线程注册。
+
+需要注意：
+
+- 候选 `SSC core` 池来自第一颗 socket，而不是 `dominant_node`。
+- 当前实现故意不设置 `SWITCH_PARTIAL`。
 
 ---
 
-## 5. 性能特征
+## 5. 2026-03-16 实验数据
 
-### 5.1 BPF 优化（相比初始实现）
+本节只记录当前实现重新验证后的结果。
 
-| 优化 | 说明 | 收益 |
+### 5.1 直接对比：`lb_simple` vs `mcs-tas`
+
+命令：
+
+```bash
+/home/jz/.codex/skills/analyze-lb-simple-cpu-limit/scripts/run_bench_with_pidstat.sh \
+  --repo /home/jz/Projects/lb_simple \
+  -- \
+  --locks lb_simple,mcs-tas \
+  --sudo-mode auto \
+  --threads 32 \
+  --critical-ns 350 \
+  --outside-ns 350 \
+  --duration-ms 3000 \
+  --warmup-duration-ms 1000 \
+  --repeats 3
+```
+
+结果目录：
+
+- `bench/mutexbench/results/cpu_limit_20260316T120057Z`
+
+结果：
+
+| 模式 | 吞吐量 | 等待 | handoff | steady CPU | steady cores |
+|---|---:|---:|---:|---:|---:|
+| `lb_simple` | 882,349 ops/s | 43.55us | 543.45ns | 457.04% | 4.57 |
+| `mcs-tas` | 1,637,511 ops/s | 19.16us | 215.32ns | 3197.56% | 31.98 |
+
+结论：
+
+- 当前 full mode 明确观察到了 CPU limiting。
+- 但吞吐仍比 `mcs-tas` 低约 `46.12%`。
+
+### 5.2 四模式拆分
+
+命令：
+
+```bash
+/home/jz/.codex/skills/analyze-lb-simple-cpu-limit/scripts/run_breakdown_with_pidstat.sh \
+  --repo /home/jz/Projects/lb_simple \
+  --sudo-mode auto \
+  -- \
+  --threads 32 \
+  --critical-ns 350 \
+  --outside-ns 350 \
+  --duration-ms 3000 \
+  --warmup-duration-ms 1000 \
+  --repeats 3
+```
+
+结果目录：
+
+- `bench/mutexbench/results/cpu_breakdown_20260316T120241Z`
+
+结果：
+
+| 模式 | 吞吐量 | ns/op | 等待 | handoff | steady CPU | steady cores |
+|---|---:|---:|---:|---:|---:|---:|
+| `mcs-tas` | 1,637,951 ops/s | 610.52 | 19.13us | 208.89ns | 3196.88% | 31.97 |
+| `lb_simple_no_bpf` | 1,655,771 ops/s | 603.95 | 18.95us | 220.00ns | 3189.00% | 31.89 |
+| `lb_simple_stats_only` | 1,584,943 ops/s | 630.94 | 19.80us | 236.70ns | 3186.30% | 31.86 |
+| `lb_simple_full` | 783,943 ops/s | 1275.60 | 87.72us | 532.89ns | 401.59% | 4.02 |
+
+拆分结论：
+
+- 用户态锁替换开销：
+  - `lb_simple_no_bpf - mcs-tas = -6.57ns/op`
+  - 落在噪声范围内，可视作“几乎没有额外成本”
+- BPF 统计路径开销：
+  - `lb_simple_stats_only - lb_simple_no_bpf = 26.99ns/op`
+  - 约占 full mode 总额外开销的 `4.06%`
+- 完整调度路径剩余开销：
+  - `lb_simple_full - lb_simple_stats_only = 644.67ns/op`
+  - 约占 total overhead 的 `96.93%`
+
+当前代码最重的成本不在 interpose，也不在 BPF 读统计，而在完整的自 parking + `SSC_DSQ` + `SSC core` 控制路径。
+
+---
+
+## 6. 当前实现与设计文档的差距
+
+| 项目 | 状态 | 说明 |
 |---|---|---|
-| Task Local Storage | 替代 hash map 查找，O(1) per-task 访问 | 消除 hash 计算 + bucket 锁争用 |
-| Per-CPU 累加器 | 替代全局原子变量 `agg_run_ns/agg_wait_ns` | 消除跨核原子争用（~64K 次/窗口） |
-| select_cpu 快路径分发 | 已 admitted 任务直接分发到 local DSQ | wakeup 延迟降低，READY_DSQ 锁争用按比例下降 |
-| 收缩二分 + 扩张比例步长 | 替代 ±1/窗口 线性步长 | 收缩收敛 ~5x 更快（96→2 约 2.4s） |
-| Drought-safe 扩张 | total_wait==0 时不触发扩张 | 消除信号缺失导致的 target 振荡 |
-
-### 5.2 性能基准（96 线程, critical=350ns, outside=350ns, 单锁）
-
-| 模式 | 吞吐量 | 持锁 | 等待 | Handoff | 每核效率 |
-|---|---|---|---|---|---|
-| 原生 pthread_mutex | 832K ops/s | 388ns | 115μs | 814ns | 8.7K |
-| MCS-TAS（无 BPF） | 1,712K ops/s | 338ns | 56μs | 246ns | 17.8K |
-| MCS-TAS + BPF 统计 | 1,654K ops/s | 330ns | 58μs | 274ns | 17.2K |
-| **MCS-TAS + 完整 admission** | **215K ops/s** | **242ns** | **356μs** | **4,463ns** | **107K** |
-
-- **BPF 统计开销**：3.4%（lock interposition 开销的噪声级别）
-- **Admission control**：将 96 线程限制到 TGT=2 活跃核心，SSC 中 94 线程
-- **每核效率提升 6.2x**：从 17.2K → 107K ops/s/core
-- **CPU 资源节省 48x**：2 核 vs 96 核
-
-### 5.3 反馈环路收敛行为
-
-- 从初始 TGT=96 收敛到 TGT=2 约需 **2-4 秒**（二分法：96→48→24→12→6→2）。
-- 到达均衡后保持稳定 30+ 秒无振荡。
-- 均衡点 TGT=2：理论 p_w = (N-1)/(N+1) = 1/3 = 333，位于 p_low(200) 和 p_high(350) 之间。
-- 已知：在 TGT=2 时 wait 信号极度稀疏（1/8 采样 + 低竞争），EWMA 停留在初始 burst 的残留值。系统通过 drought-safe 机制保持稳定。
+| MCS-TAS 基础锁 | ✅ | 已实现 |
+| wait 时间导出 | ✅ | 使用 `wait_ns_total/start/end` |
+| owner/role 导出 | ❌ | 当前没有 |
+| seqcount 一致性保护 | ❌ | 当前没有 |
+| `stopping()` 记账 | ❌ | 当前未启用 |
+| `tick()` 自 parking | ✅ | 当前主控制路径 |
+| `SSC_DSQ` | ✅ | 已实现 |
+| 动态 `ssc_active_count` | ✅ | 通过窗口投票按 2x/0.5x 调整 |
+| `target_local/target_remote` 控制 | ❌ | 当前已废弃 |
+| 精细 NUMA admission | ❌ | 当前只固定第一颗 socket 作为 `SSC` 候选池 |
+| `LB_SIMPLE_STATS_ONLY` | ✅ | 已实现 |
+| `LB_SIMPLE_DISABLE_BPF` | ✅ | 已实现 |
+| partial switch | ❌ | 当前仍是全局 sched-ext |
 
 ---
 
-## 6. Benchmark 与测试
+## 7. 已知问题与后续工作
 
-- `bench/mutexbench`：C++ 互斥锁基准测试。
-- `bench/mutexbench_rust`：Rust 版本基准。
-- `test/`：bpftrace 脚本，覆盖并发竞争者、缓存迁移、唤醒延迟等假设验证场景。
-- **三模式性能分解**：使用 `LB_SIMPLE_DISABLE_BPF=1` / `LB_SIMPLE_STATS_ONLY=1` / 默认，分离 lock interposition / BPF stats / admission control 各层开销。注意必须用 `sudo env VAR=1 script` 传递环境变量。
+## 7.1 full mode 吞吐回退仍大
 
----
+当前 32 线程 / 350ns / 350ns 参数下：
 
-## 7. 与设计文档的差距汇总
+- steady CPU 从约 32 核降到 4 核
+- 吞吐也同步掉到约 0.78M 到 0.88M ops/s
 
-| 设计要求 | 状态 | 说明 |
-|---|---|---|
-| MCS-TAS 基础锁 | ✅ 完成 | |
-| try_lock 使用 CAS | ✅ 完成 | |
-| 导出 wait_ns_total + role | ✅ 完成 | 1/8 采样步幅，BPF 侧 8x 还原 |
-| Seqcount 写侧保护 | ⚠️ 已禁用 | 写侧注释，读侧跳过验证；不影响正确性 |
-| per-task 窗口记账 | ✅ 完成 | Task Local Storage，per-CPU 累加 |
-| 单一 SSC DSQ | ✅ 完成 | |
-| OWNER 保护 | ✅ 完成 | enqueue + stopping 均检查 |
-| 双阈值控制律 | ✅ 完成 | 含比例步长和 drought-safe 扩张 |
-| EWMA wait ratio | ✅ 完成 | p_w = wait/run（wait 是 run 的子集） |
-| NUMA 感知 active 计数 | ✅ 完成 | local/remote 分离计数 + running() 中迁移 |
-| 先收远端后收本地 | ✅ 完成 | 比例步长，remote 优先 |
-| 先扩本地后扩远端 | ✅ 完成 | 按 headroom 比例分配（headroom 大者得 ~2/3） |
-| select_cpu 快路径分发 | ✅ 完成 | idle CPU + admitted/OWNER → SCX_DSQ_LOCAL |
-| SSC 最大滞留时间强制 | ⚠️ 不完整 | 变量定义但 dispatch 未逐任务检查 |
-| SSC 最小驻留时间 | ❌ 缺失 | 变量定义但 dispatch 未使用 |
-| dispatch 按 NUMA 选择性释放 | ❌ 不可行 | BPF API 只能移动 DSQ 队头 |
-| dominant_node 动态更新 | ❌ 缺失 | 启动时固定 |
-| forced_release_cnt 统计 | ❌ 不完整 | 计数器定义但未在释放路径递增 |
-| slow_rate / runnable_pressure | ❌ 未实现 | 设计 §16.2 后续功能 |
-| SWITCH_PARTIAL | ⚠️ 有意偏离 | 全局接管但 admission 仅对注册线程生效 |
+这说明当前阈值和放行策略仍然偏激进。
 
----
+## 7.2 没有 owner 保护
 
-## 8. 已知问题与后续工作
+线程是否被压进 `SSC_DSQ` 只取决于等待占比，可能把“即将完成锁交接”的线程也压掉。
 
-### 8.1 信号稀疏问题
-在低 target（TGT=2）时，1/8 等待时间采样导致 wait 信号极度稀疏，EWMA 不再反映实际竞争水平。当前通过 drought-safe 扩张机制规避振荡，但 EWMA 值是残留的。可能的改进：
-- 降低采样步幅（如 1/4 或 1/2）
-- 基于当前 target 推断理论 p_w 值
-- 自适应采样：低 target 时全量采样
+## 7.3 admission 收敛依赖 `tick()`
 
-### 8.2 SSC dispatch 延迟
-从 SSC 释放任务的 handoff 延迟约 4μs（vs 无 admission 时 274ns）。这是 sched_ext `dsq_move_to_local` 的固有成本。可能的改进：
-- Timer-based 主动释放
-- 批量释放优化
+由于没有 `stopping()`，记账和自 parking 都依赖 `tick()`，可能导致：
 
-### 8.3 窗口长度
-`window_ns` 从最初的 4ms 经 50ms 最终调至 200ms。根本原因是 1/8 采样步幅导致 wait 信号稀疏——每次 `account_task_activity` 仅约 1.5–5% 概率观测到非零 `wait_delta`。短窗口（4ms）时大量窗口 `total_wait==0`，EWMA 被拉向 0 触发扩张，导致 target 在 2↔48 之间持续振荡无法收敛。200ms 窗口给出足够积累时间，配合 drought-safe 扩张机制实现稳定收敛。详见 `design.md` §17.1。
+- admission 收敛滞后
+- 线程在被重新压制前已经多跑了一个或多个 tick
 
-`window_ns` 与 `WAIT_TIME_SAMPLE_STRIDE` 存在耦合：若降低采样步幅，窗口可相应缩短。
+## 7.4 NUMA 信息还没有真正进入控制律
 
-### 8.4 Per-LLC DSQ
-当前单一全局 READY_DSQ 在多核上有锁争用。按 LLC/NUMA node 拆分可减少争用并改善数据局部性。复杂度较高，适合作为后续优化。
+当前只有：
+
+- `cpu_to_node`
+- `dominant_node`
+- `first_socket_cpus -> ssc_cpu_list`
+
+还没有：
+
+- local/remote 独立目标
+- NUMA-aware release/park
+- 基于 LLC 的 READY/SSC 分层

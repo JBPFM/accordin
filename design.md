@@ -1,812 +1,362 @@
-# 锁感知协同调度设计文档
+# 锁感知调度器设计文档
 
 ## 1. 文档目的
 
-本文档给出一套面向高锁竞争场景的“锁实现 + sched-ext 调度器”协同设计方案。第一版设计强调**实现简单、观测可靠、控制面低开销**，先基于 **per-thread 的锁等待统计** 完成锁感知调度。
+本文档描述 `lb_simple` 当前已经实现的锁感知调度器设计，而不是早期的 `target_local / target_remote` 目标并发度方案。
 
-目标是：
+当前实现的核心目标是：
 
-* 利用 **MCS-TAS** 作为锁侧基础原语，降低 LWP（Lock Waiter Preemption）与纯自旋带来的扩展性崩塌风险。
-* 利用 **sched-ext** 在调度层限制过度并发，控制活跃竞争者数量，减少无效自旋、跨 NUMA 交接和错误扩核。
-* 保持实现可落地：锁侧仅导出少量 **per-thread 共享状态**，调度器侧使用 per-task 状态与 DSQ 完成 admission control。
+- 在高锁竞争负载下，用锁等待信号识别“应该降并发”的线程。
+- 把明显在等锁的线程暂时放入 `SSC_DSQ`，把 CPU 让给更可能做有用工作的线程。
+- 用一组可动态伸缩的 “SSC core” 专门从 `SSC_DSQ` 拉任务运行，形成简单、可测的反馈回路。
+- 保持用户态锁路径尽量轻量，使 `LB_SIMPLE_DISABLE_BPF=1` 和 `LB_SIMPLE_STATS_ONLY=1` 成为可靠的拆分基线。
 
-该设计适合如下场景：
+当前实现不追求：
 
-* 某一组线程持续存在明显的锁竞争。
-* 线程可被 sched-ext 接管调度。
-* 用户态锁实现可修改，并允许通过共享内存或 map 向 BPF 导出状态。
-
----
-
-## 2. 设计目标与非目标
-
-### 2.1 目标
-
-1. **降低锁等待导致的 CPU 浪费**
-
-   * 减少大量竞争线程同时活跃自旋。
-   * 避免线程数继续增加却只放大锁开销与缓存一致性流量。
-
-2. **降低跨 NUMA 的错误扩核与交接开销**
-
-   * 在 NUMA 感知下优先保留或释放同节点任务。
-   * 当等待占比已经很高时，即使存在空闲 CPU，也不盲目扩大发生锁竞争的活跃线程数。
-
-3. **支持基于线程等待占比的并发度控制**
-
-   * 以线程级等待统计为主要反馈信号，对 workload 的活跃线程数进行控制。
-
-4. **控制面低开销、低振荡**
-
-   * 统计以时间窗口和 EWMA 为主，而不是每次 lock/unlock 都做复杂决策。
-   * 使用双阈值和最小驻留时间，避免 active set 大小频繁抖动。
+- 精确的 per-lock owner / waiter 拓扑。
+- 完整的 NUMA-aware local/remote target 控制。
+- partial switch；当前仍是 sched-ext 全局接管。
 
 ---
 
-## 3. 核心设计思想
+## 2. 总体结构
 
-整体设计分成三层：
+`lb_simple` 由三个部分组成：
 
-### 3.1 锁侧：MCS-TAS
+1. 用户态锁库：
+   - 以 `LD_PRELOAD` 形式拦截 `pthread_mutex_*` / `pthread_cond_*`。
+   - 用 MCS-TAS 代替原始 `pthread_mutex_t` 的互斥实现。
+   - 为每个线程导出锁等待上下文，供 BPF 周期性读取。
 
-* 无竞争时使用 TAS 快路径，降低常态开销。
-* 竞争出现后进入队列化等待，利用 MCS 队列减少广播式竞争。
-* 第一版锁侧只维护 **per-thread** 的轻量状态。
-* 锁侧额外导出“线程累计等待时间”和“线程当前是否持锁”等最小信息，供调度器观测。
+2. sched-ext 调度器：
+   - 维护 `READY_DSQ` 和 `SSC_DSQ` 两个队列。
+   - 普通线程优先走 `READY_DSQ`。
+   - 被判定为“锁等待占比过高”的线程被标记为 `admitted=0`，随后重新入队时进入 `SSC_DSQ`。
 
-### 3.2 统计层：线程等待占比
+3. 反馈控制回路：
+   - 非 `SSC core` 上运行的线程如果在当前窗口内 `wait_ns_window > run_ns_window / 10`，会在 `tick()` 中自 parking。
+   - `SSC core` 负责从 `SSC_DSQ` 拉任务，并汇报“当前活跃 SSC core 数是否带来更高有效工作量”。
+   - 调度器以 200ms 窗口收集投票，按 2 倍/2 分之一调整 `ssc_active_count`。
 
-* 每个线程维护单调递增的 `wait_ns_total`。
-* 调度器在 `running/stopping` 周期内读取其 delta，计算窗口内等待占比。
-* `tick()` 可以更高频地触发控制判断，但不重复结算同一段等待时间。
-* 第一版统计只依赖线程级等待时间。
-
-### 3.3 调度层：SSC DSQ + NUMA 感知的 admission control
-
-* 调度器维护一个用于暂缓调度的 SSC DSQ，用于承载被抑制的线程。
-* CPU 空闲或任务让出 CPU 时，由 `dispatch()` 决定是否从 SSC DSQ 中释放任务。
-* 如果当前并发度已经超过控制器计算出的目标值，则即使 CPU 空闲，也不从 SSC DSQ 中继续释放任务。
-* 在存在 NUMA 差异时，优先抑制与大多数活跃线程处于不同 NUMA 节点的任务，优先保留同节点任务。
+设计上的关键点是：当前实现不再显式维护 “活跃线程目标值”，而是通过 “多少个 CPU 负责消费 `SSC_DSQ`” 间接限制锁竞争并发度。
 
 ---
 
-## 4. 锁设计
+## 3. 用户态锁设计
 
-第一版不要求锁侧导出复杂的排队角色。调度器只需要知道线程是否正在持锁，以及该线程累计在慢路径中等待了多长时间。
+## 3.1 MCS-TAS 互斥体
 
-因此，锁侧最小导出需求为：
+当前锁实现位于 [`src/mcs_tas.rs`](./src/mcs_tas.rs)。
 
-* `wait_ns_total`：线程累计锁等待时间。
-* `state`：线程当前是否持锁，第一版仅区分 `NONE / OWNER`。
+- 快路径：先做 TAS；无竞争时直接拿锁。
+- 慢路径：进入 MCS 队列，等待前驱唤醒，再抢占 TAS 位。
+- `try_lock()` 使用 CAS，避免无谓的 cache-line 失效。
+- 竞争锁成功后可申请 timeslice extension；解锁时归还扩展时间片。
 
-这样做的原因是：
+这层的目标不是做复杂调度决策，而是稳定暴露“线程什么时候开始等锁、什么时候停止等锁”。
 
-* 接口简单，容易在用户态锁库中落地。
-* 能支持“持锁线程尽量不要被抑制”的基本策略。
-* 可以先验证等待占比是否足以作为并发度控制信号，再决定是否扩展到更复杂的状态。
+## 3.2 每线程导出上下文
 
----
-
-## 5. 用户态导出接口
-
-## 5.1 每线程共享上下文
-
-不建议只导出一个 `wait_time` 地址。建议每个线程在首次进入锁库时，向调度器注册一块固定布局的共享上下文：
+当前用户态导出的结构如下：
 
 ```c
 struct lock_sched_thread_ctx {
-    u64 wait_ns_total;      // 单调递增累计等待时间
-    u32 state;              // NONE / OWNER
-    u32 seq;                // 版本号，用于一致性读取
-    u32 reserved;
+    u64 wait_ns_total;
+    u64 wait_start_ns;
+    u64 wait_end_ns;
 };
 ```
 
-该结构仅表示**线程级聚合信息**。
+语义如下：
 
-## 5.2 注册方式
+- `wait_ns_total`：
+  - 已完成的慢路径等待时间累计值。
+  - 单调递增。
+- `wait_start_ns`：
+  - 本次慢路径等待开始时间。
+- `wait_end_ns`：
+  - 最近一次已完成等待的结束时间。
+  - 当 `wait_end_ns < wait_start_ns` 时，BPF 侧把该线程视为“当前仍在等待”。
 
-线程启动后，第一次进入 `pthread_mutex_lock` 封装层时：
+与早期设计不同，当前实现没有导出 `role` / `OWNER` 状态，也没有 seqcount。
 
-1. 初始化本线程 `lock_sched_thread_ctx`。
-2. 将该地址注册到 per-task map。
-3. 后续调度器通过 task id 找到对应用户态共享结构。
+## 3.3 线程注册
 
-## 5.3 一致性要求
+线程第一次进入拦截后的 `pthread_mutex_lock()` 时：
 
-为避免 BPF 读取用户态共享数据时看到中间态，建议：
+1. 初始化线程本地 `lock_sched_thread_ctx`。
+2. 调用 `prepare_thread_timeslice()`。
+3. 把 `tid -> ctx_ptr` 注册到 `thread_ctx_addr_map`。
+4. 在线程退出时删除该 map 项。
 
-* 用户态写入前 `seq++` 置奇数。
-* 字段写完后 `seq++` 置偶数。
-* BPF 端读取时检查前后 `seq` 一致且为偶数。
-
-第一版如果实现复杂，也可先接受近似读取，只要不会影响正确性，仅影响控制精度。
-
----
-
-## 6. sched-ext 总体结构
-
-## 6.1 设计原则
-
-1. **调度最终在本地 DSQ 生效**。
-2. `select_cpu()` 只是优化 hint，不负责最终 admission。
-3. 真正的“按策略释放”逻辑放在 `dispatch()`。
-4. `running/stopping` 负责时间统计，`tick()` 只负责窗口推进和必要的 reschedule 触发。
-
-## 6.2 调度器工作模式
-
-建议第一版使用 partial switch，只接管目标 workload：
-
-* 目标进程设为 `SCHED_EXT`
-* 其他普通线程仍由 fair class 调度
-
-这样可避免外部 CPU 密集任务直接进入你的控制环路。
+因此，只有真正使用 lb_simple 锁路径的线程才会被 BPF 建立 `task_scx_ctx`。
 
 ---
 
-## 7. 核心数据结构
+## 4. BPF 调度器结构
 
-## 7.1 per-task 调度上下文
+## 4.1 队列模型
 
-第一版只保留控制闭环真正需要的字段：能够计算线程等待占比、识别持锁线程、判断线程当前是否已被纳入 active set、以及支持 SSC 滞留时间与 NUMA 策略。
+调度器维护两个 DSQ：
+
+- `READY_DSQ`
+  - 正常 runnable 线程。
+- `SSC_DSQ`
+  - 已被暂时压制、等待再次放行的线程。
+
+当前实现的语义是：
+
+- 新线程默认 `admitted=1`。
+- 一旦线程在某个窗口里显示出明显锁等待，它会在 `tick()` 中把自己标记为 `admitted=0` 并主动缩短 slice。
+- 该线程后续重新入队时会进入 `SSC_DSQ`。
+- 只有被选中的 `SSC core` 会优先从 `SSC_DSQ` 取任务。
+
+## 4.2 per-task 状态
+
+当前 per-task 状态如下：
 
 ```c
 struct task_scx_ctx {
-    u64 last_wait_ns;     // 上次读取到的 wait_ns_total，用于计算本窗口 wait delta
-
-    u64 run_start_ns;     // 本次 running 开始时间戳
-    u64 run_ns_window;    // 当前窗口累计运行时间
-    u64 wait_ns_window;   // 当前窗口累计锁等待时间
-
-    u32 role;             // NONE / OWNER
-    u32 admitted;         // 当前是否处于 active set
-    s32 last_node;        // 线程最近一次实际运行所在的 NUMA 节点
-
-    u64 ssc_enter_ts;     // 进入 SSC 的时间戳，用于最大滞留时间控制
+    u64 window_epoch;
+    u64 last_wait_ns;
+    u64 pending_wait_ns;
+    u64 run_start_ns;
+    u64 run_ns_window;
+    u64 wait_ns_window;
+    u32 admitted;
+    u64 user_ctx_ptr;
 };
 ```
 
-各字段必要性如下：
+各字段职责：
 
-* `last_wait_ns`
+- `window_epoch`：
+  - 当前 task 记账属于哪个投票窗口。
+- `last_wait_ns`：
+  - 上次读到的 `wait_ns_total`。
+- `pending_wait_ns`：
+  - 当前仍在进行中的等待时间，避免 `tick()` 重复累加。
+- `run_start_ns`：
+  - 最近一次开始运行的时间戳。
+- `run_ns_window` / `wait_ns_window`：
+  - 当前窗口内的运行时间与锁等待时间。
+- `admitted`：
+  - 1 表示重新入队时走 `READY_DSQ`，0 表示走 `SSC_DSQ`。
+- `user_ctx_ptr`：
+  - 缓存的用户态 `lock_sched_thread_ctx` 地址。
 
-  * 必要。
-  * 用户态导出的是单调递增的 `wait_ns_total`，调度器必须保存上一次读到的值，才能在 `stopping()` 中计算增量等待时间。没有这个字段，就无法把累计值转成窗口内的 `wait_ns_window`。
+这里同样没有 `OWNER`、`last_node`、`target_local` 之类字段。
 
-* `run_start_ns`
+## 4.3 Maps 与全局变量
 
-  * 必要。
-  * `running()` 和 `stopping()` 之间需要结算本轮实际运行时间。没有这个字段，就无法在 `stopping()` 中计算 `now - run_start_ns`，也就无法得到等待占比的分母。
+当前控制回路依赖以下 map / 全局变量：
 
-* `run_ns_window`
+- `task_ctx_map`
+  - `BPF_MAP_TYPE_TASK_STORAGE`，存放 `task_scx_ctx`。
+- `thread_ctx_addr_map`
+  - `tid -> user_ctx_ptr`。
+- `stats_map`
+  - 导出窗口统计和调试计数。
+- `cpu_to_node`
+  - CPU 到 NUMA node 的映射。
+- `agg_percpu_map`
+  - 每 CPU 的 `run_ns` / `wait_ns` 累加器。
+- `ssc_vote_slot_map`
+  - 每个 active `SSC core` 在当前窗口中的投票快照。
 
-  * 必要。
-  * 等待占比 `p_t` 需要窗口内运行时间。只记录单次运行时长不够，因为一个窗口内可能经历多次 `running()/stopping()`。
+关键全局变量：
 
-* `wait_ns_window`
-
-  * 必要。
-  * 这是等待占比 `p_t` 的分子，也是判断线程是否处于高锁等待状态的直接依据。
-
-* `role`
-
-  * 必要。
-  * 第一版虽然只区分 `NONE / OWNER`，但这一位是 admission control 的关键保护条件。没有它，调度器无法保证“持锁线程绝不进入 SSC”。
-
-* `admitted`
-
-  * 必要。
-  * 调度器需要快速知道线程当前是在 active set 中还是已经被压入 SSC。理论上可以从队列状态间接推断，但实现复杂且查询代价更高；保留一个显式标志可以让 admission / release 路径更简单、更稳定。
-
-* `last_node`
-
-  * 必要。
-  * 文档已经把 NUMA 策略作为第一版目标之一，需要区分 local / remote 的收缩和释放。相比 `last_cpu`，调度控制真正消费的是 NUMA 节点归属，而不是精确 CPU 号，因此保留 `last_node` 即可。
-
-* `ssc_enter_ts`
-
-  * 必要。
-  * 文档中已经要求加入“最大滞留时间”和“最小驻留时间”之类的防振荡机制。没有进入 SSC 的时间戳，就无法实现这类时间约束，也难以做“谁先被释放”的时间优先级。
-
-以下字段建议删除：
-
-* `ewma_wait_ratio`
-
-  * 删除。
-  * 第一版控制信号是 workload 级的 `p_w`，不是 per-task 的长期平滑值。线程级控制直接基于当前窗口 `run_ns_window / wait_ns_window` 即可，保留 per-task EWMA 会增加维护开销，但不会显著提升第一版控制质量。
-
-* `last_cpu`
-
-  * 删除。
-  * 当前设计只需要 NUMA 节点级 locality，不需要 CPU 级 affinity 历史。`last_cpu` 更适合调试、可视化或更激进的局部性优化，不属于第一版必需状态。
-
-* `ssc_reason`
-
-  * 删除。
-  * 这是调试字段，不参与 admission、release、统计或正确性约束。第一版应去掉。
-
-* `reserved`
-
-  * 删除。
-  * 在设计文档层面没有必要保留占位字段；如果实现中确实需要为对齐补位，再由代码阶段处理。
-
-简化后，这个结构刚好对应第一版的四个核心需求：
-
-1. 通过 `last_wait_ns + run_start_ns + run_ns_window + wait_ns_window` 计算等待占比。
-2. 通过 `role` 保护持锁线程。
-3. 通过 `admitted + ssc_enter_ts` 实现 SSC 进入、滞留和释放控制。
-4. 通过 `last_node` 支持 local / remote 的 NUMA 策略。
-
-## 7.2 per-CPU 调度提示
-
-```c
-struct cpu_sched_ctx {
-    u32 prefer_local;
-    u32 reserved;
-};
-```
-
-用途：
-
-* 在 NUMA 感知策略下，提示调度器优先选择本地节点任务。
-* `dispatch()` 可结合该提示与 active set 状态决定是否从 SSC 释放线程。
+- `ssc_vote_window_ns = 200ms`
+- `ssc_active_count = 2`
+- `ssc_cpu_count`
+- `ssc_cpu_list[]`
+- `ssc_cpu_rank[]`
+- `stats_only_mode`
+- `ssc_vote_*` 一组窗口内汇总量和迟滞计数器
 
 ---
 
-## 8. 线程角色与状态机
+## 5. 锁感知控制律
 
-## 8.1 角色定义
+## 5.1 等待时间记账
 
-### 8.1.1 NONE
+当前实现只在 `running()` 和 `tick()` 之间记账，没有启用 `stopping()` 回调。
 
-线程当前不持有锁。
+`account_task_activity()` 的逻辑是：
 
-### 8.1.2 OWNER
+1. 用 `now - run_start_ns` 计算 `run_delta`。
+2. 读取用户态 `lock_sched_thread_ctx`。
+3. 用 `wait_ns_total - last_wait_ns` 结算已经完成的等待。
+4. 如果 `wait_end_ns < wait_start_ns`，说明线程此刻还在等锁，再把 `now - wait_start_ns` 的增量累加到 `pending_wait_ns`。
+5. 更新当前 task 的窗口统计，并顺手累加到 per-CPU 聚合器。
 
-线程当前持有锁，处于临界区执行中。
+因此，当前等待信号覆盖两类情况：
 
-## 8.2 角色迁移
+- 已结束的慢路径等待。
+- 仍在进行中的慢路径等待。
 
-理想迁移顺序：
+## 5.2 自 parking 规则
 
-`NONE -> OWNER -> NONE`
-
-说明：
-
-* 无竞争和有竞争场景都可以抽象为该最小状态迁移。
-* 第一版不要求调度器识别等待队列中的细粒度位置。
-
-## 8.3 调度语义
-
-* `OWNER`：绝不放入 SSC。
-* `NONE`：按普通调度策略处理。
-
----
-
-## 9. 统计设计
-
-## 9.1 为什么不只靠 `tick()`
-
-`tick()` 周期较粗，并且只在 CPU 正执行 SCX task 时触发，适合做低频控制，不适合做精确记账。
-
-因此：
-
-* `running()`：记录 run 开始时间。
-* `stopping()`：结算本次运行时间，并读取用户态 `wait_ns_total` delta。
-* `tick()`：仅用于窗口推进、EWMA 更新、必要时将 `slice = 0` 以触发 reschedule。
-
-## 9.2 窗口统计
-
-每个 task 维护窗口统计：
-
-* `run_ns_window`
-* `wait_ns_window`
-
-窗口长度可选：
-
-* 时间窗口：例如 2ms、4ms、8ms
-* 或者以若干个 `stopping()` 周期作为窗口
-
-建议第一版使用**时间窗口 + EWMA**，避免过度依赖单个时间片。
-
-## 9.3 等待占比定义
-
-对线程：
-
-`p_t = wait_ns_window / run_ns_window`
-
-注意：wait_ns 是 run_ns 的**子集**（线程在 CPU 上自旋等锁时同时计入 run 和 wait），因此正确公式是 `wait/run`，而非 `wait/(run+wait)`（后者会双重计数并将信号减半）。
-
-对 workload：
-
-`p_w = EWMA(aggregate of p_t)`
-
-即对受控线程集合的等待占比进行聚合（使用 per-CPU 累加器求和），作为 active set 调整信号。当 `total_wait==0`（信号缺失窗口）时使用缓慢线性衰减而非标准 EWMA 更新，避免信号缺失被误判为低竞争。
-
-## 9.4 额外统计量
-
-除了等待占比，建议同时维护：
-
-* `slow_rate`：慢路径进入频率
-* `runnable_pressure`：当前 runnable 线程数量
-
-第一版至少实现 `wait_ratio + slow_rate` 即可。
-
----
-
-## 10. SSC / Active Set 设计
-
-## 10.1 使用单一 SSC 队列
-
-第一版采用单一全局 SSC 队列或单一 workload 级 SSC DSQ，用于承载被暂缓调度的线程。
-
-这样做的原因：
-
-* 实现简单，便于先验证线程级等待占比是否足以驱动 admission control。
-* 能直接服务于“控制整体活跃竞争者数量”的目标。
-* 避免引入额外的对象标识、队列管理和复杂一致性问题。
-
-## 10.2 Admission 对象
-
-允许直接进入 active set 的是：
-
-* 持锁线程
-* 一部分普通 runnable 线程
-
-其余线程进入 SSC 暂缓 dispatch。
-
-## 10.3 Active Set 的两层结构
-
-workload 维护：
-
-* `target_local`
-* `target_remote`
-
-控制原则：
-
-1. **先收远端，再收本地**
-2. **先扩本地，再扩远端**
-3. 本地 active set 一般不建议降到 1，以避免临界区交接过慢
-
----
-
-## 11. NUMA 策略
-
-## 11.1 基本原则
-
-对受控 workload：
-
-* 当前活跃线程主要所在的 NUMA 节点定义为首选节点。
-* 优先保留和释放同节点线程。
-* 不同节点上的线程优先作为被抑制对象。
-
-## 11.2 收缩策略
-
-当等待占比高时：
-
-1. 优先减少 remote node 上 admitted 线程。
-2. 若仍然拥塞，再减少 local node 上普通线程。
-3. 不压制持锁线程。
-
-## 11.3 扩张策略
-
-当等待占比降低、慢路径频率回落时：
-
-1. 先增加 local node 的 admitted 数。
-2. 仅在本地资源用尽或本地不足以支撑吞吐时，才扩张 remote node。
-
-## 11.4 关于 `(1 - p) * n`
-
-该公式可作为直觉，但不能直接作为最终控制律。建议：
-
-* `p` 使用 EWMA，而非瞬时值。
-* `n` 不取全系统总核数，而取受控 workload 可用核数上限。
-* 结果再经过 `min_active`, `max_active`, hysteresis 和 NUMA policy 修正。
-
-更稳的形式：
+在非 `SSC core` 上运行的线程，会在 `tick()` 中检查：
 
 ```text
-raw_target = clamp(round((1 - p_w) * n_eff), min_active, max_active)
+wait_ns_window > run_ns_window / 10
 ```
 
-其中：
+也就是窗口内超过 10% 的 CPU 时间都耗在“边运行边等锁”上。
 
-* `n_eff`：受控 workload 可有效使用的 CPU 数
-* `min_active`：通常至少为 2
-* `max_active`：不超过可用核数与线程数
+满足条件时：
 
----
+- `tc->admitted = 0`
+- `p->scx.slice = 0`
 
-## 12. 控制律
+这样线程会尽快让出 CPU，并在下次 `enqueue()` 时进入 `SSC_DSQ`。
 
-## 12.1 双阈值与 drought-safe 迟滞
+当前实现没有 owner 保护，因此这条规则完全基于等待占比，不区分线程是否刚从临界区出来，或是否即将获得锁。
 
-对 workload 定义：
+## 5.3 `SSC core` 投票
 
-* `P_high`：高等待阈值（默认 0.35）
-* `P_low`：低等待阈值（默认 0.20），且 `P_low < P_high`
+每个 active `SSC core` 在窗口内都汇报一份快照：
 
-控制规则：
+- `last_run_ns`
+- `last_wait_ns`
 
-* 若 `p_w > P_high` 且持续 H 个窗口：收缩 active set
-* 若 `p_w < P_low` 且持续 L 个窗口 **且窗口内有实际 wait 数据**：扩张 active set
-* 介于两者之间：保持不动
+窗口有足够投票后，调度器计算：
 
-**drought-safe 扩张**：当窗口内 `total_wait==0`（信号缺失），即使 EWMA 低于 P_low，也不累加 consec_low。信号缺失不等于低竞争，不应触发扩张。这防止低 target 时采样稀疏导致的振荡。
-
-## 12.2 收缩策略：二分法
-
-收缩采用**二分法（bisection）**：每次将 total target 减半，而非线性步进。
-
-理由：
-* 高竞争是主动有害的（CPU 浪费、cache thrashing），应尽快消除
-* 过度收缩代价低 — target 下限（`target_local >= 2`）兜底，吞吐降低但系统稳定
-* 扩张侧保持保守（比例步长 + drought-safe），会缓慢恢复到最优点
-* 从 TGT=96 收敛到 TGT=2 仅需 ~6 步（~2.4s），比比例步长（~10s）快 5x
-
-减半后按 NUMA 分配缩减量：
-
-1. remote 线程优先进入 SSC
-2. local 普通线程进入 SSC
-3. 绝不压制 owner
-
-## 12.3 扩张顺序
-
-1. 优先从本地节点释放一个线程
-2. 本地不足时，再考虑其他 NUMA 节点
-3. 每个窗口最多释放有限个线程，避免瞬时放量造成振荡
-
-## 12.4 防振荡机制
-
-必须加入以下保护：
-
-* **最小驻留时间**：线程进入 SSC 后至少停留一段时间才允许再次 admission。
-* **最大滞留时间**：线程在 SSC 中不可无限等待。
-* **收缩二分法**：收缩方向每次将 total target 减半，~6 步可从满配收敛到下限。高竞争主动有害，应尽快消除。
-* **扩张比例步长 + 上限**：扩张步长与 EWMA 偏离阈值的程度成正比（`delta / 50`），上限为当前 total target 的 25%。扩张方向保持保守，避免反弹。
-* **Drought-safe 扩张**：信号缺失窗口不触发扩张（见 §12.1）。
-* **Target 下限**：`target_local >= 2`，保证 N=2 时 p_w=(N-1)/(N+1)=1/3 位于 P_low 和 P_high 之间，形成自然均衡点。
-* **扩张步长基于当前值**：扩张上限为 `cur_total / 4`（非剩余空间 / 4），防止从近零快速扩张。
-
----
-
-## 13. sched-ext 回调分工
-
-## 13.1 `select_cpu()`
-
-职责：
-
-* 提供 CPU 选择 hint。
-* 如果发现首选 NUMA 节点存在空闲 CPU，优先 hint 到该节点。
-* **快路径分发**：若找到 idle CPU 且任务已 admitted 或是 OWNER，直接 `scx_bpf_dsq_insert(SCX_DSQ_LOCAL)`，sched_ext 核心跳过 `enqueue()`，降低 wakeup-to-running 延迟。
-
-原则：
-
-* 快路径分发仅是性能优化，不影响正确性。`stopping()` 仍会执行 self-parking 判断。
-* 未 admitted 或 suppressed 的任务仍走 `enqueue()` → SSC 路径。
-
-## 13.2 `enqueue()`
-
-职责：
-
-* 将新 runnable 线程分流到：
-
-  * 普通 DSQ
-  * 或 SSC_DSQ
-* 若线程是 owner，则直接进入普通路径或本地优先路径。
-* 若线程超出 active set，则插入 `SSC_DSQ`。
-
-## 13.3 `running()`
-
-职责：
-
-* 记录 `run_start_ns`。
-* 刷新当前 task 的 role / node 信息。
-* 若该 task 由 SSC 刚刚释放，可记录 release-to-run latency。
-
-## 13.4 `stopping()`
-
-职责：
-
-* 结算本轮运行时间：`now - run_start_ns`
-* 读取用户态 `wait_ns_total`，计算 delta，更新 `wait_ns_window`
-* 必要时更新 per-CPU 调度提示
-
-注意：
-
-* 不应假设 `stopping()` 在 task 刚才运行的 CPU 上执行。
-* 必须依据 task 的实际运行位置更新其 NUMA 节点归属信息。
-
-## 13.5 `tick()`
-
-职责：
-
-* 推进窗口。
-* 更新 EWMA。
-* 若检测到本地存在更适合释放的线程，可触发 reschedule。
-
-不建议在 `tick()` 内做大量复杂逻辑。
-
-## 13.6 `dispatch()`
-
-这是整个设计的关键位置。
-
-职责：
-
-1. 查看当前 CPU 所在节点和 active set 状态
-2. 若本地节点仍允许扩张，优先从 `SSC_DSQ` 中释放本地线程
-3. 若本地为空或本地目标已满，再考虑其他 NUMA 节点
-4. 若仍无任务，则走普通 DSQ 或普通 runnable 队列
-
-这样可将“按策略释放”放在真正发生选任务的位置实现。
-
----
-
-## 14. 调度决策规则
-
-## 14.1 线程进入 SSC 的条件
-
-线程满足以下条件时，可以进入 SSC：
-
-* `role == NONE`
-* 当前 admitted 数已超过 target
-* 线程不属于当前首选 NUMA 节点的优先保留对象
-
-## 14.2 线程不可进入 SSC 的条件
-
-* `role == OWNER`
-* 线程在 SSC 中已接近最大滞留时间
-* 线程最近刚从 SSC 释放，处于保护窗口
-
-## 14.3 从 SSC 释放的优先级
-
-1. 同 NUMA
-2. 更长等待时间优先
-3. 更长 SSC 停留时间优先
-
----
-
-## 15. 正确性与安全性约束
-
-## 15.1 Watchdog 风险
-
-sched-ext 对长期 runnable 但未被调度的线程存在 watchdog 约束。因此：
-
-* SSC 中线程不能无限滞留。
-* 必须设定 `max_ssc_wait_ms`。
-* 必须有保底释放路径。
-
-## 15.2 锁语义正确性
-
-调度器只能控制 runnable/admission，不能破坏锁本身的互斥和队列语义。
-
-因此：
-
-* 锁的 owner 识别必须尽量准确。
-* admission control 只影响“谁能更快获得 CPU”，不能改变 lock transfer 的内存序语义。
-
-## 15.3 用户态导出失败
-
-若某线程尚未注册共享上下文，调度器应：
-
-* 将其视为 `NONE`
-* 走普通路径
-* 不能因为缺失 lock 统计而阻塞线程
-
----
-
-## 16. 第一版实现建议
-
-## 16.1 必选功能
-
-1. MCS-TAS 基础锁
-2. `try_lock()` 改为 CAS
-3. 导出 `wait_ns_total + role`
-4. per-task 窗口记账
-5. 单一 SSC DSQ
-6. owner 保护
-7. 双阈值控制律
-8. SSC 最大滞留时间
-
-## 16.2 可后续增加的功能
-
-1. runnable pressure EWMA
-2. handoff delay 统计
-3. bounded barging
-4. 更精细的 remote/local 目标值调节
-
----
-
-## 17. 参数建议
-
-第一版建议从保守参数开始：
-
-* `window_ns`: 200ms（见下方 §17.1 窗口长度选择依据）
-* `P_high`: 0.35（x1000 = 350）
-* `P_low`: 0.20（x1000 = 200）
-* `ewma_alpha`: 0.30（x1000 = 300）
-* `min_active_local`: 2（均衡点 p_w=1/3 在双阈值之间）
-* `min_active_remote`: 0
-* `H_persist`: 2（收缩触发窗口数）
-* `L_persist`: 3（扩张触发窗口数，比收缩更保守）
-* `max_step_per_window`: 比例步长，上限为 total target 的 25%
-* `max_ssc_wait_ms`: 显著小于 sched-ext timeout
-* `WAIT_TIME_SAMPLE_STRIDE`: 8（用户态 1/8 采样，BPF 侧 8x 还原）
-
-说明：
-
-* 这些值不应硬编码为论文式常数，应允许在线调参与 profiling。
-
-### 17.1 窗口长度选择依据
-
-`window_ns` 从最初的 4ms 增大到 200ms，原因是 **wait 信号的稀疏性与控制环路振荡**。
-
-**信号稀疏的来源：**
-1. 用户态锁库使用 1/8 采样步幅（`WAIT_TIME_SAMPLE_STRIDE=8`），每 8 次慢路径仅记录 1 次等待时间，降低热路径开销。
-2. `wait_ns_total` 仅在线程**获取锁后**才更新，自旋期间不写入。BPF 在 `stopping()/tick()` 读取时看到的是"上次获取锁时的累计值"，两次读取之间可能没有新的锁获取事件。
-3. 实测每次 `account_task_activity` 调用中仅约 1.5–5% 观测到非零 `wait_delta`。
-
-**短窗口的问题（4ms 时的实际表现）：**
-
-```
-4ms 窗口 → 每秒 250 个控制决策
-→ target 收敛到低值后，活跃线程少、lock 操作少、采样命中更少
-→ 大多数窗口 total_wait == 0（drought 窗口）
-→ p_w_sample = 0 → EWMA 被拉向 0 → 跌破 P_low → 触发扩张
-→ 扩张后线程增多 → 竞争升高 → p_w 飙升 → 触发收缩
-→ 回到低 target → 又 drought → 再扩张...
-→ 无法收敛，target 在 2 ↔ 48 之间持续振荡
+```text
+useful_run = max(ssc_vote_sum_run - ssc_vote_sum_wait, 0)
+score = ssc_active_count * useful_run / ssc_vote_sum_run * 1024
 ```
 
-**200ms 窗口的效果：**
-- 给出足够时间积累采样：即使只有 2 个活跃线程，200ms 内有数十万次 `account_task_activity` 调用，wait 信号有机会被捕获。
-- 控制决策频率从 250/sec 降到 5/sec，减少过度反应。
-- 配合 drought-safe 扩张机制（§12.1），系统可在 TGT=2 处稳定 50+ 秒无振荡。
+直觉上：
 
-**窗口长度与采样步幅的关系：**
-`window_ns` 和 `WAIT_TIME_SAMPLE_STRIDE` 存在耦合。若降低采样步幅（如从 1/8 改为 1/2），每窗口内有效采样数增加 4 倍，`window_ns` 可相应缩短（如 50ms），在保持信号质量的同时加快控制响应。
+- `ssc_active_count` 越大，说明更多 CPU 正在服务 `SSC_DSQ`。
+- `useful_run / total_run` 越大，说明这些 CPU 花在“真正干活”上的比例越高。
 
----
+调整规则：
 
-## 18. 实现阶段建议
+- 连续两个窗口 `score` 比上一窗口更高：`ssc_active_count *= 2`
+- 连续两个窗口 `score` 比最近一次生效值更低：`ssc_active_count /= 2`
+- 最终把值 clamp 到 `[2, ssc_cpu_count]`
 
-## 18.1 阶段一：验证锁侧统计
+这是一种非常粗粒度但实现简单的乘法控制器。
 
-目标：确认 `wait_ns_total` 与 role 导出正确。
+## 5.4 任务放行规则
 
-步骤：
+`dispatch()` 的行为：
 
-1. 在用户态锁库中加入共享上下文。
-2. 打印慢路径等待时间与 owner 切换日志。
-3. 验证在无调度控制时统计是否稳定。
+- `stats_only_mode`：只消费 `READY_DSQ`。
+- 否则，如果当前 CPU 是 active `SSC core` 且 `SSC_DSQ` 非空：
+  - 先 `move_to_local(SSC_DSQ_ID)`。
+- 之后无条件再 `move_to_local(READY_DSQ_ID)`。
 
-## 18.2 阶段二：只做观测，不做 admission
+这意味着：
 
-目标：接入 sched-ext，但先不把线程放入 SSC。
-
-步骤：
-
-1. 在 `running/stopping` 中做窗口记账。
-2. 在 `tick()` 中输出 per-task 与 workload EWMA。
-3. 验证线程级等待占比聚合是否与 workload 行为一致。
-
-## 18.3 阶段三：启用 SSC
-
-目标：实现真正的 active set 控制。
-
-步骤：
-
-1. 启用单一 SSC DSQ。
-2. 启用 owner 保护。
-3. 只先做 remote 收缩。
-4. 再加入 local 收缩和本地优先扩张。
-
-## 18.4 阶段四：NUMA 优化
-
-目标：强化 locality。
-
-步骤：
-
-1. 记录活跃线程分布的主导 NUMA 节点。
-2. `dispatch()` 优先释放同 node 任务。
-3. 验证跨 node 调度是否下降。
+- active `SSC core` 会优先服务被抑制线程。
+- 其他 CPU 只处理 `READY_DSQ`。
+- `SSC_DSQ` 的放行能力直接受 `ssc_active_count` 控制。
 
 ---
 
-## 19. 评估方案
+## 6. 拓扑与 CPU 选择
 
-## 19.1 对比对象
+## 6.1 NUMA / socket 初始化
 
-建议对比以下基线：
+用户态初始化时会：
 
-1. 普通 pthread mutex / futex 路径
-2. 纯 TAS / TTAS
-3. 纯 MCS
-4. MCS-TAS 无调度协同
-5. MCS-TAS + sched-ext 观测版
-6. MCS-TAS + SSC
+- 扫描 `/sys/devices/system/node/node*/cpulist`
+- 生成 `cpu_to_node`
+- 识别 CPU 最多的 node，写入 `dominant_node`
+- 记录 `first_socket_cpus`
 
-## 19.2 指标
+当前实现里真正用于 SSC 的并不是 `dominant_node`，而是：
 
-* throughput
-* tail latency
-* lock wait time
-* slowpath rate
-* CPU utilization
-* LLC miss / coherence traffic
-* remote NUMA 调度次数
-* owner->next-owner handoff delay
-* runnable stall 次数
+- 把 `first_socket_cpus` 发布到 `ssc_cpu_list[]`
+- 用 `ssc_cpu_rank[]` 记录每个 CPU 在该列表中的排名
+- 令排名前 `ssc_active_count` 个 CPU 成为 active `SSC core`
 
-## 19.3 工作负载
+所以当前 NUMA 支持更接近“固定 socket 内缩放 SSC 消费者”，而不是“按 local/remote 目标精确控并发”。
 
-* 单热锁 microbenchmark
-* 混合锁竞争 workload
-* 带外部 CPU 密集任务的混合系统
-* 不同线程数、不同 NUMA 拓扑
-* 不同临界区长度与不同持锁时间分布
+## 6.2 `select_cpu()`
+
+当前 `select_cpu()` 只做两件事：
+
+- 调用 `scx_bpf_select_cpu_dfl()` 取默认 hint。
+- 如果找到了 idle CPU，则直接把任务插到 `SCX_DSQ_LOCAL`。
+
+这个快路径不检查 `admitted`。因此 admission 不是在 `select_cpu()` 上硬阻断，而是靠后续的 `tick()` 自 parking 和 `enqueue()` 分流来收敛。
 
 ---
 
-## 20. 预期收益与风险
+## 7. 运行模式
 
-## 20.1 预期收益
+支持三种模式：
 
-1. 高竞争时减少无效自旋与过度扩核。
-2. 降低 remote node 线程参与度，改善 handoff 局部性。
-3. 相比单纯锁优化，更能抑制“调度器把错误线程跑起来”的问题。
-4. 相比单纯调度限流，更能结合持锁状态进行控制。
+- 默认模式：
+  - 加载 BPF，启用 `SSC_DSQ`、自 parking 和 `SSC core` 投票。
+- `LB_SIMPLE_STATS_ONLY=1`
+  - 仍加载 BPF 和记账，但不消费 `SSC_DSQ`，只保留统计路径。
+- `LB_SIMPLE_DISABLE_BPF=1`
+  - 完全不加载 BPF，只使用用户态 MCS-TAS 锁替换。
 
-## 20.2 风险
-
-1. 若等待占比不能准确反映真实竞争强度，控制面可能失真。
-2. 若 owner 识别错误，会明显影响临界区执行连续性。
-3. 若 SSC 滞留时间控制不当，可能触发 watchdog 风险。
-4. 锁侧和调度器共享状态的读写若无保护，可能出现观测噪声。
+这三种模式构成了性能拆分实验的基线。
 
 ---
 
-## 21. 最终推荐方案
+## 8. 当前实验快照
 
-推荐采用以下第一版实现：
+2026-03-16 在当前 40 CPU 机器上，使用 `bench/mutexbench` 跑了 fresh breakdown：
 
-1. **锁侧**
+- `threads=32`
+- `critical_ns=350`
+- `outside_ns=350`
+- `duration_ms=3000`
+- `warmup_duration_ms=1000`
+- `repeats=3`
 
-   * 使用 MCS-TAS
-   * try_lock 改 CAS
-   * 导出 `wait_ns_total / role`
+结果如下：
 
-2. **统计侧**
+| 模式 | 吞吐量 | ns/op | 平均等待 | handoff | steady CPU | steady cores |
+|---|---:|---:|---:|---:|---:|---:|
+| `mcs-tas` | 1.638M ops/s | 610.52 | 19.13us | 208.89ns | 3196.88% | 31.97 |
+| `lb_simple_no_bpf` | 1.656M ops/s | 603.95 | 18.95us | 220.00ns | 3189.00% | 31.89 |
+| `lb_simple_stats_only` | 1.585M ops/s | 630.94 | 19.80us | 236.70ns | 3186.30% | 31.86 |
+| `lb_simple_full` | 0.784M ops/s | 1275.60 | 87.72us | 532.89ns | 401.59% | 4.02 |
 
-   * 以 `running/stopping` 为主记账
-   * 按窗口和 EWMA 估计等待占比
-   * 以 workload 为聚合单位
+当前可得出的结论：
 
-3. **调度侧**
-
-   * partial switch 只接管目标 workload
-   * 使用单一 `SSC_DSQ`
-   * `dispatch()` 时按 `本地 NUMA -> 远 NUMA` 顺序释放
-
-4. **控制律**
-
-   * 双阈值
-   * 小步长调节
-   * owner 保护
-   * 先收远端，后收本地；先扩本地，后扩远端
-
-这套方案实现更简单，也更适合作为第一版原型。
+- 纯用户态锁替换基本没有额外成本；`lb_simple_no_bpf` 与 `mcs-tas` 处于同一量级。
+- 统计路径本身只引入约 `26.99ns/op`，约占总额外开销的 `4.06%`。
+- 完整调度路径额外引入约 `644.67ns/op`，约占总额外开销的 `96.93%`。
+- 默认模式确实观察到了明显 CPU limiting，但当前参数下吞吐回退仍然较大。
 
 ---
 
-## 22. 后续工作
+## 9. 已知限制
 
-下一步实现时建议先输出以下三个可观察量：
+当前实现与早期方案相比，仍有几个明确限制：
 
-1. 每个线程窗口内 `wait_ratio`
-2. 当前 workload 的 `active_local / active_remote / target_local / target_remote`
-3. `dispatch()` 中每次释放任务时的 `src_node / dst_cpu / role`
+- 没有 owner 保护：
+  - 线程是否进入 `SSC_DSQ` 完全由等待占比决定。
+- 没有 `stopping()`：
+  - 记账和自 parking 依赖 `tick()`，响应延迟受 tick 周期影响。
+- `select_cpu()` 的 idle fast path 会短暂绕过 admission：
+  - 最终靠 `tick()` 再把线程压回 `SSC_DSQ`。
+- 没有 seqcount：
+  - BPF 对用户态上下文做单次 `bpf_probe_read_user()` 近似读取。
+- 仍是全局 sched-ext：
+  - 未实现 partial switch。
+- NUMA 策略仍偏弱：
+  - 当前只是固定一个 socket 作为 `SSC core` 候选池，没有 local/remote 精细控制。
 
-只要这三组观测数据稳定，你的系统基本就具备进入参数调优与论文级实验的条件。
+---
 
+## 10. 后续工作
 
+下一步最值得做的事情是：
+
+1. 给用户态导出增加 owner / in-critical-section 信号，避免把即将完成交接的线程过早压进 `SSC_DSQ`。
+2. 把自 parking 判断从 `tick()` 挪到 `stopping()` 或与其结合，减少基于 tick 的延迟。
+3. 重新审视 `wait > run/10` 这条阈值，确认它在 32 线程以上是否过于激进。
+4. 让 `SSC core` 候选池基于真实 NUMA / LLC 拓扑，而不是固定第一颗 socket。
+5. 在验证清楚控制律之前，再考虑把 global switch 收敛到 partial switch。

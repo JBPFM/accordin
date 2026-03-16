@@ -28,6 +28,7 @@ struct lock_sched_thread_ctx {
 struct task_scx_ctx {
   unsigned long long window_epoch;
   unsigned long long last_wait_ns;
+  unsigned long long pending_wait_ns;
   unsigned long long run_start_ns;
   unsigned long long run_ns_window;
   unsigned long long wait_ns_window;

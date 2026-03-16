@@ -316,7 +316,7 @@ fn init_ebpf() {
     let stats_only = env_flag(STATS_ONLY_ENV);
 
     // 初始化调度器（只执行一次）
-    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(true, stats_only) {
+    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false, stats_only) {
         Ok(state) => {
             if stats_only {
                 info!(
@@ -332,7 +332,7 @@ fn init_ebpf() {
             state
         }
         Err(e) => {
-            eprintln!("[lb_simple] Failed to load eBPF scheduler: {}", e);
+            eprintln!("[lb_simple] Failed to load eBPF scheduler: {:#}", e);
             panic!("eBPF initialization failed");
         }
     });
@@ -379,8 +379,16 @@ mod tests {
             "BPF stats comments should not mention removed wait sampling",
         );
         assert!(
-            compact_stats.contains("wait_delta=uctx.wait_ns_total-tc->last_wait_ns;"),
-            "BPF stats should use the raw wait delta directly",
+            compact_stats.contains("completed_wait=uctx.wait_ns_total-tc->last_wait_ns;"),
+            "BPF stats should derive completed wait directly from the raw cumulative delta",
+        );
+        assert!(
+            compact_stats.contains("wait_delta+=completed_wait-tc->pending_wait_ns;"),
+            "BPF stats should subtract already-accounted pending wait instead of scaling samples",
+        );
+        assert!(
+            compact_stats.contains("wait_delta+=pending_wait-tc->pending_wait_ns;"),
+            "BPF stats should accumulate in-flight wait without any sample scaling residue",
         );
     }
 
@@ -529,6 +537,21 @@ mod tests {
         assert!(
             !stats.contains("if(ssc_cpu_count<2)returnssc_cpu_count;"),
             "SSC active-count clamp should not drop below 2 when CPU count is smaller",
+        );
+    }
+
+    #[test]
+    fn stats_headers_do_not_use_probe_write_user_in_struct_ops_path() {
+        let intf = include_str!("bpf/intf.h");
+        let stats = include_str!("bpf/stats.bpf.h");
+
+        assert!(
+            intf.contains("pending_wait_ns"),
+            "task context should keep pending wait accounting in BPF state",
+        );
+        assert!(
+            !stats.contains("bpf_probe_write_user"),
+            "struct_ops stats path must not use bpf_probe_write_user",
         );
     }
 }

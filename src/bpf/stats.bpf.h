@@ -128,6 +128,7 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
     tc->window_epoch = ssc_vote_epoch;
     tc->run_ns_window = 0;
     tc->wait_ns_window = 0;
+    tc->pending_wait_ns = 0;
   }
 
   if (agg && agg->epoch != ssc_vote_epoch) {
@@ -149,22 +150,31 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
   if (tc->user_ctx_ptr) {
     if (read_thread_ctx(tc->user_ctx_ptr, &uctx)) {
       if (uctx.wait_ns_total >= tc->last_wait_ns) {
-        wait_delta = uctx.wait_ns_total - tc->last_wait_ns;
+        __u64 completed_wait = uctx.wait_ns_total - tc->last_wait_ns;
+
         tc->last_wait_ns = uctx.wait_ns_total;
+
+        if (completed_wait > tc->pending_wait_ns)
+          wait_delta += completed_wait - tc->pending_wait_ns;
+
+        tc->pending_wait_ns = 0;
       }
 
       if (uctx.wait_end_ns < uctx.wait_start_ns && now > uctx.wait_start_ns) {
         __u64 pending_wait = now - uctx.wait_start_ns;
-        __u64 *wait_start_ptr =
-            (__u64 *)(unsigned long)(tc->user_ctx_ptr +
-                                     __builtin_offsetof(
-                                         struct lock_sched_thread_ctx,
-                                         wait_start_ns));
 
-        if (bpf_probe_write_user(wait_start_ptr, &now, sizeof(now)) == 0)
-          wait_delta += pending_wait;
+        if (pending_wait > tc->pending_wait_ns)
+          wait_delta += pending_wait - tc->pending_wait_ns;
+
+        tc->pending_wait_ns = pending_wait;
+      } else {
+        tc->pending_wait_ns = 0;
       }
+    } else {
+      tc->pending_wait_ns = 0;
     }
+  } else {
+    tc->pending_wait_ns = 0;
   }
 
   tc->run_ns_window += run_delta;

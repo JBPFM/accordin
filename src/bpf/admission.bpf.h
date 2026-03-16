@@ -78,6 +78,34 @@ static __always_inline bool is_local_node(__s32 node) {
   return node == dominant_node;
 }
 
+static __always_inline __s32 get_ssc_cpu_by_index(__u32 idx) {
+  if (idx >= ssc_cpu_count || idx >= MAX_CPUS)
+    return -1;
+
+  return (__s32)ssc_cpu_list[idx];
+}
+
+static __always_inline bool is_cpu_ssc_core(__s32 cpu) {
+  __u32 limit = ssc_cpu_count;
+
+  if (limit > MAX_CPUS)
+    limit = MAX_CPUS;
+
+#pragma unroll
+  for (__u32 i = 0; i < MAX_CPUS; i++) {
+    if (i >= limit)
+      break;
+    if ((__s32)ssc_cpu_list[i] == cpu)
+      return true;
+  }
+
+  return false;
+}
+
+static __always_inline bool is_task_on_ssc_core(struct task_struct *p) {
+  return is_cpu_ssc_core(scx_bpf_task_cpu(p));
+}
+
 /* ------------------------------------------------------------------ */
 /*  Admission                                                          */
 /* ------------------------------------------------------------------ */

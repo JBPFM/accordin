@@ -89,6 +89,8 @@ volatile __u32 L_persist = 3;
 
 /* NUMA */
 volatile __s32 dominant_node = 0;
+volatile __u32 ssc_cpu_count = 0;
+volatile __u32 ssc_cpu_list[MAX_CPUS] = {};
 
 /* Stats */
 volatile __u64 forced_release_cnt = 0;

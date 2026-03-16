@@ -15,9 +15,9 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
-#include "admission.bpf.h"
 #include "maps.bpf.h"
 #include "stats.bpf.h"
+#include "admission.bpf.h"
 
 /* ------------------------------------------------------------------ */
 /*  Callbacks                                                          */
@@ -99,15 +99,16 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   struct task_scx_ctx *tc = lookup_task_ctx(p);
   // scx_bpf_now is efficient than bpf_task_storage_delete
   __u64 now = scx_bpf_now();
+  __s32 cpu = scx_bpf_task_cpu(p);
 
-  if (tc)
+  if (tc) {
     account_task_activity(tc, pid, now);
-
-  try_advance_window(now);
+  }
 
   if (stats_only_mode)
     return;
 
+  // try_advance_window(now);
   /*
    * If active count is above target, force a reschedule so the
    * current task enters stopping() -> self-parking sooner.

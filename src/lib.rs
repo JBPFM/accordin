@@ -27,6 +27,7 @@ use scx_utils::scx_ops_open;
 const SCHEDULER_NAME: &str = "lb_simple";
 const DISABLE_BPF_ENV: &str = "LB_SIMPLE_DISABLE_BPF";
 const STATS_ONLY_ENV: &str = "LB_SIMPLE_STATS_ONLY";
+const SSC_CPU_CAP: usize = bpf_intf::MAX_CPUS as usize;
 
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
@@ -47,6 +48,8 @@ struct NumaTopology {
     dominant_node: i32,
     local_cpu_count: i64,
     remote_cpu_count: i64,
+    first_socket_node: i32,
+    first_socket_cpus: Vec<u32>,
 }
 
 fn parse_cpu_list(cpulist: &str) -> Vec<u32> {
@@ -81,26 +84,61 @@ fn parse_cpu_list(cpulist: &str) -> Vec<u32> {
     cpus
 }
 
+fn build_numa_topology_from_nodes(mut node_cpus: Vec<(u32, Vec<u32>)>) -> NumaTopology {
+    node_cpus.retain(|(_, cpus)| !cpus.is_empty());
+    node_cpus.sort_by_key(|(node_id, _)| *node_id);
+
+    if node_cpus.is_empty() {
+        let fallback = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1)
+            .max(1);
+        let fallback_cpus: Vec<u32> = (0..fallback).collect();
+
+        return NumaTopology {
+            cpu_to_node: fallback_cpus.iter().copied().map(|cpu| (cpu, 0)).collect(),
+            dominant_node: 0,
+            local_cpu_count: i64::from(fallback),
+            remote_cpu_count: 0,
+            first_socket_node: 0,
+            first_socket_cpus: fallback_cpus,
+        };
+    }
+
+    let first_socket_node = node_cpus[0].0;
+    let first_socket_cpus = node_cpus[0].1.clone();
+    let mut cpu_to_node = Vec::new();
+    let mut node_counts = Vec::new();
+
+    for (node_id, cpus) in node_cpus {
+        node_counts.push((node_id, cpus.len() as i64));
+        for cpu in cpus {
+            cpu_to_node.push((cpu, node_id));
+        }
+    }
+
+    node_counts.sort_by_key(|(node_id, count)| (-*count, *node_id as i64));
+    let (dominant_node, local_cpu_count) = node_counts[0];
+    let total_cpu_count: i64 = node_counts.iter().map(|(_, count)| *count).sum();
+
+    NumaTopology {
+        cpu_to_node,
+        dominant_node: dominant_node as i32,
+        local_cpu_count: local_cpu_count.max(1),
+        remote_cpu_count: (total_cpu_count - local_cpu_count).max(0),
+        first_socket_node: first_socket_node as i32,
+        first_socket_cpus,
+    }
+}
+
 fn detect_numa_topology() -> NumaTopology {
     let node_base = "/sys/devices/system/node";
     let entries = match std::fs::read_dir(node_base) {
         Ok(e) => e,
-        Err(_) => {
-            let fallback = std::thread::available_parallelism()
-                .map(|n| n.get() as i64)
-                .unwrap_or(1)
-                .max(1);
-            return NumaTopology {
-                cpu_to_node: Vec::new(),
-                dominant_node: 0,
-                local_cpu_count: fallback,
-                remote_cpu_count: 0,
-            };
-        }
+        Err(_) => return build_numa_topology_from_nodes(Vec::new()),
     };
 
-    let mut cpu_to_node = Vec::new();
-    let mut node_counts = Vec::new();
+    let mut node_cpus = Vec::new();
 
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -124,39 +162,29 @@ fn detect_numa_topology() -> NumaTopology {
             continue;
         }
 
-        node_counts.push((node_id, cpus.len() as i64));
-        for cpu in cpus {
-            cpu_to_node.push((cpu, node_id));
-        }
+        node_cpus.push((node_id, cpus));
     }
 
-    if cpu_to_node.is_empty() {
-        let fallback = std::thread::available_parallelism()
-            .map(|n| n.get() as i64)
-            .unwrap_or(1)
-            .max(1);
-        return NumaTopology {
-            cpu_to_node,
-            dominant_node: 0,
-            local_cpu_count: fallback,
-            remote_cpu_count: 0,
-        };
-    }
-
-    node_counts.sort_by_key(|(node_id, count)| (-*count, *node_id as i64));
-    let (dominant_node, local_cpu_count) = node_counts[0];
-    let total_cpu_count: i64 = node_counts.iter().map(|(_, count)| *count).sum();
-
-    NumaTopology {
-        cpu_to_node,
-        dominant_node: dominant_node as i32,
-        local_cpu_count: local_cpu_count.max(1),
-        remote_cpu_count: (total_cpu_count - local_cpu_count).max(0),
-    }
+    build_numa_topology_from_nodes(node_cpus)
 }
 
-fn configure_scheduler_topology(skel: &mut OpenBpfSkel<'_>, topology: &NumaTopology) {
-    if let Some(data) = skel.maps.data_data.as_mut() {}
+fn configure_scheduler_topology(_skel: &mut OpenBpfSkel<'_>, _topology: &NumaTopology) {}
+
+fn publish_ssc_cpu_topology(
+    ssc_cpu_count: &mut u32,
+    ssc_cpu_list: &mut [u32; SSC_CPU_CAP],
+    topology: &NumaTopology,
+) {
+    ssc_cpu_list.fill(0);
+
+    let count = topology.first_socket_cpus.len().min(ssc_cpu_list.len());
+    *ssc_cpu_count = count as u32;
+    for (slot, cpu) in ssc_cpu_list
+        .iter_mut()
+        .zip(topology.first_socket_cpus.iter().copied())
+    {
+        *slot = cpu;
+    }
 }
 
 /// Populate cpu_to_node BPF map and publish NUMA defaults.
@@ -171,11 +199,17 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
     if let Some(bss) = skel.maps.bss_data.as_mut() {
         bss.dominant_node = topology.dominant_node;
         bss.stats_only_mode = u32::from(stats_only);
+        publish_ssc_cpu_topology(&mut bss.ssc_cpu_count, &mut bss.ssc_cpu_list, topology);
     }
 
     info!(
-        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} stats_only={}",
-        topology.dominant_node, topology.local_cpu_count, topology.remote_cpu_count, stats_only
+        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} first_socket_node={} ssc_cpu_count={} stats_only={}",
+        topology.dominant_node,
+        topology.local_cpu_count,
+        topology.remote_cpu_count,
+        topology.first_socket_node,
+        topology.first_socket_cpus.len(),
+        stats_only
     );
 }
 
@@ -301,6 +335,8 @@ static INIT: extern "C" fn() = {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     fn compact(source: &str) -> String {
         source.split_whitespace().collect()
     }
@@ -330,6 +366,54 @@ mod tests {
         assert!(
             compact_stats.contains("wait_delta=uctx.wait_ns_total-tc->last_wait_ns;"),
             "BPF stats should use the raw wait delta directly",
+        );
+    }
+
+    #[test]
+    fn ssc_topology_keeps_first_socket_cpu_list_even_when_not_dominant() {
+        let topology = build_numa_topology_from_nodes(vec![
+            (1, vec![8, 9, 10, 11]),
+            (0, vec![0, 2]),
+            (2, vec![12]),
+        ]);
+
+        assert_eq!(topology.first_socket_node, 0);
+        assert_eq!(topology.first_socket_cpus, vec![0, 2]);
+        assert_eq!(topology.dominant_node, 1);
+        assert_eq!(topology.local_cpu_count, 4);
+        assert_eq!(topology.remote_cpu_count, 3);
+    }
+
+    #[test]
+    fn bpf_headers_define_ssc_cpu_globals_and_helper() {
+        let maps = include_str!("bpf/maps.bpf.h");
+        let admission = include_str!("bpf/admission.bpf.h");
+
+        assert!(
+            maps.contains("ssc_cpu_count"),
+            "BPF globals should expose SSC CPU count",
+        );
+        assert!(
+            maps.contains("ssc_cpu_list"),
+            "BPF globals should expose SSC CPU list",
+        );
+        assert!(
+            admission.contains("get_ssc_cpu_by_index"),
+            "BPF helpers should expose indexed SSC CPU lookup",
+        );
+    }
+
+    #[test]
+    fn ssc_helper_headers_define_task_membership_helpers() {
+        let admission = include_str!("bpf/admission.bpf.h");
+
+        assert!(
+            admission.contains("is_cpu_ssc_core"),
+            "BPF helpers should expose CPU-level SSC-core membership checks",
+        );
+        assert!(
+            admission.contains("is_task_on_ssc_core"),
+            "BPF helpers should expose task-level SSC-core membership checks",
         );
     }
 }

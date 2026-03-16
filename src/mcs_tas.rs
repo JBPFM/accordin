@@ -31,43 +31,11 @@ impl Node {
 #[repr(C)]
 pub struct LockSchedThreadCtx {
     pub wait_ns_total: u64,
-    pub state: u32,
-    pub seq: u32,
 }
 
 impl LockSchedThreadCtx {
     const fn new() -> Self {
-        Self {
-            wait_ns_total: 0,
-            state: 0, // ROLE_NONE
-            seq: 0,
-        }
-    }
-
-    // #[inline(always)]
-    // fn seq_begin(&mut self) {
-    //     self.seq = self.seq.wrapping_add(1); // odd = writing
-    //     std::sync::atomic::fence(Ordering::Release);
-    // }
-    //
-    // #[inline(always)]
-    // fn seq_end(&mut self) {
-    //     std::sync::atomic::fence(Ordering::Release);
-    //     self.seq = self.seq.wrapping_add(1); // even = committed
-    // }
-
-    #[inline(always)]
-    fn set_role_owner(&mut self) {
-        // self.seq_begin();
-        self.state = 1; // ROLE_OWNER
-        // self.seq_end();
-    }
-
-    #[inline(always)]
-    fn set_role_none(&mut self) {
-        // self.seq_begin();
-        self.state = 0; // ROLE_NONE
-        // self.seq_end();
+        Self { wait_ns_total: 0 }
     }
 }
 
@@ -119,9 +87,6 @@ impl McsTasLockRaw {
     pub fn lock(&self) {
         // Fast path: TAS
         if !self.locked.0.swap(true, Ordering::Acquire) {
-            // Acquired immediately — set ROLE_OWNER
-            let ctx = thread_ctx();
-            unsafe { (*ctx).set_role_owner() };
             return;
         }
 
@@ -186,7 +151,6 @@ impl McsTasLockRaw {
             if sample_wait {
                 (*ctx).wait_ns_total += wait_time_elapsed_ns(wait_start);
             }
-            (*ctx).set_role_owner();
         }
     }
 
@@ -200,8 +164,6 @@ impl McsTasLockRaw {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            let ctx = thread_ctx();
-            unsafe { (*ctx).set_role_owner() };
             true
         } else {
             false
@@ -212,9 +174,6 @@ impl McsTasLockRaw {
     pub fn unlock(&self) {
         // Release the lock first
         self.locked.0.store(false, Ordering::Release);
-        // Then clear role — brief "dual OWNER" is a conservative protective bias
-        let ctx = thread_ctx();
-        unsafe { (*ctx).set_role_none() };
         // Yield extended timeslice if one was granted
         TIMESLICE_REQUESTED.with(|cell| {
             if cell.get() {

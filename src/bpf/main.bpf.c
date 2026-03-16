@@ -51,15 +51,10 @@ void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev) {
     return;
   }
 
-  if (scx_bpf_dsq_nr_queued(SSC_DSQ_ID) > 0) {
-    // if the core is SSC cores, it should prioritize dispatching SSC waiters
-    //
-    // but if there is some task with the cpu mask under timeout in global queue
-    // it should also prioritize dispatching those tasks to avoid starvation
-    //
+  if (is_cpu_ssc_core(cpu) && scx_bpf_dsq_nr_queued(SSC_DSQ_ID) > 0) {
+    scx_bpf_dsq_move_to_local(SSC_DSQ_ID);
   } else {
-    // 如果有SSC DSQ中快要超时的任务，也进行调度
-    // 否则即使CPU空闲也不调度SSC_DSQ中的任务，避免过早调度导致的频繁切换
+    scx_bpf_dsq_move_to_local(READY_DSQ_ID);
   }
 
   /* Regular dispatch from READY_DSQ */

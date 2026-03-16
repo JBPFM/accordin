@@ -156,12 +156,7 @@ fn detect_numa_topology() -> NumaTopology {
 }
 
 fn configure_scheduler_topology(skel: &mut OpenBpfSkel<'_>, topology: &NumaTopology) {
-    if let Some(data) = skel.maps.data_data.as_mut() {
-        data.target_local = topology.local_cpu_count;
-        data.target_remote = topology.remote_cpu_count;
-        data.max_target_local = topology.local_cpu_count;
-        data.max_target_remote = topology.remote_cpu_count;
-    }
+    if let Some(data) = skel.maps.data_data.as_mut() {}
 }
 
 /// Populate cpu_to_node BPF map and publish NUMA defaults.
@@ -303,3 +298,38 @@ static INIT: extern "C" fn() = {
     }
     init
 };
+
+#[cfg(test)]
+mod tests {
+    fn compact(source: &str) -> String {
+        source.split_whitespace().collect()
+    }
+
+    #[test]
+    fn bpf_headers_do_not_keep_wait_sample_scaling_residue() {
+        let intf = include_str!("bpf/intf.h");
+        let stats = include_str!("bpf/stats.bpf.h");
+        let compact_stats = compact(stats);
+
+        assert!(
+            !intf.contains("WAIT_TIME_SAMPLE_STRIDE"),
+            "BPF interface should not keep wait sample stride after sampling removal",
+        );
+        assert!(
+            !intf.contains("cumulative sampled wait time"),
+            "BPF interface comment should describe raw cumulative wait time",
+        );
+        assert!(
+            !stats.contains("scale_sampled_wait_ns"),
+            "BPF stats should not scale wait deltas after sampling removal",
+        );
+        assert!(
+            !stats.contains("8x sample scaling"),
+            "BPF stats comments should not mention removed wait sampling",
+        );
+        assert!(
+            compact_stats.contains("wait_delta=uctx.wait_ns_total-tc->last_wait_ns;"),
+            "BPF stats should use the raw wait delta directly",
+        );
+    }
+}

@@ -586,4 +586,19 @@ mod tests {
             "arch helpers should not keep the compiler barrier used only by the removed timeslice extension",
         );
     }
+
+    #[test]
+    fn rust_sources_use_tsc_conversion_for_wait_timestamps() {
+        let arch = include_str!("arch.rs");
+        let mcs_tas = include_str!("mcs_tas.rs");
+
+        assert!(
+            arch.contains("pub fn wait_time_to_ns("),
+            "arch helpers should expose direct wait-time cycle to ns conversion",
+        );
+        assert!(
+            !mcs_tas.contains("wait_time_now_ns()"),
+            "mcs_tas slow path should not call wait_time_now_ns directly",
+        );
+    }
 }

@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use crate::arch::{pause, wait_time_elapsed_ns, wait_time_now_ns, wait_time_start};
+use crate::arch::{pause, wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns};
 
 // we remove sample cause in some high contention env wait can occupy full timeslice
 // or we can reserve a fast path in low contention
@@ -94,10 +94,9 @@ impl McsTasLockRaw {
 
         // Slow path: MCS queue + TAS
         let wait_start = wait_time_start();
-        let wait_start_ns = wait_time_now_ns();
         let ctx = thread_ctx();
         unsafe {
-            (*ctx).wait_start_ns = wait_start_ns;
+            (*ctx).wait_start_ns = wait_time_to_ns(wait_start);
         }
 
         let my_node = Self::thread_node();
@@ -147,10 +146,10 @@ impl McsTasLockRaw {
         }
 
         // Acquired after contention — accumulate sampled wait time, set ROLE_OWNER
-        let wait_end_ns = wait_time_now_ns();
+        let wait_end = wait_time_start();
         unsafe {
-            (*ctx).wait_ns_total += wait_time_elapsed_ns(wait_start);
-            (*ctx).wait_end_ns = wait_end_ns;
+            (*ctx).wait_ns_total += wait_time_elapsed_ns_between(wait_start, wait_end);
+            (*ctx).wait_end_ns = wait_time_to_ns(wait_end);
         }
     }
 

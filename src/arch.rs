@@ -102,12 +102,6 @@ pub fn wait_time_elapsed_ns(start_ns: u64) -> u64 {
     monotonic_ns().wrapping_sub(start_ns)
 }
 
-/// Compiler-only fence (no hardware barrier), equivalent to C++ `atomic_signal_fence(seq_cst)`.
-#[inline(always)]
-pub fn compiler_barrier() {
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-}
-
 #[inline(always)]
 pub fn pause() {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]

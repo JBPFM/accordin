@@ -8,7 +8,6 @@ mod arch;
 pub mod bpf_intf;
 mod mcs_tas;
 mod mutex_hook;
-mod timeslice_extension;
 
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
@@ -552,6 +551,39 @@ mod tests {
         assert!(
             !stats.contains("bpf_probe_write_user"),
             "struct_ops stats path must not use bpf_probe_write_user",
+        );
+    }
+
+    #[test]
+    fn rust_sources_remove_timeslice_extension_support() {
+        let arch = include_str!("arch.rs");
+        let mcs_tas = include_str!("mcs_tas.rs");
+        let mutex_hook = include_str!("mutex_hook.rs");
+        let build_script = include_str!("../build.rs");
+
+        assert!(
+            !std::path::Path::new("src/timeslice_extension.rs").exists(),
+            "timeslice extension module file should be removed",
+        );
+        assert!(
+            !mcs_tas.contains("timeslice_extension"),
+            "mcs_tas should not depend on the removed timeslice extension module",
+        );
+        assert!(
+            !mcs_tas.contains("prepare_thread_timeslice"),
+            "mcs_tas should not keep thread preparation wrappers for the removed timeslice extension",
+        );
+        assert!(
+            !mutex_hook.contains("prepare_thread_timeslice"),
+            "mutex hook registration should not call removed timeslice preparation",
+        );
+        assert!(
+            !build_script.contains("lb_simple_tse_available"),
+            "build script should not keep cfg plumbing for removed timeslice extension support",
+        );
+        assert!(
+            !arch.contains("pub fn compiler_barrier()"),
+            "arch helpers should not keep the compiler barrier used only by the removed timeslice extension",
         );
     }
 }

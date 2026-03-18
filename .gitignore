@@ -7,3 +7,5 @@ compile_commands.json
 .claude/worktrees
 .worktrees
 results
+.dmux/
+.dmux-hooks

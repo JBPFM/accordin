@@ -192,6 +192,10 @@ fn publish_ssc_cpu_topology(
     *ssc_cpu_count = count as u32;
 }
 
+fn initial_ssc_active_count(ssc_cpu_count: u32) -> u32 {
+    ssc_cpu_count.clamp(2, 8)
+}
+
 /// Populate cpu_to_node BPF map and publish NUMA defaults.
 fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, stats_only: bool) {
     for (cpu, node_id) in &topology.cpu_to_node {
@@ -213,7 +217,9 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
     }
 
     if let Some(data) = skel.maps.data_data.as_mut() {
-        data.ssc_active_count = 2;
+        data.ssc_active_count = initial_ssc_active_count(
+            u32::try_from(topology.first_socket_cpus.len()).unwrap_or(u32::MAX),
+        );
     }
 
     info!(
@@ -407,6 +413,15 @@ mod tests {
     }
 
     #[test]
+    fn initial_ssc_active_count_uses_a_warm_start_seed() {
+        assert_eq!(initial_ssc_active_count(0), 2);
+        assert_eq!(initial_ssc_active_count(1), 2);
+        assert_eq!(initial_ssc_active_count(4), 4);
+        assert_eq!(initial_ssc_active_count(8), 8);
+        assert_eq!(initial_ssc_active_count(20), 8);
+    }
+
+    #[test]
     fn bpf_headers_define_ssc_cpu_globals_and_helper() {
         let maps = include_str!("bpf/maps.bpf.h");
         let admission = include_str!("bpf/admission.bpf.h");
@@ -496,6 +511,54 @@ mod tests {
     }
 
     #[test]
+    fn shift_detection_headers_define_state() {
+        let intf = include_str!("bpf/intf.h");
+        let maps = include_str!("bpf/maps.bpf.h");
+        let stats = include_str!("bpf/stats.bpf.h");
+
+        assert!(
+            intf.contains("enum ssc_search_phase"),
+            "BPF interface should define the SSC search phase enum",
+        );
+        assert!(
+            maps.contains("ssc_search_phase"),
+            "BPF globals should expose the current SSC search phase",
+        );
+        assert!(
+            maps.contains("ssc_refine_low"),
+            "BPF globals should expose the lower refinement bound",
+        );
+        assert!(
+            maps.contains("ssc_refine_high"),
+            "BPF globals should expose the upper refinement bound",
+        );
+        assert!(
+            maps.contains("ssc_wait_ratio_ewma"),
+            "BPF globals should expose the wait-ratio EWMA baseline",
+        );
+        assert!(
+            !maps.contains("ssc_demand_ewma"),
+            "BPF globals should not track a demand EWMA that feeds back controller-induced wait inflation",
+        );
+        assert!(
+            maps.contains("ssc_shift_streak"),
+            "BPF globals should track consecutive shift detections",
+        );
+        assert!(
+            maps.contains("ssc_resize_holdoff"),
+            "BPF globals should expose the resize holdoff window count",
+        );
+        assert!(
+            stats.contains("detect_ssc_workload_shift"),
+            "BPF stats helpers should expose workload-shift detection",
+        );
+        assert!(
+            stats.contains("#define SSC_RESIZE_HOLDOFF_WINDOWS 3U"),
+            "workload-shift detection should wait multiple windows after a resize before re-arming",
+        );
+    }
+
+    #[test]
     fn tick_quorum_logic_requires_majority_before_adjusting_active_count() {
         let main = compact(include_str!("bpf/main.bpf.c"));
 
@@ -516,12 +579,47 @@ mod tests {
             "simple_tick should only halve active_count after two consecutive drops below the effective score",
         );
         assert!(
-            main.contains("ssc_active_count=clamp_ssc_active_count(ssc_active_count<<1);"),
-            "simple_tick should clamp doubled active_count",
+            main.contains("ssc_set_active_count(ssc_active_count<<1,score);"),
+            "simple_tick should funnel doubled active_count through the clamped resize helper",
         );
         assert!(
-            main.contains("ssc_active_count=clamp_ssc_active_count(ssc_active_count>>1);"),
-            "simple_tick should clamp halved active_count",
+            main.contains("ssc_set_active_count(ssc_next_refine_target(),ssc_best_score);"),
+            "simple_tick should funnel refinement targets through the clamped resize helper",
+        );
+    }
+
+    #[test]
+    fn quorum_shift_detection_resets_search_phase() {
+        let main = compact(include_str!("bpf/main.bpf.c"));
+        let stats = include_str!("bpf/stats.bpf.h");
+
+        assert!(
+            main.contains("ssc_search_phase==SSC_SEARCH_REFINE&&detect_ssc_workload_shift(now,&wait_ratio)"),
+            "simple_tick should only run workload-shift detection while refining around a prior best point",
+        );
+        assert!(
+            main.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
+            "confirmed workload shifts should reset the controller back to fast seek mode",
+        );
+        assert!(
+            stats.contains("ssc_enter_refine_mode"),
+            "BPF stats helpers should expose refine-mode entry",
+        );
+        assert!(
+            stats.contains("ssc_next_refine_target"),
+            "BPF stats helpers should expose bounded refinement target selection",
+        );
+        assert!(
+            main.contains("ssc_enter_refine_mode(ssc_best_count,ssc_active_count,score);"),
+            "simple_tick should enter bounded refinement after a clear regression",
+        );
+        assert!(
+            main.contains("ssc_set_active_count(ssc_best_count,ssc_best_score);"),
+            "confirmed workload shifts should fall back to the last best known core count instead of immediately doubling or halving",
+        );
+        assert!(
+            !stats.contains("demand_shift"),
+            "workload-shift detection should not key off a demand signal that already embeds wait inflation",
         );
     }
 

@@ -115,6 +115,15 @@ volatile __u64 ssc_vote_last_score = 0;
 volatile __u64 ssc_vote_last_effective_score = 0;
 volatile __u32 ssc_vote_consec_grow = 0;
 volatile __u32 ssc_vote_consec_shrink = 0;
+volatile __u32 ssc_search_phase = SSC_SEARCH_SEEK;
+volatile __u32 ssc_best_count = 2;
+volatile __u64 ssc_best_score = 0;
+volatile __u32 ssc_refine_low = 2;
+volatile __u32 ssc_refine_high = 2;
+volatile __u64 ssc_wait_ratio_ewma = 0;
+volatile __u32 ssc_shift_streak = 0;
+volatile __u32 ssc_resize_holdoff = 0;
+volatile __u32 ssc_shift_baseline_valid = 0;
 
 /* Per-window debug stats — updated only when dbg_counters_enabled=1 */
 volatile __u32 dbg_counters_enabled = 0; /* 0=off (production), 1=on (debug) */

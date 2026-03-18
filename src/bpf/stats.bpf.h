@@ -9,6 +9,12 @@
 #include "maps.bpf.h"
 
 #define SSC_SCORE_SCALE 1024ULL
+#define SSC_SHIFT_EWMA_ALPHA_NUM 1ULL
+#define SSC_SHIFT_EWMA_ALPHA_DEN 4ULL
+#define SSC_SHIFT_WAIT_ABS_THRESHOLD (SSC_SCORE_SCALE / 12ULL)
+#define SSC_SHIFT_WAIT_REL_PCT 25ULL
+#define SSC_SHIFT_CONFIRM_WINDOWS 3U
+#define SSC_RESIZE_HOLDOFF_WINDOWS 3U
 
 /*
  * Statistics layer: window-based EWMA wait ratio computation.
@@ -79,6 +85,145 @@ static __always_inline __u64 compute_ssc_vote_score(__u32 active_count) {
 
   return ((__u64)active_count * useful_run * SSC_SCORE_SCALE) /
          ssc_vote_sum_run;
+}
+
+static __always_inline __u64 abs_diff_u64(__u64 a, __u64 b) {
+  return a > b ? a - b : b - a;
+}
+
+static __always_inline bool rel_change_exceeds(__u64 cur, __u64 base,
+                                               __u64 pct) {
+  if (!base)
+    return cur > 0;
+
+  return abs_diff_u64(cur, base) * 100ULL >= base * pct;
+}
+
+static __always_inline __u64 ewma_update_u64(__u64 prev, __u64 sample) {
+  __u64 delta;
+
+  if (!prev)
+    return sample;
+
+  if (sample > prev) {
+    delta = sample - prev;
+    return prev + (delta * SSC_SHIFT_EWMA_ALPHA_NUM) /
+                      SSC_SHIFT_EWMA_ALPHA_DEN;
+  }
+
+  delta = prev - sample;
+  return prev -
+         (delta * SSC_SHIFT_EWMA_ALPHA_NUM) / SSC_SHIFT_EWMA_ALPHA_DEN;
+}
+
+static __always_inline __u64 compute_ssc_wait_ratio(__u64 run_ns,
+                                                    __u64 wait_ns) {
+  if (!run_ns)
+    return 0;
+
+  return (wait_ns * SSC_SCORE_SCALE) / run_ns;
+}
+
+static __always_inline void reset_ssc_refine_bounds(__u32 active_count) {
+  active_count = clamp_ssc_active_count(active_count);
+  ssc_refine_low = active_count;
+  ssc_refine_high = active_count;
+}
+
+static __always_inline void ssc_note_resize(__u64 effective_score) {
+  ssc_resize_holdoff = SSC_RESIZE_HOLDOFF_WINDOWS;
+  ssc_vote_last_score = 0;
+  ssc_vote_last_effective_score = effective_score;
+  ssc_vote_consec_grow = 0;
+  ssc_vote_consec_shrink = 0;
+}
+
+static __always_inline void ssc_set_active_count(__u32 active_count,
+                                                 __u64 effective_score) {
+  active_count = clamp_ssc_active_count(active_count);
+
+  if (active_count == ssc_active_count)
+    return;
+
+  ssc_active_count = active_count;
+  ssc_note_resize(effective_score);
+}
+
+static __always_inline void ssc_enter_refine_mode(__u32 low, __u32 high,
+                                                  __u64 score) {
+  if (low > high) {
+    __u32 tmp = low;
+    low = high;
+    high = tmp;
+  }
+
+  ssc_refine_low = clamp_ssc_active_count(low);
+  ssc_refine_high = clamp_ssc_active_count(high);
+  if (ssc_refine_low > ssc_refine_high) {
+    __u32 tmp = ssc_refine_low;
+    ssc_refine_low = ssc_refine_high;
+    ssc_refine_high = tmp;
+  }
+
+  ssc_search_phase = SSC_SEARCH_REFINE;
+  if (ssc_best_count < ssc_refine_low || ssc_best_count > ssc_refine_high)
+    ssc_best_count = ssc_refine_low;
+  if (!ssc_best_score)
+    ssc_best_score = score;
+}
+
+static __always_inline __u32 ssc_next_refine_target(void) {
+  if (ssc_refine_high <= ssc_refine_low + 1)
+    return ssc_best_count ? ssc_best_count : ssc_refine_low;
+
+  return clamp_ssc_active_count(ssc_refine_low +
+                                ((ssc_refine_high - ssc_refine_low) >> 1));
+}
+
+static __always_inline bool detect_ssc_workload_shift(__u64 now,
+                                                      __u64 *wait_ratio_out) {
+  __u64 wait_ratio = compute_ssc_wait_ratio(ssc_vote_sum_run, ssc_vote_sum_wait);
+  __u64 demand = ssc_vote_sum_run + ssc_vote_sum_wait;
+  __u64 prev_wait_ratio = ssc_wait_ratio_ewma;
+  bool wait_shift = false;
+
+  (void)now;
+  (void)demand;
+
+  if (wait_ratio_out)
+    *wait_ratio_out = wait_ratio;
+
+  if (!ssc_shift_baseline_valid) {
+    ssc_wait_ratio_ewma = wait_ratio;
+    ssc_shift_baseline_valid = 1;
+    return false;
+  }
+
+  if (ssc_resize_holdoff) {
+    ssc_resize_holdoff--;
+    ssc_shift_streak = 0;
+    return false;
+  }
+
+  if (abs_diff_u64(wait_ratio, prev_wait_ratio) >= SSC_SHIFT_WAIT_ABS_THRESHOLD &&
+      rel_change_exceeds(wait_ratio, prev_wait_ratio, SSC_SHIFT_WAIT_REL_PCT))
+    wait_shift = true;
+
+  if (wait_shift)
+    ssc_shift_streak++;
+  else
+    ssc_shift_streak = 0;
+
+  if (ssc_shift_streak >= SSC_SHIFT_CONFIRM_WINDOWS) {
+    ssc_wait_ratio_ewma = wait_ratio;
+    ssc_shift_streak = 0;
+
+    return true;
+  }
+
+  ssc_wait_ratio_ewma = ewma_update_u64(prev_wait_ratio, wait_ratio);
+
+  return false;
 }
 
 static __always_inline void rotate_ssc_vote_window(__u64 now) {

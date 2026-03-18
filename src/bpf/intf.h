@@ -43,6 +43,11 @@ struct ssc_vote_slot {
   unsigned long long last_wait_ns;
 };
 
+enum ssc_search_phase {
+  SSC_SEARCH_SEEK = 0,
+  SSC_SEARCH_REFINE = 1,
+};
+
 /* Stats exported via stats_map for userspace monitoring. */
 enum stat_key {
   STAT_P_W_EWMA = 0,

@@ -16,12 +16,19 @@ enum thread_role {
   ROLE_OWNER = 1,
 };
 
+enum lock_sched_state {
+  LOCK_SCHED_STATE_NONE = 0,
+  LOCK_SCHED_STATE_SPINNER = 1,
+  LOCK_SCHED_STATE_OWNER = 2,
+};
+
 /* Stored in user thread-local memory and read from BPF via bpf_probe_read_user.
  */
 struct lock_sched_thread_ctx {
   unsigned long long wait_ns_total; /* cumulative wait time */
   unsigned long long wait_start_ns; /* current wait start timestamp */
   unsigned long long wait_end_ns;   /* latest completed wait end timestamp */
+  unsigned int lock_state;          /* spinner / owner protection state */
 };
 
 /* Per-task scheduling context stored in BPF task_ctx_map. */
@@ -33,6 +40,7 @@ struct task_scx_ctx {
   unsigned long long run_ns_window;
   unsigned long long wait_ns_window;
   unsigned int admitted;
+  unsigned int lock_state;
   unsigned long long
       user_ctx_ptr; /* cached pointer to user-space lock_sched_thread_ctx */
 };

@@ -96,4 +96,22 @@ static __always_inline bool is_task_on_ssc_core(struct task_struct *p) {
   return is_cpu_ssc_core(scx_bpf_task_cpu(p));
 }
 
+static __always_inline bool is_task_lock_protected(struct task_scx_ctx *tc) {
+  if (!tc)
+    return false;
+
+  return tc->lock_state == LOCK_SCHED_STATE_SPINNER ||
+         tc->lock_state == LOCK_SCHED_STATE_OWNER;
+}
+
+static __always_inline void keep_task_lock_protected(struct task_struct *p,
+                                                     struct task_scx_ctx *tc) {
+  if (!tc)
+    return;
+
+  tc->admitted = 1;
+  if (p->scx.slice < SCX_SLICE_DFL)
+    p->scx.slice = SCX_SLICE_DFL;
+}
+
 #endif /* __ADMISSION_BPF_H */

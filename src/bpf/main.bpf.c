@@ -36,8 +36,19 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
   struct task_scx_ctx *tc = lookup_task_ctx(p);
-  if (!tc || tc->admitted) {
+  if (!tc) {
     /* Untracked task (not yet seen in running()) — let it run. */
+    scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+    return;
+  }
+
+  if (is_task_lock_protected(tc)) {
+    tc->admitted = 1;
+    scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+    return;
+  }
+
+  if (tc->admitted) {
     scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
     return;
   }
@@ -89,6 +100,7 @@ void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p) {
 void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   __u32 pid = p->pid;
   struct task_scx_ctx *tc = lookup_task_ctx(p);
+  bool lock_protected = false;
   // scx_bpf_now is efficient than bpf_task_storage_delete
   __u64 now = scx_bpf_now();
 
@@ -96,6 +108,7 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
 
   if (tc) {
     account_task_activity(tc, pid, now);
+    lock_protected = is_task_lock_protected(tc);
   }
 
   if (stats_only_mode)
@@ -181,7 +194,15 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
       rotate_ssc_vote_window(now);
     }
 
+    if (lock_protected)
+      keep_task_lock_protected(p, tc);
+
   } else {
+    if (lock_protected) {
+      keep_task_lock_protected(p, tc);
+      return;
+    }
+
     /*
      * If active count is above target, force a reschedule so the
      * current task enters stopping() -> self-parking sooner.

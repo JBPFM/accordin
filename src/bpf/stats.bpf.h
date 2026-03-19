@@ -263,6 +263,7 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
                                                   __u32 pid, __u64 now) {
   __u64 run_delta = 0;
   __u64 wait_delta = 0;
+  bool have_uctx = false;
   struct lock_sched_thread_ctx uctx = {};
   struct agg_percpu *agg = lookup_cpu_agg();
 
@@ -282,6 +283,13 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
     agg->wait_ns = 0;
   }
 
+  if (tc->user_ctx_ptr && read_thread_ctx(tc->user_ctx_ptr, &uctx)) {
+    have_uctx = true;
+    tc->lock_state = uctx.lock_state;
+  } else {
+    tc->lock_state = LOCK_SCHED_STATE_NONE;
+  }
+
   if (!tc->run_start_ns) {
     tc->run_start_ns = now;
     return;
@@ -292,29 +300,25 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
 
   tc->run_start_ns = now;
 
-  if (tc->user_ctx_ptr) {
-    if (read_thread_ctx(tc->user_ctx_ptr, &uctx)) {
-      if (uctx.wait_ns_total >= tc->last_wait_ns) {
-        __u64 completed_wait = uctx.wait_ns_total - tc->last_wait_ns;
+  if (have_uctx) {
+    if (uctx.wait_ns_total >= tc->last_wait_ns) {
+      __u64 completed_wait = uctx.wait_ns_total - tc->last_wait_ns;
 
-        tc->last_wait_ns = uctx.wait_ns_total;
+      tc->last_wait_ns = uctx.wait_ns_total;
 
-        if (completed_wait > tc->pending_wait_ns)
-          wait_delta += completed_wait - tc->pending_wait_ns;
+      if (completed_wait > tc->pending_wait_ns)
+        wait_delta += completed_wait - tc->pending_wait_ns;
 
-        tc->pending_wait_ns = 0;
-      }
+      tc->pending_wait_ns = 0;
+    }
 
-      if (uctx.wait_end_ns < uctx.wait_start_ns && now > uctx.wait_start_ns) {
-        __u64 pending_wait = now - uctx.wait_start_ns;
+    if (uctx.wait_end_ns < uctx.wait_start_ns && now > uctx.wait_start_ns) {
+      __u64 pending_wait = now - uctx.wait_start_ns;
 
-        if (pending_wait > tc->pending_wait_ns)
-          wait_delta += pending_wait - tc->pending_wait_ns;
+      if (pending_wait > tc->pending_wait_ns)
+        wait_delta += pending_wait - tc->pending_wait_ns;
 
-        tc->pending_wait_ns = pending_wait;
-      } else {
-        tc->pending_wait_ns = 0;
-      }
+      tc->pending_wait_ns = pending_wait;
     } else {
       tc->pending_wait_ns = 0;
     }

@@ -594,7 +594,9 @@ mod tests {
         let stats = include_str!("bpf/stats.bpf.h");
 
         assert!(
-            main.contains("ssc_search_phase==SSC_SEARCH_REFINE&&detect_ssc_workload_shift(now,&wait_ratio)"),
+            main.contains(
+                "ssc_search_phase==SSC_SEARCH_REFINE&&detect_ssc_workload_shift(now,&wait_ratio)"
+            ),
             "simple_tick should only run workload-shift detection while refining around a prior best point",
         );
         assert!(
@@ -682,6 +684,60 @@ mod tests {
         assert!(
             !arch.contains("pub fn compiler_barrier()"),
             "arch helpers should not keep the compiler barrier used only by the removed timeslice extension",
+        );
+    }
+
+    #[test]
+    fn lock_state_headers_define_spinner_and_owner_protection() {
+        let intf = include_str!("bpf/intf.h");
+        let admission = include_str!("bpf/admission.bpf.h");
+
+        assert!(
+            intf.contains("LOCK_SCHED_STATE_SPINNER"),
+            "BPF interface should define a spinner protection state",
+        );
+        assert!(
+            intf.contains("LOCK_SCHED_STATE_OWNER"),
+            "BPF interface should define an owner protection state",
+        );
+        assert!(
+            intf.contains("unsigned int lock_state;"),
+            "shared lock context should expose the current lock-protection state",
+        );
+        assert!(
+            admission.contains("is_task_lock_protected"),
+            "BPF admission helpers should identify spinner/owner protected tasks",
+        );
+        assert!(
+            admission.contains("keep_task_lock_protected"),
+            "BPF admission helpers should restore slice/admission for protected tasks",
+        );
+    }
+
+    #[test]
+    fn source_keeps_spinner_and_owner_threads_out_of_self_parking() {
+        let main = compact(include_str!("bpf/main.bpf.c"));
+        let mcs_tas = include_str!("mcs_tas.rs");
+
+        assert!(
+            main.contains("if(is_task_lock_protected(tc)){tc->admitted=1;scx_bpf_dsq_insert(p,READY_DSQ_ID,SCX_SLICE_DFL,enq_flags);return;}"),
+            "enqueue should keep protected spinner/owner tasks in READY_DSQ",
+        );
+        assert!(
+            main.contains("if(lock_protected){keep_task_lock_protected(p,tc);return;}"),
+            "tick should skip self-parking for protected non-SSC tasks",
+        );
+        assert!(
+            mcs_tas.contains("set_thread_lock_state(LockSchedState::Spinner);"),
+            "user lock should mark the designated spinner before the TAS handoff loop",
+        );
+        assert!(
+            mcs_tas.contains("set_thread_lock_state(LockSchedState::Owner);"),
+            "user lock should mark the thread as owner when the lock is acquired",
+        );
+        assert!(
+            mcs_tas.contains("set_thread_lock_state(LockSchedState::None);"),
+            "user lock should clear the protection state on unlock",
         );
     }
 

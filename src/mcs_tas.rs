@@ -34,6 +34,7 @@ pub struct LockSchedThreadCtx {
     pub wait_ns_total: u64,
     pub wait_start_ns: u64,
     pub wait_end_ns: u64,
+    pub lock_state: u32,
 }
 
 impl LockSchedThreadCtx {
@@ -42,6 +43,7 @@ impl LockSchedThreadCtx {
             wait_ns_total: 0,
             wait_start_ns: 0,
             wait_end_ns: 0,
+            lock_state: LockSchedState::None as u32,
         }
     }
 }
@@ -50,6 +52,20 @@ thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
     static THREAD_CTX: UnsafeCell<LockSchedThreadCtx> = const { UnsafeCell::new(LockSchedThreadCtx::new()) };
     // static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
+}
+
+#[repr(u32)]
+enum LockSchedState {
+    None = 0,
+    Spinner = 1,
+    Owner = 2,
+}
+
+#[inline(always)]
+fn set_thread_lock_state(state: LockSchedState) {
+    THREAD_CTX.with(|ctx| unsafe {
+        (*ctx.get()).lock_state = state as u32;
+    });
 }
 
 /// Returns a pointer to the current thread's LockSchedThreadCtx.
@@ -89,6 +105,7 @@ impl McsTasLockRaw {
     pub fn lock(&self) {
         // Fast path: TAS
         if !self.locked.0.swap(true, Ordering::Acquire) {
+            set_thread_lock_state(LockSchedState::Owner);
             return;
         }
 
@@ -116,9 +133,14 @@ impl McsTasLockRaw {
             }
         }
 
+        set_thread_lock_state(LockSchedState::Spinner);
+
         while self.locked.0.swap(true, Ordering::Acquire) {
             pause();
         }
+
+        set_thread_lock_state(LockSchedState::Owner);
+
         let mut succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
         if succ.is_null()
             && self
@@ -163,6 +185,7 @@ impl McsTasLockRaw {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            set_thread_lock_state(LockSchedState::Owner);
             true
         } else {
             false
@@ -172,5 +195,6 @@ impl McsTasLockRaw {
     #[inline(always)]
     pub fn unlock(&self) {
         self.locked.0.store(false, Ordering::Release);
+        set_thread_lock_state(LockSchedState::None);
     }
 }

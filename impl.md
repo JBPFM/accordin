@@ -124,7 +124,7 @@ struct ssc_vote_slot {
 
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
-| `ssc_vote_window_ns` | 200ms | 控制窗口长度 |
+| `ssc_vote_window_ns` | `2 * SCX_SLICE_DFL` | 控制窗口长度 |
 | `ssc_active_count` | 2 | 当前活跃 `SSC core` 数 |
 | `ssc_cpu_count` | 运行时写入 | `SSC` 候选 CPU 数 |
 | `ssc_cpu_list[]` | 运行时写入 | 候选 CPU 列表 |

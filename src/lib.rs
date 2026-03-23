@@ -8,6 +8,7 @@ mod arch;
 pub mod bpf_intf;
 mod mcs_tas;
 mod mutex_hook;
+mod timeslice_extension;
 
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
@@ -210,6 +211,9 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
     if let Some(bss) = skel.maps.bss_data.as_mut() {
         bss.dominant_node = topology.dominant_node;
         bss.stats_only_mode = u32::from(stats_only);
+        if let Some(rodata) = skel.maps.rodata_data.as_ref() {
+            bss.ssc_vote_window_ns = rodata.__SCX_SLICE_DFL.saturating_mul(2);
+        }
         publish_ssc_cpu_topology(
             &mut bss.ssc_cpu_count,
             &mut bss.ssc_cpu_list,
@@ -475,6 +479,7 @@ mod tests {
         let intf = include_str!("bpf/intf.h");
         let maps = include_str!("bpf/maps.bpf.h");
         let stats = include_str!("bpf/stats.bpf.h");
+        let lib = compact(include_str!("lib.rs"));
 
         assert!(
             intf.contains("struct ssc_vote_slot"),
@@ -487,6 +492,10 @@ mod tests {
         assert!(
             maps.contains("ssc_vote_window_ns"),
             "BPF globals should expose the SSC vote timeout window",
+        );
+        assert!(
+            lib.contains("bss.ssc_vote_window_ns=rodata.__SCX_SLICE_DFL.saturating_mul(2);"),
+            "SSC vote window should default to two sched_ext default slices",
         );
         assert!(
             maps.contains("ssc_vote_publish_count"),
@@ -666,35 +675,123 @@ mod tests {
     }
 
     #[test]
-    fn rust_sources_remove_timeslice_extension_support() {
-        let arch = include_str!("arch.rs");
+    fn rust_sources_reintroduce_preempt_yield_timeslice_support() {
+        let lib = include_str!("lib.rs");
         let mcs_tas = include_str!("mcs_tas.rs");
         let mutex_hook = include_str!("mutex_hook.rs");
-        let build_script = include_str!("../build.rs");
 
         assert!(
-            !std::path::Path::new("src/timeslice_extension.rs").exists(),
-            "timeslice extension module file should be removed",
+            std::path::Path::new("src/timeslice_extension.rs").exists(),
+            "timeslice extension module file should be restored for the MCS slow path",
         );
         assert!(
-            !mcs_tas.contains("timeslice_extension"),
-            "mcs_tas should not depend on the removed timeslice extension module",
+            lib.contains("mod timeslice_extension;"),
+            "library root should wire the restored timeslice extension module back in",
         );
         assert!(
-            !mcs_tas.contains("prepare_thread_timeslice"),
-            "mcs_tas should not keep thread preparation wrappers for the removed timeslice extension",
+            mcs_tas.contains("timeslice_extension"),
+            "mcs_tas should use the restored timeslice extension helpers in the slow path",
+        );
+        assert!(
+            mcs_tas.contains("fn mcs_exit("),
+            "mcs_tas should factor queue release into a dedicated mcs_exit helper",
+        );
+        assert!(
+            mcs_tas.contains("grant_was_cleared_by_kernel"),
+            "mcs_tas slow path should poll whether the kernel has revoked the current grant",
+        );
+        assert!(
+            mcs_tas.matches("grant_was_cleared_by_kernel").count() >= 2,
+            "mcs_tas should check reschedule conditions in both predecessor-wait and head-spin paths",
+        );
+        assert!(
+            mcs_tas.contains("on_mcs_spin_preempted"),
+            "mcs_tas slow path should route abandoned MCS head waiters through the preempted timeslice helper",
+        );
+        assert!(
+            !mcs_tas.contains("gap_ns"),
+            "mcs_tas slow path should no longer depend on an undefined gap_ns preemption heuristic",
         );
         assert!(
             !mutex_hook.contains("prepare_thread_timeslice"),
-            "mutex hook registration should not call removed timeslice preparation",
+            "mutex hook registration should not bring back the removed thread-preparation wrapper",
+        );
+    }
+
+    #[test]
+    fn mcs_tas_sources_model_a_cancelable_doubly_linked_queue() {
+        let mcs_tas = include_str!("mcs_tas.rs");
+
+        assert!(
+            mcs_tas.contains("prev: AtomicPtr<Node>"),
+            "MCS nodes should keep a backward link so queued waiters can cancel like kernel osq_lock",
         );
         assert!(
-            !build_script.contains("lb_simple_tse_available"),
-            "build script should not keep cfg plumbing for removed timeslice extension support",
+            mcs_tas.contains("fn mcs_wait_next("),
+            "mcs_tas should provide a wait_next helper to stabilize the successor pointer during unlock/unqueue",
         );
         assert!(
-            !arch.contains("pub fn compiler_barrier()"),
-            "arch helpers should not keep the compiler barrier used only by the removed timeslice extension",
+            mcs_tas.contains("fn mcs_unqueue("),
+            "mcs_tas should provide an unqueue helper for cancelable queued waiters",
+        );
+    }
+
+    #[test]
+    fn timeslice_extension_matches_documented_barrier_placement() {
+        let timeslice = compact(include_str!("timeslice_extension.rs"));
+
+        assert_eq!(
+            timeslice.matches("compiler_fence(Ordering::SeqCst);").count(),
+            3,
+            "timeslice extension should keep only the init fence plus the documented request/clear ordering fences",
+        );
+        assert!(
+            timeslice.contains(
+                "*(*state.rseq).slice_ctrl.request_ptr()=1;}compiler_fence(Ordering::SeqCst);true",
+            ),
+            "request path should keep the compiler barrier after publishing request=1",
+        );
+        assert!(
+            timeslice.contains(
+                "compiler_fence(Ordering::SeqCst);unsafe{*(*state.rseq).slice_ctrl.request_ptr()=0;}",
+            ),
+            "clear path should keep the compiler barrier before publishing request=0",
+        );
+    }
+
+    #[test]
+    fn timeslice_extension_splits_clear_and_yield_around_kernel_grant_probe() {
+        let timeslice = compact(include_str!("timeslice_extension.rs"));
+
+        assert!(
+            timeslice.contains(
+                "pub(crate)fngrant_was_cleared_by_kernel()->bool{imp::grant_was_cleared_by_kernel()}",
+            ),
+            "timeslice extension should expose a read-only helper for kernel-cleared grant detection",
+        );
+        assert!(
+            timeslice.contains("pub(super)fnclear_extension(){"),
+            "timeslice extension should expose request clearing separately from yielding",
+        );
+        assert!(
+            timeslice.contains("pub(super)fnyield_extended_slice()->bool{",),
+            "timeslice extension should expose yielding separately from request clearing",
+        );
+        assert!(
+            timeslice.contains(
+                "pub(crate)fnon_mcs_spin_preempted(){imp::clear_extension();if!imp::yield_extended_slice(){std::thread::yield_now();}}",
+            ),
+            "preempted MCS path should clear its request first and only issue slice yield if grant remains active",
+        );
+        assert!(
+            timeslice.contains(
+                "pub(crate)fnon_critical_section_exit(){imp::clear_extension();let_=imp::yield_extended_slice();}",
+            ),
+            "critical-section exit should keep clear and yield split apart",
+        );
+        assert!(
+            !timeslice.contains("clear_extension_and_yield_if_granted"),
+            "timeslice extension should not keep the combined clear-and-yield helper after the logic split",
         );
     }
 

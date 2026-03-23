@@ -94,7 +94,7 @@ volatile __u32 consec_high = 0;
 volatile __u32 consec_low = 0;
 volatile __u32 H_persist = 2;
 volatile __u32 L_persist = 3;
-volatile __u64 ssc_vote_window_ns = 200000000ULL;
+volatile __u64 ssc_vote_window_ns = 0;
 
 /* NUMA */
 volatile __s32 dominant_node = 0;

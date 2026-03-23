@@ -36,7 +36,7 @@
 3. 反馈控制回路：
    - 非 `SSC core` 上运行的线程如果在当前窗口内 `wait_ns_window > run_ns_window / 10`，会在 `tick()` 中自 parking。
    - `SSC core` 负责从 `SSC_DSQ` 拉任务，并汇报“当前活跃 SSC core 数是否带来更高有效工作量”。
-   - 调度器以 200ms 窗口收集投票，按 2 倍/2 分之一调整 `ssc_active_count`。
+   - 调度器以 `2 * SCX_SLICE_DFL` 窗口收集投票，按 2 倍/2 分之一调整 `ssc_active_count`。
 
 设计上的关键点是：当前实现不再显式维护 “活跃线程目标值”，而是通过 “多少个 CPU 负责消费 `SSC_DSQ`” 间接限制锁竞争并发度。
 
@@ -166,7 +166,7 @@ struct task_scx_ctx {
 
 关键全局变量：
 
-- `ssc_vote_window_ns = 200ms`
+- `ssc_vote_window_ns = 2 * SCX_SLICE_DFL`
 - `ssc_active_count = 2`
 - `ssc_cpu_count`
 - `ssc_cpu_list[]`

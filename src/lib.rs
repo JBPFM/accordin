@@ -741,7 +741,9 @@ mod tests {
         let timeslice = compact(include_str!("timeslice_extension.rs"));
 
         assert_eq!(
-            timeslice.matches("compiler_fence(Ordering::SeqCst);").count(),
+            timeslice
+                .matches("compiler_fence(Ordering::SeqCst);")
+                .count(),
             3,
             "timeslice extension should keep only the init fence plus the documented request/clear ordering fences",
         );
@@ -778,10 +780,14 @@ mod tests {
             "timeslice extension should expose yielding separately from request clearing",
         );
         assert!(
+            timeslice.contains("pub(crate)fnclear_extension_request(){imp::clear_extension();}",),
+            "timeslice extension should expose a clear-only helper for queued waiters that park after unqueue",
+        );
+        assert!(
             timeslice.contains(
                 "pub(crate)fnon_mcs_spin_preempted(){imp::clear_extension();if!imp::yield_extended_slice(){std::thread::yield_now();}}",
             ),
-            "preempted MCS path should clear its request first and only issue slice yield if grant remains active",
+            "head-spin preemption path should still clear its request and issue a yield when needed",
         );
         assert!(
             timeslice.contains(
@@ -807,6 +813,94 @@ mod tests {
         assert!(
             !mcs_tas.contains("wait_time_now_ns()"),
             "mcs_tas slow path should not call wait_time_now_ns directly",
+        );
+    }
+
+    #[test]
+    fn mcs_tas_preempted_waiters_sleep_after_unqueue() {
+        let mcs_tas = compact(include_str!("mcs_tas.rs"));
+
+        assert!(
+            mcs_tas.contains("sleep_seq:CacheAligned<AtomicU32>"),
+            "mcs_tas should keep a futex wait word for preempted waiters that leave the MCS queue",
+        );
+        assert!(
+            mcs_tas.contains("fnwait_for_unlock_change(&self){"),
+            "mcs_tas should factor the futex sleep into a dedicated helper",
+        );
+        assert!(
+            mcs_tas.contains("ifself.mcs_unqueue(my_node){break;}timeslice_extension::clear_extension_request();self.wait_for_unlock_change();continue'slow_path;"),
+            "preempted predecessor waiters should leave the MCS queue, clear their request, sleep, and then retry the slow path",
+        );
+        assert!(
+            mcs_tas.contains(
+                "self.locked.0.store(false,Ordering::Release);self.wake_preempted_waiters();"
+            ),
+            "unlock should wake futex sleepers after releasing the TAS bit",
+        );
+        assert!(
+            mcs_tas.contains("fnfutex_wake_one(word:&AtomicU32){"),
+            "mcs_tas should provide a futex wake-one helper for parked waiters",
+        );
+        assert!(
+            mcs_tas.contains("futex_wake_one(&self.sleep_seq.0);"),
+            "unlock should wake a single parked waiter instead of broadcasting to all of them",
+        );
+        assert!(
+            !mcs_tas.contains("futex_wake_all(&self.sleep_seq.0);"),
+            "unlock should not broadcast to all parked waiters once wake-one is enabled",
+        );
+    }
+
+    #[test]
+    fn owner_preemption_paths_are_wired_through_bpf_and_mcs_tas() {
+        let intf = include_str!("bpf/intf.h");
+        let main = compact(include_str!("bpf/main.bpf.c"));
+        let mcs_tas = compact(include_str!("mcs_tas.rs"));
+
+        assert!(
+            intf.contains("owner_state_ptr"),
+            "thread ctx should expose the current lock owner-state pointer to BPF",
+        );
+        assert!(
+            intf.contains("ROLE_OWNER"),
+            "thread ctx interface should keep the owner role marker",
+        );
+        assert!(
+            main.contains("voidBPF_STRUCT_OPS(lb_simple_stopping,structtask_struct*p,boolrunnable){"),
+            "scheduler should define a stopping callback for owner preemption tracking",
+        );
+        assert!(
+            main.contains("bpf_probe_write_user((void*)(unsignedlong)uctx.owner_state_ptr,&owner_state,sizeof(owner_state))"),
+            "stopping should mark the current owner as preempted through the exported owner-state pointer",
+        );
+        assert!(
+            main.contains(".stopping=(void*)lb_simple_stopping,"),
+            "scheduler ops should register the stopping callback",
+        );
+        assert!(
+            mcs_tas.contains("owner_state:CacheAligned<AtomicU32>"),
+            "mcs_tas should keep a lock-local owner state word",
+        );
+        assert!(
+            mcs_tas.contains("owner_seq:CacheAligned<AtomicU32>"),
+            "mcs_tas should keep a futex sequence word for owner-preempted sleepers",
+        );
+        assert!(
+            mcs_tas.contains("owner_sleepers:CacheAligned<AtomicU32>"),
+            "mcs_tas should track how many waiters parked due to an owner preemption",
+        );
+        assert!(
+            mcs_tas.contains("fnwait_for_preempted_owner(&self){"),
+            "mcs_tas should factor owner-preemption futex sleep into a dedicated helper",
+        );
+        assert!(
+            mcs_tas.contains("ifself.owner_is_preempted(){"),
+            "both MCS wait and TAS head spin should test the owner-preempted state",
+        );
+        assert!(
+            mcs_tas.contains("self.wake_owner_waiters();"),
+            "unlock should wake a parked waiter when clearing owner-preempted state",
         );
     }
 }

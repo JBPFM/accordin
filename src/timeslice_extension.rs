@@ -1,12 +1,17 @@
 use std::mem::offset_of;
 use std::ptr;
-use std::sync::atomic::{compiler_fence, Ordering};
+use std::sync::atomic::{Ordering, compiler_fence};
 
 use libc::c_int;
 
 #[inline(always)]
 pub(crate) fn on_mcs_spin_start() -> bool {
     imp::request_extension()
+}
+
+#[inline(always)]
+pub(crate) fn clear_extension_request() {
+    imp::clear_extension();
 }
 
 #[inline(always)]

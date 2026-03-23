@@ -1,6 +1,6 @@
 use std::cell::{Cell, UnsafeCell};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering, fence};
 
 use crate::arch::{pause, wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns};
 use crate::timeslice_extension;
@@ -13,6 +13,60 @@ use crate::timeslice_extension;
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const FUTEX_PRIVATE_FLAG: libc::c_int = 128;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const FUTEX_WAIT_PRIVATE: libc::c_int = libc::FUTEX_WAIT | FUTEX_PRIVATE_FLAG;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const FUTEX_WAKE_PRIVATE: libc::c_int = libc::FUTEX_WAKE | FUTEX_PRIVATE_FLAG;
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[inline(always)]
+fn futex_wait(word: &AtomicU32, expected: u32) {
+    loop {
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                word.as_ptr(),
+                FUTEX_WAIT_PRIVATE,
+                expected,
+                ptr::null::<libc::timespec>(),
+            )
+        };
+        if rc == 0 {
+            return;
+        }
+
+        let err = unsafe { *libc::__errno_location() };
+        if err != libc::EINTR {
+            return;
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[inline(always)]
+fn futex_wait(_word: &AtomicU32, _expected: u32) {
+    std::thread::yield_now();
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[inline(always)]
+fn futex_wake_one(word: &AtomicU32) {
+    let _ = unsafe { libc::syscall(libc::SYS_futex, word.as_ptr(), FUTEX_WAKE_PRIVATE, 1) };
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[inline(always)]
+fn futex_wake_one(_word: &AtomicU32) {}
+
+const ROLE_NONE: u32 = 0;
+const ROLE_OWNER: u32 = 1;
+
+const OWNER_STATE_NONE: u32 = 0;
+const OWNER_STATE_RUNNING: u32 = 1;
+const OWNER_STATE_PREEMPTED: u32 = 2;
 
 #[repr(C, align(64))]
 pub struct Node {
@@ -37,6 +91,9 @@ pub struct LockSchedThreadCtx {
     pub wait_ns_total: u64,
     pub wait_start_ns: u64,
     pub wait_end_ns: u64,
+    pub role: u32,
+    pub _pad: u32,
+    pub owner_state_ptr: u64,
 }
 
 impl LockSchedThreadCtx {
@@ -45,6 +102,9 @@ impl LockSchedThreadCtx {
             wait_ns_total: 0,
             wait_start_ns: 0,
             wait_end_ns: 0,
+            role: ROLE_NONE,
+            _pad: 0,
+            owner_state_ptr: 0,
         }
     }
 }
@@ -75,6 +135,11 @@ pub fn thread_ctx() -> *mut LockSchedThreadCtx {
 pub struct McsTasLockRaw {
     tail: CacheAligned<AtomicPtr<Node>>,
     locked: CacheAligned<AtomicBool>,
+    owner_state: CacheAligned<AtomicU32>,
+    owner_seq: CacheAligned<AtomicU32>,
+    owner_sleepers: CacheAligned<AtomicU32>,
+    sleep_seq: CacheAligned<AtomicU32>,
+    sleepers: CacheAligned<AtomicU32>,
 }
 
 impl McsTasLockRaw {
@@ -82,6 +147,11 @@ impl McsTasLockRaw {
         Self {
             tail: CacheAligned(AtomicPtr::new(ptr::null_mut())),
             locked: CacheAligned(AtomicBool::new(false)),
+            owner_state: CacheAligned(AtomicU32::new(OWNER_STATE_NONE)),
+            owner_seq: CacheAligned(AtomicU32::new(0)),
+            owner_sleepers: CacheAligned(AtomicU32::new(0)),
+            sleep_seq: CacheAligned(AtomicU32::new(0)),
+            sleepers: CacheAligned(AtomicU32::new(0)),
         }
     }
 
@@ -194,9 +264,86 @@ impl McsTasLockRaw {
     }
 
     #[inline(always)]
+    fn publish_owner(&self) {
+        let ctx = thread_ctx();
+
+        self.owner_state.0.store(OWNER_STATE_RUNNING, Ordering::Release);
+        unsafe {
+            (*ctx).owner_state_ptr = self.owner_state.0.as_ptr() as u64;
+            (*ctx).role = ROLE_OWNER;
+        }
+    }
+
+    #[inline(always)]
+    fn clear_owner(&self) {
+        let ctx = thread_ctx();
+
+        unsafe {
+            (*ctx).role = ROLE_NONE;
+            (*ctx).owner_state_ptr = 0;
+        }
+        self.owner_state.0.store(OWNER_STATE_NONE, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn owner_is_preempted(&self) -> bool {
+        self.owner_state.0.load(Ordering::Acquire) == OWNER_STATE_PREEMPTED
+            && self.locked.0.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    fn wait_for_preempted_owner(&self) {
+        self.owner_sleepers.0.fetch_add(1, Ordering::AcqRel);
+
+        if self.owner_is_preempted() {
+            let seq = self.owner_seq.0.load(Ordering::Acquire);
+            if self.owner_is_preempted() {
+                futex_wait(&self.owner_seq.0, seq);
+            }
+        }
+
+        self.owner_sleepers.0.fetch_sub(1, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn wake_owner_waiters(&self) {
+        if self.owner_sleepers.0.load(Ordering::Acquire) == 0 {
+            return;
+        }
+
+        self.owner_seq.0.fetch_add(1, Ordering::Release);
+        futex_wake_one(&self.owner_seq.0);
+    }
+
+    #[inline(always)]
+    fn wait_for_unlock_change(&self) {
+        self.sleepers.0.fetch_add(1, Ordering::AcqRel);
+
+        if self.locked.0.load(Ordering::Acquire) {
+            let seq = self.sleep_seq.0.load(Ordering::Acquire);
+            if self.locked.0.load(Ordering::Acquire) {
+                futex_wait(&self.sleep_seq.0, seq);
+            }
+        }
+
+        self.sleepers.0.fetch_sub(1, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn wake_preempted_waiters(&self) {
+        if self.sleepers.0.load(Ordering::Acquire) == 0 {
+            return;
+        }
+
+        self.sleep_seq.0.fetch_add(1, Ordering::Release);
+        futex_wake_one(&self.sleep_seq.0);
+    }
+
+    #[inline(always)]
     pub fn lock(&self) {
         // Fast path: TAS
         if !self.locked.0.swap(true, Ordering::Acquire) {
+            self.publish_owner();
             return;
         }
 
@@ -228,18 +375,43 @@ impl McsTasLockRaw {
                         break;
                     }
 
+                    if self.owner_is_preempted() {
+                        if self.mcs_unqueue(my_node) {
+                            break;
+                        }
+                        if timeslice_requested {
+                            timeslice_extension::clear_extension_request();
+                        }
+                        self.wait_for_preempted_owner();
+                        continue 'slow_path;
+                    }
+
                     if timeslice_requested && timeslice_extension::grant_was_cleared_by_kernel() {
                         if self.mcs_unqueue(my_node) {
                             break;
                         }
-                        timeslice_extension::on_mcs_spin_preempted();
+                        timeslice_extension::clear_extension_request();
+                        self.wait_for_unlock_change();
                         continue 'slow_path;
                     }
                     pause();
                 }
             }
 
-            while self.locked.0.swap(true, Ordering::Acquire) {
+            loop {
+                if self.owner_is_preempted() {
+                    self.mcs_exit(my_node);
+                    if timeslice_requested {
+                        timeslice_extension::clear_extension_request();
+                    }
+                    self.wait_for_preempted_owner();
+                    continue 'slow_path;
+                }
+
+                if !self.locked.0.swap(true, Ordering::Acquire) {
+                    break;
+                }
+
                 if timeslice_requested && timeslice_extension::grant_was_cleared_by_kernel() {
                     self.mcs_exit(my_node);
                     timeslice_extension::on_mcs_spin_preempted();
@@ -248,6 +420,7 @@ impl McsTasLockRaw {
                 pause();
             }
 
+            self.publish_owner();
             if timeslice_requested {
                 TIMESLICE_REQUESTED.with(|cell| cell.set(true));
             }
@@ -273,6 +446,7 @@ impl McsTasLockRaw {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            self.publish_owner();
             true
         } else {
             false
@@ -281,7 +455,10 @@ impl McsTasLockRaw {
 
     #[inline(always)]
     pub fn unlock(&self) {
+        self.clear_owner();
         self.locked.0.store(false, Ordering::Release);
+        self.wake_preempted_waiters();
+        self.wake_owner_waiters();
         TIMESLICE_REQUESTED.with(|cell| {
             if cell.replace(false) {
                 timeslice_extension::on_critical_section_exit();
@@ -378,5 +555,46 @@ mod tests {
             drop(Box::from_raw(node));
             drop(Box::from_raw(prev));
         }
+    }
+
+    #[test]
+    fn publish_owner_updates_lock_and_thread_ctx() {
+        let lock = McsTasLockRaw::new();
+        let ctx = thread_ctx();
+
+        lock.publish_owner();
+
+        assert_eq!(lock.owner_state.0.load(Ordering::Acquire), OWNER_STATE_RUNNING);
+        assert_eq!(unsafe { (*ctx).role }, ROLE_OWNER);
+        assert_eq!(
+            unsafe { (*ctx).owner_state_ptr },
+            lock.owner_state.0.as_ptr() as u64,
+        );
+
+        lock.clear_owner();
+    }
+
+    #[test]
+    fn clear_owner_resets_lock_and_thread_ctx() {
+        let lock = McsTasLockRaw::new();
+        let ctx = thread_ctx();
+
+        lock.publish_owner();
+        lock.clear_owner();
+
+        assert_eq!(lock.owner_state.0.load(Ordering::Acquire), OWNER_STATE_NONE);
+        assert_eq!(unsafe { (*ctx).role }, ROLE_NONE);
+        assert_eq!(unsafe { (*ctx).owner_state_ptr }, 0);
+    }
+
+    #[test]
+    fn wake_owner_waiters_advances_owner_seq_when_sleepers_exist() {
+        let lock = McsTasLockRaw::new();
+        let before = lock.owner_seq.0.load(Ordering::Acquire);
+
+        lock.owner_sleepers.0.store(1, Ordering::Release);
+        lock.wake_owner_waiters();
+
+        assert_eq!(lock.owner_seq.0.load(Ordering::Acquire), before + 1);
     }
 }

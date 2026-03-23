@@ -69,22 +69,25 @@ void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p) {
   tc->run_start_ns = scx_bpf_now();
 }
 
-// void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)
-// {
-//   __u32 pid = p->pid;
-//   struct task_scx_ctx *tc = lookup_task_ctx(p);
-//   if (!tc)
-//     return;
-//
-//   /* Window advance moved to tick() — only CPU 0 advances */
-//
-//   if (stats_only_mode)
-//     return;
-//
-//   // we should determine if the task should be parked (i.e. move to SSC)
-//   based
-//   // on its context and current state
-// }
+void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable) {
+  struct task_scx_ctx *tc = lookup_task_ctx(p);
+  struct lock_sched_thread_ctx uctx = {};
+  __u32 owner_state = OWNER_STATE_PREEMPTED;
+
+  (void)runnable;
+
+  if (!tc || stats_only_mode || !tc->user_ctx_ptr)
+    return;
+
+  if (!read_thread_ctx(tc->user_ctx_ptr, &uctx))
+    return;
+
+  if (uctx.role != ROLE_OWNER || !uctx.owner_state_ptr)
+    return;
+
+  bpf_probe_write_user((void *)(unsigned long)uctx.owner_state_ptr,
+                       &owner_state, sizeof(owner_state));
+}
 
 void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   __u32 pid = p->pid;
@@ -182,7 +185,7 @@ SCX_OPS_DEFINE(lb_simple_ops, .select_cpu = (void *)lb_simple_select_cpu,
                .enqueue = (void *)lb_simple_enqueue,
                .dispatch = (void *)lb_simple_dispatch,
                .running = (void *)lb_simple_running,
-               // .stopping = (void *)lb_simple_stopping,
+               .stopping = (void *)lb_simple_stopping,
                .tick = (void *)lb_simple_tick,
                .exit_task = (void *)lb_simple_exit_task,
                .init = (void *)lb_simple_init, .exit = (void *)lb_simple_exit,

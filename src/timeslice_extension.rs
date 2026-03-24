@@ -159,7 +159,7 @@ mod imp {
             return ptr::null_mut();
         }
 
-        let offset = unsafe { __rseq_offset as isize };
+        let offset = unsafe { __rseq_offset };
         unsafe { tp.offset(offset).cast::<RseqWithSliceCtrl>() }
     }
 

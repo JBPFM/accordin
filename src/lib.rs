@@ -16,8 +16,6 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use libbpf_rs::Link;
 use libbpf_rs::MapCore;
-use libbpf_rs::MapFlags;
-use libbpf_rs::MapHandle;
 use libbpf_rs::OpenObject;
 use log::info;
 use scx_utils::scx_ops_attach;
@@ -198,47 +196,7 @@ fn initial_ssc_active_count(ssc_cpu_count: u32) -> u32 {
     ssc_cpu_count.clamp(2, 8)
 }
 
-/// Populate cpu_to_node BPF map and publish NUMA defaults.
-fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, stats_only: bool) {
-    let ssc_cpu_count = u32::try_from(topology.first_socket_cpus.len()).unwrap_or(u32::MAX);
-
-    for (cpu, node_id) in &topology.cpu_to_node {
-        let _ =
-            skel.maps
-                .cpu_to_node
-                .update(&cpu.to_ne_bytes(), &node_id.to_ne_bytes(), MapFlags::ANY);
-    }
-
-    if let Some(bss) = skel.maps.bss_data.as_mut() {
-        bss.dominant_node = topology.dominant_node;
-        bss.stats_only_mode = u32::from(stats_only);
-        if let Some(rodata) = skel.maps.rodata_data.as_ref() {
-            bss.ssc_vote_window_ns = rodata.__SCX_SLICE_DFL.saturating_mul(2);
-        }
-        publish_ssc_cpu_topology(
-            &mut bss.ssc_cpu_count,
-            &mut bss.ssc_cpu_list,
-            &mut bss.ssc_cpu_rank,
-            topology,
-        );
-    }
-
-    if let Some(data) = skel.maps.data_data.as_mut() {
-        data.ssc_active_count = initial_ssc_active_count(ssc_cpu_count);
-    }
-
-    info!(
-        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} first_socket_node={} ssc_cpu_count={} stats_only={}",
-        topology.dominant_node,
-        topology.local_cpu_count,
-        topology.remote_cpu_count,
-        topology.first_socket_node,
-        topology.first_socket_cpus.len(),
-        stats_only
-    );
-}
-
-fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
+fn init_scheduler(debug: bool, _stats_only: bool) -> Result<SchedulerState> {
     let topology = detect_numa_topology();
     let mut skel_builder = BpfSkelBuilder::default();
     skel_builder.obj_builder.debug(debug);
@@ -259,15 +217,6 @@ fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
 
     // Load the BPF program
     let mut skel = scx_ops_load!(skel, lb_simple_ops, uei)?;
-
-    // Duplicate the map handle so mutex hooks can use libbpf helpers directly.
-    let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
-    mutex_hook::set_thread_ctx_map(thread_ctx_map);
-    let owner_state_map = MapHandle::try_from(&skel.maps.owner_state_map)?;
-    mcs_tas::set_owner_state_map(owner_state_map)?;
-
-    // Publish cpu_to_node map and NUMA defaults after load.
-    publish_scheduler_topology(&mut skel, &topology, stats_only);
 
     // Attach the scheduler
     let link = scx_ops_attach!(skel, lb_simple_ops)?;

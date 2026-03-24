@@ -190,8 +190,15 @@ unsafe fn ensure_state_slow(
         }
 
         // We won the CAS: allocate and initialise state.
+        let lock = match McsTasLockRaw::new() {
+            Ok(lock) => lock,
+            Err(ret) => {
+                atomic.store(0, Ordering::Release);
+                return Err(ret);
+            }
+        };
         let state = Box::new(McsTasState {
-            lock: McsTasLockRaw::new(),
+            lock,
             real_mutex: unsafe { UnsafeCell::new(std::mem::zeroed()) },
         });
         let ptr = Box::into_raw(state);
@@ -236,8 +243,12 @@ pub unsafe extern "C" fn pthread_mutex_init(
     attr: *const libc::pthread_mutexattr_t,
 ) -> libc::c_int {
     unsafe {
+        let lock = match McsTasLockRaw::new() {
+            Ok(lock) => lock,
+            Err(ret) => return ret,
+        };
         let state = Box::new(McsTasState {
-            lock: McsTasLockRaw::new(),
+            lock,
             real_mutex: UnsafeCell::new(std::mem::zeroed()),
         });
         let ptr = Box::into_raw(state);

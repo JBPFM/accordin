@@ -27,6 +27,14 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, MAX_LOCK_SLOTS);
+  __uint(map_flags, BPF_F_MMAPABLE);
+  __type(key, __u32);
+  __type(value, __u32); /* enum OWNER_STATE_* */
+} owner_state_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, STAT_NR);
   __type(key, __u32);
   __type(value, __u64);

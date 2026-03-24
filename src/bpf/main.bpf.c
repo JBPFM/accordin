@@ -72,7 +72,8 @@ void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p) {
 void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable) {
   struct task_scx_ctx *tc = lookup_task_ctx(p);
   struct lock_sched_thread_ctx uctx = {};
-  __u32 owner_state = OWNER_STATE_PREEMPTED;
+  __u32 slot;
+  __u32 *owner_state;
 
   (void)runnable;
 
@@ -82,11 +83,15 @@ void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable) {
   if (!read_thread_ctx(tc->user_ctx_ptr, &uctx))
     return;
 
-  if (uctx.role != ROLE_OWNER || !uctx.owner_state_ptr)
+  slot = uctx.owner_state_slot;
+  if (slot == OWNER_SLOT_NONE || slot >= MAX_LOCK_SLOTS)
     return;
 
-  bpf_probe_write_user((void *)(unsigned long)uctx.owner_state_ptr,
-                       &owner_state, sizeof(owner_state));
+  owner_state = bpf_map_lookup_elem(&owner_state_map, &slot);
+  if (!owner_state)
+    return;
+
+  *owner_state = OWNER_STATE_PREEMPTED;
 }
 
 void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {

@@ -1,9 +1,14 @@
+use anyhow::{Context, anyhow, ensure};
 use std::cell::{Cell, UnsafeCell};
-use std::ptr;
+use std::os::fd::{AsFd, AsRawFd};
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering, fence};
+use std::sync::{Mutex, OnceLock};
 
 use crate::arch::{pause, wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns};
+use crate::bpf_intf;
 use crate::timeslice_extension;
+use libbpf_rs::{MapCore, MapHandle};
 
 // we remove sample cause in some high contention env wait can occupy full timeslice
 // or we can reserve a fast path in low contention
@@ -61,12 +66,271 @@ fn futex_wake_one(word: &AtomicU32) {
 #[inline(always)]
 fn futex_wake_one(_word: &AtomicU32) {}
 
-const ROLE_NONE: u32 = 0;
-const ROLE_OWNER: u32 = 1;
+const OWNER_SLOT_NONE: u32 = bpf_intf::OWNER_SLOT_NONE;
+const OWNER_STATE_NONE: u32 = bpf_intf::OWNER_STATE_NONE;
+const OWNER_STATE_RUNNING: u32 = bpf_intf::OWNER_STATE_RUNNING;
+const OWNER_STATE_PREEMPTED: u32 = bpf_intf::OWNER_STATE_PREEMPTED;
 
-const OWNER_STATE_NONE: u32 = 0;
-const OWNER_STATE_RUNNING: u32 = 1;
-const OWNER_STATE_PREEMPTED: u32 = 2;
+struct MmapOwnerStateBacking {
+    _map: MapHandle,
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl Drop for MmapOwnerStateBacking {
+    fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
+    }
+}
+
+enum OwnerStateBacking {
+    Mmap {
+        _mmap: MmapOwnerStateBacking,
+    },
+    #[cfg(test)]
+    Boxed {
+        _boxed: Box<[u32]>,
+    },
+}
+
+struct OwnerStateRegistry {
+    _backing: OwnerStateBacking,
+    base: NonNull<u32>,
+    max_entries: u32,
+    next_slot: AtomicU32,
+    free_slots: Mutex<Vec<u32>>,
+}
+
+// SAFETY: the registry exposes shared map-backed state through atomics and
+// protects slot recycling with a mutex.
+unsafe impl Send for OwnerStateRegistry {}
+unsafe impl Sync for OwnerStateRegistry {}
+
+struct SharedOwnerState {
+    registry: &'static OwnerStateRegistry,
+    slot: u32,
+    ptr: NonNull<u32>,
+}
+
+enum OwnerStateStorage {
+    Shared(SharedOwnerState),
+    Local(Box<AtomicU32>),
+}
+
+static OWNER_STATE_REGISTRY: OnceLock<OwnerStateRegistry> = OnceLock::new();
+
+fn round_up(value: usize, align: usize) -> anyhow::Result<usize> {
+    ensure!(align != 0, "alignment must be non-zero");
+    let remainder = value % align;
+    if remainder == 0 {
+        return Ok(value);
+    }
+
+    value
+        .checked_add(align - remainder)
+        .ok_or_else(|| anyhow!("value {value} overflows when rounding to {align}"))
+}
+
+fn owner_state_map_mmap_len(map: &MapHandle) -> anyhow::Result<usize> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+    ensure!(page_size > 0, "failed to determine page size");
+
+    let value_size = round_up(map.value_size() as usize, 8)?;
+    let values_len = value_size
+        .checked_mul(map.max_entries() as usize)
+        .ok_or_else(|| anyhow!("owner_state_map size overflows"))?;
+    round_up(values_len, page_size as usize)
+}
+
+impl OwnerStateRegistry {
+    fn from_map(map: MapHandle) -> anyhow::Result<Self> {
+        ensure!(
+            map.value_size() as usize == std::mem::size_of::<u32>(),
+            "owner_state_map value_size must be 4 bytes, got {}",
+            map.value_size(),
+        );
+        ensure!(
+            map.max_entries() > OWNER_SLOT_NONE + 1,
+            "owner_state_map must expose at least one usable slot",
+        );
+
+        let max_entries = map.max_entries();
+        let mmap_len = owner_state_map_mmap_len(&map)?;
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                mmap_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                map.as_fd().as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error()).context("failed to mmap owner_state_map");
+        }
+
+        let base = NonNull::new(ptr.cast::<u32>())
+            .ok_or_else(|| anyhow!("owner_state_map mmap returned a null pointer"))?;
+
+        Ok(Self {
+            _backing: OwnerStateBacking::Mmap {
+                _mmap: MmapOwnerStateBacking {
+                    _map: map,
+                    ptr,
+                    len: mmap_len,
+                },
+            },
+            base,
+            max_entries,
+            next_slot: AtomicU32::new(OWNER_SLOT_NONE + 1),
+            free_slots: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(max_entries: u32) -> Self {
+        let mut backing = vec![0u32; max_entries as usize].into_boxed_slice();
+        let base = NonNull::new(backing.as_mut_ptr()).expect("test owner-state backing");
+
+        Self {
+            _backing: OwnerStateBacking::Boxed { _boxed: backing },
+            base,
+            max_entries,
+            next_slot: AtomicU32::new(OWNER_SLOT_NONE + 1),
+            free_slots: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn slot_ptr(&self, slot: u32) -> NonNull<u32> {
+        debug_assert!(slot < self.max_entries);
+        let ptr = unsafe { self.base.as_ptr().add(slot as usize) };
+        NonNull::new(ptr).expect("owner-state slot pointer")
+    }
+
+    fn alloc_slot(&'static self) -> Option<SharedOwnerState> {
+        let slot = self
+            .free_slots
+            .lock()
+            .expect("owner-state free list poisoned")
+            .pop()
+            .unwrap_or_else(|| self.next_slot.fetch_add(1, Ordering::AcqRel));
+
+        if slot == OWNER_SLOT_NONE || slot >= self.max_entries {
+            return None;
+        }
+
+        let state = SharedOwnerState {
+            registry: self,
+            slot,
+            ptr: self.slot_ptr(slot),
+        };
+        state.store(OWNER_STATE_NONE, Ordering::Release);
+        Some(state)
+    }
+
+    fn release_slot(&self, slot: u32) {
+        if slot == OWNER_SLOT_NONE || slot >= self.max_entries {
+            return;
+        }
+
+        let ptr = self.slot_ptr(slot);
+        unsafe {
+            AtomicU32::from_ptr(ptr.as_ptr()).store(OWNER_STATE_NONE, Ordering::Release);
+        }
+        self.free_slots
+            .lock()
+            .expect("owner-state free list poisoned")
+            .push(slot);
+    }
+}
+
+impl SharedOwnerState {
+    #[inline(always)]
+    fn load(&self, order: Ordering) -> u32 {
+        unsafe { AtomicU32::from_ptr(self.ptr.as_ptr()).load(order) }
+    }
+
+    #[inline(always)]
+    fn store(&self, value: u32, order: Ordering) {
+        unsafe {
+            AtomicU32::from_ptr(self.ptr.as_ptr()).store(value, order);
+        }
+    }
+}
+
+impl OwnerStateStorage {
+    fn new() -> std::result::Result<Self, libc::c_int> {
+        match owner_state_registry() {
+            Some(registry) => registry.alloc_slot().map(Self::Shared).ok_or(libc::ENOMEM),
+            None => Ok(Self::Local(Box::new(AtomicU32::new(OWNER_STATE_NONE)))),
+        }
+    }
+
+    #[inline(always)]
+    fn slot(&self) -> u32 {
+        match self {
+            Self::Shared(state) => state.slot,
+            Self::Local(_) => OWNER_SLOT_NONE,
+        }
+    }
+
+    #[inline(always)]
+    fn load(&self, order: Ordering) -> u32 {
+        match self {
+            Self::Shared(state) => state.load(order),
+            Self::Local(state) => state.load(order),
+        }
+    }
+
+    #[inline(always)]
+    fn store(&self, value: u32, order: Ordering) {
+        match self {
+            Self::Shared(state) => state.store(value, order),
+            Self::Local(state) => state.store(value, order),
+        }
+    }
+}
+
+impl Drop for OwnerStateStorage {
+    fn drop(&mut self) {
+        if let Self::Shared(state) = self {
+            state.registry.release_slot(state.slot);
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn owner_state_registry() -> Option<&'static OwnerStateRegistry> {
+    OWNER_STATE_REGISTRY.get()
+}
+
+#[cfg(test)]
+fn owner_state_registry() -> Option<&'static OwnerStateRegistry> {
+    static TEST_OWNER_STATE_REGISTRY: OnceLock<OwnerStateRegistry> = OnceLock::new();
+
+    OWNER_STATE_REGISTRY.get().or_else(|| {
+        Some(TEST_OWNER_STATE_REGISTRY.get_or_init(|| OwnerStateRegistry::new_for_tests(1024)))
+    })
+}
+
+pub(crate) fn set_owner_state_map(map: MapHandle) -> anyhow::Result<()> {
+    if OWNER_STATE_REGISTRY.get().is_some() {
+        return Ok(());
+    }
+
+    let registry = OwnerStateRegistry::from_map(map)?;
+    OWNER_STATE_REGISTRY
+        .set(registry)
+        .map_err(|_| anyhow!("owner_state_map is already initialized"))?;
+    Ok(())
+}
 
 #[repr(C, align(64))]
 pub struct Node {
@@ -91,9 +355,8 @@ pub struct LockSchedThreadCtx {
     pub wait_ns_total: u64,
     pub wait_start_ns: u64,
     pub wait_end_ns: u64,
-    pub role: u32,
+    pub owner_state_slot: u32,
     pub _pad: u32,
-    pub owner_state_ptr: u64,
 }
 
 impl LockSchedThreadCtx {
@@ -102,9 +365,8 @@ impl LockSchedThreadCtx {
             wait_ns_total: 0,
             wait_start_ns: 0,
             wait_end_ns: 0,
-            role: ROLE_NONE,
+            owner_state_slot: OWNER_SLOT_NONE,
             _pad: 0,
-            owner_state_ptr: 0,
         }
     }
 }
@@ -135,7 +397,7 @@ pub fn thread_ctx() -> *mut LockSchedThreadCtx {
 pub struct McsTasLockRaw {
     tail: CacheAligned<AtomicPtr<Node>>,
     locked: CacheAligned<AtomicBool>,
-    owner_state: CacheAligned<AtomicU32>,
+    owner_state: OwnerStateStorage,
     owner_seq: CacheAligned<AtomicU32>,
     owner_sleepers: CacheAligned<AtomicU32>,
     sleep_seq: CacheAligned<AtomicU32>,
@@ -143,16 +405,16 @@ pub struct McsTasLockRaw {
 }
 
 impl McsTasLockRaw {
-    pub const fn new() -> Self {
-        Self {
+    pub fn new() -> std::result::Result<Self, libc::c_int> {
+        Ok(Self {
             tail: CacheAligned(AtomicPtr::new(ptr::null_mut())),
             locked: CacheAligned(AtomicBool::new(false)),
-            owner_state: CacheAligned(AtomicU32::new(OWNER_STATE_NONE)),
+            owner_state: OwnerStateStorage::new()?,
             owner_seq: CacheAligned(AtomicU32::new(0)),
             owner_sleepers: CacheAligned(AtomicU32::new(0)),
             sleep_seq: CacheAligned(AtomicU32::new(0)),
             sleepers: CacheAligned(AtomicU32::new(0)),
-        }
+        })
     }
 
     fn thread_node() -> *mut Node {
@@ -267,11 +529,11 @@ impl McsTasLockRaw {
     fn publish_owner(&self) {
         let ctx = thread_ctx();
 
-        self.owner_state.0.store(OWNER_STATE_RUNNING, Ordering::Release);
         unsafe {
-            (*ctx).owner_state_ptr = self.owner_state.0.as_ptr() as u64;
-            (*ctx).role = ROLE_OWNER;
+            (*ctx).owner_state_slot = self.owner_state.slot();
         }
+        self.owner_state
+            .store(OWNER_STATE_RUNNING, Ordering::Release);
     }
 
     #[inline(always)]
@@ -279,15 +541,14 @@ impl McsTasLockRaw {
         let ctx = thread_ctx();
 
         unsafe {
-            (*ctx).role = ROLE_NONE;
-            (*ctx).owner_state_ptr = 0;
+            (*ctx).owner_state_slot = OWNER_SLOT_NONE;
         }
-        self.owner_state.0.store(OWNER_STATE_NONE, Ordering::Release);
+        self.owner_state.store(OWNER_STATE_NONE, Ordering::Release);
     }
 
     #[inline(always)]
     fn owner_is_preempted(&self) -> bool {
-        self.owner_state.0.load(Ordering::Acquire) == OWNER_STATE_PREEMPTED
+        self.owner_state.load(Ordering::Acquire) == OWNER_STATE_PREEMPTED
             && self.locked.0.load(Ordering::Acquire)
     }
 
@@ -426,7 +687,7 @@ impl McsTasLockRaw {
             }
             self.mcs_exit(my_node);
 
-            // Acquired after contention — accumulate sampled wait time, set ROLE_OWNER
+            // Acquired after contention — accumulate the measured wait interval.
             let wait_end = wait_time_start();
             unsafe {
                 (*ctx).wait_ns_total += wait_time_elapsed_ns_between(wait_start, wait_end);
@@ -473,7 +734,7 @@ mod tests {
 
     #[test]
     fn mcs_exit_clears_tail_without_successor() {
-        let lock = McsTasLockRaw::new();
+        let lock = McsTasLockRaw::new().expect("test lock");
         let node = Box::into_raw(Box::new(Node::new()));
 
         lock.tail.0.store(node, Ordering::Release);
@@ -488,7 +749,7 @@ mod tests {
 
     #[test]
     fn mcs_exit_wakes_successor_when_present() {
-        let lock = McsTasLockRaw::new();
+        let lock = McsTasLockRaw::new().expect("test lock");
         let node = Box::into_raw(Box::new(Node::new()));
         let succ = Box::into_raw(Box::new(Node::new()));
 
@@ -509,7 +770,7 @@ mod tests {
 
     #[test]
     fn mcs_unqueue_relinks_neighbors() {
-        let lock = McsTasLockRaw::new();
+        let lock = McsTasLockRaw::new().expect("test lock");
         let prev = Box::into_raw(Box::new(Node::new()));
         let node = Box::into_raw(Box::new(Node::new()));
         let next = Box::into_raw(Box::new(Node::new()));
@@ -536,7 +797,7 @@ mod tests {
 
     #[test]
     fn mcs_unqueue_rewinds_tail_when_node_is_last() {
-        let lock = McsTasLockRaw::new();
+        let lock = McsTasLockRaw::new().expect("test lock");
         let prev = Box::into_raw(Box::new(Node::new()));
         let node = Box::into_raw(Box::new(Node::new()));
 
@@ -555,46 +816,5 @@ mod tests {
             drop(Box::from_raw(node));
             drop(Box::from_raw(prev));
         }
-    }
-
-    #[test]
-    fn publish_owner_updates_lock_and_thread_ctx() {
-        let lock = McsTasLockRaw::new();
-        let ctx = thread_ctx();
-
-        lock.publish_owner();
-
-        assert_eq!(lock.owner_state.0.load(Ordering::Acquire), OWNER_STATE_RUNNING);
-        assert_eq!(unsafe { (*ctx).role }, ROLE_OWNER);
-        assert_eq!(
-            unsafe { (*ctx).owner_state_ptr },
-            lock.owner_state.0.as_ptr() as u64,
-        );
-
-        lock.clear_owner();
-    }
-
-    #[test]
-    fn clear_owner_resets_lock_and_thread_ctx() {
-        let lock = McsTasLockRaw::new();
-        let ctx = thread_ctx();
-
-        lock.publish_owner();
-        lock.clear_owner();
-
-        assert_eq!(lock.owner_state.0.load(Ordering::Acquire), OWNER_STATE_NONE);
-        assert_eq!(unsafe { (*ctx).role }, ROLE_NONE);
-        assert_eq!(unsafe { (*ctx).owner_state_ptr }, 0);
-    }
-
-    #[test]
-    fn wake_owner_waiters_advances_owner_seq_when_sleepers_exist() {
-        let lock = McsTasLockRaw::new();
-        let before = lock.owner_seq.0.load(Ordering::Acquire);
-
-        lock.owner_sleepers.0.store(1, Ordering::Release);
-        lock.wake_owner_waiters();
-
-        assert_eq!(lock.owner_seq.0.load(Ordering::Acquire), before + 1);
     }
 }

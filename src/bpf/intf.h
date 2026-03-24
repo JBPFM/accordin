@@ -11,16 +11,11 @@
 #define MAX_TASKS 65536U
 #define MAX_CPUS 256U
 #define MAX_NODES 8U
-enum thread_role {
-  ROLE_NONE = 0,
-  ROLE_OWNER = 1,
-};
-
-enum lock_owner_state {
-  OWNER_STATE_NONE = 0,
-  OWNER_STATE_RUNNING = 1,
-  OWNER_STATE_PREEMPTED = 2,
-};
+#define MAX_LOCK_SLOTS 262144U
+#define OWNER_SLOT_NONE 0U
+#define OWNER_STATE_NONE 0U
+#define OWNER_STATE_RUNNING 1U
+#define OWNER_STATE_PREEMPTED 2U
 
 /* Stored in user thread-local memory and read from BPF via bpf_probe_read_user.
  */
@@ -28,9 +23,8 @@ struct lock_sched_thread_ctx {
   unsigned long long wait_ns_total; /* cumulative wait time */
   unsigned long long wait_start_ns; /* current wait start timestamp */
   unsigned long long wait_end_ns;   /* latest completed wait end timestamp */
-  unsigned int role;
+  unsigned int owner_state_slot;    /* slot in owner_state_map, or OWNER_SLOT_NONE */
   unsigned int __pad;
-  unsigned long long owner_state_ptr; /* user pointer to lock->owner_state */
 };
 
 /* Per-task scheduling context stored in BPF task_ctx_map. */

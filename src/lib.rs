@@ -27,6 +27,7 @@ use scx_utils::scx_ops_open;
 const SCHEDULER_NAME: &str = "lb_simple";
 const DISABLE_BPF_ENV: &str = "LB_SIMPLE_DISABLE_BPF";
 const STATS_ONLY_ENV: &str = "LB_SIMPLE_STATS_ONLY";
+const BPF_DEBUG_ENV: &str = "LB_SIMPLE_BPF_DEBUG";
 const SSC_CPU_CAP: usize = bpf_intf::MAX_CPUS as usize;
 
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
@@ -262,6 +263,8 @@ fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
     // Duplicate the map handle so mutex hooks can use libbpf helpers directly.
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
     mutex_hook::set_thread_ctx_map(thread_ctx_map);
+    let owner_state_map = MapHandle::try_from(&skel.maps.owner_state_map)?;
+    mcs_tas::set_owner_state_map(owner_state_map)?;
 
     // Publish cpu_to_node map and NUMA defaults after load.
     publish_scheduler_topology(&mut skel, &topology, stats_only);
@@ -323,9 +326,10 @@ fn init_ebpf() {
     }
 
     let stats_only = env_flag(STATS_ONLY_ENV);
+    let debug = env_flag(BPF_DEBUG_ENV);
 
     // 初始化调度器（只执行一次）
-    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false, stats_only) {
+    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(debug, stats_only) {
         Ok(state) => {
             if stats_only {
                 info!(
@@ -661,16 +665,20 @@ mod tests {
 
     #[test]
     fn stats_headers_do_not_use_probe_write_user_in_struct_ops_path() {
-        let intf = include_str!("bpf/intf.h");
+        let main = include_str!("bpf/main.bpf.c");
         let stats = include_str!("bpf/stats.bpf.h");
 
         assert!(
-            intf.contains("pending_wait_ns"),
+            include_str!("bpf/intf.h").contains("pending_wait_ns"),
             "task context should keep pending wait accounting in BPF state",
         );
         assert!(
             !stats.contains("bpf_probe_write_user"),
             "struct_ops stats path must not use bpf_probe_write_user",
+        );
+        assert!(
+            !main.contains("bpf_probe_write_user"),
+            "scheduler callbacks must not use bpf_probe_write_user on struct_ops kernels",
         );
     }
 
@@ -853,54 +861,91 @@ mod tests {
     }
 
     #[test]
-    fn owner_preemption_paths_are_wired_through_bpf_and_mcs_tas() {
+    fn init_scheduler_hands_owner_state_map_to_userspace() {
+        let lib = compact(include_str!("lib.rs"));
+
+        assert!(
+            lib.contains("letowner_state_map=MapHandle::try_from(&skel.maps.owner_state_map)?;"),
+            "scheduler init should duplicate the mmapable owner_state_map handle after BPF load",
+        );
+        assert!(
+            lib.contains("mcs_tas::set_owner_state_map(owner_state_map)?;"),
+            "scheduler init should hand the owner_state_map handle to mcs_tas so userspace can mmap it",
+        );
+    }
+
+    #[test]
+    fn kernel_valid_scheduler_path_uses_map_backed_owner_preemption() {
         let intf = include_str!("bpf/intf.h");
+        let maps = include_str!("bpf/maps.bpf.h");
         let main = compact(include_str!("bpf/main.bpf.c"));
         let mcs_tas = compact(include_str!("mcs_tas.rs"));
 
         assert!(
-            intf.contains("owner_state_ptr"),
-            "thread ctx should expose the current lock owner-state pointer to BPF",
+            intf.contains("owner_state_slot"),
+            "thread ctx should expose a slot id that BPF can use to locate shared owner state",
         );
         assert!(
-            intf.contains("ROLE_OWNER"),
-            "thread ctx interface should keep the owner role marker",
+            !intf.contains("owner_state_ptr"),
+            "thread ctx should not expose a raw user pointer for BPF writeback",
         );
         assert!(
-            main.contains("voidBPF_STRUCT_OPS(lb_simple_stopping,structtask_struct*p,boolrunnable){"),
-            "scheduler should define a stopping callback for owner preemption tracking",
+            maps.contains("owner_state_map"),
+            "BPF maps should define the mmapable owner_state_map used for owner-preemption state",
         );
         assert!(
-            main.contains("bpf_probe_write_user((void*)(unsignedlong)uctx.owner_state_ptr,&owner_state,sizeof(owner_state))"),
-            "stopping should mark the current owner as preempted through the exported owner-state pointer",
+            maps.contains("BPF_F_MMAPABLE"),
+            "owner_state_map should be mmapable so userspace can read shared owner state directly",
+        );
+        assert!(
+            main.contains(
+                "voidBPF_STRUCT_OPS(lb_simple_stopping,structtask_struct*p,boolrunnable){"
+            ),
+            "scheduler should restore stopping() so BPF can publish owner preemption into shared state",
+        );
+        assert!(
+            !main.contains("bpf_probe_write_user"),
+            "scheduler callbacks must not use bpf_probe_write_user on struct_ops kernels",
+        );
+        assert!(
+            main.contains("owner_state=bpf_map_lookup_elem(&owner_state_map,&slot);"),
+            "stopping() should resolve the owner-state slot through owner_state_map",
+        );
+        assert!(
+            main.contains("*owner_state=OWNER_STATE_PREEMPTED;"),
+            "stopping() should publish PREEMPTED into the shared map-backed owner state",
         );
         assert!(
             main.contains(".stopping=(void*)lb_simple_stopping,"),
-            "scheduler ops should register the stopping callback",
+            "scheduler ops should register the restored stopping callback",
         );
         assert!(
-            mcs_tas.contains("owner_state:CacheAligned<AtomicU32>"),
-            "mcs_tas should keep a lock-local owner state word",
+            mcs_tas.contains("enumOwnerStateStorage{"),
+            "mcs_tas should model owner state as shared storage rather than a raw userspace pointer",
+        );
+        assert!(
+            mcs_tas.contains("owner_state_slot:u32"),
+            "userspace thread ctx should carry the current owner-state slot",
         );
         assert!(
             mcs_tas.contains("owner_seq:CacheAligned<AtomicU32>"),
-            "mcs_tas should keep a futex sequence word for owner-preempted sleepers",
+            "mcs_tas should keep the owner-preemption futex sequence word",
         );
         assert!(
             mcs_tas.contains("owner_sleepers:CacheAligned<AtomicU32>"),
-            "mcs_tas should track how many waiters parked due to an owner preemption",
+            "mcs_tas should keep the owner-preemption sleeper count",
         );
         assert!(
             mcs_tas.contains("fnwait_for_preempted_owner(&self){"),
-            "mcs_tas should factor owner-preemption futex sleep into a dedicated helper",
+            "mcs_tas should keep the owner-preemption futex sleep helper",
         );
         assert!(
             mcs_tas.contains("ifself.owner_is_preempted(){"),
-            "both MCS wait and TAS head spin should test the owner-preempted state",
+            "lock slow paths should branch on map-backed owner-preemption state",
         );
         assert!(
             mcs_tas.contains("self.wake_owner_waiters();"),
-            "unlock should wake a parked waiter when clearing owner-preempted state",
+            "unlock should wake waiters that slept on a preempted owner",
         );
     }
 }

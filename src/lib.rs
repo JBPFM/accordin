@@ -198,6 +198,8 @@ fn initial_ssc_active_count(ssc_cpu_count: u32) -> u32 {
 
 /// Populate cpu_to_node BPF map and publish NUMA defaults.
 fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, stats_only: bool) {
+    let ssc_cpu_count = u32::try_from(topology.first_socket_cpus.len()).unwrap_or(u32::MAX);
+
     for (cpu, node_id) in &topology.cpu_to_node {
         let _ =
             skel.maps
@@ -217,9 +219,7 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
     }
 
     if let Some(data) = skel.maps.data_data.as_mut() {
-        data.ssc_active_count = initial_ssc_active_count(
-            u32::try_from(topology.first_socket_cpus.len()).unwrap_or(u32::MAX),
-        );
+        data.ssc_active_count = initial_ssc_active_count(ssc_cpu_count);
     }
 
     info!(
@@ -592,32 +592,43 @@ mod tests {
     fn quorum_shift_detection_resets_search_phase() {
         let main = compact(include_str!("bpf/main.bpf.c"));
         let stats = include_str!("bpf/stats.bpf.h");
+        let compact_stats = compact(stats);
 
         assert!(
-            main.contains(
-                "ssc_search_phase==SSC_SEARCH_REFINE&&detect_ssc_workload_shift(now,&wait_ratio)"
-            ),
+            main.contains("boolrefine_mode=ssc_search_phase==SSC_SEARCH_REFINE;"),
+            "simple_tick should capture refine-mode state once before selecting the next controller action",
+        );
+        assert!(
+            main.contains("if(refine_mode&&detect_ssc_workload_shift()){"),
             "simple_tick should only run workload-shift detection while refining around a prior best point",
         );
         assert!(
-            main.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
-            "confirmed workload shifts should reset the controller back to fast seek mode",
+            main.contains("ssc_restore_best_search_state();"),
+            "confirmed workload shifts should restore the saved best point through a dedicated helper",
         );
         assert!(
             stats.contains("ssc_enter_refine_mode"),
             "BPF stats helpers should expose refine-mode entry",
         );
         assert!(
+            stats.contains("ssc_restore_best_search_state"),
+            "BPF stats helpers should expose the seek-reset helper used after confirmed workload shifts",
+        );
+        assert!(
             stats.contains("ssc_next_refine_target"),
             "BPF stats helpers should expose bounded refinement target selection",
+        );
+        assert!(
+            stats.contains("ssc_note_refine_score"),
+            "BPF stats helpers should encapsulate refine-mode score bookkeeping",
         );
         assert!(
             main.contains("ssc_enter_refine_mode(ssc_best_count,ssc_active_count,score);"),
             "simple_tick should enter bounded refinement after a clear regression",
         );
         assert!(
-            main.contains("ssc_set_active_count(ssc_best_count,ssc_best_score);"),
-            "confirmed workload shifts should fall back to the last best known core count instead of immediately doubling or halving",
+            compact_stats.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
+            "confirmed workload shifts should reset the controller back to fast seek mode",
         );
         assert!(
             !stats.contains("demand_shift"),

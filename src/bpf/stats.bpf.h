@@ -130,6 +130,12 @@ static __always_inline void reset_ssc_refine_bounds(__u32 active_count) {
   ssc_refine_high = active_count;
 }
 
+static __always_inline void ssc_set_best_point(__u32 active_count,
+                                               __u64 score) {
+  ssc_best_count = clamp_ssc_active_count(active_count);
+  ssc_best_score = score;
+}
+
 static __always_inline void ssc_note_resize(__u64 effective_score) {
   ssc_resize_holdoff = SSC_RESIZE_HOLDOFF_WINDOWS;
   ssc_vote_last_score = 0;
@@ -147,6 +153,50 @@ static __always_inline void ssc_set_active_count(__u32 active_count,
 
   ssc_active_count = active_count;
   ssc_note_resize(effective_score);
+}
+
+static __always_inline void ssc_init_search_state(__u64 score) {
+  if (!ssc_vote_last_effective_score)
+    ssc_vote_last_effective_score = score;
+
+  if (ssc_best_score)
+    return;
+
+  ssc_set_best_point(ssc_active_count, score);
+  reset_ssc_refine_bounds(ssc_active_count);
+}
+
+static __always_inline void ssc_restore_best_search_state(void) {
+  ssc_search_phase = SSC_SEARCH_SEEK;
+
+  if (ssc_best_count != ssc_active_count)
+    ssc_set_active_count(ssc_best_count, ssc_best_score);
+  else
+    ssc_note_resize(ssc_best_score);
+
+  ssc_set_best_point(ssc_active_count, ssc_best_score);
+  reset_ssc_refine_bounds(ssc_active_count);
+}
+
+static __always_inline void ssc_track_vote_trend(__u64 score) {
+  if (ssc_vote_last_score) {
+    if (score > ssc_vote_last_score)
+      ssc_vote_consec_grow++;
+    else
+      ssc_vote_consec_grow = 0;
+
+    if (score < ssc_vote_last_effective_score)
+      ssc_vote_consec_shrink++;
+    else
+      ssc_vote_consec_shrink = 0;
+  }
+
+  ssc_vote_last_score = score;
+}
+
+static __always_inline void ssc_record_best_score(__u64 score) {
+  if (score > ssc_best_score)
+    ssc_set_best_point(ssc_active_count, score);
 }
 
 static __always_inline void ssc_enter_refine_mode(__u32 low, __u32 high,
@@ -180,18 +230,22 @@ static __always_inline __u32 ssc_next_refine_target(void) {
                                 ((ssc_refine_high - ssc_refine_low) >> 1));
 }
 
-static __always_inline bool detect_ssc_workload_shift(__u64 now,
-                                                      __u64 *wait_ratio_out) {
+static __always_inline __u32 ssc_note_refine_score(__u64 score) {
+  if (score >= ssc_best_score) {
+    ssc_set_best_point(ssc_active_count, score);
+    if (ssc_active_count > ssc_refine_low)
+      ssc_refine_low = ssc_active_count;
+  } else if (ssc_active_count > ssc_refine_low) {
+    ssc_refine_high = ssc_active_count;
+  }
+
+  return ssc_next_refine_target();
+}
+
+static __always_inline bool detect_ssc_workload_shift(void) {
   __u64 wait_ratio = compute_ssc_wait_ratio(ssc_vote_sum_run, ssc_vote_sum_wait);
-  __u64 demand = ssc_vote_sum_run + ssc_vote_sum_wait;
   __u64 prev_wait_ratio = ssc_wait_ratio_ewma;
-  bool wait_shift = false;
-
-  (void)now;
-  (void)demand;
-
-  if (wait_ratio_out)
-    *wait_ratio_out = wait_ratio;
+  bool wait_shift;
 
   if (!ssc_shift_baseline_valid) {
     ssc_wait_ratio_ewma = wait_ratio;
@@ -205,9 +259,9 @@ static __always_inline bool detect_ssc_workload_shift(__u64 now,
     return false;
   }
 
-  if (abs_diff_u64(wait_ratio, prev_wait_ratio) >= SSC_SHIFT_WAIT_ABS_THRESHOLD &&
-      rel_change_exceeds(wait_ratio, prev_wait_ratio, SSC_SHIFT_WAIT_REL_PCT))
-    wait_shift = true;
+  wait_shift =
+      abs_diff_u64(wait_ratio, prev_wait_ratio) >= SSC_SHIFT_WAIT_ABS_THRESHOLD &&
+      rel_change_exceeds(wait_ratio, prev_wait_ratio, SSC_SHIFT_WAIT_REL_PCT);
 
   if (wait_shift)
     ssc_shift_streak++;

@@ -119,76 +119,34 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
 
     if (ssc_vote_publish_count * 2 > ssc_active_count) {
       __u64 score = compute_ssc_vote_score(ssc_active_count);
-      __u64 wait_ratio = 0;
-      bool shifted = ssc_search_phase == SSC_SEARCH_REFINE &&
-                     detect_ssc_workload_shift(now, &wait_ratio);
+      bool refine_mode = ssc_search_phase == SSC_SEARCH_REFINE;
 
-      (void)wait_ratio;
+      ssc_init_search_state(score);
 
-      if (!ssc_vote_last_effective_score)
-        ssc_vote_last_effective_score = score;
-      if (!ssc_best_score) {
-        ssc_best_score = score;
-        ssc_best_count = ssc_active_count;
-        reset_ssc_refine_bounds(ssc_active_count);
-      }
-
-      if (shifted) {
-        ssc_search_phase = SSC_SEARCH_SEEK;
-
-        if (ssc_best_count != ssc_active_count)
-          ssc_set_active_count(ssc_best_count, ssc_best_score);
-        else
-          ssc_note_resize(ssc_best_score);
-
-        ssc_best_count = ssc_active_count;
-        reset_ssc_refine_bounds(ssc_active_count);
-
+      if (refine_mode && detect_ssc_workload_shift()) {
+        ssc_restore_best_search_state();
         rotate_ssc_vote_window(now);
         return;
       }
 
-      if (ssc_vote_last_score) {
-        if (score > ssc_vote_last_score)
-          ssc_vote_consec_grow++;
-        else
-          ssc_vote_consec_grow = 0;
+      ssc_track_vote_trend(score);
 
-        if (score < ssc_vote_last_effective_score)
-          ssc_vote_consec_shrink++;
-        else
-          ssc_vote_consec_shrink = 0;
-      }
+      if (refine_mode) {
+        __u32 next_target = ssc_note_refine_score(score);
 
-      ssc_vote_last_score = score;
-      if (score > ssc_best_score) {
-        ssc_best_score = score;
-        ssc_best_count = ssc_active_count;
-      }
-
-      if (ssc_search_phase == SSC_SEARCH_REFINE) {
-        __u32 next_target;
-
-        if (score >= ssc_best_score) {
-          ssc_best_score = score;
-          ssc_best_count = ssc_active_count;
-          if (ssc_active_count > ssc_refine_low)
-            ssc_refine_low = ssc_active_count;
-        } else if (ssc_active_count > ssc_refine_low) {
-          ssc_refine_high = ssc_active_count;
-        }
-
-        next_target = ssc_next_refine_target();
         if (next_target != ssc_active_count)
           ssc_set_active_count(next_target, ssc_best_score);
       } else if (ssc_vote_consec_grow >= 2) {
-        ssc_best_count = ssc_active_count;
-        ssc_best_score = score;
+        ssc_set_best_point(ssc_active_count, score);
         ssc_set_active_count(ssc_active_count << 1, score);
         reset_ssc_refine_bounds(ssc_active_count);
-      } else if (ssc_vote_consec_shrink >= 2) {
-        ssc_enter_refine_mode(ssc_best_count, ssc_active_count, score);
-        ssc_set_active_count(ssc_next_refine_target(), ssc_best_score);
+      } else {
+        ssc_record_best_score(score);
+
+        if (ssc_vote_consec_shrink >= 2) {
+          ssc_enter_refine_mode(ssc_best_count, ssc_active_count, score);
+          ssc_set_active_count(ssc_next_refine_target(), ssc_best_score);
+        }
       }
 
       rotate_ssc_vote_window(now);

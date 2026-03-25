@@ -1,0 +1,21 @@
+#!/bin/sh
+
+set -eu
+
+clang_major() {
+    "$1" --version 2>/dev/null | sed -nE '1s/.*clang version ([0-9]+)\..*/\1/p'
+}
+
+for candidate in clang-19 clang-18 clang-17 clang-16 clang; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+        continue
+    fi
+
+    major="$(clang_major "$candidate")"
+    if [ -n "$major" ] && [ "$major" -ge 16 ]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+echo "error: could not find clang >= 16 for BPF build" >&2
+exit 1

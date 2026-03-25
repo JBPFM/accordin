@@ -1,0 +1,2 @@
+[env]
+BPF_CLANG = { value = ".cargo/bpf-clang", relative = true }

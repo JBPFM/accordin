@@ -39,6 +39,8 @@
 #define DPRINT(...)
 #endif
 
+#define LOWPRI_DSQ_ID 1
+
 flexguard_qnode_t qnodes[MAX_NUMBER_THREADS];
 
 num_preempted_cs_t num_preempted_cs = 0;
@@ -125,14 +127,27 @@ void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags)
 	scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
 }
 
+bool BPF_STRUCT_OPS(lb_simple_yield, struct task_struct *from, struct task_struct *to)
+{
+	if (to)
+		return false;
+
+	scx_bpf_dsq_insert(from, LOWPRI_DSQ_ID, SCX_SLICE_DFL, 0);
+	return true;
+}
+
 void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev)
 {
-	scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL);
+	if (scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL))
+		return;
+
+	if (num_preempted_cs == 0)
+		scx_bpf_dsq_move_to_local(LOWPRI_DSQ_ID);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init)
 {
-	return 0;
+	return scx_bpf_create_dsq(LOWPRI_DSQ_ID, -1);
 }
 
 void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei)
@@ -143,6 +158,7 @@ void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei)
 SCX_OPS_DEFINE(lb_simple_ops,
 	       .select_cpu = (void *)lb_simple_select_cpu,
 	       .enqueue = (void *)lb_simple_enqueue,
+	       .yield = (void *)lb_simple_yield,
 	       .dispatch = (void *)lb_simple_dispatch,
 	       .init = (void *)lb_simple_init,
 	       .exit = (void *)lb_simple_exit,

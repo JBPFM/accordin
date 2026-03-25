@@ -249,8 +249,34 @@ mod tests {
             "combined BPF source should expose the sched_ext ops definition",
         );
         assert!(
+            bpf.contains("LOWPRI_DSQ_ID"),
+            "sched_ext program should define a dedicated low-priority DSQ identifier",
+        );
+        assert!(
+            bpf.contains("scx_bpf_create_dsq(LOWPRI_DSQ_ID,-1)"),
+            "scheduler init should create the dedicated low-priority DSQ",
+        );
+        assert!(
+            bpf.contains("BPF_STRUCT_OPS(lb_simple_yield,"),
+            "combined BPF source should define a sched_ext yield callback",
+        );
+        assert!(
+            bpf.contains(".yield=(void*)lb_simple_yield"),
+            "sched_ext ops should wire the custom yield callback",
+        );
+        assert!(
             bpf.contains(".name=\"lb_simple\""),
             "sched_ext ops should keep the lb_simple scheduler name",
+        );
+    }
+
+    #[test]
+    fn dispatch_blocks_lowpri_dsq_while_critical_threads_are_preempted() {
+        let bpf = compact(include_str!("bpf/flexguard_userspace_state.bpf.c"));
+
+        assert!(
+            bpf.contains("if(num_preempted_cs==0)scx_bpf_dsq_move_to_local(LOWPRI_DSQ_ID);"),
+            "dispatch should only pull from the low-priority DSQ when no critical thread is currently preempted",
         );
     }
 
@@ -307,8 +333,12 @@ mod tests {
             "lock slow path should consult the shared preempted-critical-section counter",
         );
         assert!(
-            mcs_tas.contains("FUTEX_WAIT_PRIVATE"),
-            "lock slow path should block with futex when the BPF protocol requests it",
+            mcs_tas.contains("sched_yield()"),
+            "lock slow path should yield to the scheduler when the BPF protocol requests it",
+        );
+        assert!(
+            !mcs_tas.contains("SYS_futex"),
+            "lock slow path should no longer invoke futex syscalls for throttling",
         );
     }
 }

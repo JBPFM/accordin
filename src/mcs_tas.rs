@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::mem::offset_of;
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, Ordering};
@@ -9,8 +8,6 @@ use crate::bpf_intf;
 
 const CACHE_LINE_SIZE: usize = bpf_intf::CACHE_LINE_SIZE as usize;
 const MAX_THREAD_SLOTS: usize = bpf_intf::MAX_NUMBER_THREADS as usize;
-const FUTEX_WAIT_PRIVATE: libc::c_int = 128;
-const FUTEX_WAKE_PRIVATE: libc::c_int = 129;
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
@@ -150,32 +147,9 @@ fn mark_handoff_thread(qnode: *mut FlexguardQnode) {
 }
 
 #[inline(always)]
-fn futex_wait(addr: *mut i32, val: i32) -> libc::c_long {
+fn sched_yield() {
     unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            addr,
-            FUTEX_WAIT_PRIVATE,
-            val,
-            ptr::null::<libc::timespec>(),
-            ptr::null::<libc::c_void>(),
-            0,
-        )
-    }
-}
-
-#[inline(always)]
-fn futex_wake(addr: *mut i32, count: i32) -> libc::c_long {
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            addr,
-            FUTEX_WAKE_PRIVATE,
-            count,
-            ptr::null::<libc::timespec>(),
-            ptr::null::<libc::c_void>(),
-            0,
-        )
+        libc::sched_yield();
     }
 }
 
@@ -295,17 +269,19 @@ impl McsTasLockRaw {
                         enqueued = false;
                     }
 
-                    if self.lock_value.0.load(Ordering::Acquire) != 2 {
-                        state = self.lock_value.0.swap(2, Ordering::SeqCst);
+                    sched_yield();
+
+                    state = self.lock_value.0.load(Ordering::Acquire);
+                    if state == 0 {
+                        state = self
+                            .lock_value
+                            .0
+                            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .unwrap_or_else(|current| current);
                     }
 
-                    if state != 0 {
-                        let addr = ptr::addr_of!(self.lock_value.0) as *mut AtomicI32 as *mut i32;
-                        futex_wait(addr, 2);
-                        state = self.lock_value.0.swap(2, Ordering::SeqCst);
-                        if state != 0 && !blocking_condition() {
-                            continue 'slow_path;
-                        }
+                    if state != 0 && !blocking_condition() {
+                        continue 'slow_path;
                     }
                 } else {
                     pause();
@@ -333,12 +309,7 @@ impl McsTasLockRaw {
     #[inline(always)]
     pub fn unlock(&self) {
         let qnode = thread_qnode();
-        let addr = ptr::addr_of!(self.lock_value.0) as *mut AtomicI32 as *mut i32;
-
-        if self.lock_value.0.swap(0, Ordering::SeqCst) != 1 {
-            futex_wake(addr, 1);
-        }
-
+        self.lock_value.0.store(0, Ordering::SeqCst);
         clear_critical_state(qnode);
     }
 }
@@ -346,6 +317,7 @@ impl McsTasLockRaw {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::offset_of;
 
     #[test]
     fn flexguard_qnode_layout_matches_bindgen_contract() {

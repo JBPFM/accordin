@@ -7,22 +7,22 @@ use std::hint::spin_loop;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::mcs_tas::{McsTasLockRaw, thread_ctx};
+use crate::mcs_tas::{McsTasLockRaw, current_thread_index};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
-/// BPF map handle for thread_ctx_addr_map, set by lib.rs after BPF load.
-static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
+/// BPF map handle for nodes_map, set by lib.rs after BPF load.
+static NODES_MAP: OnceLock<MapHandle> = OnceLock::new();
 
-pub fn set_thread_ctx_map(map: MapHandle) {
-    let _ = THREAD_CTX_MAP.set(map);
+pub fn set_nodes_map(map: MapHandle) {
+    let _ = NODES_MAP.set(map);
 }
 
-trait ThreadCtxMapOps {
+trait NodesMapOps {
     fn update_entry(&self, key: &[u8], value: &[u8], flags: MapFlags) -> bool;
     fn delete_entry(&self, key: &[u8]) -> bool;
 }
 
-impl ThreadCtxMapOps for MapHandle {
+impl NodesMapOps for MapHandle {
     fn update_entry(&self, key: &[u8], value: &[u8], flags: MapFlags) -> bool {
         self.update(key, value, flags).is_ok()
     }
@@ -37,52 +37,55 @@ fn current_tid() -> u32 {
     unsafe { libc::syscall(libc::SYS_gettid) as u32 }
 }
 
-fn register_thread_ctx_with_map<M>(map: &M, tid: u32, ctx_ptr: u64) -> bool
+fn register_thread_with_map<M>(map: &M, tid: u32, thread_index: i32) -> bool
 where
-    M: ThreadCtxMapOps + ?Sized,
+    M: NodesMapOps + ?Sized,
 {
-    map.update_entry(&tid.to_ne_bytes(), &ctx_ptr.to_ne_bytes(), MapFlags::ANY)
+    map.update_entry(
+        &tid.to_ne_bytes(),
+        &thread_index.to_ne_bytes(),
+        MapFlags::ANY,
+    )
 }
 
-fn unregister_thread_ctx_with_map<M>(map: &M, tid: u32) -> bool
+fn unregister_thread_with_map<M>(map: &M, tid: u32) -> bool
 where
-    M: ThreadCtxMapOps + ?Sized,
+    M: NodesMapOps + ?Sized,
 {
     map.delete_entry(&tid.to_ne_bytes())
 }
 
-/// Register the current thread's LockSchedThreadCtx pointer into the BPF map.
+/// Register the current thread's FlexGuard thread slot into the BPF map.
 /// Called once per thread on first pthread_mutex_lock.
-fn register_thread_ctx() {
-    let Some(map) = THREAD_CTX_MAP.get() else {
+fn register_thread_node() {
+    let tid = current_tid();
+    let thread_index = current_thread_index();
+    let Some(map) = NODES_MAP.get() else {
         return;
     };
-
-    let tid = current_tid();
-    let ctx_ptr = thread_ctx() as u64;
-    let _ = register_thread_ctx_with_map(map, tid, ctx_ptr);
+    let _ = register_thread_with_map(map, tid, thread_index);
 }
 
 /// Delete the current thread's entry from the BPF map.
-fn unregister_thread_ctx() {
-    let Some(map) = THREAD_CTX_MAP.get() else {
+fn unregister_thread_node() {
+    let Some(map) = NODES_MAP.get() else {
         return;
     };
-    let _ = unregister_thread_ctx_with_map(map, current_tid());
+    let _ = unregister_thread_with_map(map, current_tid());
 }
 
 /// Thread-local guard that unregisters from the BPF map on thread exit.
-struct ThreadCtxGuard;
+struct ThreadNodeGuard;
 
-impl Drop for ThreadCtxGuard {
+impl Drop for ThreadNodeGuard {
     fn drop(&mut self) {
-        unregister_thread_ctx();
+        unregister_thread_node();
     }
 }
 
 thread_local! {
     static REGISTERED: Cell<bool> = const { Cell::new(false) };
-    static _GUARD: UnsafeCell<Option<ThreadCtxGuard>> = const { UnsafeCell::new(None) };
+    static _GUARD: UnsafeCell<Option<ThreadNodeGuard>> = const { UnsafeCell::new(None) };
 }
 
 /// Ensure the current thread is registered in the BPF map (idempotent).
@@ -90,8 +93,8 @@ thread_local! {
 fn ensure_registered() {
     REGISTERED.with(|r| {
         if !r.get() {
-            register_thread_ctx();
-            _GUARD.with(|g| unsafe { *g.get() = Some(ThreadCtxGuard) });
+            register_thread_node();
+            _GUARD.with(|g| unsafe { *g.get() = Some(ThreadNodeGuard) });
             r.set(true);
         }
     });
@@ -435,7 +438,7 @@ mod tests {
 
     use libbpf_rs::MapFlags;
 
-    use super::ThreadCtxMapOps;
+    use super::NodesMapOps;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum MapCall {
@@ -454,7 +457,7 @@ mod tests {
         calls: RefCell<Vec<MapCall>>,
     }
 
-    impl ThreadCtxMapOps for RecordingMap {
+    impl NodesMapOps for RecordingMap {
         fn update_entry(&self, key: &[u8], value: &[u8], flags: MapFlags) -> bool {
             self.calls.borrow_mut().push(MapCall::Update {
                 key: key.to_vec(),
@@ -479,30 +482,26 @@ mod tests {
     }
 
     #[test]
-    fn register_thread_ctx_uses_map_helper_update() {
+    fn register_thread_uses_map_helper_update() {
         let map = RecordingMap::default();
 
-        assert!(super::register_thread_ctx_with_map(
-            &map,
-            7,
-            0x1122_3344_5566_7788,
-        ));
+        assert!(super::register_thread_with_map(&map, 7, 23));
 
         assert_eq!(
             map.calls(),
             vec![MapCall::Update {
                 key: 7u32.to_ne_bytes().to_vec(),
-                value: 0x1122_3344_5566_7788u64.to_ne_bytes().to_vec(),
+                value: 23i32.to_ne_bytes().to_vec(),
                 flags: MapFlags::ANY,
             }]
         );
     }
 
     #[test]
-    fn unregister_thread_ctx_uses_map_helper_delete() {
+    fn unregister_thread_uses_map_helper_delete() {
         let map = RecordingMap::default();
 
-        assert!(super::unregister_thread_ctx_with_map(&map, 11));
+        assert!(super::unregister_thread_with_map(&map, 11));
 
         assert_eq!(
             map.calls(),

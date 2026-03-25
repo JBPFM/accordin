@@ -66,11 +66,10 @@ get_or_create_task_ctx(struct task_struct *p) {
 /* ------------------------------------------------------------------ */
 
 static __always_inline __s32 get_cpu_node(__s32 cpu) {
-  __u32 key = (__u32)cpu;
-  __u32 *node = bpf_map_lookup_elem(&cpu_to_node, &key);
-  if (node)
-    return (__s32)*node;
-  return 0;
+  if (cpu < 0 || cpu >= MAX_CPUS)
+    return 0;
+
+  return (__s32)ssc_cpu_node[cpu];
 }
 
 static __always_inline bool is_local_node(__s32 node) {
@@ -84,16 +83,159 @@ static __always_inline __s32 get_ssc_cpu_by_index(__u32 idx) {
   return (__s32)ssc_cpu_list[idx];
 }
 
-static __always_inline bool is_cpu_ssc_core(__s32 cpu) {
+static __always_inline struct ssc_claim_state *lookup_ssc_claim_state(void) {
+  __u32 key = 0;
+
+  return bpf_map_lookup_elem(&ssc_claim_state_map, &key);
+}
+
+static __always_inline bool is_cpu_ssc_candidate(__s32 cpu) {
   if (cpu < 0 || cpu >= MAX_CPUS)
     return false;
 
-  __u16 rank = ssc_cpu_rank[cpu];
-  return rank < ssc_active_count && rank < ssc_cpu_count;
+  return ssc_cpu_rank[cpu] < ssc_cpu_count;
+}
+
+static __always_inline __u32 get_ssc_node_capacity(__s32 node) {
+  if (node < 0 || node >= MAX_NODES)
+    return 0;
+
+  return ssc_node_capacity[node];
+}
+
+static __always_inline void reset_ssc_claim_state(struct ssc_claim_state *state) {
+  if (!state)
+    return;
+
+  state->epoch = ssc_claim_epoch;
+  state->claimed_count = 0;
+  state->anchor_node = -1;
+  state->anchor_capacity = 0;
+}
+
+static __always_inline void trim_ssc_claims_to_active_count(
+    struct ssc_claim_state *state) {
+  while (state->claimed_count > ssc_active_count) {
+    __u32 claimed = state->claimed_count;
+    __u32 slot;
+    __u32 cpu;
+
+    if (!claimed)
+      break;
+
+    slot = claimed - 1;
+    if (slot >= MAX_CPUS) {
+      state->claimed_count = MAX_CPUS;
+      continue;
+    }
+
+    cpu = state->slot_cpu[slot];
+
+    if (cpu < MAX_CPUS && state->cpu_epoch[cpu] == state->epoch &&
+        state->cpu_slot[cpu] == slot)
+      state->cpu_epoch[cpu] = 0;
+
+    state->slot_cpu[slot] = 0;
+    state->claimed_count = slot;
+  }
+}
+
+static __always_inline bool is_cpu_ssc_core(__s32 cpu) {
+  struct ssc_claim_state *state;
+
+  if (!ssc_claim_epoch || !is_cpu_ssc_candidate(cpu))
+    return false;
+
+  state = lookup_ssc_claim_state();
+  if (!state || state->epoch != ssc_claim_epoch)
+    return false;
+
+  if (state->cpu_epoch[cpu] != state->epoch)
+    return false;
+
+  return state->cpu_slot[cpu] < state->claimed_count &&
+         state->cpu_slot[cpu] < ssc_active_count;
 }
 
 static __always_inline bool is_task_on_ssc_core(struct task_struct *p) {
   return is_cpu_ssc_core(scx_bpf_task_cpu(p));
+}
+
+static __always_inline bool try_claim_ssc_core(__s32 cpu) {
+  struct ssc_claim_state *state;
+  __s32 node;
+  __u32 anchor_capacity;
+  __u32 slot;
+  bool claimed = false;
+
+  if (!ssc_claim_epoch || !is_cpu_ssc_candidate(cpu))
+    return false;
+
+  state = lookup_ssc_claim_state();
+  if (!state)
+    return false;
+
+  if (state->epoch == ssc_claim_epoch && state->cpu_epoch[cpu] == ssc_claim_epoch &&
+      state->cpu_slot[cpu] < state->claimed_count &&
+      state->cpu_slot[cpu] < ssc_active_count)
+    return true;
+
+  node = get_cpu_node(cpu);
+
+  bpf_spin_lock(&state->lock);
+
+  if (state->epoch != ssc_claim_epoch)
+    reset_ssc_claim_state(state);
+
+  trim_ssc_claims_to_active_count(state);
+
+  if (state->cpu_epoch[cpu] == state->epoch &&
+      state->cpu_slot[cpu] < state->claimed_count) {
+    claimed = true;
+    goto out_unlock;
+  }
+
+  slot = state->claimed_count;
+  if (slot >= ssc_active_count || slot >= ssc_cpu_count || slot >= MAX_CPUS)
+    goto out_unlock;
+
+  if (state->anchor_node < 0) {
+    state->anchor_node = node;
+    state->anchor_capacity = get_ssc_node_capacity(node);
+    if (!state->anchor_capacity)
+      state->anchor_capacity = ssc_cpu_count;
+  }
+
+  anchor_capacity = state->anchor_capacity;
+  if (node != state->anchor_node) {
+    if (ssc_active_count <= anchor_capacity)
+      goto out_unlock;
+    if (slot < anchor_capacity)
+      goto out_unlock;
+  }
+
+  state->cpu_epoch[cpu] = state->epoch;
+  state->cpu_slot[cpu] = slot;
+  state->slot_cpu[slot] = (__u32)cpu;
+  state->claimed_count = slot + 1;
+  claimed = true;
+
+out_unlock:
+  bpf_spin_unlock(&state->lock);
+  return claimed;
+}
+
+static __always_inline bool ssc_claims_complete(void) {
+  struct ssc_claim_state *state;
+
+  if (!ssc_claim_epoch || !ssc_active_count)
+    return false;
+
+  state = lookup_ssc_claim_state();
+  if (!state || state->epoch != ssc_claim_epoch)
+    return false;
+
+  return state->claimed_count >= ssc_active_count;
 }
 
 static __always_inline bool is_task_lock_protected(struct task_scx_ctx *tc) {

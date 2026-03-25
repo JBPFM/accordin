@@ -36,24 +36,23 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
   struct task_scx_ctx *tc = lookup_task_ctx(p);
+  __u64 dsq_id = READY_DSQ_ID;
+
   if (!tc) {
     /* Untracked task (not yet seen in running()) — let it run. */
-    scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
-    return;
+    goto out_insert;
   }
 
   if (is_task_lock_protected(tc)) {
     tc->admitted = 1;
-    scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
-    return;
+    goto out_insert;
   }
 
-  if (tc->admitted) {
-    scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
-    return;
-  }
+  if (!tc->admitted)
+    dsq_id = SSC_DSQ_ID;
 
-  scx_bpf_dsq_insert(p, SSC_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+out_insert:
+  scx_bpf_dsq_insert(p, dsq_id, SCX_SLICE_DFL, enq_flags);
 }
 
 void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev) {
@@ -80,27 +79,11 @@ void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p) {
   tc->run_start_ns = scx_bpf_now();
 }
 
-// void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)
-// {
-//   __u32 pid = p->pid;
-//   struct task_scx_ctx *tc = lookup_task_ctx(p);
-//   if (!tc)
-//     return;
-//
-//   /* Window advance moved to tick() — only CPU 0 advances */
-//
-//   if (stats_only_mode)
-//     return;
-//
-//   // we should determine if the task should be parked (i.e. move to SSC)
-//   based
-//   // on its context and current state
-// }
-
 void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   __u32 pid = p->pid;
   struct task_scx_ctx *tc = lookup_task_ctx(p);
   bool lock_protected = false;
+  bool on_ssc_core = false;
   // scx_bpf_now is efficient than bpf_task_storage_delete
   __u64 now = scx_bpf_now();
 
@@ -114,10 +97,20 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   if (stats_only_mode)
     return;
 
-  if (is_task_on_ssc_core(p)) {
+  on_ssc_core = is_task_on_ssc_core(p);
+
+  if (!on_ssc_core && tc)
+    on_ssc_core = try_claim_ssc_core(scx_bpf_task_cpu(p));
+
+  if (on_ssc_core) {
     publish_ssc_core_vote(tc, p, now);
 
-    if (ssc_vote_publish_count * 2 > ssc_active_count) {
+    if (ssc_claims_complete() && ssc_vote_publish_count >= ssc_active_count) {
+      if (ssc_resize_pending()) {
+        rotate_ssc_vote_window(now);
+        goto out_ssc;
+      }
+
       __u64 score = compute_ssc_vote_score(ssc_active_count);
       bool refine_mode = ssc_search_phase == SSC_SEARCH_REFINE;
 
@@ -135,23 +128,29 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
         __u32 next_target = ssc_note_refine_score(score);
 
         if (next_target != ssc_active_count)
-          ssc_set_active_count(next_target, ssc_best_score);
+          ssc_schedule_active_count(next_target, ssc_best_score);
       } else if (ssc_vote_consec_grow >= 2) {
+        __u32 next_target = clamp_ssc_active_count(ssc_active_count << 1);
+
         ssc_set_best_point(ssc_active_count, score);
-        ssc_set_active_count(ssc_active_count << 1, score);
-        reset_ssc_refine_bounds(ssc_active_count);
+        ssc_schedule_active_count(next_target, score);
+        reset_ssc_refine_bounds(next_target);
       } else {
         ssc_record_best_score(score);
 
         if (ssc_vote_consec_shrink >= 2) {
+          __u32 next_target;
+
           ssc_enter_refine_mode(ssc_best_count, ssc_active_count, score);
-          ssc_set_active_count(ssc_next_refine_target(), ssc_best_score);
+          next_target = ssc_next_refine_target();
+          ssc_schedule_active_count(next_target, ssc_best_score);
         }
       }
 
       rotate_ssc_vote_window(now);
     }
 
+out_ssc:
     if (lock_protected)
       keep_task_lock_protected(p, tc);
 
@@ -161,11 +160,7 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
       return;
     }
 
-    /*
-     * If active count is above target, force a reschedule so the
-     * current task enters stopping() -> self-parking sooner.
-     */
-    if (tc && tc->run_ns_window / 10 < tc->wait_ns_window) {
+    if (tc) {
       tc->admitted = 0;
       p->scx.slice = 0;
     }

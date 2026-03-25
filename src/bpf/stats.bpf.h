@@ -144,15 +144,40 @@ static __always_inline void ssc_note_resize(__u64 effective_score) {
   ssc_vote_consec_shrink = 0;
 }
 
-static __always_inline void ssc_set_active_count(__u32 active_count,
-                                                 __u64 effective_score) {
+static __always_inline bool ssc_resize_pending(void) {
+  return ssc_pending_active_count >= 2;
+}
+
+static __always_inline void ssc_schedule_active_count(__u32 active_count,
+                                                      __u64 effective_score) {
   active_count = clamp_ssc_active_count(active_count);
 
-  if (active_count == ssc_active_count)
+  if (active_count == ssc_active_count && !ssc_resize_pending())
     return;
 
-  ssc_active_count = active_count;
-  ssc_note_resize(effective_score);
+  ssc_pending_active_count = active_count;
+  ssc_pending_resize_score = effective_score;
+  ssc_pending_resize_delay = 1;
+}
+
+static __always_inline void ssc_apply_pending_resize(void) {
+  if (!ssc_resize_pending())
+    return;
+
+  if (ssc_pending_resize_delay) {
+    ssc_pending_resize_delay--;
+    return;
+  }
+
+  if (ssc_pending_active_count != ssc_active_count) {
+    ssc_active_count = ssc_pending_active_count;
+    ssc_claim_epoch++;
+    ssc_note_resize(ssc_pending_resize_score);
+  }
+
+  ssc_pending_active_count = 0;
+  ssc_pending_resize_score = 0;
+  ssc_pending_resize_delay = 0;
 }
 
 static __always_inline void ssc_init_search_state(__u64 score) {
@@ -167,15 +192,17 @@ static __always_inline void ssc_init_search_state(__u64 score) {
 }
 
 static __always_inline void ssc_restore_best_search_state(void) {
+  __u32 restore_count = clamp_ssc_active_count(ssc_best_count);
+
   ssc_search_phase = SSC_SEARCH_SEEK;
 
-  if (ssc_best_count != ssc_active_count)
-    ssc_set_active_count(ssc_best_count, ssc_best_score);
+  if (restore_count != ssc_active_count)
+    ssc_schedule_active_count(restore_count, ssc_best_score);
   else
     ssc_note_resize(ssc_best_score);
 
-  ssc_set_best_point(ssc_active_count, ssc_best_score);
-  reset_ssc_refine_bounds(ssc_active_count);
+  ssc_set_best_point(restore_count, ssc_best_score);
+  reset_ssc_refine_bounds(restore_count);
 }
 
 static __always_inline void ssc_track_vote_trend(__u64 score) {
@@ -281,6 +308,8 @@ static __always_inline bool detect_ssc_workload_shift(void) {
 }
 
 static __always_inline void rotate_ssc_vote_window(__u64 now) {
+  ssc_apply_pending_resize();
+
   if (!ssc_vote_epoch)
     ssc_vote_epoch = 1;
   else
@@ -393,7 +422,6 @@ static __always_inline void publish_ssc_core_vote(struct task_scx_ctx *tc,
                                                   struct task_struct *p,
                                                   __u64 now) {
   __s32 cpu;
-  __u16 rank;
   __u32 key;
   struct agg_percpu *agg;
   struct ssc_vote_slot *slot;
@@ -415,14 +443,10 @@ static __always_inline void publish_ssc_core_vote(struct task_scx_ctx *tc,
   }
 
   cpu = scx_bpf_task_cpu(p);
-  if (cpu < 0 || cpu >= MAX_CPUS)
+  if (!is_cpu_ssc_core(cpu))
     return;
 
-  rank = ssc_cpu_rank[cpu];
-  if (rank >= ssc_active_count || rank >= ssc_cpu_count || rank >= MAX_CPUS)
-    return;
-
-  key = (__u32)rank;
+  key = (__u32)cpu;
   slot = bpf_map_lookup_elem(&ssc_vote_slot_map, &key);
   if (!slot)
     return;

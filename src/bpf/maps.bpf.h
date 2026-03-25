@@ -89,6 +89,24 @@ struct {
   __type(value, struct ssc_vote_slot);
 } ssc_vote_slot_map SEC(".maps");
 
+struct ssc_claim_state {
+  struct bpf_spin_lock lock;
+  __u64 epoch;
+  __u32 claimed_count;
+  __s32 anchor_node;
+  __u32 anchor_capacity;
+  __u64 cpu_epoch[MAX_CPUS];
+  __u32 cpu_slot[MAX_CPUS];
+  __u32 slot_cpu[MAX_CPUS];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct ssc_claim_state);
+} ssc_claim_state_map SEC(".maps");
+
 /* Hysteresis counters */
 volatile __u32 consec_high = 0;
 volatile __u32 consec_low = 0;
@@ -101,11 +119,14 @@ volatile __s32 dominant_node = 0;
 volatile __u32 ssc_active_count = 2;
 volatile __u32 ssc_cpu_count = 0;
 volatile __u32 ssc_cpu_list[MAX_CPUS] = {};
+volatile __u32 ssc_cpu_node[MAX_CPUS] = {};
 volatile __u16 ssc_cpu_rank[MAX_CPUS] = {};
+volatile __u32 ssc_node_capacity[MAX_NODES] = {};
 
 /* Stats */
 volatile __u64 forced_release_cnt = 0;
 volatile __u32 stats_only_mode = 0;
+volatile __u64 ssc_claim_epoch = 1;
 volatile __u64 ssc_vote_epoch = 0;
 volatile __u64 ssc_vote_start_ns = 0;
 volatile __u64 ssc_vote_sum_run = 0;
@@ -120,6 +141,9 @@ volatile __u32 ssc_best_count = 2;
 volatile __u64 ssc_best_score = 0;
 volatile __u32 ssc_refine_low = 2;
 volatile __u32 ssc_refine_high = 2;
+volatile __u32 ssc_pending_active_count = 0;
+volatile __u64 ssc_pending_resize_score = 0;
+volatile __u32 ssc_pending_resize_delay = 0;
 volatile __u64 ssc_wait_ratio_ewma = 0;
 volatile __u32 ssc_shift_streak = 0;
 volatile __u32 ssc_resize_holdoff = 0;

@@ -27,6 +27,7 @@ const SCHEDULER_NAME: &str = "lb_simple";
 const DISABLE_BPF_ENV: &str = "LB_SIMPLE_DISABLE_BPF";
 const STATS_ONLY_ENV: &str = "LB_SIMPLE_STATS_ONLY";
 const SSC_CPU_CAP: usize = bpf_intf::MAX_CPUS as usize;
+const SSC_NODE_CAP: usize = bpf_intf::MAX_NODES as usize;
 
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
@@ -49,6 +50,7 @@ struct NumaTopology {
     remote_cpu_count: i64,
     first_socket_node: i32,
     first_socket_cpus: Vec<u32>,
+    node_cpus: Vec<(u32, Vec<u32>)>,
 }
 
 fn parse_cpu_list(cpulist: &str) -> Vec<u32> {
@@ -101,11 +103,13 @@ fn build_numa_topology_from_nodes(mut node_cpus: Vec<(u32, Vec<u32>)>) -> NumaTo
             remote_cpu_count: 0,
             first_socket_node: 0,
             first_socket_cpus: fallback_cpus,
+            node_cpus: vec![(0, (0..fallback).collect())],
         };
     }
 
     let first_socket_node = node_cpus[0].0;
     let first_socket_cpus = node_cpus[0].1.clone();
+    let published_node_cpus = node_cpus.clone();
     let mut cpu_to_node = Vec::new();
     let mut node_counts = Vec::new();
 
@@ -127,6 +131,7 @@ fn build_numa_topology_from_nodes(mut node_cpus: Vec<(u32, Vec<u32>)>) -> NumaTo
         remote_cpu_count: (total_cpu_count - local_cpu_count).max(0),
         first_socket_node: first_socket_node as i32,
         first_socket_cpus,
+        node_cpus: published_node_cpus,
     }
 }
 
@@ -173,21 +178,30 @@ fn publish_ssc_cpu_topology(
     ssc_cpu_count: &mut u32,
     ssc_cpu_list: &mut [u32; SSC_CPU_CAP],
     ssc_cpu_rank: &mut [u16; SSC_CPU_CAP],
+    ssc_node_capacity: &mut [u32; SSC_NODE_CAP],
     topology: &NumaTopology,
 ) {
     ssc_cpu_list.fill(0);
     ssc_cpu_rank.fill(SSC_CPU_CAP as u16);
+    ssc_node_capacity.fill(0);
 
     let mut count = 0usize;
-    for cpu in topology.first_socket_cpus.iter().copied() {
-        let cpu_idx = cpu as usize;
-        if cpu_idx >= SSC_CPU_CAP || count >= SSC_CPU_CAP {
-            continue;
+    for (node_id, cpus) in &topology.node_cpus {
+        let node_idx = *node_id as usize;
+        if node_idx < SSC_NODE_CAP {
+            ssc_node_capacity[node_idx] = u32::try_from(cpus.len()).unwrap_or(u32::MAX);
         }
 
-        ssc_cpu_list[count] = cpu;
-        ssc_cpu_rank[cpu_idx] = count as u16;
-        count += 1;
+        for cpu in cpus.iter().copied() {
+            let cpu_idx = cpu as usize;
+            if cpu_idx >= SSC_CPU_CAP || count >= SSC_CPU_CAP {
+                continue;
+            }
+
+            ssc_cpu_list[count] = cpu;
+            ssc_cpu_rank[cpu_idx] = count as u16;
+            count += 1;
+        }
     }
     *ssc_cpu_count = count as u32;
 }
@@ -198,7 +212,8 @@ fn initial_ssc_active_count(ssc_cpu_count: u32) -> u32 {
 
 /// Populate cpu_to_node BPF map and publish NUMA defaults.
 fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, stats_only: bool) {
-    let ssc_cpu_count = u32::try_from(topology.first_socket_cpus.len()).unwrap_or(u32::MAX);
+    let warm_start_ssc_cpu_count =
+        u32::try_from(topology.first_socket_cpus.len()).unwrap_or(u32::MAX);
 
     for (cpu, node_id) in &topology.cpu_to_node {
         let _ =
@@ -210,27 +225,89 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
     if let Some(bss) = skel.maps.bss_data.as_mut() {
         bss.dominant_node = topology.dominant_node;
         bss.stats_only_mode = u32::from(stats_only);
+        bss.ssc_cpu_node.fill(0);
+        for (cpu, node_id) in &topology.cpu_to_node {
+            let cpu_idx = *cpu as usize;
+            if cpu_idx < SSC_CPU_CAP {
+                bss.ssc_cpu_node[cpu_idx] = *node_id;
+            }
+        }
         publish_ssc_cpu_topology(
             &mut bss.ssc_cpu_count,
             &mut bss.ssc_cpu_list,
             &mut bss.ssc_cpu_rank,
+            &mut bss.ssc_node_capacity,
             topology,
         );
     }
 
     if let Some(data) = skel.maps.data_data.as_mut() {
-        data.ssc_active_count = initial_ssc_active_count(ssc_cpu_count);
+        data.ssc_active_count = initial_ssc_active_count(warm_start_ssc_cpu_count);
     }
 
     info!(
-        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} first_socket_node={} ssc_cpu_count={} stats_only={}",
+        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} first_socket_node={} first_socket_cpus={} ssc_candidate_cpus={} stats_only={}",
         topology.dominant_node,
         topology.local_cpu_count,
         topology.remote_cpu_count,
         topology.first_socket_node,
         topology.first_socket_cpus.len(),
+        topology.cpu_to_node.len(),
         stats_only
     );
+}
+
+#[cfg(test)]
+fn test_publish_ssc_cpu_topology(
+    topology: &NumaTopology,
+) -> (
+    u32,
+    [u32; SSC_CPU_CAP],
+    [u16; SSC_CPU_CAP],
+    [u32; SSC_NODE_CAP],
+) {
+    let mut ssc_cpu_count = 0u32;
+    let mut ssc_cpu_list = [0u32; SSC_CPU_CAP];
+    let mut ssc_cpu_rank = [SSC_CPU_CAP as u16; SSC_CPU_CAP];
+    let mut ssc_node_capacity = [0u32; SSC_NODE_CAP];
+
+    publish_ssc_cpu_topology(
+        &mut ssc_cpu_count,
+        &mut ssc_cpu_list,
+        &mut ssc_cpu_rank,
+        &mut ssc_node_capacity,
+        topology,
+    );
+
+    (
+        ssc_cpu_count,
+        ssc_cpu_list,
+        ssc_cpu_rank,
+        ssc_node_capacity,
+    )
+}
+
+#[cfg(test)]
+fn topology_candidate_prefix(topology: &NumaTopology) -> Vec<u32> {
+    topology
+        .node_cpus
+        .iter()
+        .flat_map(|(_, cpus)| cpus.iter().copied())
+        .collect()
+}
+
+#[cfg(test)]
+fn topology_node_capacities(topology: &NumaTopology) -> [u32; SSC_NODE_CAP] {
+    let mut capacities = [0u32; SSC_NODE_CAP];
+
+    for (node_id, cpus) in &topology.node_cpus {
+        let node_idx = *node_id as usize;
+        if node_idx < SSC_NODE_CAP {
+            capacities[node_idx] = u32::try_from(cpus.len()).unwrap_or(u32::MAX);
+        }
+    }
+
+    capacities
 }
 
 fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
@@ -410,6 +487,36 @@ mod tests {
         assert_eq!(topology.dominant_node, 1);
         assert_eq!(topology.local_cpu_count, 4);
         assert_eq!(topology.remote_cpu_count, 3);
+        assert_eq!(
+            topology_candidate_prefix(&topology),
+            vec![0, 2, 8, 9, 10, 11, 12]
+        );
+        assert_eq!(topology_node_capacities(&topology)[0], 2);
+        assert_eq!(topology_node_capacities(&topology)[1], 4);
+        assert_eq!(topology_node_capacities(&topology)[2], 1);
+    }
+
+    #[test]
+    fn publish_ssc_topology_exposes_all_candidate_cpus_and_node_capacities() {
+        let topology = build_numa_topology_from_nodes(vec![
+            (1, vec![8, 9]),
+            (0, vec![0, 2, 4]),
+            (2, vec![12]),
+        ]);
+        let (ssc_cpu_count, ssc_cpu_list, ssc_cpu_rank, ssc_node_capacity) =
+            test_publish_ssc_cpu_topology(&topology);
+
+        assert_eq!(ssc_cpu_count, 6);
+        assert_eq!(&ssc_cpu_list[..6], &[0, 2, 4, 8, 9, 12]);
+        assert_eq!(ssc_cpu_rank[0], 0);
+        assert_eq!(ssc_cpu_rank[2], 1);
+        assert_eq!(ssc_cpu_rank[4], 2);
+        assert_eq!(ssc_cpu_rank[8], 3);
+        assert_eq!(ssc_cpu_rank[9], 4);
+        assert_eq!(ssc_cpu_rank[12], 5);
+        assert_eq!(ssc_node_capacity[0], 3);
+        assert_eq!(ssc_node_capacity[1], 2);
+        assert_eq!(ssc_node_capacity[2], 1);
     }
 
     #[test]
@@ -435,12 +542,32 @@ mod tests {
             "BPF globals should expose SSC CPU list",
         );
         assert!(
+            maps.contains("ssc_cpu_node"),
+            "BPF globals should expose CPU-to-node metadata in .bss for lock-safe claim rebuilding",
+        );
+        assert!(
             maps.contains("ssc_active_count"),
             "BPF globals should expose active SSC CPU count",
         );
         assert!(
             maps.contains("ssc_cpu_rank"),
             "BPF globals should expose SSC CPU rank table",
+        );
+        assert!(
+            maps.contains("ssc_node_capacity"),
+            "BPF globals should expose per-node SSC candidate capacities",
+        );
+        assert!(
+            maps.contains("ssc_claim_epoch"),
+            "BPF globals should expose a claim-epoch separate from the vote epoch",
+        );
+        assert!(
+            maps.contains("ssc_pending_active_count"),
+            "BPF globals should expose a pending SSC resize target",
+        );
+        assert!(
+            maps.contains("ssc_pending_resize_delay"),
+            "BPF globals should expose the delayed-resize window countdown",
         );
         assert!(
             admission.contains("get_ssc_cpu_by_index"),
@@ -451,6 +578,7 @@ mod tests {
     #[test]
     fn ssc_helper_headers_define_task_membership_helpers() {
         let admission = include_str!("bpf/admission.bpf.h");
+        let compact_admission = compact(admission);
 
         assert!(
             admission.contains("is_cpu_ssc_core"),
@@ -461,12 +589,40 @@ mod tests {
             "BPF helpers should expose task-level SSC-core membership checks",
         );
         assert!(
-            admission.contains("ssc_cpu_rank[cpu]"),
-            "CPU-level SSC-core checks should read per-CPU SSC rank",
+            admission.contains("lookup_ssc_claim_state"),
+            "BPF helpers should expose dynamic SSC claim-state lookups",
         );
         assert!(
-            admission.contains("rank < ssc_active_count"),
-            "CPU-level SSC-core checks should clamp membership by active count",
+            compact_admission.contains("returnstate->cpu_slot[cpu]<state->claimed_count&&state->cpu_slot[cpu]<ssc_active_count;"),
+            "CPU-level SSC-core checks should clamp dynamic SSC membership by both claim order and active_count",
+        );
+        assert!(
+            compact_admission.contains("if(!state||state->epoch!=ssc_claim_epoch)returnfalse;"),
+            "CPU-level SSC-core checks should validate claim membership against the dedicated claim epoch",
+        );
+        assert!(
+            admission.contains("try_claim_ssc_core"),
+            "BPF helpers should expose first-arrival SSC claim logic",
+        );
+        assert!(
+            admission.contains("trim_ssc_claims_to_active_count"),
+            "BPF helpers should trim late claims when active_count shrinks",
+        );
+        assert!(
+            compact_admission.contains(
+                "slot=state->claimed_count;if(slot>=ssc_active_count||slot>=ssc_cpu_count||slot>=MAX_CPUS)gotoout_unlock;",
+            ),
+            "Dynamic SSC claims should clamp the slot index before touching slot_cpu",
+        );
+        assert!(
+            compact_admission.contains(
+                "slot=claimed-1;if(slot>=MAX_CPUS){state->claimed_count=MAX_CPUS;continue;}",
+            ),
+            "SSC claim trimming should clamp oversized claimed_count before indexing slot_cpu",
+        );
+        assert!(
+            admission.contains("ssc_claims_complete"),
+            "BPF helpers should expose a claim-completeness gate for vote decisions",
         );
     }
 
@@ -507,6 +663,10 @@ mod tests {
         assert!(
             maps.contains("ssc_vote_slot_map"),
             "BPF maps should expose per-core SSC vote slots",
+        );
+        assert!(
+            maps.contains("ssc_claim_state_map"),
+            "BPF maps should expose shared dynamic SSC claim state",
         );
     }
 
@@ -549,6 +709,10 @@ mod tests {
             "BPF globals should expose the resize holdoff window count",
         );
         assert!(
+            maps.contains("ssc_pending_resize_score"),
+            "BPF globals should expose the deferred resize score used once the new count becomes effective",
+        );
+        assert!(
             stats.contains("detect_ssc_workload_shift"),
             "BPF stats helpers should expose workload-shift detection",
         );
@@ -567,8 +731,8 @@ mod tests {
             "simple_tick should publish SSC-core samples into the vote state",
         );
         assert!(
-            main.contains("ssc_vote_publish_count*2>ssc_active_count"),
-            "simple_tick should require a strict majority quorum",
+            main.contains("ssc_claims_complete()&&ssc_vote_publish_count>=ssc_active_count"),
+            "simple_tick should wait for a fully claimed and fully published SSC window before adjusting active_count",
         );
         assert!(
             main.contains("ssc_vote_consec_grow>=2"),
@@ -579,12 +743,25 @@ mod tests {
             "simple_tick should only halve active_count after two consecutive drops below the effective score",
         );
         assert!(
-            main.contains("ssc_set_active_count(ssc_active_count<<1,score);"),
-            "simple_tick should funnel doubled active_count through the clamped resize helper",
+            main.contains("ssc_schedule_active_count(next_target,score);"),
+            "simple_tick should schedule doubled active_count through the delayed resize helper",
         );
         assert!(
-            main.contains("ssc_set_active_count(ssc_next_refine_target(),ssc_best_score);"),
-            "simple_tick should funnel refinement targets through the clamped resize helper",
+            main.contains("ssc_schedule_active_count(next_target,ssc_best_score);"),
+            "simple_tick should funnel refinement targets through the delayed resize helper",
+        );
+        assert!(
+            main.contains("if(ssc_resize_pending()){rotate_ssc_vote_window(now);gotoout_ssc;}"),
+            "simple_tick should let a scheduled resize wait for one full window before applying another controller decision",
+        );
+        assert!(
+            main.contains("on_ssc_core=try_claim_ssc_core(scx_bpf_task_cpu(p));"),
+            "simple_tick should let first arrivals dynamically claim SSC cores on their current CPU",
+        );
+        assert!(
+            compact(&main)
+                .contains("if(!on_ssc_core&&tc)on_ssc_core=try_claim_ssc_core(scx_bpf_task_cpu(p));"),
+            "simple_tick should allow tracked tasks to refresh SSC claims even when they are lock-protected",
         );
     }
 
@@ -615,6 +792,14 @@ mod tests {
             "BPF stats helpers should expose the seek-reset helper used after confirmed workload shifts",
         );
         assert!(
+            stats.contains("ssc_schedule_active_count"),
+            "BPF stats helpers should expose a delayed-resize scheduler",
+        );
+        assert!(
+            stats.contains("ssc_apply_pending_resize"),
+            "BPF stats helpers should apply pending resizes only when a later vote window rotates",
+        );
+        assert!(
             stats.contains("ssc_next_refine_target"),
             "BPF stats helpers should expose bounded refinement target selection",
         );
@@ -629,6 +814,10 @@ mod tests {
         assert!(
             compact_stats.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
             "confirmed workload shifts should reset the controller back to fast seek mode",
+        );
+        assert!(
+            compact_stats.contains("if(ssc_pending_resize_delay){ssc_pending_resize_delay--;return;}"),
+            "pending SSC resizes should wait one full window before becoming effective",
         );
         assert!(
             !stats.contains("demand_shift"),
@@ -731,12 +920,20 @@ mod tests {
         let mcs_tas = include_str!("mcs_tas.rs");
 
         assert!(
-            main.contains("if(is_task_lock_protected(tc)){tc->admitted=1;scx_bpf_dsq_insert(p,READY_DSQ_ID,SCX_SLICE_DFL,enq_flags);return;}"),
+            main.contains("if(is_task_lock_protected(tc)){tc->admitted=1;gotoout_insert;}"),
             "enqueue should keep protected spinner/owner tasks in READY_DSQ",
+        );
+        assert!(
+            main.contains("scx_bpf_dsq_insert(p,dsq_id,SCX_SLICE_DFL,enq_flags);"),
+            "enqueue should funnel both protected and unprotected paths through a single DSQ insert",
         );
         assert!(
             main.contains("if(lock_protected){keep_task_lock_protected(p,tc);return;}"),
             "tick should skip self-parking for protected non-SSC tasks",
+        );
+        assert!(
+            main.contains("if(tc){tc->admitted=0;p->scx.slice=0;}"),
+            "non-SSC tasks that lose the claim race should clear their slice and reenqueue through SSC_DSQ",
         );
         assert!(
             mcs_tas.contains("set_thread_lock_state(LockSchedState::Spinner);"),

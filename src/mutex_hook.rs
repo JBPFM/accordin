@@ -12,6 +12,7 @@ use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 /// BPF map handle for nodes_map, set by lib.rs after BPF load.
 static NODES_MAP: OnceLock<MapHandle> = OnceLock::new();
+const SCHED_EXT_POLICY: i32 = 7;
 
 pub fn set_nodes_map(map: MapHandle) {
     let _ = NODES_MAP.set(map);
@@ -35,6 +36,18 @@ impl NodesMapOps for MapHandle {
 #[inline(always)]
 fn current_tid() -> u32 {
     unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+pub fn enable_sched_ext_for_current_thread() -> std::io::Result<()> {
+    let param = libc::sched_param { sched_priority: 0 };
+    let ret =
+        unsafe { libc::sched_setscheduler(current_tid() as libc::pid_t, SCHED_EXT_POLICY, &param) };
+
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn register_thread_with_map<M>(map: &M, tid: u32, thread_index: i32) -> bool
@@ -93,8 +106,16 @@ thread_local! {
 fn ensure_registered() {
     REGISTERED.with(|r| {
         if !r.get() {
-            register_thread_node();
-            _GUARD.with(|g| unsafe { *g.get() = Some(ThreadNodeGuard) });
+            if NODES_MAP.get().is_some() {
+                if let Err(err) = enable_sched_ext_for_current_thread() {
+                    eprintln!(
+                        "[lb_simple] Failed to move thread {} to SCHED_EXT: {err}",
+                        current_tid()
+                    );
+                }
+                register_thread_node();
+                _GUARD.with(|g| unsafe { *g.get() = Some(ThreadNodeGuard) });
+            }
             r.set(true);
         }
     });

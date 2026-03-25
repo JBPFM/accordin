@@ -73,6 +73,8 @@ fn init_bpf(debug: bool) -> Result<BpfState> {
 
     skel.attach()
         .context("failed to attach FlexGuard BPF skeleton")?;
+    mutex_hook::enable_sched_ext_for_current_thread()
+        .context("failed to move initial thread to SCHED_EXT")?;
 
     info!("{RUNTIME_NAME} FlexGuard userspace-state BPF loaded");
     Ok(BpfState { _skel: Some(skel) })
@@ -223,6 +225,64 @@ mod tests {
         assert!(
             !hook.contains("thread_ctx()"),
             "mutex hook should no longer export user-space context pointers to BPF",
+        );
+    }
+
+    #[test]
+    fn simple_scx_scheduler_contract() {
+        let bpf = compact(include_str!("bpf/flexguard_userspace_state.bpf.c"));
+
+        assert!(
+            bpf.contains("#include<scx/common.bpf.h>"),
+            "combined BPF source should include sched_ext common helpers",
+        );
+        assert!(
+            bpf.contains("SEC(\"tp_btf/sched_switch\")"),
+            "combined BPF source should keep the sched_switch tracepoint program",
+        );
+        assert!(
+            bpf.contains("BPF_STRUCT_OPS(lb_simple_select_cpu,"),
+            "combined BPF source should define a minimal sched_ext select_cpu callback",
+        );
+        assert!(
+            bpf.contains("SCX_OPS_DEFINE(lb_simple_ops,"),
+            "combined BPF source should expose the sched_ext ops definition",
+        );
+        assert!(
+            bpf.contains(".name=\"lb_simple\""),
+            "sched_ext ops should keep the lb_simple scheduler name",
+        );
+    }
+
+    #[test]
+    fn partial_switch_limits_sched_ext_to_current_program() {
+        let bpf = compact(include_str!("bpf/flexguard_userspace_state.bpf.c"));
+        let hook = include_str!("mutex_hook.rs");
+        let lib = include_str!("lib.rs");
+        let production = lib
+            .split("#[cfg(test)]")
+            .next()
+            .expect("lib.rs should contain a test module split point");
+
+        assert!(
+            bpf.contains(".flags=SCX_OPS_SWITCH_PARTIAL"),
+            "sched_ext ops should enable partial switch so only SCHED_EXT tasks use lb_simple",
+        );
+        assert!(
+            hook.contains("enable_sched_ext_for_current_thread"),
+            "mutex hook should expose a helper that moves the current thread into SCHED_EXT",
+        );
+        assert!(
+            hook.contains("sched_setscheduler"),
+            "mutex hook should switch participating threads to the SCHED_EXT policy",
+        );
+        assert!(
+            hook.contains("if let Err(err) = enable_sched_ext_for_current_thread()"),
+            "thread registration should move each participating thread to SCHED_EXT and handle failures",
+        );
+        assert!(
+            production.contains("mutex_hook::enable_sched_ext_for_current_thread"),
+            "BPF loader should move the initial thread into SCHED_EXT after attach",
         );
     }
 

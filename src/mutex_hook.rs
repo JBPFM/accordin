@@ -7,14 +7,19 @@ use std::hint::spin_loop;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::mcs_tas::{McsTasLockRaw, thread_ctx};
+use crate::mcs_tas::{McsTasLockRaw, current_thread_index, thread_ctx};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 /// BPF map handle for thread_ctx_addr_map, set by lib.rs after BPF load.
 static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
+static NODES_MAP: OnceLock<MapHandle> = OnceLock::new();
 
 pub fn set_thread_ctx_map(map: MapHandle) {
     let _ = THREAD_CTX_MAP.set(map);
+}
+
+pub fn set_nodes_map(map: MapHandle) {
+    let _ = NODES_MAP.set(map);
 }
 
 trait ThreadCtxMapOps {
@@ -53,22 +58,45 @@ where
 
 /// Register the current thread's LockSchedThreadCtx pointer into the BPF map.
 /// Called once per thread on first pthread_mutex_lock.
-fn register_thread_ctx() {
+fn register_thread_ctx() -> bool {
     let Some(map) = THREAD_CTX_MAP.get() else {
-        return;
+        return false;
     };
 
     let tid = current_tid();
     let ctx_ptr = thread_ctx() as u64;
-    let _ = register_thread_ctx_with_map(map, tid, ctx_ptr);
+    register_thread_ctx_with_map(map, tid, ctx_ptr)
 }
 
-/// Delete the current thread's entry from the BPF map.
-fn unregister_thread_ctx() {
+fn register_thread_index() -> bool {
+    let Some(map) = NODES_MAP.get() else {
+        return false;
+    };
+
+    let tid = current_tid();
+    let thread_index = current_thread_index();
+    map.update(
+        &tid.to_ne_bytes(),
+        &thread_index.to_ne_bytes(),
+        MapFlags::ANY,
+    )
+    .is_ok()
+}
+
+/// Delete the current thread's entries from the BPF maps.
+fn unregister_thread_state() {
     let Some(map) = THREAD_CTX_MAP.get() else {
+        if let Some(nodes_map) = NODES_MAP.get() {
+            let _ = nodes_map.delete(&current_tid().to_ne_bytes());
+        }
         return;
     };
-    let _ = unregister_thread_ctx_with_map(map, current_tid());
+
+    let tid = current_tid();
+    let _ = unregister_thread_ctx_with_map(map, tid);
+    if let Some(nodes_map) = NODES_MAP.get() {
+        let _ = nodes_map.delete(&tid.to_ne_bytes());
+    }
 }
 
 /// Thread-local guard that unregisters from the BPF map on thread exit.
@@ -76,7 +104,7 @@ struct ThreadCtxGuard;
 
 impl Drop for ThreadCtxGuard {
     fn drop(&mut self) {
-        unregister_thread_ctx();
+        unregister_thread_state();
     }
 }
 
@@ -90,9 +118,13 @@ thread_local! {
 fn ensure_registered() {
     REGISTERED.with(|r| {
         if !r.get() {
-            register_thread_ctx();
-            _GUARD.with(|g| unsafe { *g.get() = Some(ThreadCtxGuard) });
-            r.set(true);
+            let registered_ctx = register_thread_ctx();
+            let registered_index = register_thread_index();
+
+            if registered_ctx || registered_index {
+                _GUARD.with(|g| unsafe { *g.get() = Some(ThreadCtxGuard) });
+                r.set(true);
+            }
         }
     });
 }

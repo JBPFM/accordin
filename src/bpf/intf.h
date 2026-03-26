@@ -6,6 +6,12 @@
 #define __kptr
 #endif
 
+/*
+ * Re-export the FlexGuard shared layout so bindgen can generate the Rust-side
+ * constants and qnode type used by the userspace lock runtime.
+ */
+#include "flexguard_bpf.h"
+
 #define READY_DSQ_ID 0x100ULL
 #define SSC_DSQ_ID 0x5CCULL
 #define MAX_TASKS 65536U

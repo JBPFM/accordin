@@ -255,9 +255,15 @@ fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
     // Load the BPF program
     let mut skel = scx_ops_load!(skel, lb_simple_ops, uei)?;
 
+    if let Some(bss) = skel.maps.bss_data.as_mut() {
+        mcs_tas::install_bpf_runtime(bss.qnodes.as_mut_ptr(), &mut bss.num_preempted_cs);
+    }
+
     // Duplicate the map handle so mutex hooks can use libbpf helpers directly.
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
     mutex_hook::set_thread_ctx_map(thread_ctx_map);
+    let nodes_map = MapHandle::try_from(&skel.maps.nodes_map)?;
+    mutex_hook::set_nodes_map(nodes_map);
 
     // Publish cpu_to_node map and NUMA defaults after load.
     publish_scheduler_topology(&mut skel, &topology, stats_only);

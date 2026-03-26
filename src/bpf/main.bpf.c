@@ -19,6 +19,87 @@ UEI_DEFINE(uei);
 #include "maps.bpf.h"
 #include "stats.bpf.h"
 
+#include "bpf_fixes.bpf.h"
+#include "flexguard_bpf.h"
+#include "platform_defs.h"
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+#ifdef DEBUG
+#define DPRINT(args...) bpf_printk(args);
+#else
+#define DPRINT(...)
+#endif
+
+flexguard_qnode_t qnodes[MAX_NUMBER_THREADS];
+
+num_preempted_cs_t num_preempted_cs = 0;
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, u32);
+  __type(value, int);
+  __uint(max_entries, MAX_NUMBER_THREADS);
+} nodes_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, u32);
+  __type(value, u32);
+  __uint(max_entries, MAX_NUMBER_THREADS);
+} is_preempted_map SEC(".maps");
+
+SEC("tp_btf/sched_switch")
+int BPF_PROG(sched_switch_btf, bool preempt, struct task_struct *prev,
+             struct task_struct *next) {
+  u32 key;
+  flexguard_qnode_ptr qnode;
+  int *thread_id;
+
+  /*
+   * Clear preempted status of next thread.
+   * Optimization: skip if next is a kernel thread.
+   */
+  if (!(next->flags & 0x00200000)) // PF_KTHREAD
+  {
+    key = next->pid;
+    if (bpf_map_delete_elem(&is_preempted_map, &key) == 0)
+      __sync_fetch_and_add(&num_preempted_cs, -1);
+  }
+
+  /*
+   * Optimization: No map lookup if prev is a kernel thread.
+   */
+  if (prev->flags & 0x00200000) // PF_KTHREAD
+    return 0;
+
+  /*
+   * Retrieve prev's qnode.
+   */
+  key = prev->pid;
+  thread_id = bpf_map_lookup_elem(&nodes_map, &key);
+  if (!thread_id || *thread_id < 0 || *thread_id >= MAX_NUMBER_THREADS ||
+      !(qnode = &qnodes[*thread_id]))
+    return 0;
+
+  if (get_task_state(prev) &
+      ((((TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_STOPPED |
+          TASK_TRACED | EXIT_DEAD | EXIT_ZOMBIE | TASK_PARKED) +
+         1)
+        << 1) -
+       1))
+    return 0;
+
+  if (flexguard_is_critical_state(qnode->cs_counter)) {
+    DPRINT("Detected preemption: %s (%d) -> %s (%d)", prev->comm, prev->pid,
+           next->comm, next->pid);
+    bpf_map_update_elem(&is_preempted_map, &key, &key, BPF_NOEXIST);
+    __sync_fetch_and_add(&num_preempted_cs, 1);
+  }
+
+  return 0;
+}
 /* ------------------------------------------------------------------ */
 /*  Callbacks                                                          */
 /* ------------------------------------------------------------------ */

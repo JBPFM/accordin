@@ -271,12 +271,44 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_blocks_lowpri_dsq_while_critical_threads_are_preempted() {
+    fn dispatch_uses_capped_lowpri_credit_refills() {
         let bpf = compact(include_str!("bpf/flexguard_userspace_state.bpf.c"));
 
         assert!(
-            bpf.contains("if(num_preempted_cs==0)scx_bpf_dsq_move_to_local(LOWPRI_DSQ_ID);"),
-            "dispatch should only pull from the low-priority DSQ when no critical thread is currently preempted",
+            bpf.contains("#defineLOWPRI_CREDIT_MAX1"),
+            "low-priority dispatch should cap accumulated release credit to avoid post-critical bursts",
+        );
+        assert!(
+            bpf.contains("u32lowpri_credit=0;"),
+            "scheduler should track explicit low-priority dispatch credit",
+        );
+        assert!(
+            bpf.contains("#defineLOWPRI_REFILL_INTERVAL_NS"),
+            "scheduler should define a periodic low-priority credit refill interval",
+        );
+        assert!(
+            bpf.contains("u64lowpri_last_refill_ns=0;"),
+            "scheduler should keep a timestamp for periodic low-priority credit refills",
+        );
+        assert!(
+            bpf.contains("BPF_STRUCT_OPS(lb_simple_stopping,"),
+            "scheduler should refill low-priority credit from the stopping callback",
+        );
+        assert!(
+            bpf.contains(".stopping=(void*)lb_simple_stopping"),
+            "sched_ext ops should wire the stopping callback",
+        );
+        assert!(
+            bpf.contains("scx_bpf_now()"),
+            "scheduler should use time-based refills to prevent low-priority starvation",
+        );
+        assert!(
+            bpf.contains("scx_bpf_dsq_nr_queued(LOWPRI_DSQ_ID)"),
+            "scheduler should query the low-priority DSQ backlog before refilling credit",
+        );
+        assert!(
+            bpf.contains("if(lowpri_credit>0&&scx_bpf_dsq_move_to_local(LOWPRI_DSQ_ID))"),
+            "dispatch should require positive low-priority credit before draining the low-priority DSQ",
         );
     }
 

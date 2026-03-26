@@ -40,10 +40,14 @@
 #endif
 
 #define LOWPRI_DSQ_ID 1
+#define LOWPRI_CREDIT_MAX 1
+#define LOWPRI_REFILL_INTERVAL_NS (1000 * 1000)
 
 flexguard_qnode_t qnodes[MAX_NUMBER_THREADS];
 
 num_preempted_cs_t num_preempted_cs = 0;
+u32 lowpri_credit = 0;
+u64 lowpri_last_refill_ns = 0;
 
 char _license[] SEC("license") = "GPL";
 
@@ -110,6 +114,21 @@ int BPF_PROG(sched_switch_btf, bool preempt, struct task_struct *prev, struct ta
 	return 0;
 }
 
+static __always_inline void refill_lowpri_credit(u64 now)
+{
+	if (!scx_bpf_dsq_nr_queued(LOWPRI_DSQ_ID))
+	{
+		lowpri_credit = 0;
+		return;
+	}
+
+	if (lowpri_credit >= LOWPRI_CREDIT_MAX)
+		return;
+
+	lowpri_credit++;
+	lowpri_last_refill_ns = now;
+}
+
 s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -136,13 +155,24 @@ bool BPF_STRUCT_OPS(lb_simple_yield, struct task_struct *from, struct task_struc
 	return true;
 }
 
+void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)
+{
+	refill_lowpri_credit(scx_bpf_now());
+}
+
 void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev)
 {
+	u64 now;
+
 	if (scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL))
 		return;
 
-	if (num_preempted_cs == 0)
-		scx_bpf_dsq_move_to_local(LOWPRI_DSQ_ID);
+	now = scx_bpf_now();
+	if (lowpri_last_refill_ns == 0 || now - lowpri_last_refill_ns >= LOWPRI_REFILL_INTERVAL_NS)
+		refill_lowpri_credit(now);
+
+	if (lowpri_credit > 0 && scx_bpf_dsq_move_to_local(LOWPRI_DSQ_ID))
+		lowpri_credit--;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init)
@@ -158,6 +188,7 @@ void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei)
 SCX_OPS_DEFINE(lb_simple_ops,
 	       .select_cpu = (void *)lb_simple_select_cpu,
 	       .enqueue = (void *)lb_simple_enqueue,
+	       .stopping = (void *)lb_simple_stopping,
 	       .yield = (void *)lb_simple_yield,
 	       .dispatch = (void *)lb_simple_dispatch,
 	       .init = (void *)lb_simple_init,

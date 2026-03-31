@@ -43,7 +43,9 @@
 
 flexguard_qnode_t qnodes[MAX_NUMBER_THREADS];
 
-num_preempted_cs_t num_preempted_cs = 0;
+preempted_flag_t preempted_flags[MAX_NUMBER_THREADS];
+
+num_preempted_holders_t num_preempted_holders = 0;
 
 char _license[4] SEC("license") = "GPL";
 
@@ -55,20 +57,14 @@ struct
 	__uint(max_entries, MAX_NUMBER_THREADS);
 } nodes_map SEC(".maps");
 
-struct
-{
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, u32);
-	__type(value, u32);
-	__uint(max_entries, MAX_NUMBER_THREADS);
-} is_preempted_map SEC(".maps");
-
 SEC("tp_btf/sched_switch")
 int BPF_PROG(sched_switch_btf, bool preempt, struct task_struct *prev, struct task_struct *next)
 {
 	u32 key;
 	flexguard_qnode_ptr qnode;
 	int *thread_id;
+	int thread_index;
+	unsigned char state;
 
 	/*
 	 * Clear preempted status of next thread.
@@ -77,8 +73,18 @@ int BPF_PROG(sched_switch_btf, bool preempt, struct task_struct *prev, struct ta
 	if (!(next->flags & 0x00200000)) // PF_KTHREAD
 	{
 		key = next->pid;
-		if (bpf_map_delete_elem(&is_preempted_map, &key) == 0)
-			__sync_fetch_and_add(&num_preempted_cs, -1);
+		thread_id = bpf_map_lookup_elem(&nodes_map, &key);
+		if (thread_id && *thread_id >= 0 && *thread_id < MAX_NUMBER_THREADS)
+		{
+			thread_index = *thread_id;
+			if (preempted_flags[thread_index])
+			{
+				state = qnodes[thread_index].cs_counter;
+				preempted_flags[thread_index] = 0;
+				if (flexguard_is_holder_state(state))
+					__sync_fetch_and_add(&num_preempted_holders, -1);
+			}
+		}
 	}
 
 	/*
@@ -92,17 +98,21 @@ int BPF_PROG(sched_switch_btf, bool preempt, struct task_struct *prev, struct ta
 	 */
 	key = prev->pid;
 	thread_id = bpf_map_lookup_elem(&nodes_map, &key);
-	if (!thread_id || *thread_id < 0 || *thread_id >= MAX_NUMBER_THREADS || !(qnode = &qnodes[*thread_id]))
+	if (!thread_id || *thread_id < 0 || *thread_id >= MAX_NUMBER_THREADS)
 		return 0;
+	thread_index = *thread_id;
+	qnode = &qnodes[thread_index];
 
 	if (get_task_state(prev) & ((((TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE | TASK_STOPPED | TASK_TRACED | EXIT_DEAD | EXIT_ZOMBIE | TASK_PARKED) + 1) << 1) - 1))
 		return 0;
 
-	if (flexguard_is_critical_state(qnode->cs_counter))
+	state = qnode->cs_counter;
+	if (!preempted_flags[thread_index] && flexguard_is_critical_state(state))
 	{
 		DPRINT("Detected preemption: %s (%d) -> %s (%d)", prev->comm, prev->pid, next->comm, next->pid);
-		bpf_map_update_elem(&is_preempted_map, &key, &key, BPF_NOEXIST);
-		__sync_fetch_and_add(&num_preempted_cs, 1);
+		preempted_flags[thread_index] = 1;
+		if (flexguard_is_holder_state(state))
+			__sync_fetch_and_add(&num_preempted_holders, 1);
 	}
 
 	return 0;

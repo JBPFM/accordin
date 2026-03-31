@@ -91,12 +91,18 @@ thread_local! {
 /// Ensure the current thread is registered in the BPF map (idempotent).
 #[inline(always)]
 fn ensure_registered() {
+    if NODES_MAP.get().is_none() {
+        return;
+    }
+
     REGISTERED.with(|r| {
-        if !r.get() {
-            register_thread_node();
-            _GUARD.with(|g| unsafe { *g.get() = Some(ThreadNodeGuard) });
-            r.set(true);
+        if r.get() {
+            return;
         }
+
+        register_thread_node();
+        _GUARD.with(|g| unsafe { *g.get() = Some(ThreadNodeGuard) });
+        r.set(true);
     });
 }
 

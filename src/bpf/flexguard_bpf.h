@@ -20,15 +20,23 @@ typedef volatile flexguard_qnode_t *flexguard_qnode_ptr;
 enum {
   FLEXGUARD_CRITICAL_STATE_NONE = 0,
   FLEXGUARD_CRITICAL_STATE_HELD = 1u << 0,
-  FLEXGUARD_CRITICAL_STATE_HANDOFF = 1u << 1,
+  FLEXGUARD_CRITICAL_STATE_FRONT = 1u << 1,
 };
 
 static inline int flexguard_is_critical_state(unsigned char cs_counter) {
   return (cs_counter &
-          (FLEXGUARD_CRITICAL_STATE_HELD | FLEXGUARD_CRITICAL_STATE_HANDOFF)) !=
-         0;
+          (FLEXGUARD_CRITICAL_STATE_HELD | FLEXGUARD_CRITICAL_STATE_FRONT)) != 0;
 }
 
-typedef volatile long long num_preempted_cs_t;
+static inline int flexguard_is_holder_state(unsigned char cs_counter) {
+  return cs_counter == FLEXGUARD_CRITICAL_STATE_HELD;
+}
+
+static inline int flexguard_is_front_state(unsigned char cs_counter) {
+  return cs_counter == FLEXGUARD_CRITICAL_STATE_FRONT;
+}
+
+typedef volatile unsigned char preempted_flag_t;
+typedef volatile long long num_preempted_holders_t;
 
 #endif

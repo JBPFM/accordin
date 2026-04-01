@@ -9,19 +9,13 @@
 #include "maps.bpf.h"
 
 #define SSC_SCORE_SCALE 1024ULL
-#define SSC_SHIFT_EWMA_ALPHA_NUM 1ULL
-#define SSC_SHIFT_EWMA_ALPHA_DEN 4ULL
-#define SSC_SHIFT_WAIT_ABS_THRESHOLD (SSC_SCORE_SCALE / 12ULL)
-#define SSC_SHIFT_WAIT_REL_PCT 25ULL
-#define SSC_SHIFT_CONFIRM_WINDOWS 3U
-#define SSC_RESIZE_HOLDOFF_WINDOWS 3U
+#define SSC_UNLOCK_GATE_THRESHOLD 200000ULL
 
 /*
- * Statistics layer: window-based EWMA wait ratio computation.
+ * Statistics layer: window-based run/wait/unlock accounting.
  *
- * Provides seqcount-protected user-space reads, per-task run/wait
- * accounting, and the elected-leader window rollover with EWMA
- * and hysteresis-driven target adjustment.
+ * Provides user-space reads, per-task activity accounting, and the
+ * elected-leader window rollover with quorum-driven target adjustment.
  */
 
 /* ------------------------------------------------------------------ */
@@ -73,55 +67,15 @@ static __always_inline __u32 clamp_ssc_active_count(__u32 active_count) {
   return active_count;
 }
 
+static __always_inline __u64 estimate_ssc_window_unlocks(__u32 active_count) {
+  if (!ssc_vote_publish_count)
+    return 0;
+
+  return (ssc_vote_sum_unlock_count * active_count) / ssc_vote_publish_count;
+}
+
 static __always_inline __u64 compute_ssc_vote_score(__u32 active_count) {
-  __u64 useful_run;
-
-  if (!ssc_vote_sum_run)
-    return 0;
-
-  useful_run = ssc_vote_sum_run > ssc_vote_sum_wait
-                   ? ssc_vote_sum_run - ssc_vote_sum_wait
-                   : 0;
-
-  return ((__u64)active_count * useful_run * SSC_SCORE_SCALE) /
-         ssc_vote_sum_run;
-}
-
-static __always_inline __u64 abs_diff_u64(__u64 a, __u64 b) {
-  return a > b ? a - b : b - a;
-}
-
-static __always_inline bool rel_change_exceeds(__u64 cur, __u64 base,
-                                               __u64 pct) {
-  if (!base)
-    return cur > 0;
-
-  return abs_diff_u64(cur, base) * 100ULL >= base * pct;
-}
-
-static __always_inline __u64 ewma_update_u64(__u64 prev, __u64 sample) {
-  __u64 delta;
-
-  if (!prev)
-    return sample;
-
-  if (sample > prev) {
-    delta = sample - prev;
-    return prev + (delta * SSC_SHIFT_EWMA_ALPHA_NUM) /
-                      SSC_SHIFT_EWMA_ALPHA_DEN;
-  }
-
-  delta = prev - sample;
-  return prev -
-         (delta * SSC_SHIFT_EWMA_ALPHA_NUM) / SSC_SHIFT_EWMA_ALPHA_DEN;
-}
-
-static __always_inline __u64 compute_ssc_wait_ratio(__u64 run_ns,
-                                                    __u64 wait_ns) {
-  if (!run_ns)
-    return 0;
-
-  return (wait_ns * SSC_SCORE_SCALE) / run_ns;
+  return estimate_ssc_window_unlocks(active_count) * SSC_SCORE_SCALE;
 }
 
 static __always_inline void reset_ssc_refine_bounds(__u32 active_count) {
@@ -131,7 +85,6 @@ static __always_inline void reset_ssc_refine_bounds(__u32 active_count) {
 }
 
 static __always_inline void ssc_note_resize(__u64 effective_score) {
-  ssc_resize_holdoff = SSC_RESIZE_HOLDOFF_WINDOWS;
   ssc_vote_last_score = 0;
   ssc_vote_last_effective_score = effective_score;
   ssc_vote_consec_grow = 0;
@@ -180,52 +133,6 @@ static __always_inline __u32 ssc_next_refine_target(void) {
                                 ((ssc_refine_high - ssc_refine_low) >> 1));
 }
 
-static __always_inline bool detect_ssc_workload_shift(__u64 now,
-                                                      __u64 *wait_ratio_out) {
-  __u64 wait_ratio = compute_ssc_wait_ratio(ssc_vote_sum_run, ssc_vote_sum_wait);
-  __u64 demand = ssc_vote_sum_run + ssc_vote_sum_wait;
-  __u64 prev_wait_ratio = ssc_wait_ratio_ewma;
-  bool wait_shift = false;
-
-  (void)now;
-  (void)demand;
-
-  if (wait_ratio_out)
-    *wait_ratio_out = wait_ratio;
-
-  if (!ssc_shift_baseline_valid) {
-    ssc_wait_ratio_ewma = wait_ratio;
-    ssc_shift_baseline_valid = 1;
-    return false;
-  }
-
-  if (ssc_resize_holdoff) {
-    ssc_resize_holdoff--;
-    ssc_shift_streak = 0;
-    return false;
-  }
-
-  if (abs_diff_u64(wait_ratio, prev_wait_ratio) >= SSC_SHIFT_WAIT_ABS_THRESHOLD &&
-      rel_change_exceeds(wait_ratio, prev_wait_ratio, SSC_SHIFT_WAIT_REL_PCT))
-    wait_shift = true;
-
-  if (wait_shift)
-    ssc_shift_streak++;
-  else
-    ssc_shift_streak = 0;
-
-  if (ssc_shift_streak >= SSC_SHIFT_CONFIRM_WINDOWS) {
-    ssc_wait_ratio_ewma = wait_ratio;
-    ssc_shift_streak = 0;
-
-    return true;
-  }
-
-  ssc_wait_ratio_ewma = ewma_update_u64(prev_wait_ratio, wait_ratio);
-
-  return false;
-}
-
 static __always_inline void rotate_ssc_vote_window(__u64 now) {
   if (!ssc_vote_epoch)
     ssc_vote_epoch = 1;
@@ -235,6 +142,7 @@ static __always_inline void rotate_ssc_vote_window(__u64 now) {
   ssc_vote_start_ns = now;
   ssc_vote_sum_run = 0;
   ssc_vote_sum_wait = 0;
+  ssc_vote_sum_unlock_count = 0;
   ssc_vote_publish_count = 0;
 }
 
@@ -263,6 +171,7 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
                                                   __u32 pid, __u64 now) {
   __u64 run_delta = 0;
   __u64 wait_delta = 0;
+  __u64 unlock_delta = 0;
   struct lock_sched_thread_ctx uctx = {};
   struct agg_percpu *agg = lookup_cpu_agg();
 
@@ -273,6 +182,7 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
     tc->window_epoch = ssc_vote_epoch;
     tc->run_ns_window = 0;
     tc->wait_ns_window = 0;
+    tc->unlock_count_window = 0;
     tc->pending_wait_ns = 0;
   }
 
@@ -280,6 +190,7 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
     agg->epoch = ssc_vote_epoch;
     agg->run_ns = 0;
     agg->wait_ns = 0;
+    agg->unlock_count = 0;
   }
 
   if (!tc->run_start_ns) {
@@ -305,6 +216,11 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
         tc->pending_wait_ns = 0;
       }
 
+      if (uctx.unlock_count >= tc->last_unlock_count) {
+        unlock_delta = uctx.unlock_count - tc->last_unlock_count;
+        tc->last_unlock_count = uctx.unlock_count;
+      }
+
       if (uctx.wait_end_ns < uctx.wait_start_ns && now > uctx.wait_start_ns) {
         __u64 pending_wait = now - uctx.wait_start_ns;
 
@@ -324,10 +240,12 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
 
   tc->run_ns_window += run_delta;
   tc->wait_ns_window += wait_delta;
+  tc->unlock_count_window += unlock_delta;
 
   if (agg) {
     agg->run_ns += run_delta;
     agg->wait_ns += wait_delta;
+    agg->unlock_count += unlock_delta;
   }
 }
 
@@ -354,6 +272,7 @@ static __always_inline void publish_ssc_core_vote(struct task_scx_ctx *tc,
     agg->epoch = ssc_vote_epoch;
     agg->run_ns = 0;
     agg->wait_ns = 0;
+    agg->unlock_count = 0;
   }
 
   cpu = scx_bpf_task_cpu(p);
@@ -373,8 +292,10 @@ static __always_inline void publish_ssc_core_vote(struct task_scx_ctx *tc,
     slot->epoch = ssc_vote_epoch;
     slot->last_run_ns = agg->run_ns;
     slot->last_wait_ns = agg->wait_ns;
+    slot->last_unlock_count = agg->unlock_count;
     ssc_vote_sum_run += agg->run_ns;
     ssc_vote_sum_wait += agg->wait_ns;
+    ssc_vote_sum_unlock_count += agg->unlock_count;
     ssc_vote_publish_count++;
     return;
   }
@@ -387,6 +308,11 @@ static __always_inline void publish_ssc_core_vote(struct task_scx_ctx *tc,
   if (agg->wait_ns > slot->last_wait_ns) {
     ssc_vote_sum_wait += agg->wait_ns - slot->last_wait_ns;
     slot->last_wait_ns = agg->wait_ns;
+  }
+
+  if (agg->unlock_count > slot->last_unlock_count) {
+    ssc_vote_sum_unlock_count += agg->unlock_count - slot->last_unlock_count;
+    slot->last_unlock_count = agg->unlock_count;
   }
 }
 

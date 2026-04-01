@@ -2,10 +2,10 @@
 /*
  * lb_simple - sched_ext lock-aware SSC admission control scheduler.
  *
- * Continuously observes per-thread lock wait statistics exported from
- * userspace, computes workload-level wait ratios, and uses a single
- * SSC (Scheduling Suppression Chamber) DSQ to throttle concurrency
- * via admission control.
+ * Continuously observes per-thread lock activity exported from
+ * userspace, computes SSC vote-window unlock estimates, and uses a
+ * single SSC (Scheduling Suppression Chamber) DSQ to throttle
+ * concurrency via admission control.
  */
 #include <scx/common.bpf.h>
 
@@ -106,11 +106,6 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
 
     if (ssc_vote_publish_count * 2 > ssc_active_count) {
       __u64 score = compute_ssc_vote_score(ssc_active_count);
-      __u64 wait_ratio = 0;
-      bool shifted = ssc_search_phase == SSC_SEARCH_REFINE &&
-                     detect_ssc_workload_shift(now, &wait_ratio);
-
-      (void)wait_ratio;
 
       if (!ssc_vote_last_effective_score)
         ssc_vote_last_effective_score = score;
@@ -118,21 +113,6 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
         ssc_best_score = score;
         ssc_best_count = ssc_active_count;
         reset_ssc_refine_bounds(ssc_active_count);
-      }
-
-      if (shifted) {
-        ssc_search_phase = SSC_SEARCH_SEEK;
-
-        if (ssc_best_count != ssc_active_count)
-          ssc_set_active_count(ssc_best_count, ssc_best_score);
-        else
-          ssc_note_resize(ssc_best_score);
-
-        ssc_best_count = ssc_active_count;
-        reset_ssc_refine_bounds(ssc_active_count);
-
-        rotate_ssc_vote_window(now);
-        return;
       }
 
       if (ssc_vote_last_score) {
@@ -182,13 +162,15 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
     }
 
   } else {
-    /*
-     * If active count is above target, force a reschedule so the
-     * current task enters stopping() -> self-parking sooner.
-     */
-    if (tc && tc->run_ns_window / 10 < tc->wait_ns_window) {
-      tc->admitted = 0;
-      p->scx.slice = 0;
+    __u64 unlock_estimate = estimate_ssc_window_unlocks(ssc_active_count);
+
+    if (tc) {
+      if (unlock_estimate < SSC_UNLOCK_GATE_THRESHOLD) {
+        tc->admitted = 0;
+        p->scx.slice = 0;
+      } else {
+        tc->admitted = 1;
+      }
     }
   }
 }

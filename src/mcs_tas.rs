@@ -34,6 +34,7 @@ pub struct LockSchedThreadCtx {
     pub wait_ns_total: u64,
     pub wait_start_ns: u64,
     pub wait_end_ns: u64,
+    pub unlock_count: u64,
 }
 
 impl LockSchedThreadCtx {
@@ -42,6 +43,7 @@ impl LockSchedThreadCtx {
             wait_ns_total: 0,
             wait_start_ns: 0,
             wait_end_ns: 0,
+            unlock_count: 0,
         }
     }
 }
@@ -171,6 +173,9 @@ impl McsTasLockRaw {
 
     #[inline(always)]
     pub fn unlock(&self) {
+        unsafe {
+            (*thread_ctx()).unlock_count += 1;
+        }
         self.locked.0.store(false, Ordering::Release);
     }
 }

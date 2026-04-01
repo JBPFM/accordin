@@ -73,6 +73,7 @@ struct agg_percpu {
   __u64 epoch;
   __u64 run_ns;
   __u64 wait_ns;
+  __u64 unlock_count;
 };
 
 struct {
@@ -110,6 +111,7 @@ volatile __u64 ssc_vote_epoch = 0;
 volatile __u64 ssc_vote_start_ns = 0;
 volatile __u64 ssc_vote_sum_run = 0;
 volatile __u64 ssc_vote_sum_wait = 0;
+volatile __u64 ssc_vote_sum_unlock_count = 0;
 volatile __u32 ssc_vote_publish_count = 0;
 volatile __u64 ssc_vote_last_score = 0;
 volatile __u64 ssc_vote_last_effective_score = 0;
@@ -120,10 +122,6 @@ volatile __u32 ssc_best_count = 2;
 volatile __u64 ssc_best_score = 0;
 volatile __u32 ssc_refine_low = 2;
 volatile __u32 ssc_refine_high = 2;
-volatile __u64 ssc_wait_ratio_ewma = 0;
-volatile __u32 ssc_shift_streak = 0;
-volatile __u32 ssc_resize_holdoff = 0;
-volatile __u32 ssc_shift_baseline_valid = 0;
 
 /* Per-window debug stats — updated only when dbg_counters_enabled=1 */
 volatile __u32 dbg_counters_enabled = 0; /* 0=off (production), 1=on (debug) */

@@ -481,6 +481,10 @@ mod tests {
             "BPF interface should define per-SSC-core vote slots",
         );
         assert!(
+            intf.contains("last_unlock_count"),
+            "BPF interface should snapshot per-slot unlock counters",
+        );
+        assert!(
             maps.contains("ssc_vote_epoch"),
             "BPF globals should expose the current SSC vote epoch",
         );
@@ -493,12 +497,20 @@ mod tests {
             "BPF globals should expose the SSC vote publish count",
         );
         assert!(
+            maps.contains("ssc_vote_sum_unlock_count"),
+            "BPF globals should expose the aggregated vote-window unlock count",
+        );
+        assert!(
             maps.contains("ssc_vote_last_effective_score"),
             "BPF globals should expose the last effective SSC score",
         );
         assert!(
             maps.contains("ssc_vote_consec_grow"),
             "BPF globals should track consecutive score growth",
+        );
+        assert!(
+            stats.contains("estimate_ssc_window_unlocks"),
+            "BPF stats helpers should estimate vote-window unlock throughput",
         );
         assert!(
             stats.contains("rotate_ssc_vote_window"),
@@ -511,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_detection_headers_define_state() {
+    fn unlock_control_headers_define_state() {
         let intf = include_str!("bpf/intf.h");
         let maps = include_str!("bpf/maps.bpf.h");
         let stats = include_str!("bpf/stats.bpf.h");
@@ -519,6 +531,18 @@ mod tests {
         assert!(
             intf.contains("enum ssc_search_phase"),
             "BPF interface should define the SSC search phase enum",
+        );
+        assert!(
+            intf.contains("unlock_count"),
+            "BPF interface should expose userspace unlock counters",
+        );
+        assert!(
+            intf.contains("last_unlock_count"),
+            "BPF task state should snapshot the last observed unlock counter",
+        );
+        assert!(
+            intf.contains("unlock_count_window"),
+            "BPF task state should retain the current window's unlock count",
         );
         assert!(
             maps.contains("ssc_search_phase"),
@@ -533,28 +557,28 @@ mod tests {
             "BPF globals should expose the upper refinement bound",
         );
         assert!(
-            maps.contains("ssc_wait_ratio_ewma"),
-            "BPF globals should expose the wait-ratio EWMA baseline",
+            maps.contains("ssc_vote_sum_unlock_count"),
+            "BPF globals should aggregate unlock counts in the current vote window",
         );
         assert!(
-            !maps.contains("ssc_demand_ewma"),
-            "BPF globals should not track a demand EWMA that feeds back controller-induced wait inflation",
+            !maps.contains("ssc_wait_ratio_ewma"),
+            "BPF globals should no longer expose wait-ratio EWMA state",
         );
         assert!(
-            maps.contains("ssc_shift_streak"),
-            "BPF globals should track consecutive shift detections",
+            !maps.contains("ssc_shift_streak"),
+            "BPF globals should no longer track wait-ratio shift streaks",
         );
         assert!(
-            maps.contains("ssc_resize_holdoff"),
-            "BPF globals should expose the resize holdoff window count",
+            !maps.contains("ssc_resize_holdoff"),
+            "BPF globals should no longer keep wait-ratio resize holdoff state",
         );
         assert!(
-            stats.contains("detect_ssc_workload_shift"),
-            "BPF stats helpers should expose workload-shift detection",
+            stats.contains("SSC_UNLOCK_GATE_THRESHOLD"),
+            "BPF stats helpers should define a fixed unlock gate threshold",
         );
         assert!(
-            stats.contains("#define SSC_RESIZE_HOLDOFF_WINDOWS 3U"),
-            "workload-shift detection should wait multiple windows after a resize before re-arming",
+            !stats.contains("detect_ssc_workload_shift"),
+            "BPF stats helpers should no longer expose workload-shift detection",
         );
     }
 
@@ -589,17 +613,13 @@ mod tests {
     }
 
     #[test]
-    fn quorum_shift_detection_resets_search_phase() {
+    fn quorum_refine_logic_keeps_op_count_search_without_shift_detection() {
         let main = compact(include_str!("bpf/main.bpf.c"));
         let stats = include_str!("bpf/stats.bpf.h");
 
         assert!(
-            main.contains("ssc_search_phase==SSC_SEARCH_REFINE&&detect_ssc_workload_shift(now,&wait_ratio)"),
-            "simple_tick should only run workload-shift detection while refining around a prior best point",
-        );
-        assert!(
-            main.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
-            "confirmed workload shifts should reset the controller back to fast seek mode",
+            !main.contains("detect_ssc_workload_shift"),
+            "simple_tick should not run wait-ratio workload-shift detection anymore",
         );
         assert!(
             stats.contains("ssc_enter_refine_mode"),
@@ -614,12 +634,12 @@ mod tests {
             "simple_tick should enter bounded refinement after a clear regression",
         );
         assert!(
-            main.contains("ssc_set_active_count(ssc_best_count,ssc_best_score);"),
-            "confirmed workload shifts should fall back to the last best known core count instead of immediately doubling or halving",
+            !main.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
+            "simple_tick should not reset back to seek mode through the removed shift detector",
         );
         assert!(
             !stats.contains("demand_shift"),
-            "workload-shift detection should not key off a demand signal that already embeds wait inflation",
+            "controller logic should still avoid demand-based shift signals",
         );
     }
 
@@ -645,6 +665,10 @@ mod tests {
         assert!(
             intf.contains("pending_wait_ns"),
             "task context should keep pending wait accounting in BPF state",
+        );
+        assert!(
+            intf.contains("unlock_count_window"),
+            "task context should keep per-window unlock accounting in BPF state",
         );
         assert!(
             !stats.contains("bpf_probe_write_user"),
@@ -697,6 +721,56 @@ mod tests {
         assert!(
             !mcs_tas.contains("wait_time_now_ns()"),
             "mcs_tas slow path should not call wait_time_now_ns directly",
+        );
+    }
+
+    #[test]
+    fn unlock_count_control_path_replaces_wait_ratio_gate() {
+        let intf = include_str!("bpf/intf.h");
+        let maps = include_str!("bpf/maps.bpf.h");
+        let stats = include_str!("bpf/stats.bpf.h");
+        let main = compact(include_str!("bpf/main.bpf.c"));
+        let mcs_tas = compact(include_str!("mcs_tas.rs"));
+
+        assert!(
+            intf.contains("unlock_count"),
+            "shared thread context should export unlock counters",
+        );
+        assert!(
+            maps.contains("ssc_vote_sum_unlock_count"),
+            "BPF globals should retain the vote-window unlock aggregate",
+        );
+        assert!(
+            stats.contains("estimate_ssc_window_unlocks"),
+            "BPF stats should estimate unlock throughput from the current vote window",
+        );
+        assert!(
+            compact(stats).contains("returnestimate_ssc_window_unlocks(active_count)*SSC_SCORE_SCALE;"),
+            "SSC score should derive from the vote-window unlock estimate",
+        );
+        assert!(
+            stats.contains("#define SSC_UNLOCK_GATE_THRESHOLD 200000ULL"),
+            "BPF stats should define a fixed unlock gate threshold",
+        );
+        assert!(
+            main.contains("__u64unlock_estimate=estimate_ssc_window_unlocks(ssc_active_count);"),
+            "simple_tick should derive the admission signal from the global SSC vote window",
+        );
+        assert!(
+            main.contains("if(unlock_estimate<SSC_UNLOCK_GATE_THRESHOLD){tc->admitted=0;p->scx.slice=0;}else{tc->admitted=1;}"),
+            "simple_tick should gate admission on the fixed unlock threshold and restore admission above it",
+        );
+        assert!(
+            !main.contains("tc->run_ns_window/10<tc->wait_ns_window"),
+            "simple_tick should no longer gate admission on per-task wait ratio",
+        );
+        assert!(
+            mcs_tas.contains("(*thread_ctx()).unlock_count+=1;"),
+            "userspace lock path should increment unlock_count on unlock",
+        );
+        assert!(
+            !stats.contains("useful_run"),
+            "BPF stats should no longer keep useful-run scoring helpers",
         );
     }
 }

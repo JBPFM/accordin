@@ -22,16 +22,19 @@ struct lock_sched_thread_ctx {
   unsigned long long wait_ns_total; /* cumulative wait time */
   unsigned long long wait_start_ns; /* current wait start timestamp */
   unsigned long long wait_end_ns;   /* latest completed wait end timestamp */
+  unsigned long long unlock_count;  /* cumulative unlock operations */
 };
 
 /* Per-task scheduling context stored in BPF task_ctx_map. */
 struct task_scx_ctx {
   unsigned long long window_epoch;
   unsigned long long last_wait_ns;
+  unsigned long long last_unlock_count;
   unsigned long long pending_wait_ns;
   unsigned long long run_start_ns;
   unsigned long long run_ns_window;
   unsigned long long wait_ns_window;
+  unsigned long long unlock_count_window;
   unsigned int admitted;
   unsigned long long
       user_ctx_ptr; /* cached pointer to user-space lock_sched_thread_ctx */
@@ -41,6 +44,7 @@ struct ssc_vote_slot {
   unsigned long long epoch;
   unsigned long long last_run_ns;
   unsigned long long last_wait_ns;
+  unsigned long long last_unlock_count;
 };
 
 enum ssc_search_phase {

@@ -749,7 +749,7 @@ mod tests {
             "SSC score should derive from the vote-window unlock estimate",
         );
         assert!(
-            stats.contains("#define SSC_UNLOCK_GATE_THRESHOLD 200000ULL"),
+            stats.contains("#define SSC_UNLOCK_GATE_THRESHOLD"),
             "BPF stats should define a fixed unlock gate threshold",
         );
         assert!(

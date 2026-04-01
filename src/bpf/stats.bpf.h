@@ -9,7 +9,7 @@
 #include "maps.bpf.h"
 
 #define SSC_SCORE_SCALE 1024ULL
-#define SSC_UNLOCK_GATE_THRESHOLD 200000ULL
+#define SSC_UNLOCK_GATE_THRESHOLD 320000ULL
 
 /*
  * Statistics layer: window-based run/wait/unlock accounting.

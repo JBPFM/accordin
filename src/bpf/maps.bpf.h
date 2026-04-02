@@ -129,5 +129,9 @@ volatile __u64 dbg_win_run = 0;
 volatile __u64 dbg_win_wait = 0;
 volatile __u64 dbg_acct_calls = 0;   /* total account_task_activity calls */
 volatile __u64 dbg_acct_read_ok = 0; /* bpf_probe_read_user succeeded */
+volatile __u64 dbg_refine_entries = 0;
+volatile __u64 dbg_refine_single_point = 0;
+volatile __u64 dbg_refine_noop_targets = 0;
+volatile __u64 dbg_noop_resizes = 0;
 
 #endif /* __MAPS_BPF_H */

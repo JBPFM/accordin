@@ -145,16 +145,35 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
           ssc_refine_high = ssc_active_count;
         }
 
+        if (dbg_counters_enabled && ssc_refine_low == ssc_refine_high)
+          dbg_refine_single_point++;
+
         next_target = ssc_next_refine_target();
-        if (next_target != ssc_active_count)
+        if (ssc_refine_low == ssc_refine_high && next_target == ssc_active_count &&
+            ssc_best_score &&
+            score * SSC_REFINE_BAD_STEADY_RATIO_DEN <
+                ssc_best_score * SSC_REFINE_BAD_STEADY_RATIO_NUM &&
+            ssc_vote_consec_shrink >= SSC_REFINE_BAD_STEADY_WINDOWS) {
+          if (dbg_counters_enabled)
+            dbg_refine_noop_targets++;
+          reset_ssc_refine_bounds(ssc_active_count);
+          ssc_note_resize(score);
+        } else if (next_target != ssc_active_count) {
           ssc_set_active_count(next_target, ssc_best_score);
+        } else if (dbg_counters_enabled) {
+          dbg_refine_noop_targets++;
+        }
       } else if (ssc_vote_consec_grow >= 2) {
         ssc_best_count = ssc_active_count;
         ssc_best_score = score;
         ssc_set_active_count(ssc_active_count << 1, score);
         reset_ssc_refine_bounds(ssc_active_count);
       } else if (ssc_vote_consec_shrink >= 2) {
+        if (dbg_counters_enabled)
+          dbg_refine_entries++;
         ssc_enter_refine_mode(ssc_best_count, ssc_active_count, score);
+        if (dbg_counters_enabled && ssc_refine_low == ssc_refine_high)
+          dbg_refine_single_point++;
         ssc_set_active_count(ssc_next_refine_target(), ssc_best_score);
       }
 

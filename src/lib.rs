@@ -26,6 +26,7 @@ use scx_utils::scx_ops_open;
 const SCHEDULER_NAME: &str = "lb_simple";
 const DISABLE_BPF_ENV: &str = "LB_SIMPLE_DISABLE_BPF";
 const STATS_ONLY_ENV: &str = "LB_SIMPLE_STATS_ONLY";
+const DEBUG_COUNTERS_ENV: &str = "LB_SIMPLE_DEBUG_COUNTERS";
 const SSC_CPU_CAP: usize = bpf_intf::MAX_CPUS as usize;
 
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
@@ -197,7 +198,12 @@ fn initial_ssc_active_count(ssc_cpu_count: u32) -> u32 {
 }
 
 /// Populate cpu_to_node BPF map and publish NUMA defaults.
-fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, stats_only: bool) {
+fn publish_scheduler_topology(
+    skel: &mut BpfSkel<'_>,
+    topology: &NumaTopology,
+    stats_only: bool,
+    debug_counters: bool,
+) {
     for (cpu, node_id) in &topology.cpu_to_node {
         let _ =
             skel.maps
@@ -208,6 +214,7 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
     if let Some(bss) = skel.maps.bss_data.as_mut() {
         bss.dominant_node = topology.dominant_node;
         bss.stats_only_mode = u32::from(stats_only);
+        bss.dbg_counters_enabled = u32::from(debug_counters);
         publish_ssc_cpu_topology(
             &mut bss.ssc_cpu_count,
             &mut bss.ssc_cpu_list,
@@ -233,7 +240,7 @@ fn publish_scheduler_topology(skel: &mut BpfSkel<'_>, topology: &NumaTopology, s
     );
 }
 
-fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
+fn init_scheduler(debug: bool, stats_only: bool, debug_counters: bool) -> Result<SchedulerState> {
     let topology = detect_numa_topology();
     let mut skel_builder = BpfSkelBuilder::default();
     skel_builder.obj_builder.debug(debug);
@@ -260,7 +267,7 @@ fn init_scheduler(debug: bool, stats_only: bool) -> Result<SchedulerState> {
     mutex_hook::set_thread_ctx_map(thread_ctx_map);
 
     // Publish cpu_to_node map and NUMA defaults after load.
-    publish_scheduler_topology(&mut skel, &topology, stats_only);
+    publish_scheduler_topology(&mut skel, &topology, stats_only, debug_counters);
 
     // Attach the scheduler
     let link = scx_ops_attach!(skel, lb_simple_ops)?;
@@ -319,9 +326,10 @@ fn init_ebpf() {
     }
 
     let stats_only = env_flag(STATS_ONLY_ENV);
+    let debug_counters = env_flag(DEBUG_COUNTERS_ENV);
 
     // 初始化调度器（只执行一次）
-    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false, stats_only) {
+    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false, stats_only, debug_counters) {
         Ok(state) => {
             if stats_only {
                 info!(
@@ -634,12 +642,147 @@ mod tests {
             "simple_tick should enter bounded refinement after a clear regression",
         );
         assert!(
-            !main.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
-            "simple_tick should not reset back to seek mode through the removed shift detector",
+            main.contains("ssc_enter_refine_mode(ssc_best_count,ssc_active_count,score);"),
+            "simple_tick should still enter bounded refinement after a clear regression",
+        );
+        assert!(
+            !main.contains("detect_ssc_workload_shift"),
+            "simple_tick should not reset back to seek through the removed workload-shift detector",
         );
         assert!(
             !stats.contains("demand_shift"),
             "controller logic should still avoid demand-based shift signals",
+        );
+    }
+
+    #[test]
+    fn ssc_resize_helper_refreshes_effective_score_on_noop_resize() {
+        let stats = compact(include_str!("bpf/stats.bpf.h"));
+
+        assert!(
+            stats.contains("if(active_count==ssc_active_count){"),
+            "ssc_set_active_count should keep an explicit no-op resize branch",
+        );
+        assert!(
+            stats.contains("ssc_note_resize(effective_score);return;}"),
+            "ssc_set_active_count should refresh the effective-score anchor before returning from a no-op resize",
+        );
+    }
+
+    #[test]
+    fn refine_bad_steady_state_rebases_within_refine() {
+        let main = compact(include_str!("bpf/main.bpf.c"));
+        let stats = compact(include_str!("bpf/stats.bpf.h"));
+
+        assert!(
+            stats.contains("SSC_REFINE_BAD_STEADY_RATIO_NUM"),
+            "stats helpers should define the score-gap ratio for bad steady-state detection",
+        );
+        assert!(
+            stats.contains("SSC_REFINE_BAD_STEADY_RATIO_DEN"),
+            "stats helpers should define the denominator for bad steady-state detection",
+        );
+        assert!(
+            stats.contains("SSC_REFINE_BAD_STEADY_WINDOWS"),
+            "stats helpers should define how many shrink windows are needed before rebasing",
+        );
+        assert!(
+            main.contains("if(ssc_refine_low==ssc_refine_high&&next_target==ssc_active_count&&ssc_best_score&&score*SSC_REFINE_BAD_STEADY_RATIO_DEN<ssc_best_score*SSC_REFINE_BAD_STEADY_RATIO_NUM&&ssc_vote_consec_shrink>=SSC_REFINE_BAD_STEADY_WINDOWS){"),
+            "controller should only trigger bad steady-state handling when single-point no-op refine is also a persistent score regression",
+        );
+        assert!(
+            main.contains("reset_ssc_refine_bounds(ssc_active_count);ssc_note_resize(score);"),
+            "bad steady-state refine should rebase anchors around the current score instead of jumping back to SEEK",
+        );
+        assert!(
+            !main.contains("ssc_search_phase=SSC_SEARCH_SEEK;reset_ssc_refine_bounds(ssc_active_count);ssc_note_resize(ssc_best_score);"),
+            "bad steady-state refine should no longer jump back to SEEK",
+        );
+        assert!(
+            main.contains("elseif(next_target!=ssc_active_count){ssc_set_active_count(next_target,ssc_best_score);}"),
+            "normal refine targets should still resize through the clamped helper",
+        );
+    }
+
+    #[test]
+    fn debug_counter_headers_define_refine_state_probes() {
+        let maps = include_str!("bpf/maps.bpf.h");
+        let stats = compact(include_str!("bpf/stats.bpf.h"));
+        let main = compact(include_str!("bpf/main.bpf.c"));
+
+        assert!(
+            maps.contains("dbg_refine_entries"),
+            "BPF globals should expose a counter for refine-mode entries",
+        );
+        assert!(
+            maps.contains("dbg_refine_single_point"),
+            "BPF globals should expose a counter for refine intervals that collapse to a single point",
+        );
+        assert!(
+            maps.contains("dbg_refine_noop_targets"),
+            "BPF globals should expose a counter for refine targets that do not move active_count",
+        );
+        assert!(
+            maps.contains("dbg_noop_resizes"),
+            "BPF globals should expose a counter for helper resizes that clamp back to the current width",
+        );
+        assert!(
+            stats.contains("if(dbg_counters_enabled)dbg_noop_resizes++;"),
+            "resize helper should count no-op resize attempts when debug counters are enabled",
+        );
+        assert!(
+            main.contains("if(dbg_counters_enabled)dbg_refine_entries++;ssc_enter_refine_mode(ssc_best_count,ssc_active_count,score);"),
+            "shrink path should count refine-mode entries before switching into refinement",
+        );
+        assert!(
+            main.contains("if(dbg_counters_enabled&&ssc_refine_low==ssc_refine_high)dbg_refine_single_point++;"),
+            "controller should count refinement intervals that collapse to a single point",
+        );
+        assert!(
+            main.contains("if(ssc_refine_low==ssc_refine_high&&next_target==ssc_active_count&&ssc_best_score&&score*SSC_REFINE_BAD_STEADY_RATIO_DEN<ssc_best_score*SSC_REFINE_BAD_STEADY_RATIO_NUM&&ssc_vote_consec_shrink>=SSC_REFINE_BAD_STEADY_WINDOWS){if(dbg_counters_enabled)dbg_refine_noop_targets++;"),
+            "controller should count no-op targets that appear after refine collapses to a single point and qualify as a bad steady-state",
+        );
+        assert!(
+            main.contains("}elseif(dbg_counters_enabled){dbg_refine_noop_targets++;}"),
+            "controller should also count non-single-point refine targets that still do not move the active width",
+        );
+    }
+
+    #[test]
+    fn rust_sources_can_enable_bpf_debug_counters() {
+        let lib = include_str!("lib.rs");
+
+        assert!(
+            lib.contains("const DEBUG_COUNTERS_ENV: &str = \"LB_SIMPLE_DEBUG_COUNTERS\";"),
+            "Rust sources should define an env var for enabling BPF debug counters",
+        );
+        assert!(
+            lib.contains("let debug_counters = env_flag(DEBUG_COUNTERS_ENV);"),
+            "scheduler init should read the debug-counter env flag",
+        );
+        assert!(
+            lib.contains("bss.dbg_counters_enabled = u32::from(debug_counters);"),
+            "scheduler setup should publish the debug-counter toggle into BPF globals",
+        );
+        assert!(
+            lib.contains("init_scheduler(false, stats_only, debug_counters)"),
+            "library init should pass the debug-counter toggle into scheduler setup",
+        );
+    }
+
+    #[test]
+    fn benchmark_scripts_preserve_lb_simple_debug_counter_env() {
+        let multi = include_str!("../bench/mutexbench/scripts/sweep_mutex_throughput_multi_lock.sh");
+
+        assert!(
+            multi.contains("LB_SIMPLE_DEBUG_COUNTERS"),
+            "multi-lock benchmark script should mention the lb_simple debug-counter env",
+        );
+        assert!(
+            multi.contains("cmd=(env \"LB_SIMPLE_DEBUG_COUNTERS=${LB_SIMPLE_DEBUG_COUNTERS}\" \"LB_SIMPLE_DISABLE_BPF=1\" \"${cmd[@]}\")")
+                || multi.contains("cmd=(env \"LB_SIMPLE_DEBUG_COUNTERS=${LB_SIMPLE_DEBUG_COUNTERS:-}\" \"LB_SIMPLE_DISABLE_BPF=1\" \"${cmd[@]}\")")
+                || multi.contains("cmd=(env \"LB_SIMPLE_DEBUG_COUNTERS=${LB_SIMPLE_DEBUG_COUNTERS}\" \"${cmd[@]}\")"),
+            "multi-lock benchmark script should forward LB_SIMPLE_DEBUG_COUNTERS into the sudo-launched sweep command",
         );
     }
 

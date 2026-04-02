@@ -10,6 +10,9 @@
 
 #define SSC_SCORE_SCALE 1024ULL
 #define SSC_UNLOCK_GATE_THRESHOLD 320000ULL
+#define SSC_REFINE_BAD_STEADY_RATIO_NUM 4ULL
+#define SSC_REFINE_BAD_STEADY_RATIO_DEN 5ULL
+#define SSC_REFINE_BAD_STEADY_WINDOWS 4U
 
 /*
  * Statistics layer: window-based run/wait/unlock accounting.
@@ -95,8 +98,12 @@ static __always_inline void ssc_set_active_count(__u32 active_count,
                                                  __u64 effective_score) {
   active_count = clamp_ssc_active_count(active_count);
 
-  if (active_count == ssc_active_count)
+  if (active_count == ssc_active_count) {
+    if (dbg_counters_enabled)
+      dbg_noop_resizes++;
+    ssc_note_resize(effective_score);
     return;
+  }
 
   ssc_active_count = active_count;
   ssc_note_resize(effective_score);

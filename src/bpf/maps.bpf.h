@@ -109,6 +109,7 @@ volatile __u64 forced_release_cnt = 0;
 volatile __u32 stats_only_mode = 0;
 volatile __u64 ssc_vote_epoch = 0;
 volatile __u64 ssc_vote_start_ns = 0;
+volatile __u64 ssc_vote_decided_epoch = 0;
 volatile __u64 ssc_vote_sum_run = 0;
 volatile __u64 ssc_vote_sum_wait = 0;
 volatile __u64 ssc_vote_sum_unlock_count = 0;
@@ -133,5 +134,6 @@ volatile __u64 dbg_refine_entries = 0;
 volatile __u64 dbg_refine_single_point = 0;
 volatile __u64 dbg_refine_noop_targets = 0;
 volatile __u64 dbg_noop_resizes = 0;
+volatile __u64 dbg_active_count_changes = 0;
 
 #endif /* __MAPS_BPF_H */

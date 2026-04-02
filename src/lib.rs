@@ -603,6 +603,10 @@ mod tests {
             "simple_tick should require a strict majority quorum",
         );
         assert!(
+            main.contains("now>ssc_vote_start_ns&&now-ssc_vote_start_ns>=ssc_vote_window_ns"),
+            "simple_tick should also wait for a full vote window before advancing controller state",
+        );
+        assert!(
             main.contains("ssc_vote_consec_grow>=2"),
             "simple_tick should only double active_count after two consecutive increases",
         );
@@ -692,15 +696,11 @@ mod tests {
         );
         assert!(
             main.contains("reset_ssc_refine_bounds(ssc_active_count);ssc_note_resize(score);"),
-            "bad steady-state refine should rebase anchors around the current score instead of jumping back to SEEK",
+            "bad steady-state refine should rebase anchors around the current score instead of reopening a new range",
         );
         assert!(
-            !main.contains("ssc_search_phase=SSC_SEARCH_SEEK;reset_ssc_refine_bounds(ssc_active_count);ssc_note_resize(ssc_best_score);"),
-            "bad steady-state refine should no longer jump back to SEEK",
-        );
-        assert!(
-            main.contains("elseif(next_target!=ssc_active_count){ssc_set_active_count(next_target,ssc_best_score);}"),
-            "normal refine targets should still resize through the clamped helper",
+            !main.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
+            "bad steady-state handling should not jump back to SEEK",
         );
     }
 
@@ -727,8 +727,16 @@ mod tests {
             "BPF globals should expose a counter for helper resizes that clamp back to the current width",
         );
         assert!(
+            maps.contains("dbg_active_count_changes"),
+            "BPF globals should expose a counter for real active-count changes",
+        );
+        assert!(
             stats.contains("if(dbg_counters_enabled)dbg_noop_resizes++;"),
             "resize helper should count no-op resize attempts when debug counters are enabled",
+        );
+        assert!(
+            stats.contains("if(dbg_counters_enabled)dbg_active_count_changes++;"),
+            "resize helper should count real active-count changes when debug counters are enabled",
         );
         assert!(
             main.contains("if(dbg_counters_enabled)dbg_refine_entries++;ssc_enter_refine_mode(ssc_best_count,ssc_active_count,score);"),

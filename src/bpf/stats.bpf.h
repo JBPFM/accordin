@@ -106,6 +106,8 @@ static __always_inline void ssc_set_active_count(__u32 active_count,
   }
 
   ssc_active_count = active_count;
+  if (dbg_counters_enabled)
+    dbg_active_count_changes++;
   ssc_note_resize(effective_score);
 }
 

@@ -104,7 +104,9 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   if (is_task_on_ssc_core(p)) {
     publish_ssc_core_vote(tc, p, now);
 
-    if (ssc_vote_publish_count * 2 > ssc_active_count) {
+    if (ssc_vote_publish_count * 2 > ssc_active_count &&
+        now > ssc_vote_start_ns &&
+        now - ssc_vote_start_ns >= ssc_vote_window_ns) {
       __u64 score = compute_ssc_vote_score(ssc_active_count);
 
       if (!ssc_vote_last_effective_score)

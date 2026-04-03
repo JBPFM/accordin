@@ -11,7 +11,7 @@ pub mod bpf_intf {
 mod lock_backend;
 #[path = "../../lock_stats.rs"]
 mod lock_stats;
-#[path = "../../mcs_tas.rs"]
+#[path = "../mcs_tas.rs"]
 mod mcs_tas;
 #[path = "../../mutex_hook.rs"]
 mod mutex_hook;
@@ -24,10 +24,10 @@ use libbpf_rs::{Link, MapCore, MapFlags, MapHandle, OpenObject};
 use log::info;
 use scx_utils::{scx_ops_attach, scx_ops_load, scx_ops_open};
 
-const SCHEDULER_NAME: &str = "lb_simple";
-const DISABLE_BPF_ENV: &str = "LB_SIMPLE_DISABLE_BPF";
-const STATS_ONLY_ENV: &str = "LB_SIMPLE_STATS_ONLY";
-const DEBUG_COUNTERS_ENV: &str = "LB_SIMPLE_DEBUG_COUNTERS";
+const SCHEDULER_NAME: &str = "mcs_tas_simple";
+const DISABLE_BPF_ENV: &str = "MCS_TAS_SIMPLE_DISABLE_BPF";
+const STATS_ONLY_ENV: &str = "MCS_TAS_SIMPLE_STATS_ONLY";
+const DEBUG_COUNTERS_ENV: &str = "MCS_TAS_SIMPLE_DEBUG_COUNTERS";
 const SSC_CPU_CAP: usize = bpf_intf::MAX_CPUS as usize;
 
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
@@ -227,7 +227,7 @@ fn publish_scheduler_topology(
     }
 
     info!(
-        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} first_socket_node={} ssc_cpu_count={} stats_only={}",
+        "mcs_tas_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} first_socket_node={} ssc_cpu_count={} stats_only={}",
         topology.dominant_node,
         topology.local_cpu_count,
         topology.remote_cpu_count,
@@ -302,7 +302,7 @@ fn init_ebpf() {
             "{SCHEDULER_NAME} scheduler disabled by env {}",
             DISABLE_BPF_ENV
         );
-        eprintln!("[lb_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
+        eprintln!("[mcs_tas_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
         return;
     }
 
@@ -317,15 +317,15 @@ fn init_ebpf() {
                     STATS_ONLY_ENV
                 );
                 eprintln!(
-                    "[lb_simple] eBPF scheduler stats-only mode enabled by {}",
+                    "[mcs_tas_simple] eBPF scheduler stats-only mode enabled by {}",
                     STATS_ONLY_ENV
                 );
             }
-            eprintln!("[lb_simple] eBPF scheduler loaded successfully");
+            eprintln!("[mcs_tas_simple] eBPF scheduler loaded successfully");
             state
         }
         Err(e) => {
-            eprintln!("[lb_simple] Failed to load eBPF scheduler: {:#}", e);
+            eprintln!("[mcs_tas_simple] Failed to load eBPF scheduler: {:#}", e);
             panic!("eBPF initialization failed");
         }
     });
@@ -339,3 +339,30 @@ static INIT: extern "C" fn() = {
     }
     init
 };
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mcs_tas_simple_replaces_lb_simple_target_name() {
+        let manifest = include_str!("../Cargo.toml");
+        let readme = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../bench/mutexbench/README.md"),
+        )
+        .unwrap_or_default();
+        let multi = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../bench/mutexbench/scripts/sweep_mutex_throughput_multi_lock.sh"),
+        )
+        .unwrap_or_default();
+
+        assert!(manifest.contains("name = \"mcs_tas_simple\""));
+        assert!(manifest.contains("[lib]\nname = \"mcs_tas_simple\""));
+        assert!(readme.contains("mcs_tas_simple"));
+        assert!(!readme.contains("`lb_simple`"));
+        assert!(multi.contains("resolve_mcs_tas_simple_lib_path"));
+        assert!(multi.contains("mcs_tas_simple)"));
+        assert!(multi.contains("mcs_tas_simple_no_bpf"));
+        assert!(multi.contains("libmcs_tas_simple.so"));
+    }
+}

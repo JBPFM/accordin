@@ -23,7 +23,7 @@ use libbpf_rs::{Link, MapCore, MapHandle, OpenObject};
 use log::info;
 use scx_utils::{scx_ops_attach, scx_ops_load, scx_ops_open};
 
-const SCHEDULER_NAME: &str = "lb_simple";
+const SCHEDULER_NAME: &str = "flexguard_simple";
 const DISABLE_BPF_ENV: &str = "LB_SIMPLE_DISABLE_BPF";
 const STATS_ONLY_ENV: &str = "LB_SIMPLE_STATS_ONLY";
 const DEBUG_COUNTERS_ENV: &str = "LB_SIMPLE_DEBUG_COUNTERS";
@@ -284,7 +284,7 @@ fn init_ebpf() {
 
     if env_flag(DISABLE_BPF_ENV) {
         info!("{SCHEDULER_NAME} scheduler disabled by env {}", DISABLE_BPF_ENV);
-        eprintln!("[lb_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
+        eprintln!("[flexguard_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
         return;
     }
 
@@ -298,13 +298,13 @@ fn init_ebpf() {
                     "{SCHEDULER_NAME} scheduler running in stats-only mode via env {}",
                     STATS_ONLY_ENV
                 );
-                eprintln!("[lb_simple] eBPF scheduler stats-only mode enabled by {}", STATS_ONLY_ENV);
+                eprintln!("[flexguard_simple] eBPF scheduler stats-only mode enabled by {}", STATS_ONLY_ENV);
             }
-            eprintln!("[lb_simple] eBPF scheduler loaded successfully");
+            eprintln!("[flexguard_simple] eBPF scheduler loaded successfully");
             state
         }
         Err(e) => {
-            eprintln!("[lb_simple] Failed to load eBPF scheduler: {:#}", e);
+            eprintln!("[flexguard_simple] Failed to load eBPF scheduler: {:#}", e);
             panic!("eBPF initialization failed");
         }
     });

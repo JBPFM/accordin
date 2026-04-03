@@ -366,9 +366,49 @@ static INIT: extern "C" fn() = {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     fn compact(source: &str) -> String {
         source.split_whitespace().collect()
+    }
+
+    #[test]
+    fn mcs_tas_simple_replaces_lb_simple_target_name() {
+        let cargo = include_str!("../Cargo.toml");
+        let target_manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcs_tas_simple/Cargo.toml"),
+        )
+        .unwrap_or_default();
+        let readme = include_str!("../bench/mutexbench/README.md");
+        let multi = include_str!("../bench/mutexbench/scripts/sweep_mutex_throughput_multi_lock.sh");
+        let run_example = include_str!("../bench/mutexbench/run_example.sh");
+
+        assert!(cargo.contains("src/mcs_tas_simple"));
+        assert!(target_manifest.contains("name = \"mcs_tas_simple\""));
+        assert!(target_manifest.contains("[lib]\nname = \"mcs_tas_simple\""));
+        assert!(!readme.contains("`lb_simple`（通过 `LD_PRELOAD=target/release/liblb_simple.so`）"));
+        assert!(readme.contains("mcs_tas_simple"));
+        assert!(readme.contains("MCS_TAS_SIMPLE_DISABLE_BPF"));
+        assert!(!multi.contains("lb_simple_no_bpf"));
+        assert!(multi.contains("mcs_tas_simple"));
+        assert!(multi.contains("resolve_mcs_tas_simple_lib_path"));
+        assert!(multi.contains("$PROJECT_ROOT/target/release/libmcs_tas_simple.so"));
+        assert!(run_example.contains("mcs_tas_simple"));
+    }
+
+    #[test]
+    fn user_visible_logs_use_new_target_names() {
+        let mcs_tas_simple = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcs_tas_simple/src/lib.rs"),
+        )
+        .unwrap_or_default();
+        let flexguard = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/libflexguard/src/lib.rs"),
+        )
+        .unwrap_or_default();
+
+        assert!(mcs_tas_simple.contains("[mcs_tas_simple] eBPF scheduler loaded successfully"));
+        assert!(!mcs_tas_simple.contains("[lb_simple] eBPF scheduler loaded successfully"));
+        assert!(flexguard.contains("const SCHEDULER_NAME: &str = \"flexguard_simple\";"));
+        assert!(flexguard.contains("[flexguard_simple] eBPF scheduler loaded successfully"));
+        assert!(!flexguard.contains("[lb_simple] eBPF scheduler loaded successfully"));
     }
 }

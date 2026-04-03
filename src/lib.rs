@@ -591,20 +591,44 @@ mod tests {
     }
 
     #[test]
-    fn tick_quorum_logic_requires_majority_before_adjusting_active_count() {
+    fn tick_publishes_current_ssc_sample_before_elapsed_window_quorum_evaluation() {
         let main = compact(include_str!("bpf/main.bpf.c"));
 
         assert!(
-            main.contains("publish_ssc_core_vote(tc,p,now);"),
-            "simple_tick should publish SSC-core samples into the vote state",
+            main.contains("publish_ssc_core_vote(tc,p,now);if(ssc_vote_epoch&&ssc_vote_publish_count*2>ssc_active_count&&now>ssc_vote_start_ns&&now-ssc_vote_start_ns>=ssc_vote_window_ns){"),
+            "simple_tick should publish the current SSC-core sample before evaluating an elapsed quorum window",
+        );
+    }
+
+    #[test]
+    fn tick_quorum_logic_requires_majority_before_adjusting_active_count() {
+        let main = compact(include_str!("bpf/main.bpf.c"));
+        let maps = include_str!("bpf/maps.bpf.h");
+        let stats = compact(include_str!("bpf/stats.bpf.h"));
+
+        assert!(
+            main.contains("if(ssc_vote_epoch&&ssc_vote_publish_count*2>ssc_active_count&&now>ssc_vote_start_ns&&now-ssc_vote_start_ns>=ssc_vote_window_ns){"),
+            "simple_tick should evaluate a completed vote window only after quorum and elapsed window time",
         );
         assert!(
-            main.contains("ssc_vote_publish_count*2>ssc_active_count"),
-            "simple_tick should require a strict majority quorum",
+            stats.contains("SSC_MIN_BOOTSTRAP_UNLOCKS"),
+            "stats helpers should define a minimum unlock threshold for the first effective controller decision",
         );
         assert!(
-            main.contains("now>ssc_vote_start_ns&&now-ssc_vote_start_ns>=ssc_vote_window_ns"),
-            "simple_tick should also wait for a full vote window before advancing controller state",
+            stats.contains("SSC_MIN_BOOTSTRAP_WINDOWS"),
+            "stats helpers should define how many mature windows are required before controller bootstrap completes",
+        );
+        assert!(
+            main.contains("if(!ssc_best_score&&ssc_vote_sum_unlock_count<SSC_MIN_BOOTSTRAP_UNLOCKS){ssc_bootstrap_mature_windows=0;rotate_ssc_vote_window(now);}elseif(!ssc_best_score&&++ssc_bootstrap_mature_windows<SSC_MIN_BOOTSTRAP_WINDOWS){rotate_ssc_vote_window(now);}else{__u64score=compute_ssc_vote_score(ssc_active_count);"),
+            "simple_tick should require multiple mature windows before the first score-driven controller state update",
+        );
+        assert!(
+            main.contains("if(!ssc_best_score){ssc_best_score=ssc_vote_sum_unlock_count*SSC_SCORE_SCALE;ssc_best_count=ssc_active_count;reset_ssc_refine_bounds(ssc_active_count);ssc_pending_capped_grow=1;seeded_best=true;}"),
+            "bootstrap should seed the first best_score from a conservative raw unlock signal and arm the one-shot capped-grow state",
+        );
+        assert!(
+            main.contains("rotate_ssc_vote_window(now);publish_ssc_core_vote(tc,p,now);"),
+            "simple_tick should rotate to a fresh window before publishing the current SSC-core sample",
         );
         assert!(
             main.contains("ssc_vote_consec_grow>=2"),
@@ -615,8 +639,21 @@ mod tests {
             "simple_tick should only halve active_count after two consecutive drops below the effective score",
         );
         assert!(
-            main.contains("ssc_set_active_count(ssc_active_count<<1,score);"),
-            "simple_tick should funnel doubled active_count through the clamped resize helper",
+            maps.contains("ssc_pending_capped_grow"),
+            "BPF globals should expose an explicit one-shot state for the post-bootstrap capped grow",
+        );
+        assert!(
+            main.contains("if(!ssc_best_score){ssc_best_score=ssc_vote_sum_unlock_count*SSC_SCORE_SCALE;ssc_best_count=ssc_active_count;reset_ssc_refine_bounds(ssc_active_count);ssc_pending_capped_grow=1;seeded_best=true;}"),
+            "bootstrap should arm the explicit one-shot capped-grow state when it seeds the first best score",
+        );
+        assert!(
+            main.contains("booluse_capped_grow=ssc_pending_capped_grow&&ssc_active_count>=8;ssc_pending_capped_grow=0;")
+                && main.contains("__u32grow_target=ssc_active_count<<1;if(use_capped_grow)grow_target=ssc_active_count+(ssc_active_count>>1);"),
+            "simple_tick should consume the explicit one-shot state on the first actual grow decision and only cap that grow when the current width is at least 8",
+        );
+        assert!(
+            main.contains("ssc_set_active_count(grow_target,score);"),
+            "post-bootstrap capped growth should still flow through the clamped resize helper",
         );
         assert!(
             main.contains("ssc_set_active_count(ssc_next_refine_target(),ssc_best_score);"),
@@ -674,6 +711,71 @@ mod tests {
     }
 
     #[test]
+    fn best_score_decay_headers_define_candidate_tracking() {
+        let maps = include_str!("bpf/maps.bpf.h");
+        let stats = compact(include_str!("bpf/stats.bpf.h"));
+
+        assert!(
+            maps.contains("ssc_best_candidate_count"),
+            "BPF globals should track which SSC width is waiting for best-score promotion",
+        );
+        assert!(
+            maps.contains("ssc_best_candidate_streak"),
+            "BPF globals should track how many mature windows have confirmed the candidate width",
+        );
+        assert!(
+            stats.contains("SSC_BEST_SCORE_DECAY_SHIFT"),
+            "stats helpers should define the per-window best-score decay rate",
+        );
+        assert!(
+            stats.contains("SSC_BEST_CONFIRM_WINDOWS"),
+            "stats helpers should define how many mature windows confirm a new best anchor",
+        );
+        assert!(
+            stats.contains("static__always_inlinevoidssc_reset_best_candidate(void){ssc_best_candidate_count=0;ssc_best_candidate_streak=0;}"),
+            "stats helpers should expose a helper that clears pending best-score promotion state",
+        );
+        assert!(
+            stats.contains("static__always_inline__u64ssc_decay_best_score(void){"),
+            "stats helpers should expose a helper that decays the historical best score once per mature window",
+        );
+        assert!(
+            stats.contains("static__always_inlinevoidssc_maybe_promote_best_candidate(__u32active_count,__u64score,__u64compare_best_score){"),
+            "stats helpers should expose a helper that requires repeated mature windows before rewriting the best anchor",
+        );
+        assert!(
+            stats.contains("ssc_reset_best_candidate();ssc_vote_last_score=0;ssc_vote_last_effective_score=effective_score;"),
+            "resize bookkeeping should clear any pending best-score candidate before refreshing the effective-score anchor",
+        );
+    }
+
+    #[test]
+    fn best_score_decay_quorum_logic_requires_decay_and_two_window_confirmation() {
+        let main = compact(include_str!("bpf/main.bpf.c"));
+
+        assert!(
+            main.contains("compare_best_score=seeded_best?ssc_best_score:ssc_decay_best_score();ssc_maybe_promote_best_candidate(ssc_active_count,score,compare_best_score);"),
+            "simple_tick should decay the best anchor before routing mature-window scores through the two-window promotion helper",
+        );
+        assert!(
+            main.contains("if(score>=compare_best_score){if(ssc_active_count>ssc_refine_low)ssc_refine_low=ssc_active_count;}elseif(ssc_active_count>ssc_refine_low){ssc_refine_high=ssc_active_count;}"),
+            "refine-mode bounds should compare against the decayed best anchor instead of a permanent historical peak",
+        );
+        assert!(
+            !main.contains("if(score>ssc_best_score){ssc_best_score=score;ssc_best_count=ssc_active_count;}"),
+            "a single mature window should no longer overwrite the best anchor immediately",
+        );
+        assert!(
+            !main.contains("if(score>=ssc_best_score){ssc_best_score=score;ssc_best_count=ssc_active_count;"),
+            "refine-mode should no longer rewrite the best anchor inline on the first qualifying window",
+        );
+        assert!(
+            !main.contains("ssc_best_count=ssc_active_count;ssc_best_score=score;ssc_set_active_count(grow_target,score);"),
+            "seek-mode growth should stop overwriting the best anchor just because the controller is about to grow",
+        );
+    }
+
+    #[test]
     fn refine_bad_steady_state_rebases_within_refine() {
         let main = compact(include_str!("bpf/main.bpf.c"));
         let stats = compact(include_str!("bpf/stats.bpf.h"));
@@ -696,7 +798,7 @@ mod tests {
         );
         assert!(
             main.contains("reset_ssc_refine_bounds(ssc_active_count);ssc_note_resize(score);"),
-            "bad steady-state refine should rebase anchors around the current score instead of reopening a new range",
+            "bad steady-state refine should rebase anchors around the current score without reopening range or rewriting best anchors",
         );
         assert!(
             !main.contains("ssc_search_phase=SSC_SEARCH_SEEK;"),
@@ -705,10 +807,55 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_refine_target_clamps_stale_best_anchor_within_current_interval() {
+        let stats = compact(include_str!("bpf/stats.bpf.h"));
+
+        assert!(
+            stats.contains("static__always_inline__u32ssc_clamp_refine_target(__u32target){target=clamp_ssc_active_count(target);if(target<ssc_refine_low)returnssc_refine_low;if(target>ssc_refine_high)returnssc_refine_high;returntarget;}"),
+            "stats helpers should expose a refine-target clamp that keeps chosen anchors inside the current interval",
+        );
+        assert!(
+            stats.contains("if(ssc_refine_high<=ssc_refine_low+1)returnssc_clamp_refine_target(ssc_best_count?ssc_best_count:ssc_refine_low);"),
+            "collapsed refine target selection should clamp the chosen anchor back into the current refine interval",
+        );
+        assert!(
+            !stats.contains("if(ssc_refine_high<=ssc_refine_low+1)returnssc_best_count?ssc_best_count:ssc_refine_low;"),
+            "collapsed refine target selection should not return a stale best anchor without interval clamping",
+        );
+    }
+
+    #[test]
+    fn capped_grow_step_uses_explicit_one_shot_post_bootstrap_state() {
+        let maps = include_str!("bpf/maps.bpf.h");
+        let main = compact(include_str!("bpf/main.bpf.c"));
+
+        assert!(
+            maps.contains("ssc_pending_capped_grow"),
+            "BPF globals should expose an explicit one-shot state for the post-bootstrap capped grow",
+        );
+        assert!(
+            main.contains("if(!ssc_best_score){ssc_best_score=ssc_vote_sum_unlock_count*SSC_SCORE_SCALE;ssc_best_count=ssc_active_count;reset_ssc_refine_bounds(ssc_active_count);ssc_pending_capped_grow=1;seeded_best=true;}"),
+            "bootstrap should arm the explicit one-shot capped-grow state when it seeds the first best score",
+        );
+        assert!(
+            main.contains("booluse_capped_grow=ssc_pending_capped_grow&&ssc_active_count>=8;ssc_pending_capped_grow=0;")
+                && main.contains("__u32grow_target=ssc_active_count<<1;if(use_capped_grow)grow_target=ssc_active_count+(ssc_active_count>>1);"),
+            "simple_tick should consume the explicit one-shot state on the first actual grow decision and only cap that grow when the current width is at least 8",
+        );
+        assert!(
+            !main.contains("booluse_capped_grow=ssc_bootstrap_mature_windows<=SSC_MIN_BOOTSTRAP_WINDOWS+2;")
+                && !main.contains("if(ssc_best_score&&ssc_bootstrap_mature_windows<SSC_MIN_BOOTSTRAP_WINDOWS+3)ssc_bootstrap_mature_windows++;")
+                && !main.contains("if(ssc_bootstrap_mature_windows==SSC_MIN_BOOTSTRAP_WINDOWS&&ssc_active_count>=8)grow_target=ssc_active_count+(ssc_active_count>>1);"),
+            "simple_tick should stop tying capped-grow lifetime to bootstrap mature-window counting after bootstrap",
+        );
+    }
+
+    #[test]
     fn debug_counter_headers_define_refine_state_probes() {
         let maps = include_str!("bpf/maps.bpf.h");
         let stats = compact(include_str!("bpf/stats.bpf.h"));
         let main = compact(include_str!("bpf/main.bpf.c"));
+        let admission = compact(include_str!("bpf/admission.bpf.h"));
 
         assert!(
             maps.contains("dbg_refine_entries"),
@@ -731,12 +878,48 @@ mod tests {
             "BPF globals should expose a counter for real active-count changes",
         );
         assert!(
+            maps.contains("dbg_bad_steady_rebases"),
+            "BPF globals should expose a counter for bad steady-state rebase events",
+        );
+        assert!(
+            maps.contains("dbg_task_ctx_creates"),
+            "BPF globals should expose a counter for successful task_ctx creations",
+        );
+        assert!(
+            maps.contains("dbg_task_ctx_misses"),
+            "BPF globals should expose a counter for tasks that miss userspace ctx registration",
+        );
+        assert!(
+            maps.contains("dbg_grow_uses_capped_step"),
+            "BPF globals should expose a counter for growth decisions that used the capped post-bootstrap step",
+        );
+        assert!(
+            maps.contains("dbg_last_grow_target"),
+            "BPF globals should expose the most recent seek-growth target width",
+        );
+        assert!(
             stats.contains("if(dbg_counters_enabled)dbg_noop_resizes++;"),
             "resize helper should count no-op resize attempts when debug counters are enabled",
         );
         assert!(
             stats.contains("if(dbg_counters_enabled)dbg_active_count_changes++;"),
             "resize helper should count real active-count changes when debug counters are enabled",
+        );
+        assert!(
+            admission.contains("if(dbg_counters_enabled)dbg_task_ctx_creates++;"),
+            "task ctx creation path should count successful userspace ctx attachments when debug counters are enabled",
+        );
+        assert!(
+            admission.contains("if(dbg_counters_enabled)dbg_task_ctx_misses++;"),
+            "task ctx creation path should count tasks that have no registered userspace ctx when debug counters are enabled",
+        );
+        assert!(
+            main.contains("if(dbg_counters_enabled){dbg_last_grow_target=grow_target;"),
+            "grow path should record the most recent grow target",
+        );
+        assert!(
+            main.contains("if(grow_target!=(ssc_active_count<<1))dbg_grow_uses_capped_step++;"),
+            "grow path should count when it used the capped post-bootstrap step",
         );
         assert!(
             main.contains("if(dbg_counters_enabled)dbg_refine_entries++;ssc_enter_refine_mode(ssc_best_count,ssc_active_count,score);"),
@@ -747,8 +930,8 @@ mod tests {
             "controller should count refinement intervals that collapse to a single point",
         );
         assert!(
-            main.contains("if(ssc_refine_low==ssc_refine_high&&next_target==ssc_active_count&&ssc_best_score&&score*SSC_REFINE_BAD_STEADY_RATIO_DEN<ssc_best_score*SSC_REFINE_BAD_STEADY_RATIO_NUM&&ssc_vote_consec_shrink>=SSC_REFINE_BAD_STEADY_WINDOWS){if(dbg_counters_enabled)dbg_refine_noop_targets++;"),
-            "controller should count no-op targets that appear after refine collapses to a single point and qualify as a bad steady-state",
+            main.contains("if(ssc_refine_low==ssc_refine_high&&next_target==ssc_active_count&&ssc_best_score&&score*SSC_REFINE_BAD_STEADY_RATIO_DEN<ssc_best_score*SSC_REFINE_BAD_STEADY_RATIO_NUM&&ssc_vote_consec_shrink>=SSC_REFINE_BAD_STEADY_WINDOWS){if(dbg_counters_enabled){dbg_refine_noop_targets++;dbg_bad_steady_rebases++;}"),
+            "controller should count bad steady-state rebase events when single-point no-op refine qualifies for local rebasing",
         );
         assert!(
             main.contains("}elseif(dbg_counters_enabled){dbg_refine_noop_targets++;}"),

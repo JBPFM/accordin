@@ -47,8 +47,11 @@ get_or_create_task_ctx(struct task_struct *p) {
 
   __u32 pid = p->pid;
   __u64 *user_ptr_p = bpf_map_lookup_elem(&thread_ctx_addr_map, &pid);
-  if (!user_ptr_p)
+  if (!user_ptr_p) {
+    if (dbg_counters_enabled)
+      dbg_task_ctx_misses++;
     return NULL;
+  }
 
   tc =
       bpf_task_storage_get(&task_ctx_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
@@ -57,6 +60,8 @@ get_or_create_task_ctx(struct task_struct *p) {
 
   tc->admitted = 1;
   tc->user_ctx_ptr = *user_ptr_p;
+  if (dbg_counters_enabled)
+    dbg_task_ctx_creates++;
 
   return tc;
 }

@@ -7,19 +7,20 @@ mod arch;
 pub mod bpf_intf {
     include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"));
 }
-#[path = "../../flexguard.rs"]
-mod flexguard;
 #[path = "../../lock_backend.rs"]
 mod lock_backend;
 #[path = "../../lock_stats.rs"]
 mod lock_stats;
+#[path = "../../mcs_tas.rs"]
+mod mcs_tas;
+#[path = "../../mutex_hook.rs"]
 mod mutex_hook;
 
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use libbpf_rs::{Link, MapCore, MapHandle, OpenObject};
+use libbpf_rs::{Link, MapCore, MapFlags, MapHandle, OpenObject};
 use log::info;
 use scx_utils::{scx_ops_attach, scx_ops_load, scx_ops_open};
 
@@ -32,8 +33,7 @@ const SSC_CPU_CAP: usize = bpf_intf::MAX_CPUS as usize;
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
 
 struct SchedulerState {
-    _scheduler_link: Option<Link>,
-    _flexguard_link: Option<Link>,
+    _link: Option<Link>,
     _skel: Option<BpfSkel<'static>>,
 }
 
@@ -44,11 +44,15 @@ unsafe impl Sync for SchedulerState {}
 struct NumaTopology {
     cpu_to_node: Vec<(u32, u32)>,
     dominant_node: i32,
+    local_cpu_count: i64,
+    remote_cpu_count: i64,
+    first_socket_node: i32,
     first_socket_cpus: Vec<u32>,
 }
 
 fn parse_cpu_list(cpulist: &str) -> Vec<u32> {
     let mut cpus = Vec::new();
+
     for range_str in cpulist.trim().split(',') {
         let range_str = range_str.trim();
         if range_str.is_empty() {
@@ -74,6 +78,7 @@ fn parse_cpu_list(cpulist: &str) -> Vec<u32> {
             cpus.push(cpu);
         }
     }
+
     cpus
 }
 
@@ -91,10 +96,14 @@ fn build_numa_topology_from_nodes(mut node_cpus: Vec<(u32, Vec<u32>)>) -> NumaTo
         return NumaTopology {
             cpu_to_node: fallback_cpus.iter().copied().map(|cpu| (cpu, 0)).collect(),
             dominant_node: 0,
+            local_cpu_count: i64::from(fallback),
+            remote_cpu_count: 0,
+            first_socket_node: 0,
             first_socket_cpus: fallback_cpus,
         };
     }
 
+    let first_socket_node = node_cpus[0].0;
     let first_socket_cpus = node_cpus[0].1.clone();
     let mut cpu_to_node = Vec::new();
     let mut node_counts = Vec::new();
@@ -107,11 +116,15 @@ fn build_numa_topology_from_nodes(mut node_cpus: Vec<(u32, Vec<u32>)>) -> NumaTo
     }
 
     node_counts.sort_by_key(|(node_id, count)| (-*count, *node_id as i64));
-    let (dominant_node, _) = node_counts[0];
+    let (dominant_node, local_cpu_count) = node_counts[0];
+    let total_cpu_count: i64 = node_counts.iter().map(|(_, count)| *count).sum();
 
     NumaTopology {
         cpu_to_node,
         dominant_node: dominant_node as i32,
+        local_cpu_count: local_cpu_count.max(1),
+        remote_cpu_count: (total_cpu_count - local_cpu_count).max(0),
+        first_socket_node: first_socket_node as i32,
         first_socket_cpus,
     }
 }
@@ -124,6 +137,7 @@ fn detect_numa_topology() -> NumaTopology {
     };
 
     let mut node_cpus = Vec::new();
+
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -134,15 +148,18 @@ fn detect_numa_topology() -> NumaTopology {
             Ok(n) => n,
             Err(_) => continue,
         };
+
         let cpulist_path = format!("{}/{}/cpulist", node_base, name_str);
         let cpulist = match std::fs::read_to_string(&cpulist_path) {
             Ok(s) => s,
             Err(_) => continue,
         };
+
         let cpus = parse_cpu_list(&cpulist);
         if cpus.is_empty() {
             continue;
         }
+
         node_cpus.push((node_id, cpus));
     }
 
@@ -166,6 +183,7 @@ fn publish_ssc_cpu_topology(
         if cpu_idx >= SSC_CPU_CAP || count >= SSC_CPU_CAP {
             continue;
         }
+
         ssc_cpu_list[count] = cpu;
         ssc_cpu_rank[cpu_idx] = count as u16;
         count += 1;
@@ -184,10 +202,10 @@ fn publish_scheduler_topology(
     debug_counters: bool,
 ) {
     for (cpu, node_id) in &topology.cpu_to_node {
-        let _ = skel
-            .maps
-            .cpu_to_node
-            .update(&cpu.to_ne_bytes(), &node_id.to_ne_bytes(), libbpf_rs::MapFlags::ANY);
+        let _ =
+            skel.maps
+                .cpu_to_node
+                .update(&cpu.to_ne_bytes(), &node_id.to_ne_bytes(), MapFlags::ANY);
     }
 
     if let Some(bss) = skel.maps.bss_data.as_mut() {
@@ -207,6 +225,16 @@ fn publish_scheduler_topology(
             u32::try_from(topology.first_socket_cpus.len()).unwrap_or(u32::MAX),
         );
     }
+
+    info!(
+        "lb_simple topology initialized: dominant_node={} local_cpus={} remote_cpus={} first_socket_node={} ssc_cpu_count={} stats_only={}",
+        topology.dominant_node,
+        topology.local_cpu_count,
+        topology.remote_cpu_count,
+        topology.first_socket_node,
+        topology.first_socket_cpus.len(),
+        stats_only
+    );
 }
 
 fn init_scheduler(debug: bool, stats_only: bool, debug_counters: bool) -> Result<SchedulerState> {
@@ -223,35 +251,22 @@ fn init_scheduler(debug: bool, stats_only: bool, debug_counters: bool) -> Result
     let mut skel = scx_ops_load!(skel, lb_simple_ops, uei)?;
 
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
-    let nodes_map = MapHandle::try_from(&skel.maps.nodes_map)?;
     mutex_hook::set_thread_ctx_map(thread_ctx_map);
-    mutex_hook::set_nodes_map(nodes_map);
-
-    if let Some(bss) = skel.maps.bss_data.as_mut() {
-        let qnodes: *mut crate::bpf_intf::flexguard_qnode_t =
-            std::ptr::addr_of_mut!(bss.qnodes).cast();
-        let num_preempted_holders: *mut i64 = std::ptr::addr_of_mut!(bss.num_preempted_holders);
-        let preempted_flags: *mut u8 = std::ptr::addr_of_mut!(bss.preempted_flags).cast();
-        flexguard::install_bpf_runtime(qnodes, num_preempted_holders, preempted_flags);
-    }
 
     publish_scheduler_topology(&mut skel, &topology, stats_only, debug_counters);
 
-    let scheduler_link = scx_ops_attach!(skel, lb_simple_ops)?;
-    let flexguard_link = skel.links.sched_switch_btf.take();
+    let link = scx_ops_attach!(skel, lb_simple_ops)?;
 
     info!("{SCHEDULER_NAME} scheduler started via LD_PRELOAD");
     Ok(SchedulerState {
-        _scheduler_link: Some(scheduler_link),
-        _flexguard_link: flexguard_link,
+        _link: Some(link),
         _skel: Some(skel),
     })
 }
 
 impl Drop for SchedulerState {
     fn drop(&mut self) {
-        let _ = self._scheduler_link.take();
-        let _ = self._flexguard_link.take();
+        let _ = self._link.take();
         let _ = self._skel.take();
         info!("{SCHEDULER_NAME} scheduler stopped");
     }
@@ -283,7 +298,10 @@ fn init_ebpf() {
     );
 
     if env_flag(DISABLE_BPF_ENV) {
-        info!("{SCHEDULER_NAME} scheduler disabled by env {}", DISABLE_BPF_ENV);
+        info!(
+            "{SCHEDULER_NAME} scheduler disabled by env {}",
+            DISABLE_BPF_ENV
+        );
         eprintln!("[lb_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
         return;
     }
@@ -298,7 +316,10 @@ fn init_ebpf() {
                     "{SCHEDULER_NAME} scheduler running in stats-only mode via env {}",
                     STATS_ONLY_ENV
                 );
-                eprintln!("[lb_simple] eBPF scheduler stats-only mode enabled by {}", STATS_ONLY_ENV);
+                eprintln!(
+                    "[lb_simple] eBPF scheduler stats-only mode enabled by {}",
+                    STATS_ONLY_ENV
+                );
             }
             eprintln!("[lb_simple] eBPF scheduler loaded successfully");
             state

@@ -1113,4 +1113,30 @@ mod tests {
             "flexguard_simple should reuse the mutex benchmark lock kind",
         );
     }
+
+    #[test]
+    fn lb_simple_target_moves_to_parallel_package_layout() {
+        let cargo = include_str!("../Cargo.toml");
+        let target_manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lb_simple/Cargo.toml"),
+        )
+        .unwrap_or_default();
+        let build_rs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lb_simple/build.rs"),
+        )
+        .unwrap_or_default();
+        let target_lib = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lb_simple/src/lib.rs"),
+        )
+        .unwrap_or_default();
+        let multi = include_str!("../bench/mutexbench/scripts/sweep_mutex_throughput_multi_lock.sh");
+
+        assert!(cargo.contains("src/lb_simple"));
+        assert!(target_manifest.contains("name = \"lb_simple\""));
+        assert!(target_manifest.contains("crate-type = [\"cdylib\"]"));
+        assert!(build_rs.contains("enable_skel(\"../bpf/main.bpf.c\", \"bpf\")"));
+        assert!(target_lib.contains("mod mcs_tas;"));
+        assert!(target_lib.contains("mod mutex_hook;"));
+        assert!(multi.contains("$PROJECT_ROOT/target/release/liblb_simple.so"));
+    }
 }

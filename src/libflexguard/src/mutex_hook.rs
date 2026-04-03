@@ -3,7 +3,7 @@ use std::hint::spin_loop;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::flexguard::McsTasLockRaw as FlexguardLockRaw;
+use crate::flexguard::FlexguardLockRaw;
 use crate::lock_backend::LockBackend;
 use crate::lock_stats::{record_unlock, record_wait_end, record_wait_start, thread_ctx};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};

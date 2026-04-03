@@ -13,6 +13,10 @@
 #define SSC_REFINE_BAD_STEADY_RATIO_NUM 4ULL
 #define SSC_REFINE_BAD_STEADY_RATIO_DEN 5ULL
 #define SSC_REFINE_BAD_STEADY_WINDOWS 4U
+#define SSC_MIN_BOOTSTRAP_UNLOCKS 1024ULL
+#define SSC_MIN_BOOTSTRAP_WINDOWS 2U
+#define SSC_BEST_SCORE_DECAY_SHIFT 4U
+#define SSC_BEST_CONFIRM_WINDOWS 2U
 
 /*
  * Statistics layer: window-based run/wait/unlock accounting.
@@ -87,7 +91,52 @@ static __always_inline void reset_ssc_refine_bounds(__u32 active_count) {
   ssc_refine_high = active_count;
 }
 
+static __always_inline void ssc_reset_best_candidate(void) {
+  ssc_best_candidate_count = 0;
+  ssc_best_candidate_streak = 0;
+}
+
+static __always_inline __u64 ssc_decay_best_score(void) {
+  __u64 decay;
+
+  if (!ssc_best_score)
+    return 0;
+
+  decay = ssc_best_score >> SSC_BEST_SCORE_DECAY_SHIFT;
+  if (!decay)
+    return ssc_best_score;
+
+  ssc_best_score -= decay;
+  return ssc_best_score;
+}
+
+static __always_inline void ssc_maybe_promote_best_candidate(__u32 active_count,
+                                                             __u64 score,
+                                                             __u64 compare_best_score) {
+  if (!compare_best_score || score < compare_best_score) {
+    ssc_reset_best_candidate();
+    return;
+  }
+
+  if (ssc_best_candidate_count != active_count) {
+    ssc_best_candidate_count = active_count;
+    ssc_best_candidate_streak = 1;
+    return;
+  }
+
+  if (ssc_best_candidate_streak < SSC_BEST_CONFIRM_WINDOWS)
+    ssc_best_candidate_streak++;
+
+  if (ssc_best_candidate_streak < SSC_BEST_CONFIRM_WINDOWS)
+    return;
+
+  ssc_best_score = score;
+  ssc_best_count = active_count;
+  ssc_reset_best_candidate();
+}
+
 static __always_inline void ssc_note_resize(__u64 effective_score) {
+  ssc_reset_best_candidate();
   ssc_vote_last_score = 0;
   ssc_vote_last_effective_score = effective_score;
   ssc_vote_consec_grow = 0;
@@ -134,12 +183,23 @@ static __always_inline void ssc_enter_refine_mode(__u32 low, __u32 high,
     ssc_best_score = score;
 }
 
+static __always_inline __u32 ssc_clamp_refine_target(__u32 target) {
+  target = clamp_ssc_active_count(target);
+
+  if (target < ssc_refine_low)
+    return ssc_refine_low;
+  if (target > ssc_refine_high)
+    return ssc_refine_high;
+
+  return target;
+}
+
 static __always_inline __u32 ssc_next_refine_target(void) {
   if (ssc_refine_high <= ssc_refine_low + 1)
-    return ssc_best_count ? ssc_best_count : ssc_refine_low;
+    return ssc_clamp_refine_target(ssc_best_count ? ssc_best_count : ssc_refine_low);
 
-  return clamp_ssc_active_count(ssc_refine_low +
-                                ((ssc_refine_high - ssc_refine_low) >> 1));
+  return ssc_clamp_refine_target(ssc_refine_low +
+                                 ((ssc_refine_high - ssc_refine_low) >> 1));
 }
 
 static __always_inline void rotate_ssc_vote_window(__u64 now) {
@@ -214,6 +274,8 @@ static __always_inline void account_task_activity(struct task_scx_ctx *tc,
 
   if (tc->user_ctx_ptr) {
     if (read_thread_ctx(tc->user_ctx_ptr, &uctx)) {
+      if (dbg_counters_enabled)
+        dbg_acct_read_ok++;
       if (uctx.wait_ns_total >= tc->last_wait_ns) {
         __u64 completed_wait = uctx.wait_ns_total - tc->last_wait_ns;
 

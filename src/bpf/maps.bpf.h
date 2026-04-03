@@ -116,11 +116,15 @@ volatile __u64 ssc_vote_sum_unlock_count = 0;
 volatile __u32 ssc_vote_publish_count = 0;
 volatile __u64 ssc_vote_last_score = 0;
 volatile __u64 ssc_vote_last_effective_score = 0;
+volatile __u32 ssc_bootstrap_mature_windows = 0;
+volatile __u32 ssc_pending_capped_grow = 0;
 volatile __u32 ssc_vote_consec_grow = 0;
 volatile __u32 ssc_vote_consec_shrink = 0;
 volatile __u32 ssc_search_phase = SSC_SEARCH_SEEK;
 volatile __u32 ssc_best_count = 2;
 volatile __u64 ssc_best_score = 0;
+volatile __u32 ssc_best_candidate_count = 0;
+volatile __u32 ssc_best_candidate_streak = 0;
 volatile __u32 ssc_refine_low = 2;
 volatile __u32 ssc_refine_high = 2;
 
@@ -135,5 +139,10 @@ volatile __u64 dbg_refine_single_point = 0;
 volatile __u64 dbg_refine_noop_targets = 0;
 volatile __u64 dbg_noop_resizes = 0;
 volatile __u64 dbg_active_count_changes = 0;
+volatile __u64 dbg_bad_steady_rebases = 0;
+volatile __u64 dbg_task_ctx_creates = 0;
+volatile __u64 dbg_task_ctx_misses = 0;
+volatile __u64 dbg_grow_uses_capped_step = 0;
+volatile __u64 dbg_last_grow_target = 0;
 
 #endif /* __MAPS_BPF_H */

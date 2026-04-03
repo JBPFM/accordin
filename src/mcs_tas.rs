@@ -2,7 +2,8 @@ use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use crate::arch::{pause, wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns};
+use crate::arch::pause;
+use crate::lock_backend::LockBackend;
 
 // we remove sample cause in some high contention env wait can occupy full timeslice
 // or we can reserve a fast path in low contention
@@ -28,35 +29,9 @@ impl Node {
     }
 }
 
-/// Per-thread lock scheduling context, read by BPF via bpf_probe_read_user.
-#[repr(C)]
-pub struct LockSchedThreadCtx {
-    pub wait_ns_total: u64,
-    pub wait_start_ns: u64,
-    pub wait_end_ns: u64,
-    pub unlock_count: u64,
-}
-
-impl LockSchedThreadCtx {
-    const fn new() -> Self {
-        Self {
-            wait_ns_total: 0,
-            wait_start_ns: 0,
-            wait_end_ns: 0,
-            unlock_count: 0,
-        }
-    }
-}
-
 thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
-    static THREAD_CTX: UnsafeCell<LockSchedThreadCtx> = const { UnsafeCell::new(LockSchedThreadCtx::new()) };
     // static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
-}
-
-/// Returns a pointer to the current thread's LockSchedThreadCtx.
-pub fn thread_ctx() -> *mut LockSchedThreadCtx {
-    THREAD_CTX.with(|ctx| ctx.get())
 }
 
 // #[inline(always)]
@@ -88,19 +63,7 @@ impl McsTasLockRaw {
     }
 
     #[inline(always)]
-    pub fn lock(&self) {
-        // Fast path: TAS
-        if !self.locked.0.swap(true, Ordering::Acquire) {
-            return;
-        }
-
-        // Slow path: MCS queue + TAS
-        let wait_start = wait_time_start();
-        let ctx = thread_ctx();
-        unsafe {
-            (*ctx).wait_start_ns = wait_time_to_ns(wait_start);
-        }
-
+    fn lock_slow(&self) {
         let my_node = Self::thread_node();
         unsafe {
             (*my_node).next.store(ptr::null_mut(), Ordering::Relaxed);
@@ -147,17 +110,11 @@ impl McsTasLockRaw {
             }
         }
 
-        // Acquired after contention — accumulate sampled wait time, set ROLE_OWNER
-        let wait_end = wait_time_start();
-        unsafe {
-            (*ctx).wait_ns_total += wait_time_elapsed_ns_between(wait_start, wait_end);
-            (*ctx).wait_end_ns = wait_time_to_ns(wait_end);
-        }
     }
 
     /// Returns true if the lock was acquired, false if it was already held.
     #[inline(always)]
-    pub fn try_lock(&self) -> bool {
+    fn try_lock_fast(&self) -> bool {
         // CAS instead of swap to avoid unnecessary cache-line invalidation
         if self
             .locked
@@ -172,10 +129,24 @@ impl McsTasLockRaw {
     }
 
     #[inline(always)]
-    pub fn unlock(&self) {
+    fn unlock_fast(&self) {
         self.locked.0.store(false, Ordering::Release);
-        unsafe {
-            (*thread_ctx()).unlock_count += 1;
-        }
+    }
+}
+
+impl LockBackend for McsTasLockRaw {
+    #[inline(always)]
+    fn lock(&self) {
+        self.lock_slow();
+    }
+
+    #[inline(always)]
+    fn try_lock(&self) -> bool {
+        self.try_lock_fast()
+    }
+
+    #[inline(always)]
+    fn unlock(&self) {
+        self.unlock_fast();
     }
 }

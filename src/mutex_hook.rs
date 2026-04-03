@@ -7,7 +7,9 @@ use std::hint::spin_loop;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::mcs_tas::{McsTasLockRaw, thread_ctx};
+use crate::lock_backend::LockBackend;
+use crate::lock_stats::{record_unlock, record_wait_end, record_wait_start, thread_ctx};
+use crate::mcs_tas::McsTasLockRaw;
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 /// BPF map handle for thread_ctx_addr_map, set by lib.rs after BPF load.
@@ -123,6 +125,22 @@ macro_rules! real {
             unsafe { std::mem::transmute::<*mut std::ffi::c_void, _>(ptr) }
         }
     }};
+}
+
+#[inline(always)]
+fn lock_with_stats<L: LockBackend>(lock: &L) {
+    if lock.try_lock() {
+        return;
+    }
+    let wait_start = record_wait_start();
+    lock.lock();
+    record_wait_end(wait_start);
+}
+
+#[inline(always)]
+fn unlock_with_stats<L: LockBackend>(lock: &L) {
+    lock.unlock();
+    record_unlock();
 }
 
 /// Sentinel value stored in mutex[0..8] while McsTasState is being initialized.
@@ -294,7 +312,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut libc::pthread_mutex_t) -
             Ok(state) => state,
             Err(ret) => return ret,
         };
-        (*state).lock.lock();
+        lock_with_stats(&(*state).lock);
         0
     }
 }
@@ -325,7 +343,7 @@ pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut libc::pthread_mutex_t)
         let atomic = state_atomic(mutex);
         let val = atomic.load(Ordering::Acquire);
         if val > SENTINEL {
-            (*(val as *mut McsTasState)).lock.unlock();
+            unlock_with_stats(&(*(val as *mut McsTasState)).lock);
             return 0;
         }
         libc::EINVAL
@@ -388,11 +406,10 @@ pub unsafe extern "C" fn pthread_cond_wait(
         // Lock the internal real_mutex before releasing the MCS lock so that
         // a racing signal cannot be lost in the window between the two.
         real_lock(real_mu);
-        (*state).lock.unlock();
+        unlock_with_stats(&(*state).lock);
         let ret = real_wait(cond, real_mu);
-        // Returns with real_mu held.
         real_unlock(real_mu);
-        (*state).lock.lock();
+        lock_with_stats(&(*state).lock);
         ret
     }
 }
@@ -421,10 +438,10 @@ pub unsafe extern "C" fn pthread_cond_timedwait(
         ) -> libc::c_int = real!(pthread_cond_timedwait);
 
         real_lock(real_mu);
-        (*state).lock.unlock();
+        unlock_with_stats(&(*state).lock);
         let ret = real_timedwait(cond, real_mu, abstime);
         real_unlock(real_mu);
-        (*state).lock.lock();
+        lock_with_stats(&(*state).lock);
         ret
     }
 }

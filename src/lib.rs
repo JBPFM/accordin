@@ -6,6 +6,8 @@ mod bpf_skel;
 pub use bpf_skel::*;
 mod arch;
 pub mod bpf_intf;
+mod lock_backend;
+mod lock_stats;
 mod mcs_tas;
 mod mutex_hook;
 
@@ -876,12 +878,123 @@ mod tests {
     }
 
     #[test]
+    fn lock_stats_module_owns_thread_ctx_accounting() {
+        let lib = include_str!("lib.rs");
+        let mcs_tas = include_str!("mcs_tas.rs");
+        let lock_stats_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lock_stats.rs");
+
+        assert!(
+            lib.contains("mod lock_stats;"),
+            "library should declare the shared lock-stats module",
+        );
+        assert!(
+            lock_stats_path.exists(),
+            "lock stats should live in src/lock_stats.rs so scheduler accounting is lock-agnostic",
+        );
+
+        let lock_stats = std::fs::read_to_string(&lock_stats_path)
+            .expect("lock_stats.rs should be readable once created");
+
+        assert!(
+            lock_stats.contains("pub struct LockSchedThreadCtx"),
+            "lock stats module should own the shared thread context",
+        );
+        assert!(
+            lock_stats.contains("pub fn thread_ctx()"),
+            "lock stats module should export the BPF-facing thread context pointer",
+        );
+        assert!(
+            lock_stats.contains("pub fn record_wait_start("),
+            "lock stats module should expose slow-path wait start recording",
+        );
+        assert!(
+            lock_stats.contains("pub fn record_wait_end("),
+            "lock stats module should expose slow-path wait completion recording",
+        );
+        assert!(
+            lock_stats.contains("pub fn record_unlock()"),
+            "lock stats module should expose lock-agnostic unlock counting",
+        );
+        assert!(
+            !mcs_tas.contains("pub struct LockSchedThreadCtx"),
+            "mcs_tas should not own scheduler thread accounting after decoupling",
+        );
+        assert!(
+            !mcs_tas.contains("pub fn thread_ctx()"),
+            "mcs_tas should not export thread_ctx after decoupling",
+        );
+    }
+
+    #[test]
+    fn mutex_hook_uses_try_lock_fast_path_and_lock_agnostic_accounting() {
+        let mutex_hook = compact(include_str!("mutex_hook.rs"));
+
+        assert!(
+            mutex_hook.contains("fnlock_with_stats<L:LockBackend>(lock:&L){iflock.try_lock(){return;}letwait_start=record_wait_start();lock.lock();record_wait_end(wait_start);}"),
+            "mutex hook should treat try_lock as the fast path and record wait only around the slow path",
+        );
+        assert!(
+            mutex_hook.contains("fnunlock_with_stats<L:LockBackend>(lock:&L){lock.unlock();record_unlock();}"),
+            "mutex hook should keep unlock accounting outside the concrete lock implementation",
+        );
+        assert!(
+            mutex_hook.contains("lock_with_stats(&(*state).lock);"),
+            "pthread mutex lock path should go through the fast-then-slow helper",
+        );
+        assert!(
+            mutex_hook.contains("ifval>SENTINEL{unlock_with_stats("),
+            "pthread mutex unlock path should go through the lock-agnostic unlock helper",
+        );
+    }
+
+    #[test]
+    fn condvar_paths_use_lock_agnostic_helpers() {
+        let mutex_hook = compact(include_str!("mutex_hook.rs"));
+
+        assert!(
+            mutex_hook.contains("real_lock(real_mu);unlock_with_stats(&(*state).lock);letret=real_wait(cond,real_mu);real_unlock(real_mu);lock_with_stats(&(*state).lock);"),
+            "pthread_cond_wait should release and reacquire through the shared fast/slow-path helpers",
+        );
+        assert!(
+            mutex_hook.contains("real_lock(real_mu);unlock_with_stats(&(*state).lock);letret=real_timedwait(cond,real_mu,abstime);real_unlock(real_mu);lock_with_stats(&(*state).lock);"),
+            "pthread_cond_timedwait should release and reacquire through the shared fast/slow-path helpers",
+        );
+    }
+
+    #[test]
+    fn mcs_tas_implements_pure_slow_path_backend() {
+        let mcs_tas = compact(include_str!("mcs_tas.rs"));
+        let lock_backend = include_str!("lock_backend.rs");
+
+        assert!(
+            lock_backend.contains("pub trait LockBackend"),
+            "shared lock backend interface should live in its own module",
+        );
+        assert!(
+            mcs_tas.contains("implLockBackendforMcsTasLockRaw"),
+            "mcs_tas should implement the shared lock backend interface",
+        );
+        assert!(
+            !mcs_tas.contains("if!self.locked.0.swap(true,Ordering::Acquire){return;}"),
+            "mcs_tas lock() should become pure slow path after try_lock owns the fast path",
+        );
+        assert!(
+            !mcs_tas.contains("wait_time_start"),
+            "mcs_tas slow path should not do scheduler wait accounting directly",
+        );
+        assert!(
+            !mcs_tas.contains("thread_ctx()"),
+            "mcs_tas slow path should not reach into thread-local scheduler state directly",
+        );
+    }
+
+    #[test]
     fn unlock_count_control_path_replaces_wait_ratio_gate() {
         let intf = include_str!("bpf/intf.h");
         let maps = include_str!("bpf/maps.bpf.h");
         let stats = include_str!("bpf/stats.bpf.h");
         let main = compact(include_str!("bpf/main.bpf.c"));
-        let mcs_tas = compact(include_str!("mcs_tas.rs"));
+        let lock_stats = compact(include_str!("lock_stats.rs"));
 
         assert!(
             intf.contains("unlock_count"),
@@ -916,8 +1029,8 @@ mod tests {
             "simple_tick should no longer gate admission on per-task wait ratio",
         );
         assert!(
-            mcs_tas.contains("(*thread_ctx()).unlock_count+=1;"),
-            "userspace lock path should increment unlock_count on unlock",
+            lock_stats.contains("(*thread_ctx()).unlock_count+=1;"),
+            "userspace lock path should increment unlock_count in the lock-agnostic stats module",
         );
         assert!(
             !stats.contains("useful_run"),

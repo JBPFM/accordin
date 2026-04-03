@@ -1037,4 +1037,80 @@ mod tests {
             "BPF stats should no longer keep useful-run scoring helpers",
         );
     }
+
+    #[test]
+    fn flexguard_cdylib_target_links_main_and_flexguard_bpf() {
+        let cargo = include_str!("../Cargo.toml");
+        let target_manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/libflexguard/Cargo.toml"),
+        )
+        .unwrap_or_default();
+        let build_rs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/libflexguard/build.rs"),
+        )
+        .unwrap_or_default();
+
+        assert!(cargo.contains("src/libflexguard"));
+        assert!(target_manifest.contains("crate-type = [\"cdylib\"]"));
+        assert!(build_rs.contains("enable_skel(\"../bpf/main.bpf.c\", \"bpf\")"));
+        assert!(build_rs.contains("add_source(\"../bpf/flexguard.bpf.c\")"));
+    }
+
+    #[test]
+    fn flexguard_target_registers_scheduler_and_flexguard_maps() {
+        let lib = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/libflexguard/src/lib.rs"),
+        )
+        .unwrap_or_default();
+        let hook = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/libflexguard/src/mutex_hook.rs"),
+        )
+        .unwrap_or_default();
+
+        assert!(lib.contains("thread_ctx_addr_map"));
+        assert!(lib.contains("nodes_map"));
+        assert!(hook.contains("register_thread_with_maps"));
+        assert!(hook.contains("set_thread_ctx_map"));
+        assert!(hook.contains("set_nodes_map"));
+    }
+
+    #[test]
+    fn flexguard_target_installs_runtime_and_attaches_probe() {
+        let lib = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/libflexguard/src/lib.rs"),
+        )
+        .unwrap_or_default();
+
+        assert!(lib.contains("flexguard::install_bpf_runtime"));
+        assert!(lib.contains("thread_ctx_addr_map"));
+        assert!(lib.contains("nodes_map"));
+        assert!(lib.contains("sched_switch_btf"));
+    }
+
+    #[test]
+    fn mutexbench_multi_lock_supports_flexguard_simple() {
+        let readme = include_str!("../bench/mutexbench/README.md");
+        let script = include_str!("../bench/mutexbench/scripts/sweep_mutex_throughput_multi_lock.sh");
+
+        assert!(
+            readme.contains("flexguard_simple"),
+            "mutexbench README should document the flexguard_simple lock alias",
+        );
+        assert!(
+            script.contains("resolve_flexguard_simple_lib_path"),
+            "multi-lock script should resolve libflexguard.so path for flexguard_simple",
+        );
+        assert!(
+            script.contains("flexguard_simple)"),
+            "multi-lock script should parse the flexguard_simple lock name",
+        );
+        assert!(
+            script.contains("--bench-ld-preload \"$flexguard_simple_lib\""),
+            "flexguard_simple should run through LD_PRELOAD=libflexguard.so",
+        );
+        assert!(
+            script.contains("--lock-kind \"mutex\""),
+            "flexguard_simple should reuse the mutex benchmark lock kind",
+        );
+    }
 }

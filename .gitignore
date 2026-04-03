@@ -9,3 +9,4 @@ compile_commands.json
 results
 .dmux/
 .dmux-hooks
+.claude

@@ -173,9 +173,9 @@ impl McsTasLockRaw {
 
     #[inline(always)]
     pub fn unlock(&self) {
+        self.locked.0.store(false, Ordering::Release);
         unsafe {
             (*thread_ctx()).unlock_count += 1;
         }
-        self.locked.0.store(false, Ordering::Release);
     }
 }

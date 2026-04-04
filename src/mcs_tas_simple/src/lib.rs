@@ -11,7 +11,6 @@ pub mod bpf_intf {
 mod lock_backend;
 #[path = "../../lock_stats.rs"]
 mod lock_stats;
-#[path = "../mcs_tas.rs"]
 mod mcs_tas;
 #[path = "../../mutex_hook.rs"]
 mod mutex_hook;

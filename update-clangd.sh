@@ -1,15 +1,24 @@
 #!/bin/bash
-# Script to update .clangd configuration with the latest build directory
+# Script to update .clangd configuration for shared BPF flags
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-find_latest_build_out_dir() {
-    { find "$SCRIPT_DIR/target/debug/build" -path '*/out/scx_utils-bpf_h' -type d -printf '%T@ %p\n' 2>/dev/null || true; } \
-        | sort -rn \
-        | awk 'NR == 1 { print $2 }'
+has_generated_bpf_headers() {
+    local profile build_root
+
+    for profile in debug release; do
+        build_root="$SCRIPT_DIR/target/$profile/build"
+        [ -d "$build_root" ] || continue
+
+        if find "$build_root" -path '*/out/scx_utils-bpf_h' -type d -print -quit 2>/dev/null | grep -q .; then
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 detect_target_arch_define() {
@@ -54,12 +63,10 @@ detect_multiarch_include_dir() {
     fi
 }
 
-BUILD_OUT_DIR="$(find_latest_build_out_dir)"
-if [ -z "$BUILD_OUT_DIR" ]; then
+if ! has_generated_bpf_headers; then
     echo "Error: No generated scx_utils BPF headers found. Please run 'cargo build' first." >&2
     exit 1
 fi
-BUILD_OUT_DIR="$(realpath "$BUILD_OUT_DIR")"
 
 TARGET_ARCH_DEFINE="$(detect_target_arch_define)"
 MULTIARCH_INCLUDE_DIR="$(detect_multiarch_include_dir)"
@@ -69,7 +76,6 @@ BPF_FLAGS=(
     "-I$SCRIPT_DIR/src/bpf"
     "-I/usr/local/include"
     "-I/usr/include"
-    "-I$BUILD_OUT_DIR"
     "-D__BPF__"
     "-D__BPF_TRACING__"
     "-D$TARGET_ARCH_DEFINE"
@@ -118,4 +124,4 @@ EOF
 } > .clangd
 
 echo "Successfully updated .clangd configuration"
-echo "Using generated headers from: $BUILD_OUT_DIR"
+echo "Using shared BPF flags; target-specific generated headers come from compile_commands.json"

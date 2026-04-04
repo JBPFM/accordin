@@ -7,7 +7,6 @@ mod arch;
 pub mod bpf_intf {
     include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"));
 }
-#[path = "../../flexguard.rs"]
 mod flexguard;
 #[path = "../../lock_backend.rs"]
 mod lock_backend;

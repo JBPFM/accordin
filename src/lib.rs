@@ -985,6 +985,7 @@ mod tests {
         assert!(multi.contains("mcs_tas_simple"));
         assert!(multi.contains("resolve_mcs_tas_simple_lib_path"));
         assert!(multi.contains("$PROJECT_ROOT/target/release/libmcs_tas_simple.so"));
+        assert!(multi.contains("--profile                  Enable perf profiling"));
         assert!(run_example.contains("mcs_tas_simple"));
     }
 

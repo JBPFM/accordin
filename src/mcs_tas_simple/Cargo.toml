@@ -27,3 +27,4 @@ scx_cargo = { version = "1.0.22" }
 
 [features]
 enable_backtrace = []
+perf-symbols = []

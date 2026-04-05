@@ -2,3 +2,7 @@
 resolver = "3"
 members = ["src/mcs_tas_simple", "src/libflexguard"]
 exclude = ["bench/mutexbench_rust"]
+
+[profile.release]
+debug = 1
+strip = "none"

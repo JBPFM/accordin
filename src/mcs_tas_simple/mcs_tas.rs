@@ -62,7 +62,8 @@ impl McsTasLockRaw {
         THREAD_NODE.with(|node| node.get())
     }
 
-    #[inline(always)]
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn lock_slow(&self) {
         let my_node = Self::thread_node();
         unsafe {
@@ -113,7 +114,8 @@ impl McsTasLockRaw {
     }
 
     /// Returns true if the lock was acquired, false if it was already held.
-    #[inline(always)]
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn try_lock_fast(&self) -> bool {
         // CAS instead of swap to avoid unnecessary cache-line invalidation
         if self
@@ -128,24 +130,28 @@ impl McsTasLockRaw {
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock_fast(&self) {
         self.locked.0.store(false, Ordering::Release);
     }
 }
 
 impl LockBackend for McsTasLockRaw {
-    #[inline(always)]
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn lock(&self) {
         self.lock_slow();
     }
 
-    #[inline(always)]
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn try_lock(&self) -> bool {
         self.try_lock_fast()
     }
 
-    #[inline(always)]
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock(&self) {
         self.unlock_fast();
     }

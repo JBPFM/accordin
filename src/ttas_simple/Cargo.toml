@@ -1,0 +1,30 @@
+[package]
+name = "ttas_simple"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[lib]
+name = "ttas_simple"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.65"
+ctrlc = { version = "3.1", features = ["termination"] }
+clap = { version = "4.5.28", features = ["derive", "env", "unicode", "wrap_help"] }
+crossbeam = "0.8.4"
+libbpf-rs = "=0.26.0-beta.1"
+log = "0.4.17"
+scx_stats = {version = "1.0.17" }
+scx_stats_derive = {version = "1.0.17" }
+scx_utils = {version = "1.0.22", features = ["autopower"] }
+serde = { version = "1.0.215", features = ["derive"] }
+simplelog = "0.12"
+libc = "0.2.177"
+
+[build-dependencies]
+scx_cargo = { version = "1.0.22" }
+
+[features]
+enable_backtrace = []
+perf-symbols = []

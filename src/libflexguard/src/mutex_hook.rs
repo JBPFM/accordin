@@ -51,7 +51,11 @@ where
     U: ThreadCtxMapOps + ?Sized,
 {
     thread_ctx_map.update_entry(&tid.to_ne_bytes(), &ctx_ptr.to_ne_bytes(), MapFlags::ANY)
-        && nodes_map.update_entry(&tid.to_ne_bytes(), &thread_index.to_ne_bytes(), MapFlags::ANY)
+        && nodes_map.update_entry(
+            &tid.to_ne_bytes(),
+            &thread_index.to_ne_bytes(),
+            MapFlags::ANY,
+        )
 }
 
 fn unregister_thread_with_maps<T, U>(thread_ctx_map: &T, nodes_map: &U, tid: u32) -> bool
@@ -117,7 +121,10 @@ macro_rules! real {
                         concat!(stringify!($name), "\0").as_ptr() as *const libc::c_char,
                     )
                 };
-                assert!(!ptr.is_null(), concat!("dlsym failed for ", stringify!($name)));
+                assert!(
+                    !ptr.is_null(),
+                    concat!("dlsym failed for ", stringify!($name))
+                );
                 REAL.store(ptr, Ordering::Release);
             }
             unsafe { std::mem::transmute::<*mut std::ffi::c_void, _>(ptr) }
@@ -157,7 +164,9 @@ unsafe fn state_atomic(mutex: *mut libc::pthread_mutex_t) -> &'static AtomicUsiz
 }
 
 #[inline(always)]
-unsafe fn ensure_state(mutex: *mut libc::pthread_mutex_t) -> Result<*mut FlexguardState, libc::c_int> {
+unsafe fn ensure_state(
+    mutex: *mut libc::pthread_mutex_t,
+) -> Result<*mut FlexguardState, libc::c_int> {
     if mutex.is_null() {
         return Err(libc::EINVAL);
     }
@@ -188,7 +197,10 @@ unsafe fn ensure_state_slow(
             continue;
         }
 
-        if atomic.compare_exchange(0, SENTINEL, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if atomic
+            .compare_exchange(0, SENTINEL, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             val = atomic.load(Ordering::Acquire);
             continue;
         }
@@ -205,7 +217,9 @@ unsafe fn ensure_state_slow(
         ) -> libc::c_int = real!(pthread_mutex_init);
         let ret = unsafe { real_init((*ptr).real_mutex.get(), std::ptr::null()) };
         if ret != 0 {
-            unsafe { drop(Box::from_raw(ptr)); }
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
             atomic.store(0, Ordering::Release);
             return Err(ret);
         }
@@ -249,7 +263,11 @@ pub unsafe extern "C" fn pthread_mutex_init(
             return ret;
         }
 
-        std::ptr::write_bytes(mutex as *mut u8, 0, std::mem::size_of::<libc::pthread_mutex_t>());
+        std::ptr::write_bytes(
+            mutex as *mut u8,
+            0,
+            std::mem::size_of::<libc::pthread_mutex_t>(),
+        );
         (*(mutex as *mut usize)) = ptr as usize;
         0
     }
@@ -450,7 +468,9 @@ mod tests {
         }
 
         fn delete_entry(&self, key: &[u8]) -> bool {
-            self.calls.borrow_mut().push(MapCall::Delete { key: key.to_vec() });
+            self.calls
+                .borrow_mut()
+                .push(MapCall::Delete { key: key.to_vec() });
             true
         }
     }

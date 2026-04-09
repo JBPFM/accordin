@@ -8,6 +8,7 @@ mod arch;
 pub mod bpf_intf;
 mod lock_backend;
 mod lock_stats;
+#[path = "mcs_tas_simple/src/mcs_tas.rs"]
 mod mcs_tas;
 mod mutex_hook;
 
@@ -149,7 +150,9 @@ mod tests {
     #[test]
     fn env_flag_defaults_to_false() {
         let key = "LB_SIMPLE_TEST_ENV_FLAG_MISSING";
-        std::env::remove_var(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
         assert!(!env_flag(key));
     }
 
@@ -157,9 +160,13 @@ mod tests {
     fn env_flag_accepts_common_truthy_values() {
         let key = "LB_SIMPLE_TEST_ENV_FLAG_TRUTHY";
         for value in ["1", "true", "TRUE", "yes", "on"] {
-            std::env::set_var(key, value);
+            unsafe {
+                std::env::set_var(key, value);
+            }
             assert!(env_flag(key), "expected truthy value {value}");
         }
-        std::env::remove_var(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
     }
 }

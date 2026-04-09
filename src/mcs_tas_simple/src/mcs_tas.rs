@@ -65,6 +65,7 @@ impl McsTasLockRaw {
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn lock_slow(&self) {
+        // prepare node and set pred
         let my_node = Self::thread_node();
         unsafe {
             (*my_node).next.store(ptr::null_mut(), Ordering::Relaxed);
@@ -73,6 +74,7 @@ impl McsTasLockRaw {
 
         let pred = self.tail.0.swap(my_node, Ordering::AcqRel);
         if !pred.is_null() {
+            // mcs spin loop
             unsafe {
                 (*my_node).waiting.store(true, Ordering::Relaxed);
                 (*pred).next.store(my_node, Ordering::Release);
@@ -82,9 +84,12 @@ impl McsTasLockRaw {
             }
         }
 
+        // front spinning
         while self.locked.0.swap(true, Ordering::Acquire) {
             pause();
         }
+
+        // set next node
         let mut succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
         if succ.is_null()
             && self
@@ -110,7 +115,6 @@ impl McsTasLockRaw {
                 (*succ).waiting.store(false, Ordering::Release);
             }
         }
-
     }
 
     /// Returns true if the lock was acquired, false if it was already held.

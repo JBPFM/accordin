@@ -1,19 +1,14 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 
-#[path = "../../arch.rs"]
-mod arch;
+pub use lb_shared::arch;
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 pub mod bpf_intf {
     include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"));
 }
-#[path = "../../lock_backend.rs"]
-mod lock_backend;
-#[path = "../../lock_stats.rs"]
-mod lock_stats;
-#[path = "../ttas.rs"]
+pub use lb_shared::lock_backend;
+pub use lb_shared::lock_stats;
 mod ttas;
-#[path = "../mutex_hook.rs"]
 mod mutex_hook;
 
 use std::mem::MaybeUninit;

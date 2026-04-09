@@ -805,6 +805,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
+name = "lb_shared"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "lb_simple"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libbpf-rs",
+ "libc",
+ "log",
+ "scx_cargo",
+ "scx_utils",
+ "simplelog",
+]
+
+[[package]]
 name = "libbpf-cargo"
 version = "0.26.0-beta.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -857,6 +877,7 @@ name = "libflexguard"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lb_shared",
  "libbpf-rs",
  "libc",
  "log",
@@ -906,6 +927,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "ctrlc",
+ "lb_shared",
  "libbpf-rs",
  "libc",
  "log",
@@ -1763,6 +1785,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "ctrlc",
+ "lb_shared",
  "libbpf-rs",
  "libc",
  "log",

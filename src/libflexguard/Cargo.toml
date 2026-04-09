@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0.65"
+lb_shared = { path = "../lb_shared" }
 libbpf-rs = "=0.26.0-beta.1"
 log = "0.4.17"
 scx_utils = { version = "1.0.22", features = ["autopower"] }

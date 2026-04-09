@@ -1,7 +1,34 @@
+[package]
+name = "lb_simple"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+build = "build.rs"
+
+[lib]
+name = "lb_simple"
+crate-type = ["cdylib"]
+
 [workspace]
 resolver = "3"
-members = ["src/mcs_tas_simple", "src/ttas_simple", "src/libflexguard"]
+members = ["src/lb_shared", "src/mcs_tas_simple", "src/ttas_simple", "src/libflexguard"]
+default-members = [".", "src/lb_shared", "src/mcs_tas_simple", "src/ttas_simple", "src/libflexguard"]
 exclude = ["bench/mutexbench_rust"]
+
+[dependencies]
+anyhow = "1.0.65"
+libbpf-rs = "=0.26.0-beta.1"
+libc = "0.2.177"
+log = "0.4.17"
+scx_utils = { version = "1.0.22", features = ["autopower"] }
+simplelog = "0.12"
+
+[build-dependencies]
+scx_cargo = { version = "1.0.22" }
+
+[features]
+enable_backtrace = []
+perf-symbols = []
 
 [profile.release]
 debug = 1

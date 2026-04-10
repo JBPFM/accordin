@@ -140,3 +140,12 @@ static INIT: extern "C" fn() = {
     }
     init
 };
+
+#[unsafe(link_section = ".fini_array")]
+#[used]
+static FINI: extern "C" fn() = {
+    extern "C" fn fini() {
+        lock_stats::print_process_stats("flexguard_simple");
+    }
+    fini
+};

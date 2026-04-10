@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::flexguard::FlexguardLockRaw;
 use crate::lock_backend::LockBackend;
-use crate::lock_stats::{record_unlock, record_wait_end, record_wait_start, thread_ctx};
+use crate::lock_stats::{
+    record_hold_end, record_lock_acquired, record_thread_start, record_wait_end, record_wait_start,
+    thread_ctx,
+};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
@@ -88,6 +91,7 @@ struct ThreadCtxGuard;
 
 impl Drop for ThreadCtxGuard {
     fn drop(&mut self) {
+        crate::lock_stats::flush_current_thread_stats();
         unregister_thread_ctx();
     }
 }
@@ -101,6 +105,7 @@ thread_local! {
 fn ensure_registered() {
     REGISTERED.with(|r| {
         if !r.get() {
+            record_thread_start();
             register_thread_ctx();
             _GUARD.with(|g| unsafe { *g.get() = Some(ThreadCtxGuard) });
             r.set(true);
@@ -135,17 +140,19 @@ macro_rules! real {
 #[inline(always)]
 fn lock_with_stats<L: LockBackend>(lock: &L) {
     if lock.try_lock() {
+        record_lock_acquired();
         return;
     }
     let wait_start = record_wait_start();
     lock.lock();
     record_wait_end(wait_start);
+    record_lock_acquired();
 }
 
 #[inline(always)]
 fn unlock_with_stats<L: LockBackend>(lock: &L) {
+    record_hold_end();
     lock.unlock();
-    record_unlock();
 }
 
 const SENTINEL: usize = 1;
@@ -319,6 +326,7 @@ pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut libc::pthread_mutex_t
             Err(ret) => return ret,
         };
         if (*state).lock.try_lock() {
+            record_lock_acquired();
             0
         } else {
             libc::EBUSY

@@ -14,9 +14,13 @@
 /* Stored in user thread-local memory and read from BPF via bpf_probe_read_user.
  */
 struct lock_sched_thread_ctx {
+  unsigned long long thread_start_ns;        /* thread stats start timestamp */
+  unsigned long long thread_elapsed_ns_total; /* latest cumulative thread time */
   unsigned long long wait_ns_total; /* cumulative wait time */
   unsigned long long wait_start_ns; /* current wait start timestamp */
-  unsigned long long wait_end_ns;   /* latest completed wait end timestamp */
+  unsigned long long hold_ns_total; /* cumulative hold time */
+  unsigned long long hold_start_ns; /* current hold start timestamp */
+  unsigned long long lock_count;    /* completed lock hold intervals */
 };
 
 /* Kept only so existing task-storage userspace bindings still generate cleanly. */

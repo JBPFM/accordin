@@ -150,8 +150,7 @@ pub fn print_process_stats(label: &str) {
         0.0
     };
     let avg_outside_ns_elapsed = if lock_count != 0 {
-        thread_elapsed_ns_total
-            .saturating_sub(wait_ns_total.saturating_add(hold_ns_total)) as f64
+        thread_elapsed_ns_total.saturating_sub(wait_ns_total.saturating_add(hold_ns_total)) as f64
             / lock_count as f64
     } else {
         0.0

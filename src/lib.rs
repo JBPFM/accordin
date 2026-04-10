@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// 动态链接库入口，在加载时初始化 eBPF 调度器
+// Shared library entry point that initializes the eBPF scheduler on load.
 
 mod bpf_skel;
 pub use bpf_skel::*;
-mod arch;
+pub use lb_shared::arch;
 pub mod bpf_intf;
-mod lock_backend;
-mod lock_stats;
+pub use lb_shared::lock_backend;
+pub use lb_shared::lock_stats;
 #[path = "mcs_tas_simple/src/mcs_tas.rs"]
 mod mcs_tas;
+#[path = "mcs_tas_simple/src/mutex_hook.rs"]
 mod mutex_hook;
 
 use std::mem::MaybeUninit;

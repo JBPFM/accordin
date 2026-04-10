@@ -1,14 +1,10 @@
-use std::cell::{Cell, UnsafeCell};
-use std::hint::spin_loop;
+// SPDX-License-Identifier: GPL-2.0-only
+
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::flexguard::FlexguardLockRaw;
-use crate::lock_backend::LockBackend;
-use crate::lock_stats::{
-    record_hold_end, record_lock_acquired, record_thread_start, record_wait_end, record_wait_start,
-    thread_ctx,
-};
+use crate::lock_stats::thread_ctx;
+use lb_shared::mutex_hook::{MutexHookBackend, ThreadRegistration, current_tid};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
@@ -35,11 +31,6 @@ impl ThreadCtxMapOps for MapHandle {
     fn delete_entry(&self, key: &[u8]) -> bool {
         self.delete(key).is_ok()
     }
-}
-
-#[inline(always)]
-fn current_tid() -> u32 {
-    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
 }
 
 fn register_thread_with_maps<T, U>(
@@ -69,376 +60,54 @@ where
     thread_ctx_map.delete_entry(&tid.to_ne_bytes()) && nodes_map.delete_entry(&tid.to_ne_bytes())
 }
 
-fn register_thread_ctx() {
-    let (Some(thread_ctx_map), Some(nodes_map)) = (THREAD_CTX_MAP.get(), NODES_MAP.get()) else {
-        return;
-    };
+struct FlexguardBackend;
 
-    let tid = current_tid();
-    let ctx_ptr = thread_ctx() as u64;
-    let thread_index = crate::flexguard::current_thread_index() as u32;
-    let _ = register_thread_with_maps(thread_ctx_map, nodes_map, tid, ctx_ptr, thread_index);
-}
+impl MutexHookBackend for FlexguardBackend {
+    type LockState = FlexguardLockRaw;
 
-fn unregister_thread_ctx() {
-    let (Some(thread_ctx_map), Some(nodes_map)) = (THREAD_CTX_MAP.get(), NODES_MAP.get()) else {
-        return;
-    };
-    let _ = unregister_thread_with_maps(thread_ctx_map, nodes_map, current_tid());
-}
+    fn create_state() -> Self::LockState {
+        FlexguardLockRaw::new()
+    }
 
-struct ThreadCtxGuard;
+    fn lock(state: &Self::LockState) {
+        state.lock();
+    }
 
-impl Drop for ThreadCtxGuard {
-    fn drop(&mut self) {
-        crate::lock_stats::flush_current_thread_stats();
-        unregister_thread_ctx();
+    fn try_lock(state: &Self::LockState) -> bool {
+        state.try_lock()
+    }
+
+    fn unlock(state: &Self::LockState) {
+        state.unlock();
     }
 }
 
-thread_local! {
-    static REGISTERED: Cell<bool> = const { Cell::new(false) };
-    static _GUARD: UnsafeCell<Option<ThreadCtxGuard>> = const { UnsafeCell::new(None) };
-}
+struct FlexguardRegistration;
 
-#[inline(always)]
-fn ensure_registered() {
-    REGISTERED.with(|r| {
-        if !r.get() {
-            record_thread_start();
-            register_thread_ctx();
-            _GUARD.with(|g| unsafe { *g.get() = Some(ThreadCtxGuard) });
-            r.set(true);
-        }
-    });
-}
-
-macro_rules! real {
-    ($name:ident) => {{
-        #[allow(unused_unsafe)]
-        {
-            static REAL: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-            let mut ptr = REAL.load(Ordering::Relaxed);
-            if ptr.is_null() {
-                ptr = unsafe {
-                    libc::dlsym(
-                        libc::RTLD_NEXT,
-                        concat!(stringify!($name), "\0").as_ptr() as *const libc::c_char,
-                    )
-                };
-                assert!(
-                    !ptr.is_null(),
-                    concat!("dlsym failed for ", stringify!($name))
-                );
-                REAL.store(ptr, Ordering::Release);
-            }
-            unsafe { std::mem::transmute::<*mut std::ffi::c_void, _>(ptr) }
-        }
-    }};
-}
-
-#[inline(always)]
-fn lock_with_stats<L: LockBackend>(lock: &L) {
-    if lock.try_lock() {
-        record_lock_acquired();
-        return;
-    }
-    let wait_start = record_wait_start();
-    lock.lock();
-    record_wait_end(wait_start);
-    record_lock_acquired();
-}
-
-#[inline(always)]
-fn unlock_with_stats<L: LockBackend>(lock: &L) {
-    record_hold_end();
-    lock.unlock();
-}
-
-const SENTINEL: usize = 1;
-
-struct FlexguardState {
-    lock: FlexguardLockRaw,
-    real_mutex: UnsafeCell<libc::pthread_mutex_t>,
-}
-
-unsafe impl Send for FlexguardState {}
-unsafe impl Sync for FlexguardState {}
-
-#[inline(always)]
-unsafe fn state_atomic(mutex: *mut libc::pthread_mutex_t) -> &'static AtomicUsize {
-    unsafe { &*(mutex as *const AtomicUsize) }
-}
-
-#[inline(always)]
-unsafe fn ensure_state(
-    mutex: *mut libc::pthread_mutex_t,
-) -> Result<*mut FlexguardState, libc::c_int> {
-    if mutex.is_null() {
-        return Err(libc::EINVAL);
-    }
-
-    let val = unsafe { state_atomic(mutex) }.load(Ordering::Acquire);
-    if likely(val > SENTINEL) {
-        return Ok(val as *mut FlexguardState);
-    }
-    unsafe { ensure_state_slow(mutex, val) }
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn ensure_state_slow(
-    mutex: *mut libc::pthread_mutex_t,
-    initial: usize,
-) -> Result<*mut FlexguardState, libc::c_int> {
-    let atomic = unsafe { state_atomic(mutex) };
-    let mut val = initial;
-    loop {
-        if val > SENTINEL {
-            return Ok(val as *mut FlexguardState);
-        }
-
-        if val == SENTINEL {
-            spin_loop();
-            val = atomic.load(Ordering::Acquire);
-            continue;
-        }
-
-        if atomic
-            .compare_exchange(0, SENTINEL, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            val = atomic.load(Ordering::Acquire);
-            continue;
-        }
-
-        let state = Box::new(FlexguardState {
-            lock: FlexguardLockRaw::new(),
-            real_mutex: unsafe { UnsafeCell::new(std::mem::zeroed()) },
-        });
-        let ptr = Box::into_raw(state);
-
-        let real_init: unsafe extern "C" fn(
-            *mut libc::pthread_mutex_t,
-            *const libc::pthread_mutexattr_t,
-        ) -> libc::c_int = real!(pthread_mutex_init);
-        let ret = unsafe { real_init((*ptr).real_mutex.get(), std::ptr::null()) };
-        if ret != 0 {
-            unsafe {
-                drop(Box::from_raw(ptr));
-            }
-            atomic.store(0, Ordering::Release);
-            return Err(ret);
-        }
-
-        atomic.store(ptr as usize, Ordering::Release);
-        return Ok(ptr);
-    }
-}
-
-#[inline(always)]
-const fn likely(b: bool) -> bool {
-    if !b {
-        cold_path();
-    }
-    b
-}
-
-#[cold]
-#[inline(never)]
-const fn cold_path() {}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_init(
-    mutex: *mut libc::pthread_mutex_t,
-    attr: *const libc::pthread_mutexattr_t,
-) -> libc::c_int {
-    unsafe {
-        let state = Box::new(FlexguardState {
-            lock: FlexguardLockRaw::new(),
-            real_mutex: UnsafeCell::new(std::mem::zeroed()),
-        });
-        let ptr = Box::into_raw(state);
-
-        let real_init: unsafe extern "C" fn(
-            *mut libc::pthread_mutex_t,
-            *const libc::pthread_mutexattr_t,
-        ) -> libc::c_int = real!(pthread_mutex_init);
-        let ret = real_init((*ptr).real_mutex.get(), attr);
-        if ret != 0 {
-            drop(Box::from_raw(ptr));
-            return ret;
-        }
-
-        std::ptr::write_bytes(
-            mutex as *mut u8,
-            0,
-            std::mem::size_of::<libc::pthread_mutex_t>(),
-        );
-        (*(mutex as *mut usize)) = ptr as usize;
-        0
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
-    unsafe {
-        if mutex.is_null() {
-            return libc::EINVAL;
-        }
-
-        let atomic = state_atomic(mutex);
-        let val = atomic.load(Ordering::Acquire);
-        if val > SENTINEL {
-            let ptr = val as *mut FlexguardState;
-            let real_destroy: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
-                real!(pthread_mutex_destroy);
-            let ret = real_destroy((*ptr).real_mutex.get());
-            if ret != 0 {
-                return ret;
-            }
-            drop(Box::from_raw(ptr));
-            atomic.store(0, Ordering::Release);
-        }
-        0
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
-    ensure_registered();
-    unsafe {
-        let state = match ensure_state(mutex) {
-            Ok(state) => state,
-            Err(ret) => return ret,
+impl ThreadRegistration for FlexguardRegistration {
+    fn register_current_thread() -> bool {
+        let (Some(thread_ctx_map), Some(nodes_map)) = (THREAD_CTX_MAP.get(), NODES_MAP.get())
+        else {
+            return false;
         };
-        lock_with_stats(&(*state).lock);
-        0
-    }
-}
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
-    ensure_registered();
-    unsafe {
-        let state = match ensure_state(mutex) {
-            Ok(state) => state,
-            Err(ret) => return ret,
+        let tid = current_tid();
+        let ctx_ptr = thread_ctx() as u64;
+        let thread_index = crate::flexguard::current_thread_index() as u32;
+        register_thread_with_maps(thread_ctx_map, nodes_map, tid, ctx_ptr, thread_index)
+    }
+
+    fn unregister_current_thread() {
+        let (Some(thread_ctx_map), Some(nodes_map)) = (THREAD_CTX_MAP.get(), NODES_MAP.get())
+        else {
+            return;
         };
-        if (*state).lock.try_lock() {
-            record_lock_acquired();
-            0
-        } else {
-            libc::EBUSY
-        }
+
+        let _ = unregister_thread_with_maps(thread_ctx_map, nodes_map, current_tid());
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
-    unsafe {
-        if mutex.is_null() {
-            return libc::EINVAL;
-        }
-
-        let atomic = state_atomic(mutex);
-        let val = atomic.load(Ordering::Acquire);
-        if val > SENTINEL {
-            unlock_with_stats(&(*(val as *mut FlexguardState)).lock);
-            return 0;
-        }
-        libc::EINVAL
-    }
-}
-
-macro_rules! passthrough_hook {
-    ($sym:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty) => {
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $sym($($arg: $ty),*) -> $ret {
-            let f: unsafe extern "C" fn($($ty),*) -> $ret = real!($sym);
-            unsafe { f($($arg),*) }
-        }
-    };
-}
-
-passthrough_hook!(pthread_cond_init(
-    cond: *mut libc::pthread_cond_t,
-    attr: *const libc::pthread_condattr_t,
-) -> libc::c_int);
-
-passthrough_hook!(pthread_cond_destroy(
-    cond: *mut libc::pthread_cond_t,
-) -> libc::c_int);
-
-passthrough_hook!(pthread_cond_signal(
-    cond: *mut libc::pthread_cond_t,
-) -> libc::c_int);
-
-passthrough_hook!(pthread_cond_broadcast(
-    cond: *mut libc::pthread_cond_t,
-) -> libc::c_int);
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_cond_wait(
-    cond: *mut libc::pthread_cond_t,
-    user_mutex: *mut libc::pthread_mutex_t,
-) -> libc::c_int {
-    unsafe {
-        let state = match ensure_state(user_mutex) {
-            Ok(state) => state,
-            Err(ret) => return ret,
-        };
-        let real_mu = (*state).real_mutex.get();
-
-        let real_lock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
-            real!(pthread_mutex_lock);
-        let real_unlock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
-            real!(pthread_mutex_unlock);
-        let real_wait: unsafe extern "C" fn(
-            *mut libc::pthread_cond_t,
-            *mut libc::pthread_mutex_t,
-        ) -> libc::c_int = real!(pthread_cond_wait);
-
-        real_lock(real_mu);
-        unlock_with_stats(&(*state).lock);
-        let ret = real_wait(cond, real_mu);
-        real_unlock(real_mu);
-        lock_with_stats(&(*state).lock);
-        ret
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_cond_timedwait(
-    cond: *mut libc::pthread_cond_t,
-    user_mutex: *mut libc::pthread_mutex_t,
-    abstime: *const libc::timespec,
-) -> libc::c_int {
-    unsafe {
-        let state = match ensure_state(user_mutex) {
-            Ok(state) => state,
-            Err(ret) => return ret,
-        };
-        let real_mu = (*state).real_mutex.get();
-
-        let real_lock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
-            real!(pthread_mutex_lock);
-        let real_unlock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
-            real!(pthread_mutex_unlock);
-        let real_timedwait: unsafe extern "C" fn(
-            *mut libc::pthread_cond_t,
-            *mut libc::pthread_mutex_t,
-            *const libc::timespec,
-        ) -> libc::c_int = real!(pthread_cond_timedwait);
-
-        real_lock(real_mu);
-        unlock_with_stats(&(*state).lock);
-        let ret = real_timedwait(cond, real_mu, abstime);
-        real_unlock(real_mu);
-        lock_with_stats(&(*state).lock);
-        ret
-    }
-}
+lb_shared::export_mutex_hooks!(FlexguardBackend, FlexguardRegistration);
 
 #[cfg(test)]
 mod tests {
@@ -446,7 +115,7 @@ mod tests {
 
     use libbpf_rs::MapFlags;
 
-    use super::ThreadCtxMapOps;
+    use super::{ThreadCtxMapOps, register_thread_with_maps, unregister_thread_with_maps};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum MapCall {
@@ -494,7 +163,7 @@ mod tests {
         let thread_ctx_map = RecordingMap::default();
         let nodes_map = RecordingMap::default();
 
-        assert!(super::register_thread_with_maps(
+        assert!(register_thread_with_maps(
             &thread_ctx_map,
             &nodes_map,
             7,
@@ -502,7 +171,42 @@ mod tests {
             13,
         ));
 
-        assert_eq!(thread_ctx_map.calls().len(), 1);
-        assert_eq!(nodes_map.calls().len(), 1);
+        assert_eq!(
+            thread_ctx_map.calls(),
+            vec![MapCall::Update {
+                key: 7u32.to_ne_bytes().to_vec(),
+                value: 0x1122_3344_5566_7788u64.to_ne_bytes().to_vec(),
+                flags: MapFlags::ANY,
+            }]
+        );
+        assert_eq!(
+            nodes_map.calls(),
+            vec![MapCall::Update {
+                key: 7u32.to_ne_bytes().to_vec(),
+                value: 13u32.to_ne_bytes().to_vec(),
+                flags: MapFlags::ANY,
+            }]
+        );
+    }
+
+    #[test]
+    fn unregister_thread_removes_scheduler_and_flexguard_maps() {
+        let thread_ctx_map = RecordingMap::default();
+        let nodes_map = RecordingMap::default();
+
+        assert!(unregister_thread_with_maps(&thread_ctx_map, &nodes_map, 11,));
+
+        assert_eq!(
+            thread_ctx_map.calls(),
+            vec![MapCall::Delete {
+                key: 11u32.to_ne_bytes().to_vec(),
+            }]
+        );
+        assert_eq!(
+            nodes_map.calls(),
+            vec![MapCall::Delete {
+                key: 11u32.to_ne_bytes().to_vec(),
+            }]
+        );
     }
 }

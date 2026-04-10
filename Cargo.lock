@@ -816,6 +816,7 @@ name = "lb_simple"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lb_shared",
  "libbpf-rs",
  "libc",
  "log",

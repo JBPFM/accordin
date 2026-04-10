@@ -103,8 +103,14 @@ fn init_ebpf() {
     );
 
     if env_flag(DISABLE_BPF_ENV) {
-        info!("{SCHEDULER_NAME} scheduler disabled by env {}", DISABLE_BPF_ENV);
-        eprintln!("[flexguard_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
+        info!(
+            "{SCHEDULER_NAME} scheduler disabled by env {}",
+            DISABLE_BPF_ENV
+        );
+        eprintln!(
+            "[flexguard_simple] eBPF scheduler disabled by {}",
+            DISABLE_BPF_ENV
+        );
         return;
     }
 

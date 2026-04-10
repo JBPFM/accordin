@@ -94,7 +94,10 @@ fn init_ebpf() {
             "{SCHEDULER_NAME} scheduler disabled by env {}",
             DISABLE_BPF_ENV
         );
-        eprintln!("[mcs_tas_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
+        eprintln!(
+            "[mcs_tas_simple] eBPF scheduler disabled by {}",
+            DISABLE_BPF_ENV
+        );
         return;
     }
 

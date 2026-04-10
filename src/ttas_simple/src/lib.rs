@@ -8,8 +8,8 @@ pub mod bpf_intf {
 }
 pub use lb_shared::lock_backend;
 pub use lb_shared::lock_stats;
-mod ttas;
 mod mutex_hook;
+mod ttas;
 
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
@@ -94,7 +94,10 @@ fn init_ebpf() {
             "{SCHEDULER_NAME} scheduler disabled by env {}",
             DISABLE_BPF_ENV
         );
-        eprintln!("[ttas_simple] eBPF scheduler disabled by {}", DISABLE_BPF_ENV);
+        eprintln!(
+            "[ttas_simple] eBPF scheduler disabled by {}",
+            DISABLE_BPF_ENV
+        );
         return;
     }
 

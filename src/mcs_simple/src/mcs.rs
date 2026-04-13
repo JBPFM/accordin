@@ -9,61 +9,52 @@ use crate::lock_stats::{
     mark_critical_section_entered, mark_slow_path_pending, thread_has_admission,
 };
 
-// we remove sample cause in some high contention env wait can occupy full timeslice
-// or we can reserve a fast path in low contention
-// // Keep in sync with WAIT_TIME_SAMPLE_STRIDE in src/bpf/intf.h.
-// const WAIT_TIME_SAMPLE_STRIDE: u32 = 8;
-// const WAIT_TIME_SAMPLE_MASK: u32 = WAIT_TIME_SAMPLE_STRIDE - 1;
-
 #[repr(align(64))]
 struct CacheAligned<T>(T);
 
 #[repr(C, align(64))]
 pub struct Node {
     next: AtomicPtr<Node>,
-    waiting: AtomicBool,
+    locked: AtomicBool,
 }
 
 impl Node {
     pub const fn new() -> Self {
         Self {
             next: AtomicPtr::new(ptr::null_mut()),
-            waiting: AtomicBool::new(false),
+            locked: AtomicBool::new(false),
         }
     }
 }
 
 thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
-    // static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
 }
 
-// #[inline(always)]
-// fn should_sample_wait() -> bool {
-//     WAIT_SAMPLE_COUNTER.with(|counter| {
-//         let next = counter.get().wrapping_add(1);
-//         counter.set(next);
-//         (next & WAIT_TIME_SAMPLE_MASK) == 0
-//     })
-// }
-//
-
-/// MCS-TAS lock with cache-aligned state variables.
-pub struct McsTasLockRaw {
+pub struct McsLockRaw {
     tail: CacheAligned<AtomicPtr<Node>>,
-    locked: CacheAligned<AtomicBool>,
 }
 
-impl McsTasLockRaw {
+impl McsLockRaw {
     pub const fn new() -> Self {
         Self {
             tail: CacheAligned(AtomicPtr::new(ptr::null_mut())),
-            locked: CacheAligned(AtomicBool::new(false)),
         }
     }
 
+    #[inline(always)]
     fn thread_node() -> *mut Node {
         THREAD_NODE.with(|node| node.get())
+    }
+
+    #[inline(always)]
+    fn prepare_node(locked: bool) -> *mut Node {
+        let my_node = Self::thread_node();
+        unsafe {
+            (*my_node).next.store(ptr::null_mut(), Ordering::Relaxed);
+            (*my_node).locked.store(locked, Ordering::Relaxed);
+        }
+        my_node
     }
 
     #[inline(always)]
@@ -94,37 +85,46 @@ impl McsTasLockRaw {
 
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
-    fn lock_slow(&self) {
+    fn lock_queue(&self) {
         self.ensure_slow_path_admission();
 
-        // prepare node and set pred
-        let my_node = Self::thread_node();
-        unsafe {
-            (*my_node).next.store(ptr::null_mut(), Ordering::Relaxed);
-            (*my_node).waiting.store(false, Ordering::Relaxed);
-        }
-
+        let my_node = Self::prepare_node(true);
         let pred = self.tail.0.swap(my_node, Ordering::AcqRel);
         if !pred.is_null() {
-            // mcs spin loop
             unsafe {
-                (*my_node).waiting.store(true, Ordering::Relaxed);
                 (*pred).next.store(my_node, Ordering::Release);
-                while (*my_node).waiting.load(Ordering::Acquire) {
+                while (*my_node).locked.load(Ordering::Acquire) {
                     pause();
                 }
             }
         }
 
-        // front spinning
-        while self.locked.0.swap(true, Ordering::Acquire) {
-            pause();
-        }
+        mark_critical_section_entered();
+    }
 
-        // set next node
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
+    fn try_lock_fast(&self) -> bool {
+        let my_node = Self::prepare_node(false);
+        self.tail
+            .0
+            .compare_exchange(
+                ptr::null_mut(),
+                my_node,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
+    fn unlock_queue(&self) {
+        let my_node = Self::thread_node();
         let mut succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
-        if succ.is_null()
-            && self
+
+        if succ.is_null() {
+            if self
                 .tail
                 .0
                 .compare_exchange(
@@ -133,8 +133,12 @@ impl McsTasLockRaw {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_err()
-        {
+                .is_ok()
+            {
+                clear_admission_state();
+                return;
+            }
+
             while {
                 succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
                 succ.is_null()
@@ -142,45 +146,19 @@ impl McsTasLockRaw {
                 pause();
             }
         }
-        if !succ.is_null() {
-            unsafe {
-                (*succ).waiting.store(false, Ordering::Release);
-            }
+
+        unsafe {
+            (*succ).locked.store(false, Ordering::Release);
         }
-
-        mark_critical_section_entered();
-    }
-
-    /// Returns true if the lock was acquired, false if it was already held.
-    #[cfg_attr(feature = "perf-symbols", inline(never))]
-    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
-    fn try_lock_fast(&self) -> bool {
-        // CAS instead of swap to avoid unnecessary cache-line invalidation
-        if self
-            .locked
-            .0
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            true
-        } else {
-            false
-        }
-    }
-
-    #[cfg_attr(feature = "perf-symbols", inline(never))]
-    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
-    fn unlock_fast(&self) {
-        self.locked.0.store(false, Ordering::Release);
         clear_admission_state();
     }
 }
 
-impl LockBackend for McsTasLockRaw {
+impl LockBackend for McsLockRaw {
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn lock(&self) {
-        self.lock_slow();
+        self.lock_queue();
     }
 
     #[cfg_attr(feature = "perf-symbols", inline(never))]
@@ -192,14 +170,18 @@ impl LockBackend for McsTasLockRaw {
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock(&self) {
-        self.unlock_fast();
+        self.unlock_queue();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Node;
+    use std::cell::UnsafeCell;
+    use std::sync::Arc;
+
+    use super::{McsLockRaw, Node};
     use crate::bpf_intf;
+    use crate::lock_backend::LockBackend;
     use crate::lock_stats::{ADMISSION_CPU_NONE, admission_state_snapshot, clear_admission_state};
 
     #[test]
@@ -228,5 +210,52 @@ mod tests {
         assert_eq!(snapshot.admission_cpu, ADMISSION_CPU_NONE);
         assert!(!snapshot.in_critical_section);
         assert!(!snapshot.slow_path_pending);
+    }
+
+    #[test]
+    fn try_lock_requires_unlock_before_reacquire() {
+        let lock = McsLockRaw::new();
+
+        assert!(lock.try_lock());
+        assert!(!lock.try_lock());
+        lock.unlock();
+        assert!(lock.try_lock());
+        lock.unlock();
+    }
+
+    struct SharedCounter {
+        lock: McsLockRaw,
+        value: UnsafeCell<usize>,
+    }
+
+    unsafe impl Sync for SharedCounter {}
+
+    #[test]
+    fn lock_serializes_counter_updates() {
+        let shared = Arc::new(SharedCounter {
+            lock: McsLockRaw::new(),
+            value: UnsafeCell::new(0),
+        });
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let shared = Arc::clone(&shared);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..10_000 {
+                    shared.lock.lock();
+                    unsafe {
+                        let next = (*shared.value.get()).wrapping_add(1);
+                        *shared.value.get() = next;
+                    }
+                    shared.lock.unlock();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(unsafe { *shared.value.get() }, 40_000);
     }
 }

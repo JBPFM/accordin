@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns};
 
+pub const ADMISSION_CPU_NONE: u32 = u32::MAX;
+
 /// Per-thread lock scheduling context, read by BPF via bpf_probe_read_user.
 #[repr(C)]
 pub struct LockSchedThreadCtx {
@@ -13,6 +15,11 @@ pub struct LockSchedThreadCtx {
     pub hold_ns_total: u64,
     pub hold_start_ns: u64,
     pub lock_count: u64,
+    pub admission_owned: u32,
+    pub admission_cpu: u32,
+    pub admission_requeue_home: u32,
+    pub in_critical_section: u32,
+    pub slow_path_pending: u32,
 }
 
 impl LockSchedThreadCtx {
@@ -25,6 +32,11 @@ impl LockSchedThreadCtx {
             hold_ns_total: 0,
             hold_start_ns: 0,
             lock_count: 0,
+            admission_owned: 0,
+            admission_cpu: ADMISSION_CPU_NONE,
+            admission_requeue_home: 0,
+            in_critical_section: 0,
+            slow_path_pending: 0,
         }
     }
 }
@@ -63,6 +75,75 @@ static PROCESS_OUTSIDE_NS_GAP_SAMPLES: AtomicU64 = AtomicU64::new(0);
 /// Returns a pointer to the current thread's LockSchedThreadCtx.
 pub fn thread_ctx() -> *mut LockSchedThreadCtx {
     THREAD_CTX.with(|ctx| ctx.get())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionStateSnapshot {
+    pub admission_owned: bool,
+    pub admission_cpu: u32,
+    pub admission_requeue_home: bool,
+    pub in_critical_section: bool,
+    pub slow_path_pending: bool,
+}
+
+#[inline(always)]
+pub fn thread_has_admission() -> bool {
+    unsafe { (*thread_ctx()).admission_owned != 0 }
+}
+
+#[inline(always)]
+pub fn mark_slow_path_pending() {
+    unsafe {
+        let ctx = thread_ctx();
+        (*ctx).slow_path_pending = 1;
+        (*ctx).in_critical_section = 0;
+    }
+}
+
+#[inline(always)]
+pub fn grant_slow_path_admission(cpu: u32) {
+    unsafe {
+        let ctx = thread_ctx();
+        (*ctx).admission_owned = 1;
+        (*ctx).admission_cpu = cpu;
+        (*ctx).admission_requeue_home = 0;
+    }
+}
+
+#[inline(always)]
+pub fn mark_critical_section_entered() {
+    unsafe {
+        let ctx = thread_ctx();
+        (*ctx).slow_path_pending = 0;
+        (*ctx).in_critical_section = 1;
+        (*ctx).admission_requeue_home = 0;
+    }
+}
+
+#[inline(always)]
+pub fn clear_admission_state() {
+    unsafe {
+        let ctx = thread_ctx();
+        (*ctx).admission_owned = 0;
+        (*ctx).admission_cpu = ADMISSION_CPU_NONE;
+        (*ctx).admission_requeue_home = 0;
+        (*ctx).in_critical_section = 0;
+        (*ctx).slow_path_pending = 0;
+    }
+}
+
+#[inline(always)]
+pub fn admission_state_snapshot() -> AdmissionStateSnapshot {
+    unsafe {
+        let ctx = thread_ctx();
+        AdmissionStateSnapshot {
+            admission_owned: (*ctx).admission_owned != 0,
+            admission_cpu: (*ctx).admission_cpu,
+            admission_requeue_home: (*ctx).admission_requeue_home != 0,
+            in_critical_section: (*ctx).in_critical_section != 0,
+            slow_path_pending: (*ctx).slow_path_pending != 0,
+        }
+    }
 }
 
 #[inline(always)]
@@ -236,7 +317,17 @@ fn record_outside_gap_sample(aux: &mut ThreadStatsAux, hold_start_ns: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThreadStatsAux, record_outside_gap_sample};
+    use super::{
+        ADMISSION_CPU_NONE, ThreadStatsAux, admission_state_snapshot,
+        clear_admission_state, grant_slow_path_admission, mark_critical_section_entered,
+        mark_slow_path_pending, record_outside_gap_sample, thread_ctx,
+    };
+
+    fn reset_thread_ctx_for_test() {
+        unsafe {
+            *thread_ctx() = super::LockSchedThreadCtx::new();
+        }
+    }
 
     #[test]
     fn outside_gap_uses_previous_unlock_and_current_wait() {
@@ -278,5 +369,58 @@ mod tests {
         assert_eq!(aux.outside_ns_gap_total, 0);
         assert_eq!(aux.outside_ns_gap_samples, 1);
         assert_eq!(aux.pending_wait_ns, 0);
+    }
+
+    #[test]
+    fn admission_helpers_track_pending_grant_and_release() {
+        reset_thread_ctx_for_test();
+
+        mark_slow_path_pending();
+        assert_eq!(
+            admission_state_snapshot(),
+            super::AdmissionStateSnapshot {
+                admission_owned: false,
+                admission_cpu: ADMISSION_CPU_NONE,
+                admission_requeue_home: false,
+                in_critical_section: false,
+                slow_path_pending: true,
+            }
+        );
+
+        grant_slow_path_admission(7);
+        assert_eq!(
+            admission_state_snapshot(),
+            super::AdmissionStateSnapshot {
+                admission_owned: true,
+                admission_cpu: 7,
+                admission_requeue_home: false,
+                in_critical_section: false,
+                slow_path_pending: true,
+            }
+        );
+
+        mark_critical_section_entered();
+        assert_eq!(
+            admission_state_snapshot(),
+            super::AdmissionStateSnapshot {
+                admission_owned: true,
+                admission_cpu: 7,
+                admission_requeue_home: false,
+                in_critical_section: true,
+                slow_path_pending: false,
+            }
+        );
+
+        clear_admission_state();
+        assert_eq!(
+            admission_state_snapshot(),
+            super::AdmissionStateSnapshot {
+                admission_owned: false,
+                admission_cpu: ADMISSION_CPU_NONE,
+                admission_requeue_home: false,
+                in_critical_section: false,
+                slow_path_pending: false,
+            }
+        );
     }
 }

@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::arch::pause;
 use crate::lock_backend::LockBackend;
+use crate::lock_stats::{
+    ADMISSION_CPU_NONE, clear_admission_state, grant_slow_path_admission,
+    mark_critical_section_entered, mark_slow_path_pending, thread_has_admission,
+};
 
 // we remove sample cause in some high contention env wait can occupy full timeslice
 // or we can reserve a fast path in low contention
@@ -62,9 +66,34 @@ impl McsTasLockRaw {
         THREAD_NODE.with(|node| node.get())
     }
 
+    #[inline(always)]
+    fn current_cpu() -> u32 {
+        let cpu = unsafe { libc::sched_getcpu() };
+        assert!(cpu >= 0, "sched_getcpu failed while caching slow-path admission");
+        let cpu = cpu as u32;
+        assert!(
+            cpu != ADMISSION_CPU_NONE,
+            "current CPU collided with admission sentinel"
+        );
+        cpu
+    }
+
+    #[inline(always)]
+    fn ensure_slow_path_admission(&self) {
+        mark_slow_path_pending();
+        if thread_has_admission() {
+            return;
+        }
+
+        std::thread::yield_now();
+        grant_slow_path_admission(Self::current_cpu());
+    }
+
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn lock_slow(&self) {
+        self.ensure_slow_path_admission();
+
         // prepare node and set pred
         let my_node = Self::thread_node();
         unsafe {
@@ -115,6 +144,8 @@ impl McsTasLockRaw {
                 (*succ).waiting.store(false, Ordering::Release);
             }
         }
+
+        mark_critical_section_entered();
     }
 
     /// Returns true if the lock was acquired, false if it was already held.
@@ -138,6 +169,7 @@ impl McsTasLockRaw {
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock_fast(&self) {
         self.locked.0.store(false, Ordering::Release);
+        clear_admission_state();
     }
 }
 
@@ -158,5 +190,40 @@ impl LockBackend for McsTasLockRaw {
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock(&self) {
         self.unlock_fast();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Node;
+    use crate::bpf_intf;
+    use crate::lock_stats::{ADMISSION_CPU_NONE, admission_state_snapshot, clear_admission_state};
+
+    #[test]
+    fn node_layout_stays_cache_aligned() {
+        assert_eq!(std::mem::size_of::<Node>(), 64);
+        assert_eq!(std::mem::align_of::<Node>(), 64);
+    }
+
+    #[test]
+    fn thread_ctx_layout_matches_bindgen_contract() {
+        assert_eq!(
+            std::mem::size_of::<crate::lock_stats::LockSchedThreadCtx>(),
+            std::mem::size_of::<bpf_intf::lock_sched_thread_ctx>(),
+        );
+        assert_eq!(
+            std::mem::align_of::<crate::lock_stats::LockSchedThreadCtx>(),
+            std::mem::align_of::<bpf_intf::lock_sched_thread_ctx>(),
+        );
+    }
+
+    #[test]
+    fn clearing_admission_restores_sentinel_cpu() {
+        clear_admission_state();
+        let snapshot = admission_state_snapshot();
+        assert!(!snapshot.admission_owned);
+        assert_eq!(snapshot.admission_cpu, ADMISSION_CPU_NONE);
+        assert!(!snapshot.in_critical_section);
+        assert!(!snapshot.slow_path_pending);
     }
 }

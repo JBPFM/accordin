@@ -130,19 +130,19 @@ real_fn!(real_pthread_cond_timedwait: unsafe extern "C" fn(
 #[inline(always)]
 fn lock_with_stats<B: MutexHookBackend>(state: &B::LockState) {
     if B::try_lock(state) {
-        record_lock_acquired();
+        // record_lock_acquired();
         return;
     }
 
-    let wait_start = record_wait_start();
+    // let wait_start = record_wait_start();
     B::lock(state);
-    record_wait_end(wait_start);
-    record_lock_acquired();
+    // record_wait_end(wait_start);
+    // record_lock_acquired();
 }
 
 #[inline(always)]
 fn unlock_with_stats<B: MutexHookBackend>(state: &B::LockState) {
-    record_hold_end();
+    // record_hold_end();
     B::unlock(state);
 }
 
@@ -480,7 +480,9 @@ macro_rules! export_mutex_hooks {
             REGISTERED.with(|registered| {
                 if !registered.get() {
                     REGISTRATION_GUARD.with(|guard| {
-                        $crate::mutex_hook::ensure_thread_registered::<$registration>(registered, guard)
+                        $crate::mutex_hook::ensure_thread_registered::<$registration>(
+                            registered, guard,
+                        )
                     });
                 }
             });

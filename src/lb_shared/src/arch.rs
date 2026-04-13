@@ -109,7 +109,7 @@ fn tsc_calibration() -> &'static TscCalibration {
     static TSC_CALIBRATION: OnceLock<TscCalibration> = OnceLock::new();
 
     TSC_CALIBRATION.get_or_init(|| {
-        let freq_hz = detect_tsc_frequency_hz().max(1);
+        let freq_hz = detect_tsc_frequency_hz();
         let (base_cycles, base_ns) = capture_tsc_anchor();
 
         TscCalibration {
@@ -123,7 +123,7 @@ fn tsc_calibration() -> &'static TscCalibration {
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[inline(always)]
 pub fn wait_time_start() -> u64 {
-    let _ = tsc_calibration();
+    tsc_calibration();
     rdtsc()
 }
 
@@ -162,13 +162,17 @@ pub fn wait_time_elapsed_ns_between(start_ns: u64, end_ns: u64) -> u64 {
 mod tests {
     use super::{TscCalibration, convert_sample_to_ns, elapsed_sample_ns, scale_cycles_to_ns};
 
-    #[test]
-    fn cycles_to_ns_uses_calibrated_anchor_and_frequency() {
-        let calibration = TscCalibration {
+    fn test_calibration() -> TscCalibration {
+        TscCalibration {
             base_cycles: 1_000,
             base_ns: 5_000,
             freq_hz: 2_000_000_000,
-        };
+        }
+    }
+
+    #[test]
+    fn cycles_to_ns_uses_calibrated_anchor_and_frequency() {
+        let calibration = test_calibration();
 
         assert_eq!(scale_cycles_to_ns(600, calibration.freq_hz), 300);
         assert_eq!(convert_sample_to_ns(&calibration, 1_600), 5_300);
@@ -176,22 +180,14 @@ mod tests {
 
     #[test]
     fn elapsed_between_samples_scales_by_frequency() {
-        let calibration = TscCalibration {
-            base_cycles: 1_000,
-            base_ns: 5_000,
-            freq_hz: 2_000_000_000,
-        };
+        let calibration = test_calibration();
 
         assert_eq!(elapsed_sample_ns(&calibration, 2_000, 3_000), 500);
     }
 
     #[test]
     fn converting_sample_before_anchor_saturates_to_anchor_ns() {
-        let calibration = TscCalibration {
-            base_cycles: 1_000,
-            base_ns: 5_000,
-            freq_hz: 2_000_000_000,
-        };
+        let calibration = test_calibration();
 
         assert_eq!(convert_sample_to_ns(&calibration, 900), 5_000);
     }

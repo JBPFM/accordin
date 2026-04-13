@@ -41,7 +41,7 @@ impl LockSchedThreadCtx {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct ThreadStatsAux {
     pending_wait_ns: u64,
     outside_ns_gap_total: u64,
@@ -153,16 +153,23 @@ fn thread_aux() -> *mut ThreadStatsAux {
 
 #[inline(always)]
 fn refresh_thread_elapsed_ns_for_ctx(ctx: *mut LockSchedThreadCtx, now_ns: u64) {
-    let thread_start_ns = unsafe { (*ctx).thread_start_ns };
-    if thread_start_ns == 0 {
-        unsafe {
+    unsafe {
+        let thread_start_ns = (*ctx).thread_start_ns;
+        if thread_start_ns == 0 {
             (*ctx).thread_start_ns = now_ns;
             (*ctx).thread_elapsed_ns_total = 0;
+            return;
         }
-        return;
-    }
-    unsafe {
         (*ctx).thread_elapsed_ns_total = now_ns.saturating_sub(thread_start_ns);
+    }
+}
+
+#[inline(always)]
+fn average_or_zero(total: u64, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        total as f64 / samples as f64
     }
 }
 
@@ -225,22 +232,11 @@ pub fn print_process_stats(label: &str) {
     let outside_ns_gap_total = PROCESS_OUTSIDE_NS_GAP_TOTAL.load(Ordering::Relaxed);
     let outside_ns_gap_samples = PROCESS_OUTSIDE_NS_GAP_SAMPLES.load(Ordering::Relaxed);
 
-    let avg_critical_ns = if lock_count != 0 {
-        hold_ns_total as f64 / lock_count as f64
-    } else {
-        0.0
-    };
-    let avg_outside_ns_elapsed = if lock_count != 0 {
-        thread_elapsed_ns_total.saturating_sub(wait_ns_total.saturating_add(hold_ns_total)) as f64
-            / lock_count as f64
-    } else {
-        0.0
-    };
-    let avg_outside_ns = if outside_ns_gap_samples != 0 {
-        outside_ns_gap_total as f64 / outside_ns_gap_samples as f64
-    } else {
-        0.0
-    };
+    let outside_ns_elapsed_total =
+        thread_elapsed_ns_total.saturating_sub(wait_ns_total.saturating_add(hold_ns_total));
+    let avg_critical_ns = average_or_zero(hold_ns_total, lock_count);
+    let avg_outside_ns_elapsed = average_or_zero(outside_ns_elapsed_total, lock_count);
+    let avg_outside_ns = average_or_zero(outside_ns_gap_total, outside_ns_gap_samples);
 
     println!("stats_label: {label}");
     println!("avg_critical_ns: {avg_critical_ns:.2}");
@@ -318,9 +314,9 @@ fn record_outside_gap_sample(aux: &mut ThreadStatsAux, hold_start_ns: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ADMISSION_CPU_NONE, ThreadStatsAux, admission_state_snapshot,
-        clear_admission_state, grant_slow_path_admission, mark_critical_section_entered,
-        mark_slow_path_pending, record_outside_gap_sample, thread_ctx,
+        ADMISSION_CPU_NONE, ThreadStatsAux, admission_state_snapshot, clear_admission_state,
+        grant_slow_path_admission, mark_critical_section_entered, mark_slow_path_pending,
+        record_outside_gap_sample, thread_ctx,
     };
 
     fn reset_thread_ctx_for_test() {
@@ -331,7 +327,7 @@ mod tests {
 
     #[test]
     fn outside_gap_uses_previous_unlock_and_current_wait() {
-        let mut aux = ThreadStatsAux::default();
+        let mut aux = ThreadStatsAux::new();
 
         aux.last_unlock_ns = 150;
 
@@ -345,7 +341,7 @@ mod tests {
 
     #[test]
     fn outside_gap_skips_first_acquire_without_previous_unlock() {
-        let mut aux = ThreadStatsAux::default();
+        let mut aux = ThreadStatsAux::new();
 
         aux.pending_wait_ns = 15;
         record_outside_gap_sample(&mut aux, 80);

@@ -136,6 +136,13 @@ fn parse_timing_sample_stride(value: Option<&str>) -> u64 {
 }
 
 #[inline(always)]
+fn advance_sample_countdown(countdown: &mut u64, stride: u64) -> bool {
+    let sampled = *countdown == 0;
+    *countdown = if sampled { stride - 1 } else { *countdown - 1 };
+    sampled
+}
+
+#[inline(always)]
 fn timing_sample_stride() -> u64 {
     static TIMING_SAMPLE_STRIDE: OnceLock<u64> = OnceLock::new();
 
@@ -169,13 +176,7 @@ fn begin_lock_timing_sample(aux: &mut ThreadStatsAux) -> bool {
         return aux.op_sampled;
     }
 
-    let stride = timing_sample_stride();
-    let sampled = aux.sample_countdown == 0;
-    aux.sample_countdown = if sampled {
-        stride - 1
-    } else {
-        aux.sample_countdown - 1
-    };
+    let sampled = advance_sample_countdown(&mut aux.sample_countdown, timing_sample_stride());
     aux.op_sample_decided = true;
     aux.op_sampled = sampled;
     sampled
@@ -189,14 +190,7 @@ fn finish_lock_timing_sample(aux: &mut ThreadStatsAux) {
 
 #[inline(always)]
 fn begin_outside_gap_sample(aux: &mut ThreadStatsAux) -> bool {
-    let stride = outside_sample_stride();
-    let sampled = aux.outside_sample_countdown == 0;
-    aux.outside_sample_countdown = if sampled {
-        stride - 1
-    } else {
-        aux.outside_sample_countdown - 1
-    };
-    sampled
+    advance_sample_countdown(&mut aux.outside_sample_countdown, outside_sample_stride())
 }
 
 #[inline(always)]
@@ -342,7 +336,6 @@ pub fn record_wait_end(wait_start: u64) {
         let aux = &mut *thread_aux();
         ensure_thread_start_sample(aux, wait_end);
         if aux.op_sampled {
-            aux.wait_start_sample = wait_start;
             aux.wait_end_sample = wait_end;
         }
         if aux.outside_sample_pending && aux.outside_wait_start_sample != 0 {
@@ -394,33 +387,29 @@ pub fn record_post_unlock(hold_end: u64) {
 
         if hold_end != 0 {
             refresh_thread_elapsed_for_aux(aux, hold_end);
+
+            if aux.wait_start_sample != 0 {
+                let wait_end = if aux.wait_end_sample != 0 {
+                    aux.wait_end_sample
+                } else {
+                    aux.hold_start_sample
+                };
+                let wait_total = wait_end.saturating_sub(aux.wait_start_sample);
+                aux.wait_total += wait_total.saturating_mul(timing_sample_stride());
+                aux.wait_sample_count += 1;
+            }
+
+            if aux.hold_start_sample != 0 {
+                aux.hold_total += hold_end
+                    .saturating_sub(aux.hold_start_sample)
+                    .saturating_mul(timing_sample_stride());
+                aux.hold_sample_count += 1;
+            }
         }
 
-        if hold_end != 0 && aux.wait_start_sample != 0 {
-            let wait_end = if aux.wait_end_sample != 0 {
-                aux.wait_end_sample
-            } else {
-                aux.hold_start_sample
-            };
-            let wait_total = wait_end.saturating_sub(aux.wait_start_sample);
-            aux.wait_total += wait_total.saturating_mul(timing_sample_stride());
-            aux.wait_sample_count += 1;
-            aux.wait_start_sample = 0;
-            aux.wait_end_sample = 0;
-        } else {
-            aux.wait_start_sample = 0;
-            aux.wait_end_sample = 0;
-        }
-
-        if hold_end != 0 && aux.hold_start_sample != 0 {
-            aux.hold_total += hold_end
-                .saturating_sub(aux.hold_start_sample)
-                .saturating_mul(timing_sample_stride());
-            aux.hold_sample_count += 1;
-            aux.hold_start_sample = 0;
-        } else {
-            aux.hold_start_sample = 0;
-        }
+        aux.wait_start_sample = 0;
+        aux.wait_end_sample = 0;
+        aux.hold_start_sample = 0;
 
         finish_lock_timing_sample(aux);
         if !aux.outside_sample_pending && begin_outside_gap_sample(aux) {

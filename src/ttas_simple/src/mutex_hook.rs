@@ -136,8 +136,8 @@ fn lock_with_stats<L: LockBackend>(lock: &L) {
 
 #[inline(always)]
 fn unlock_with_stats<L: LockBackend>(lock: &L) {
-    let hold_end = record_hold_end_sample();
     lock.unlock();
+    let hold_end = record_hold_end_sample();
     record_post_unlock(hold_end);
 }
 

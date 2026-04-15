@@ -3,11 +3,6 @@ use std::hint::spin_loop;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::lock_stats::{
-    flush_current_thread_stats, record_hold_end, record_lock_acquired, record_thread_start,
-    record_wait_end, record_wait_start,
-};
-
 pub trait MutexHookBackend {
     type LockState: Send + Sync + 'static;
 
@@ -26,7 +21,7 @@ pub struct ThreadRegistrationGuard<R: ThreadRegistration>(PhantomData<R>);
 
 impl<R: ThreadRegistration> Drop for ThreadRegistrationGuard<R> {
     fn drop(&mut self) {
-        flush_current_thread_stats();
+        // flush_current_thread_stats();
         R::unregister_current_thread();
     }
 }
@@ -37,7 +32,7 @@ pub fn ensure_thread_registered<R: ThreadRegistration>(
     guard: &UnsafeCell<Option<ThreadRegistrationGuard<R>>>,
 ) {
     if !registered.get() && R::register_current_thread() {
-        record_thread_start();
+        // record_thread_start();
         unsafe {
             *guard.get() = Some(ThreadRegistrationGuard(PhantomData));
         }
@@ -307,7 +302,7 @@ pub unsafe fn pthread_mutex_trylock_impl<B: MutexHookBackend>(
 
     unsafe {
         if B::try_lock(&(*state).lock) {
-            record_lock_acquired();
+            // record_lock_acquired();
             0
         } else {
             libc::EBUSY

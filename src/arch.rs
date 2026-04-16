@@ -146,15 +146,29 @@ pub fn wait_time_to_ns(sample_ns: u64) -> u64 {
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[allow(dead_code)]
 #[inline(always)]
 pub fn wait_time_elapsed_ns_between(start_cycles: u64, end_cycles: u64) -> u64 {
     elapsed_sample_ns(tsc_calibration(), start_cycles, end_cycles)
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+#[allow(dead_code)]
 #[inline(always)]
 pub fn wait_time_elapsed_ns_between(start_ns: u64, end_ns: u64) -> u64 {
     end_ns.saturating_sub(start_ns)
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[inline(always)]
+pub fn wait_time_total_to_ns(total_cycles: u64) -> u64 {
+    scale_cycles_to_ns(total_cycles, tsc_calibration().freq_hz)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+#[inline(always)]
+pub fn wait_time_total_to_ns(total_ns: u64) -> u64 {
+    total_ns
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::lock_backend::LockBackend;
 use crate::lock_stats::{
-    record_hold_end, record_lock_acquired, record_thread_start, record_wait_end, record_wait_start,
-    thread_ctx,
+    record_hold_end_sample, record_lock_acquired, record_post_unlock, record_thread_start,
+    record_wait_end, record_wait_start, thread_ctx,
 };
 use crate::ttas::TtasLockRaw;
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
@@ -136,8 +136,9 @@ fn lock_with_stats<L: LockBackend>(lock: &L) {
 
 #[inline(always)]
 fn unlock_with_stats<L: LockBackend>(lock: &L) {
-    record_hold_end();
+    let hold_end = record_hold_end_sample();
     lock.unlock();
+    record_post_unlock(hold_end);
 }
 
 const SENTINEL: usize = 1;

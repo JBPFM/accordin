@@ -44,8 +44,7 @@ MCS_TAS_SIMPLE_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_simp
 FOCUS_LOCK_KEYS = ("accordin", "flexguard")
 PIECEWISE_Y_THRESHOLD_NS = 1000.0
 PIECEWISE_Y_LINEAR_SCALE = 3.0
-BROKEN_Y_LOWER = (1e2, 1e3)
-BROKEN_Y_MIDDLE = (1e3, 1e4)
+BROKEN_Y_NORMAL = (1e2, 1e4)
 BROKEN_Y_UPPER_MIN = 1e5
 BROKEN_LOWER_AXIS_PADDING = 1.2
 MACHINE_CORE_COUNT = 96
@@ -488,16 +487,16 @@ def compact_broken_lower_ylim(values: list[float]) -> tuple[float, float]:
     lower_values = [
         value
         for value in values
-        if BROKEN_Y_LOWER[0] <= value <= BROKEN_Y_LOWER[1]
+        if BROKEN_Y_NORMAL[0] <= value <= BROKEN_Y_NORMAL[1]
     ]
     if not lower_values:
-        return BROKEN_Y_LOWER
+        return BROKEN_Y_NORMAL
 
     lower_bound = max(
-        BROKEN_Y_LOWER[0],
+        BROKEN_Y_NORMAL[0],
         min(lower_values) / BROKEN_LOWER_AXIS_PADDING,
     )
-    return (lower_bound, BROKEN_Y_LOWER[1])
+    return (lower_bound, BROKEN_Y_NORMAL[1])
 
 
 def linear_y_limit(rows: list[dict[str, str]], metric: str) -> float | None:
@@ -752,19 +751,19 @@ def plot_broken_axis_metric(
     upper_values = [value for value in values if value >= BROKEN_Y_UPPER_MIN]
     upper_max = max(upper_values) if upper_values else BROKEN_Y_UPPER_MIN
     upper_ylim = (BROKEN_Y_UPPER_MIN, max(1e6, upper_max * 1.12))
-    lower_ylim = compact_broken_lower_ylim(values) if compact_lower_axis else BROKEN_Y_LOWER
+    lower_ylim = compact_broken_lower_ylim(values) if compact_lower_axis else BROKEN_Y_NORMAL
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
     lock_colors = {lock.key: colors[index % len(colors)] for index, lock in enumerate(LOCKS)}
 
-    fig, (upper_ax, middle_ax, lower_ax) = plt.subplots(
-        3,
+    fig, (upper_ax, lower_ax) = plt.subplots(
+        2,
         1,
         sharex=True,
         figsize=(9.5, 6.8),
-        gridspec_kw={"height_ratios": [0.9, 0.38, 2.7], "hspace": 0.06},
+        gridspec_kw={"height_ratios": [0.9, 3.0], "hspace": 0.06},
     )
 
-    for ax in (upper_ax, middle_ax, lower_ax):
+    for ax in (upper_ax, lower_ax):
         for lock in LOCKS:
             color = lock_colors[lock.key]
             metric_specs = [
@@ -809,25 +808,16 @@ def plot_broken_axis_metric(
         draw_machine_core_line(ax)
 
     upper_ax.set_ylim(*upper_ylim)
-    middle_ax.set_ylim(*BROKEN_Y_MIDDLE)
     lower_ax.set_ylim(*lower_ylim)
     upper_ax.spines["bottom"].set_visible(False)
-    middle_ax.spines["top"].set_visible(False)
-    middle_ax.spines["bottom"].set_visible(False)
     lower_ax.spines["top"].set_visible(False)
     upper_ax.tick_params(labelbottom=False, bottom=False)
-    middle_ax.tick_params(labelbottom=False, top=False, bottom=False)
     lower_ax.tick_params(top=False)
 
     break_mark = 0.012
     break_kwargs = dict(transform=upper_ax.transAxes, color="0.25", clip_on=False, linewidth=1.0)
     upper_ax.plot((-break_mark, +break_mark), (-break_mark, +break_mark), **break_kwargs)
     upper_ax.plot((1 - break_mark, 1 + break_mark), (-break_mark, +break_mark), **break_kwargs)
-    break_kwargs.update(transform=middle_ax.transAxes)
-    middle_ax.plot((-break_mark, +break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
-    middle_ax.plot((1 - break_mark, 1 + break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
-    middle_ax.plot((-break_mark, +break_mark), (-break_mark, +break_mark), **break_kwargs)
-    middle_ax.plot((1 - break_mark, 1 + break_mark), (-break_mark, +break_mark), **break_kwargs)
     break_kwargs.update(transform=lower_ax.transAxes)
     lower_ax.plot((-break_mark, +break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
     lower_ax.plot((1 - break_mark, 1 + break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)

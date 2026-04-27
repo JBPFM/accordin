@@ -33,6 +33,7 @@ from bench_csv_schema import (  # noqa: E402
 
 
 THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
+PLOT_THREADS = tuple(thread for thread in THREADS if thread >= 4)
 CRITICAL_NS = 300
 OUTSIDE_NS = 3000
 DURATION_MS = 5000
@@ -48,8 +49,8 @@ BROKEN_Y_MIDDLE = (1e3, 1e4)
 BROKEN_Y_UPPER_MIN = 1e5
 BROKEN_LOWER_AXIS_PADDING = 1.2
 MACHINE_CORE_COUNT = 96
-THREAD_AXIS_MIN = THREADS[0] / 1.08
-THREAD_AXIS_MAX = THREADS[-1] * 1.25
+THREAD_AXIS_MIN = PLOT_THREADS[0] / 1.08
+THREAD_AXIS_MAX = PLOT_THREADS[-1] * 1.25
 OVERSUBSCRIBED_LABEL_X = (MACHINE_CORE_COUNT * THREAD_AXIS_MAX) ** 0.5
 
 
@@ -470,6 +471,10 @@ def is_experiment_row(row: dict[str, str]) -> bool:
     return int(row["critical_ns"]) == CRITICAL_NS and int(row["outside_ns"]) == OUTSIDE_NS
 
 
+def is_plot_row(row: dict[str, str]) -> bool:
+    return is_experiment_row(row) and int(row["threads"]) in PLOT_THREADS
+
+
 def metric_values(rows: list[dict[str, str]], metric: str) -> list[float]:
     values: list[float] = []
     for row in rows:
@@ -579,7 +584,7 @@ def plot_metric(
     import matplotlib.pyplot as plt
     from matplotlib.ticker import ScalarFormatter
 
-    plot_rows = [row for row in rows if is_experiment_row(row)]
+    plot_rows = [row for row in rows if is_plot_row(row)]
     if not plot_rows:
         raise RuntimeError(
             f"No rows matched critical_ns={CRITICAL_NS} and outside_ns={OUTSIDE_NS} for plotting."
@@ -610,7 +615,7 @@ def plot_metric(
     apply_piecewise_y_scale(ax, plot_rows, metric)
     ax.set_xscale("log", base=2)
     ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
-    ax.set_xticks(list(THREADS))
+    ax.set_xticks(list(PLOT_THREADS))
     ax.xaxis.set_major_formatter(ScalarFormatter())
     draw_machine_core_line(ax)
     annotate_machine_core_count(ax)
@@ -640,7 +645,7 @@ def plot_focused_comparison(
     plot_rows = [
         row
         for row in rows
-        if is_experiment_row(row) and row["lock_key"] in FOCUS_LOCK_KEYS
+        if is_plot_row(row) and row["lock_key"] in FOCUS_LOCK_KEYS
     ]
     if not plot_rows:
         return
@@ -699,7 +704,7 @@ def plot_focused_comparison(
     ax.set_ylabel(ylabel)
     ax.set_xscale("log", base=2)
     ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
-    ax.set_xticks(list(THREADS))
+    ax.set_xticks(list(PLOT_THREADS))
     ax.xaxis.set_major_formatter(ScalarFormatter())
     draw_machine_core_line(ax)
     annotate_machine_core_count(ax)
@@ -731,7 +736,7 @@ def plot_broken_axis_metric(
     from matplotlib.lines import Line2D
     from matplotlib.ticker import LogFormatterMathtext, ScalarFormatter
 
-    plot_rows = [row for row in rows if is_experiment_row(row)]
+    plot_rows = [row for row in rows if is_plot_row(row)]
     if not plot_rows:
         raise RuntimeError(
             f"No rows matched critical_ns={CRITICAL_NS} and outside_ns={OUTSIDE_NS} for plotting."
@@ -832,7 +837,7 @@ def plot_broken_axis_metric(
     lower_ax.set_xlabel("Threads")
     lower_ax.set_xscale("log", base=2)
     lower_ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
-    lower_ax.set_xticks(list(THREADS))
+    lower_ax.set_xticks(list(PLOT_THREADS))
     lower_ax.xaxis.set_major_formatter(ScalarFormatter())
     annotate_machine_core_count(lower_ax)
     annotate_oversubscribed_region(upper_ax, y_fraction=0.88)

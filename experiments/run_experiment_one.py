@@ -40,6 +40,17 @@ WARMUP_DURATION_MS = 1000
 REPEATS = 4
 DEFAULT_MCS_TAS_SIMPLE_TASKSET_CPUS = "0,2,4,8,10,12,14,16,18,20,22"
 MCS_TAS_SIMPLE_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_simple.so"
+FOCUS_LOCK_KEYS = ("accordin", "flexguard")
+PIECEWISE_Y_THRESHOLD_NS = 1000.0
+PIECEWISE_Y_LINEAR_SCALE = 3.0
+BROKEN_Y_LOWER = (1e2, 1e3)
+BROKEN_Y_MIDDLE = (1e3, 1e4)
+BROKEN_Y_UPPER_MIN = 1e5
+BROKEN_LOWER_AXIS_PADDING = 1.2
+MACHINE_CORE_COUNT = 96
+THREAD_AXIS_MIN = THREADS[0] / 1.08
+THREAD_AXIS_MAX = THREADS[-1] * 1.25
+OVERSUBSCRIBED_LABEL_X = (MACHINE_CORE_COUNT * THREAD_AXIS_MAX) ** 0.5
 
 
 @dataclass(frozen=True)
@@ -47,14 +58,20 @@ class LockSpec:
     label: str
     key: str
     optional: bool = False
+    result_dirs: tuple[str, ...] = ()
+
+    def result_dir_names(self) -> tuple[str, ...]:
+        if self.result_dirs:
+            return self.result_dirs
+        return (self.key,)
 
 
 LOCKS = (
     LockSpec("MCS", "mcs"),
     LockSpec("MCS-TP", "mcstp"),
-    LockSpec("mcs-tas", "mcs-tas"),
-    LockSpec("mcs_tas_simple taskset 11c", "mcs_tas_simple", optional=True),
-    LockSpec("mcs + extension", "mcs_extension"),
+    LockSpec("MCS-TAS", "mcs-tas"),
+    LockSpec("Accordin (K=11)", "accordin", optional=True, result_dirs=("accordin", "mcs_tas_simple")),
+    LockSpec("MCS + TSE", "mcs_extension"),
     LockSpec("FlexGuard", "flexguard"),
 )
 
@@ -391,7 +408,15 @@ def load_combined_rows(result_root: Path) -> list[dict[str, str]]:
     required = set(LATENCY_PLOT_REQUIRED_FIELDS) | {CPU_FIELD}
 
     for lock in LOCKS:
-        lock_dir = result_root / lock.key
+        lock_dir = next(
+            (
+                result_root / dir_name
+                for dir_name in lock.result_dir_names()
+                if ((result_root / dir_name) / "summary.csv").is_file()
+                or ((result_root / dir_name) / "raw.csv").is_file()
+            ),
+            result_root / lock.result_dir_names()[0],
+        )
         if (
             lock.optional
             and not (lock_dir / "summary.csv").is_file()
@@ -445,6 +470,101 @@ def is_experiment_row(row: dict[str, str]) -> bool:
     return int(row["critical_ns"]) == CRITICAL_NS and int(row["outside_ns"]) == OUTSIDE_NS
 
 
+def metric_values(rows: list[dict[str, str]], metric: str) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        value = row.get(metric, "").strip()
+        if value:
+            values.append(float(value))
+    return values
+
+
+def compact_broken_lower_ylim(values: list[float]) -> tuple[float, float]:
+    lower_values = [
+        value
+        for value in values
+        if BROKEN_Y_LOWER[0] <= value <= BROKEN_Y_LOWER[1]
+    ]
+    if not lower_values:
+        return BROKEN_Y_LOWER
+
+    lower_bound = max(
+        BROKEN_Y_LOWER[0],
+        min(lower_values) / BROKEN_LOWER_AXIS_PADDING,
+    )
+    return (lower_bound, BROKEN_Y_LOWER[1])
+
+
+def linear_y_limit(rows: list[dict[str, str]], metric: str) -> float | None:
+    values = metric_values(rows, metric)
+    if not values or max(values) <= PIECEWISE_Y_THRESHOLD_NS:
+        return None
+    return PIECEWISE_Y_THRESHOLD_NS
+
+
+def apply_piecewise_y_scale(ax, rows: list[dict[str, str]], metric: str) -> None:
+    values = metric_values(rows, metric)
+    if not values:
+        return
+
+    linear_limit = linear_y_limit(rows, metric)
+    if linear_limit is None or max(values) <= linear_limit:
+        return
+
+    ax.set_yscale(
+        "symlog",
+        base=10,
+        linthresh=linear_limit,
+        linscale=PIECEWISE_Y_LINEAR_SCALE,
+    )
+    ax.axhline(linear_limit, color="0.55", linewidth=0.8, linestyle=":", alpha=0.65)
+
+
+def draw_machine_core_line(ax) -> None:
+    ax.axvspan(
+        MACHINE_CORE_COUNT,
+        THREAD_AXIS_MAX,
+        color="0.92",
+        alpha=0.55,
+        linewidth=0,
+        zorder=0,
+    )
+    ax.axvline(
+        MACHINE_CORE_COUNT,
+        color="0.22",
+        linewidth=1.0,
+        linestyle="--",
+        alpha=0.75,
+        zorder=1,
+    )
+
+
+def annotate_oversubscribed_region(ax, *, y_fraction: float = 0.94) -> None:
+    ax.annotate(
+        "Oversubscribed",
+        xy=(OVERSUBSCRIBED_LABEL_X, y_fraction),
+        xycoords=ax.get_xaxis_transform(),
+        ha="center",
+        va="top",
+        fontsize=8,
+        color="0.35",
+    )
+
+
+def annotate_machine_core_count(ax, *, y_fraction: float = 0.96, va: str = "top") -> None:
+    ax.annotate(
+        f"{MACHINE_CORE_COUNT} cores",
+        xy=(MACHINE_CORE_COUNT, y_fraction),
+        xycoords=ax.get_xaxis_transform(),
+        xytext=(6, 0),
+        textcoords="offset points",
+        ha="left",
+        va=va,
+        fontsize=8,
+        color="0.2",
+    )
+
+
 def plot_metric(
     rows: list[dict[str, str]],
     *,
@@ -487,13 +607,277 @@ def plot_metric(
     ax.set_title(title)
     ax.set_xlabel("Threads")
     ax.set_ylabel(ylabel)
+    apply_piecewise_y_scale(ax, plot_rows, metric)
     ax.set_xscale("log", base=2)
+    ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
     ax.set_xticks(list(THREADS))
     ax.xaxis.set_major_formatter(ScalarFormatter())
+    draw_machine_core_line(ax)
+    annotate_machine_core_count(ax)
+    annotate_oversubscribed_region(ax)
     ax.grid(True, axis="y", alpha=0.28)
     ax.grid(True, axis="x", which="major", alpha=0.16)
     ax.legend(frameon=False, ncol=2)
     fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_focused_comparison(
+    rows: list[dict[str, str]],
+    *,
+    metric: str,
+    ylabel: str,
+    title: str,
+    output_path: Path,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
+
+    plot_rows = [
+        row
+        for row in rows
+        if is_experiment_row(row) and row["lock_key"] in FOCUS_LOCK_KEYS
+    ]
+    if not plot_rows:
+        return
+
+    fig, ax = plt.subplots(figsize=(9.5, 5.5))
+    for lock_key in FOCUS_LOCK_KEYS:
+        lock = next(lock for lock in LOCKS if lock.key == lock_key)
+        points = [
+            (int(row["threads"]), float(row[metric]))
+            for row in plot_rows
+            if row["lock_key"] == lock_key
+        ]
+        if not points:
+            continue
+        points.sort()
+        ax.plot(
+            [thread for thread, _ in points],
+            [value for _, value in points],
+            marker="o",
+            linewidth=2.2,
+            markersize=4.5,
+            label=lock.label,
+        )
+
+    ratio_rows: dict[int, dict[str, float]] = {}
+    for row in plot_rows:
+        ratio_rows.setdefault(int(row["threads"]), {})[row["lock_key"]] = float(row[metric])
+    for thread, values in sorted(ratio_rows.items()):
+        if not all(key in values for key in FOCUS_LOCK_KEYS):
+            continue
+        lower = values["accordin"]
+        upper = values["flexguard"]
+        if lower <= 0.0 or upper <= lower:
+            continue
+        ratio = upper / lower
+        y = lower + (upper - lower) * 0.58
+        ax.annotate(
+            f"{ratio:.1f}x",
+            xy=(thread, y),
+            xytext=(0, 6),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="0.25",
+        )
+
+    values = metric_values(plot_rows, metric)
+    if values:
+        lower = min(values)
+        upper = max(values)
+        pad = max((upper - lower) * 0.16, upper * 0.05)
+        ax.set_ylim(max(0.0, lower - pad), upper + pad)
+    ax.set_title(title)
+    ax.set_xlabel("Threads")
+    ax.set_ylabel(ylabel)
+    ax.set_xscale("log", base=2)
+    ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
+    ax.set_xticks(list(THREADS))
+    ax.xaxis.set_major_formatter(ScalarFormatter())
+    draw_machine_core_line(ax)
+    annotate_machine_core_count(ax)
+    annotate_oversubscribed_region(ax)
+    ax.grid(True, axis="y", alpha=0.28)
+    ax.grid(True, axis="x", which="major", alpha=0.16)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_broken_axis_metric(
+    rows: list[dict[str, str]],
+    *,
+    metric: str,
+    metric_label: str | None = None,
+    secondary_metric: str | None = None,
+    secondary_metric_label: str | None = None,
+    compact_lower_axis: bool = False,
+    ylabel: str,
+    title: str,
+    output_path: Path,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.ticker import LogFormatterMathtext, ScalarFormatter
+
+    plot_rows = [row for row in rows if is_experiment_row(row)]
+    if not plot_rows:
+        raise RuntimeError(
+            f"No rows matched critical_ns={CRITICAL_NS} and outside_ns={OUTSIDE_NS} for plotting."
+        )
+
+    metrics = [metric]
+    if secondary_metric is not None:
+        metrics.append(secondary_metric)
+    values = [value for metric_name in metrics for value in metric_values(plot_rows, metric_name)]
+    if not values:
+        raise RuntimeError(f"No values found for metric {metric}.")
+
+    upper_values = [value for value in values if value >= BROKEN_Y_UPPER_MIN]
+    upper_max = max(upper_values) if upper_values else BROKEN_Y_UPPER_MIN
+    upper_ylim = (BROKEN_Y_UPPER_MIN, max(1e6, upper_max * 1.12))
+    lower_ylim = compact_broken_lower_ylim(values) if compact_lower_axis else BROKEN_Y_LOWER
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
+    lock_colors = {lock.key: colors[index % len(colors)] for index, lock in enumerate(LOCKS)}
+
+    fig, (upper_ax, middle_ax, lower_ax) = plt.subplots(
+        3,
+        1,
+        sharex=True,
+        figsize=(9.5, 6.8),
+        gridspec_kw={"height_ratios": [0.9, 0.38, 2.7], "hspace": 0.06},
+    )
+
+    for ax in (upper_ax, middle_ax, lower_ax):
+        for lock in LOCKS:
+            color = lock_colors[lock.key]
+            metric_specs = [
+                (metric, "-", "o", color, color, 1.8, 4.0),
+            ]
+            if secondary_metric is not None:
+                metric_specs.append(
+                    (secondary_metric, "--", "o", color, "white", 1.25, 3.5)
+                )
+            for (
+                metric_name,
+                linestyle,
+                marker,
+                color,
+                markerfacecolor,
+                linewidth,
+                markersize,
+            ) in metric_specs:
+                points = [
+                    (int(row["threads"]), float(row[metric_name]))
+                    for row in plot_rows
+                    if row["lock_key"] == lock.key
+                ]
+                if not points:
+                    continue
+                points.sort()
+                ax.plot(
+                    [thread for thread, _ in points],
+                    [value for _, value in points],
+                    color=color,
+                    linestyle=linestyle,
+                    marker=marker,
+                    markerfacecolor=markerfacecolor,
+                    markeredgecolor=color,
+                    linewidth=linewidth,
+                    markersize=markersize,
+                )
+        ax.set_yscale("log")
+        ax.grid(True, axis="y", which="major", alpha=0.28)
+        ax.grid(True, axis="x", which="major", alpha=0.16)
+        ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10))
+        draw_machine_core_line(ax)
+
+    upper_ax.set_ylim(*upper_ylim)
+    middle_ax.set_ylim(*BROKEN_Y_MIDDLE)
+    lower_ax.set_ylim(*lower_ylim)
+    upper_ax.spines["bottom"].set_visible(False)
+    middle_ax.spines["top"].set_visible(False)
+    middle_ax.spines["bottom"].set_visible(False)
+    lower_ax.spines["top"].set_visible(False)
+    upper_ax.tick_params(labelbottom=False, bottom=False)
+    middle_ax.tick_params(labelbottom=False, top=False, bottom=False)
+    lower_ax.tick_params(top=False)
+
+    break_mark = 0.012
+    break_kwargs = dict(transform=upper_ax.transAxes, color="0.25", clip_on=False, linewidth=1.0)
+    upper_ax.plot((-break_mark, +break_mark), (-break_mark, +break_mark), **break_kwargs)
+    upper_ax.plot((1 - break_mark, 1 + break_mark), (-break_mark, +break_mark), **break_kwargs)
+    break_kwargs.update(transform=middle_ax.transAxes)
+    middle_ax.plot((-break_mark, +break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
+    middle_ax.plot((1 - break_mark, 1 + break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
+    middle_ax.plot((-break_mark, +break_mark), (-break_mark, +break_mark), **break_kwargs)
+    middle_ax.plot((1 - break_mark, 1 + break_mark), (-break_mark, +break_mark), **break_kwargs)
+    break_kwargs.update(transform=lower_ax.transAxes)
+    lower_ax.plot((-break_mark, +break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
+    lower_ax.plot((1 - break_mark, 1 + break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
+
+    upper_ax.set_title(title)
+    fig.supylabel(ylabel)
+    lower_ax.set_xlabel("Threads")
+    lower_ax.set_xscale("log", base=2)
+    lower_ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
+    lower_ax.set_xticks(list(THREADS))
+    lower_ax.xaxis.set_major_formatter(ScalarFormatter())
+    annotate_machine_core_count(lower_ax)
+    annotate_oversubscribed_region(upper_ax, y_fraction=0.88)
+    lock_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=lock_colors[lock.key],
+            marker="o",
+            linewidth=1.8,
+            markersize=4,
+            label=lock.label,
+        )
+        for lock in LOCKS
+        if any(row["lock_key"] == lock.key for row in plot_rows)
+    ]
+    lock_legend = upper_ax.legend(handles=lock_handles, frameon=False, ncol=2, loc="upper left")
+    upper_ax.add_artist(lock_legend)
+    if secondary_metric is not None:
+        style_handles = [
+            Line2D(
+                [0],
+                [0],
+                color="0.2",
+                linestyle="-",
+                marker="o",
+                linewidth=1.8,
+                markersize=4,
+                label=metric_label or metric,
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="0.2",
+                linestyle="--",
+                marker="o",
+                markerfacecolor="white",
+                markeredgecolor="0.2",
+                linewidth=1.25,
+                markersize=3.5,
+                label=secondary_metric_label or secondary_metric,
+            ),
+        ]
+        upper_ax.legend(handles=style_handles, frameon=False, loc="upper right")
+    fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.11, hspace=0.06)
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
@@ -503,6 +887,7 @@ def write_plots(result_root: Path, rows: list[dict[str, str]]) -> list[Path]:
         result_root / "hold_time_vs_threads.png",
         result_root / "handoff_time_vs_threads.png",
         result_root / "hold_plus_handoff_vs_threads.png",
+        result_root / "handoff_time_flexguard_vs_accordin.png",
     ]
     plot_metric(
         rows,
@@ -511,19 +896,27 @@ def write_plots(result_root: Path, rows: list[dict[str, str]]) -> list[Path]:
         title="Lock Hold Time vs Threads",
         output_path=outputs[0],
     )
-    plot_metric(
+    plot_broken_axis_metric(
         rows,
         metric=HANDOFF_FIELD,
         ylabel="Estimated lock handoff time (ns)",
         title="Lock Handoff Time vs Threads",
         output_path=outputs[1],
     )
-    plot_metric(
+    plot_broken_axis_metric(
         rows,
         metric="avg_hold_plus_handoff_ns",
+        compact_lower_axis=True,
         ylabel="Average lock hold plus handoff time (ns)",
         title="Lock Hold Plus Handoff Time vs Threads",
         output_path=outputs[2],
+    )
+    plot_focused_comparison(
+        rows,
+        metric=HANDOFF_FIELD,
+        ylabel="Estimated lock handoff time (ns)",
+        title="Handoff Time: Accordin vs FlexGuard",
+        output_path=outputs[3],
     )
     return outputs
 

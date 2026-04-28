@@ -34,6 +34,8 @@ from bench_csv_schema import (  # noqa: E402
 
 THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
 PLOT_THREADS = tuple(thread for thread in THREADS if thread >= 4)
+DECOMPOSITION_THREADS = (128, 192, 256)
+DECOMPOSITION_LOCK_KEYS = ("mcs", "mcs_extension", "mcs-tas", "flexguard", "accordin")
 CRITICAL_NS = 300
 OUTSIDE_NS = 3000
 DURATION_MS = 5000
@@ -47,6 +49,8 @@ PIECEWISE_Y_LINEAR_SCALE = 3.0
 BROKEN_Y_NORMAL = (1e2, 1e4)
 BROKEN_Y_UPPER_MIN = 1e5
 BROKEN_LOWER_AXIS_PADDING = 1.2
+DECOMPOSITION_HOLD_COLOR = "#74a9cf"
+DECOMPOSITION_HANDOFF_COLOR = "#ef8a62"
 MACHINE_CORE_COUNT = 96
 THREAD_AXIS_MIN = PLOT_THREADS[0] / 1.08
 THREAD_AXIS_MAX = PLOT_THREADS[-1] * 1.25
@@ -877,6 +881,147 @@ def plot_broken_axis_metric(
     plt.close(fig)
 
 
+def format_ns_tick(value: float, _position: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:g}M"
+    if value >= 1_000:
+        return f"{value / 1_000:g}K"
+    return f"{value:g}"
+
+
+def plot_hold_handoff_decomposition(
+    rows: list[dict[str, str]],
+    *,
+    output_path: Path,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    from matplotlib.ticker import FuncFormatter
+
+    selected_rows = [
+        row
+        for row in rows
+        if is_experiment_row(row)
+        and int(row["threads"]) in DECOMPOSITION_THREADS
+        and row["lock_key"] in DECOMPOSITION_LOCK_KEYS
+    ]
+    if not selected_rows:
+        raise RuntimeError("No rows matched the hold/handoff decomposition plot inputs.")
+
+    row_by_key = {
+        (int(row["threads"]), row["lock_key"]): row
+        for row in selected_rows
+    }
+    missing = [
+        (thread, lock_key)
+        for thread in DECOMPOSITION_THREADS
+        for lock_key in DECOMPOSITION_LOCK_KEYS
+        if (thread, lock_key) not in row_by_key
+    ]
+    if missing:
+        missing_text = ", ".join(f"{thread}:{lock_key}" for thread, lock_key in missing)
+        raise RuntimeError(f"Missing decomposition rows: {missing_text}")
+
+    lock_by_key = {lock.key: lock for lock in LOCKS}
+    group_stride = len(DECOMPOSITION_LOCK_KEYS) + 1.7
+    bar_width = 0.72
+    x_values: list[float] = []
+    x_labels: list[str] = []
+    hold_values: list[float] = []
+    handoff_values: list[float] = []
+    group_centers: list[tuple[float, int]] = []
+
+    for group_index, thread in enumerate(DECOMPOSITION_THREADS):
+        group_start = group_index * group_stride
+        positions = [group_start + method_index for method_index in range(len(DECOMPOSITION_LOCK_KEYS))]
+        group_centers.append((sum(positions) / len(positions), thread))
+        for position, lock_key in zip(positions, DECOMPOSITION_LOCK_KEYS, strict=True):
+            row = row_by_key[(thread, lock_key)]
+            x_values.append(position)
+            x_labels.append(lock_by_key[lock_key].label)
+            hold_values.append(float(row["avg_lock_hold_ns"]))
+            handoff_values.append(float(row[HANDOFF_FIELD]))
+
+    totals = [hold + handoff for hold, handoff in zip(hold_values, handoff_values, strict=True)]
+    normal_totals = [value for value in totals if value < BROKEN_Y_UPPER_MIN]
+    lower_ylim = (0.0, max(normal_totals) * 1.15)
+    upper_values = [value for value in totals if value >= BROKEN_Y_UPPER_MIN]
+    upper_ylim = (BROKEN_Y_UPPER_MIN, max(upper_values) * 1.08)
+
+    fig, (upper_ax, lower_ax) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        figsize=(11.5, 6.8),
+        gridspec_kw={"height_ratios": [1.0, 2.8], "hspace": 0.06},
+    )
+
+    for ax in (upper_ax, lower_ax):
+        ax.bar(
+            x_values,
+            hold_values,
+            width=bar_width,
+            color=DECOMPOSITION_HOLD_COLOR,
+            edgecolor="0.25",
+            linewidth=0.5,
+        )
+        ax.bar(
+            x_values,
+            handoff_values,
+            bottom=hold_values,
+            width=bar_width,
+            color=DECOMPOSITION_HANDOFF_COLOR,
+            edgecolor="0.25",
+            linewidth=0.5,
+        )
+        ax.grid(True, axis="y", alpha=0.28)
+        ax.yaxis.set_major_formatter(FuncFormatter(format_ns_tick))
+
+    upper_ax.set_ylim(*upper_ylim)
+    lower_ax.set_ylim(*lower_ylim)
+    upper_ax.spines["bottom"].set_visible(False)
+    lower_ax.spines["top"].set_visible(False)
+    upper_ax.tick_params(labelbottom=False, bottom=False)
+    lower_ax.tick_params(top=False)
+
+    break_mark = 0.012
+    break_kwargs = dict(transform=upper_ax.transAxes, color="0.25", clip_on=False, linewidth=1.0)
+    upper_ax.plot((-break_mark, +break_mark), (-break_mark, +break_mark), **break_kwargs)
+    upper_ax.plot((1 - break_mark, 1 + break_mark), (-break_mark, +break_mark), **break_kwargs)
+    break_kwargs.update(transform=lower_ax.transAxes)
+    lower_ax.plot((-break_mark, +break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
+    lower_ax.plot((1 - break_mark, 1 + break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
+
+    lower_ax.set_xlim(min(x_values) - 0.8, max(x_values) + 0.8)
+    lower_ax.set_xticks(x_values)
+    lower_ax.set_xticklabels(x_labels, rotation=32, ha="right", fontsize=8)
+    for center, thread in group_centers:
+        lower_ax.text(
+            center,
+            -0.24,
+            f"{thread} threads",
+            transform=lower_ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=9,
+            fontweight="bold",
+        )
+
+    upper_ax.set_title("Hold/Handoff Decomposition Under Oversubscription")
+    fig.supylabel("Time (ns)")
+    handles = [
+        Patch(facecolor=DECOMPOSITION_HOLD_COLOR, edgecolor="0.25", label="hold"),
+        Patch(facecolor=DECOMPOSITION_HANDOFF_COLOR, edgecolor="0.25", label="handoff"),
+    ]
+    upper_ax.legend(handles=handles, frameon=False, loc="upper left")
+    fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.27, hspace=0.06)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
 def write_plots(result_root: Path, rows: list[dict[str, str]]) -> list[Path]:
     outputs = [
         result_root / "hold_time_vs_threads.png",
@@ -898,14 +1043,7 @@ def write_plots(result_root: Path, rows: list[dict[str, str]]) -> list[Path]:
         title="Lock Handoff Time vs Threads",
         output_path=outputs[1],
     )
-    plot_broken_axis_metric(
-        rows,
-        metric="avg_hold_plus_handoff_ns",
-        compact_lower_axis=True,
-        ylabel="Average lock hold plus handoff time (ns)",
-        title="Lock Hold Plus Handoff Time vs Threads",
-        output_path=outputs[2],
-    )
+    plot_hold_handoff_decomposition(rows, output_path=outputs[2])
     plot_focused_comparison(
         rows,
         metric=HANDOFF_FIELD,

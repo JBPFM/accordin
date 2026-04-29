@@ -86,6 +86,9 @@ emit_sources_for_target() {
         mcs_tas_simple)
             printf '%s\n' "$SCRIPT_DIR/src/bpf/main.bpf.c"
             ;;
+        reciprocating_simple)
+            printf '%s\n' "$SCRIPT_DIR/src/bpf/main.bpf.c"
+            ;;
         libflexguard|flexguard_simple)
             printf '%s\n' \
                 "$SCRIPT_DIR/src/bpf/main.bpf.c" \

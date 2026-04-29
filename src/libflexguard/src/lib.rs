@@ -102,6 +102,8 @@ fn init_ebpf() {
         simplelog::ColorChoice::Auto,
     );
 
+    lb_shared::cpu_affinity::init_from_env("flexguard_simple");
+
     if env_flag(DISABLE_BPF_ENV) {
         info!(
             "{SCHEDULER_NAME} scheduler disabled by env {}",

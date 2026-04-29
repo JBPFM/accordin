@@ -31,6 +31,8 @@ pub fn ensure_thread_registered<R: ThreadRegistration>(
     registered: &Cell<bool>,
     guard: &UnsafeCell<Option<ThreadRegistrationGuard<R>>>,
 ) {
+    crate::cpu_affinity::ensure_current_thread_affinity();
+
     if !registered.get() && R::register_current_thread() {
         // record_thread_start();
         unsafe {

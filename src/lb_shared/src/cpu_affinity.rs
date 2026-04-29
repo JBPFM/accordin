@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const CPU_MASK_K_ENV: &str = "LB_SIMPLE_CPU_MASK_K";
 pub const CPU_MASK_K_SHORT_ENV: &str = "K";
@@ -12,7 +13,9 @@ pub const CPU_MASK_K_SHORT_ENV: &str = "K";
 struct CpuAffinityConfig {
     env_name: &'static str,
     requested_cpus: usize,
-    cpus: Vec<usize>,
+    available_cpus: Vec<usize>,
+    active_cpu_count: AtomicUsize,
+    generation: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -25,7 +28,14 @@ enum CpuAffinityState {
 static CPU_AFFINITY_STATE: OnceLock<CpuAffinityState> = OnceLock::new();
 
 thread_local! {
-    static CURRENT_THREAD_AFFINITY_APPLIED: Cell<bool> = const { Cell::new(false) };
+    static CURRENT_THREAD_AFFINITY_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DynamicCpuAffinityUpdate {
+    pub requested_cpus: usize,
+    pub applied_cpus: usize,
+    pub changed: bool,
 }
 
 pub fn init_from_env(label: &str) {
@@ -34,13 +44,13 @@ pub fn init_from_env(label: &str) {
         CpuAffinityState::Invalid(error) => {
             eprintln!("[{label}] CPU affinity env ignored: {error}");
         }
-        CpuAffinityState::Configured(config) => match apply_cpu_affinity(&config.cpus) {
+        CpuAffinityState::Configured(config) => match apply_current_configured_affinity(config) {
             Ok(()) => {
                 eprintln!(
-                    "[{label}] CPU affinity limited by {}={} to CPUs: {}",
+                    "[{label}] CPU affinity initially limited by {}={} to CPUs: {}",
                     config.env_name,
                     config.requested_cpus,
-                    format_cpu_list(&config.cpus)
+                    format_cpu_list(&active_cpus(config))
                 );
             }
             Err(error) => {
@@ -55,7 +65,45 @@ pub fn init_from_env(label: &str) {
 
 pub fn ensure_current_thread_affinity() {
     if let CpuAffinityState::Configured(config) = cpu_affinity_state() {
-        let _ = apply_current_thread_affinity_once(config);
+        let _ = apply_current_thread_affinity_if_needed(config);
+    }
+}
+
+pub fn configured_cpu_count_env_present() -> bool {
+    configured_cpu_count_env().is_some()
+}
+
+pub fn update_dynamic_cpu_count(
+    requested_cpus: usize,
+) -> Result<Option<DynamicCpuAffinityUpdate>, String> {
+    let requested_cpus = requested_cpus.max(1);
+    let config = match cpu_affinity_state() {
+        CpuAffinityState::Disabled => return Ok(None),
+        CpuAffinityState::Invalid(error) => return Err(error.clone()),
+        CpuAffinityState::Configured(config) => config,
+    };
+
+    let applied_cpus = requested_cpus.min(config.available_cpus.len()).max(1);
+    let previous_cpus = config.active_cpu_count.swap(applied_cpus, Ordering::AcqRel);
+    let changed = previous_cpus != applied_cpus;
+    if changed {
+        config.generation.fetch_add(1, Ordering::AcqRel);
+        apply_process_configured_affinity(config)?;
+    }
+
+    Ok(Some(DynamicCpuAffinityUpdate {
+        requested_cpus,
+        applied_cpus,
+        changed,
+    }))
+}
+
+pub fn current_dynamic_cpu_count() -> Option<usize> {
+    match cpu_affinity_state() {
+        CpuAffinityState::Configured(config) => {
+            Some(config.active_cpu_count.load(Ordering::Acquire))
+        }
+        _ => None,
     }
 }
 
@@ -78,19 +126,21 @@ fn load_cpu_affinity_state() -> CpuAffinityState {
         Err(error) => return CpuAffinityState::Invalid(error),
     };
     let current_allowed_cpus = current_affinity_cpus().ok();
-    let cpus = match select_first_numa_cpus(
-        &first_node_cpus,
-        current_allowed_cpus.as_deref(),
-        requested_cpus,
-    ) {
-        Ok(cpus) => cpus,
-        Err(error) => return CpuAffinityState::Invalid(error),
-    };
+    let available_cpus =
+        select_first_numa_available_cpus(&first_node_cpus, current_allowed_cpus.as_deref());
+    if available_cpus.len() < requested_cpus {
+        return CpuAffinityState::Invalid(format!(
+            "requested {requested_cpus} CPUs from the first NUMA node but only {} are available",
+            available_cpus.len()
+        ));
+    }
 
     CpuAffinityState::Configured(CpuAffinityConfig {
         env_name,
         requested_cpus,
-        cpus,
+        available_cpus,
+        active_cpu_count: AtomicUsize::new(requested_cpus),
+        generation: AtomicU64::new(1),
     })
 }
 
@@ -207,18 +257,16 @@ fn current_affinity_cpus() -> io::Result<Vec<usize>> {
     Ok(cpus)
 }
 
+#[cfg(test)]
 fn select_first_numa_cpus(
     numa_cpus: &[usize],
     allowed_cpus: Option<&[usize]>,
     requested_cpus: usize,
 ) -> Result<Vec<usize>, String> {
-    let allowed: Option<BTreeSet<usize>> = allowed_cpus.map(|cpus| cpus.iter().copied().collect());
-    let cpus: Vec<usize> = numa_cpus
-        .iter()
-        .copied()
-        .filter(|cpu| allowed.as_ref().is_none_or(|allowed| allowed.contains(cpu)))
+    let cpus = select_first_numa_available_cpus(numa_cpus, allowed_cpus)
+        .into_iter()
         .take(requested_cpus)
-        .collect();
+        .collect::<Vec<_>>();
 
     if cpus.len() < requested_cpus {
         return Err(format!(
@@ -230,28 +278,99 @@ fn select_first_numa_cpus(
     Ok(cpus)
 }
 
-fn apply_current_thread_affinity_once(config: &CpuAffinityConfig) -> Result<bool, String> {
-    CURRENT_THREAD_AFFINITY_APPLIED.with(|applied| {
-        if applied.get() {
+fn select_first_numa_available_cpus(
+    numa_cpus: &[usize],
+    allowed_cpus: Option<&[usize]>,
+) -> Vec<usize> {
+    let allowed: Option<BTreeSet<usize>> = allowed_cpus.map(|cpus| cpus.iter().copied().collect());
+    numa_cpus
+        .iter()
+        .copied()
+        .filter(|cpu| allowed.as_ref().is_none_or(|allowed| allowed.contains(cpu)))
+        .collect()
+}
+
+fn active_cpus(config: &CpuAffinityConfig) -> Vec<usize> {
+    let active_cpu_count = config.active_cpu_count.load(Ordering::Acquire);
+    config
+        .available_cpus
+        .iter()
+        .copied()
+        .take(active_cpu_count)
+        .collect()
+}
+
+fn apply_current_configured_affinity(config: &CpuAffinityConfig) -> Result<(), String> {
+    apply_cpu_affinity(&active_cpus(config))
+}
+
+fn apply_process_configured_affinity(config: &CpuAffinityConfig) -> Result<(), String> {
+    apply_process_affinity(&active_cpus(config))
+}
+
+fn apply_current_thread_affinity_if_needed(config: &CpuAffinityConfig) -> Result<bool, String> {
+    let generation = config.generation.load(Ordering::Acquire);
+    if generation == 0 {
+        return Ok(false);
+    }
+
+    CURRENT_THREAD_AFFINITY_GENERATION.with(|applied_generation| {
+        if applied_generation.get() == generation {
             return Ok(false);
         }
 
-        let result = apply_cpu_affinity(&config.cpus);
-        applied.set(true);
+        let result = apply_current_configured_affinity(config);
+        applied_generation.set(generation);
         result.map(|()| true)
     })
 }
 
 fn apply_cpu_affinity(cpus: &[usize]) -> Result<(), String> {
+    apply_cpu_affinity_to_tid(0, cpus).map_err(|error| error.to_string())
+}
+
+fn apply_process_affinity(cpus: &[usize]) -> Result<(), String> {
+    for tid in current_process_tids()? {
+        match apply_cpu_affinity_to_tid(tid, cpus) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn current_process_tids() -> Result<Vec<libc::pid_t>, String> {
+    let entries = fs::read_dir("/proc/self/task")
+        .map_err(|error| format!("failed to read /proc/self/task: {error}"))?;
+    let mut tids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("failed to read task entry: {error}"))?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(tid) = file_name.parse::<libc::pid_t>() else {
+            continue;
+        };
+        tids.push(tid);
+    }
+    Ok(tids)
+}
+
+fn apply_cpu_affinity_to_tid(tid: libc::pid_t, cpus: &[usize]) -> io::Result<()> {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::CPU_ZERO(&mut set);
     }
     for &cpu in cpus {
         if cpu >= libc::CPU_SETSIZE as usize {
-            return Err(format!(
-                "CPU {cpu} is outside libc CPU_SETSIZE {}",
-                libc::CPU_SETSIZE
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "CPU {cpu} is outside libc CPU_SETSIZE {}",
+                    libc::CPU_SETSIZE
+                ),
             ));
         }
         unsafe {
@@ -259,9 +378,9 @@ fn apply_cpu_affinity(cpus: &[usize]) -> Result<(), String> {
         }
     }
 
-    let ret = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    let ret = unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) };
     if ret != 0 {
-        return Err(io::Error::last_os_error().to_string());
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -275,7 +394,9 @@ fn format_cpu_list(cpus: &[usize]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_cpu_list, parse_cpu_list, select_first_numa_cpus};
+    use super::{
+        format_cpu_list, parse_cpu_list, select_first_numa_available_cpus, select_first_numa_cpus,
+    };
 
     #[test]
     fn parse_cpu_list_accepts_singletons_and_ranges() {
@@ -310,6 +431,17 @@ mod tests {
     fn select_first_numa_cpus_requires_enough_available_cpus() {
         let error = select_first_numa_cpus(&[0, 2], Some(&[2]), 2).unwrap_err();
         assert!(error.contains("requested 2 CPUs"));
+    }
+
+    #[test]
+    fn select_first_numa_available_cpus_keeps_full_pool() {
+        let numa_cpus = vec![0, 2, 4, 6, 8, 10];
+        let allowed_cpus = vec![2, 6, 8, 12];
+
+        assert_eq!(
+            select_first_numa_available_cpus(&numa_cpus, Some(&allowed_cpus)),
+            vec![2, 6, 8]
+        );
     }
 
     #[test]

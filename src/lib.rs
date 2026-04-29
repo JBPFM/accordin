@@ -6,6 +6,7 @@ mod bpf_skel;
 pub use bpf_skel::*;
 mod arch;
 pub mod bpf_intf;
+pub use lb_shared::cpu_affinity;
 mod lock_backend;
 mod lock_stats;
 #[path = "mcs_tas_simple/src/mcs_tas.rs"]

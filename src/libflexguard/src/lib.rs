@@ -157,3 +157,18 @@ static FINI: extern "C" fn() = {
     }
     fini
 };
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lb_simple_dynamic_cpu_affinity_is_stable() -> libc::c_int {
+    i32::from(lock_stats::dynamic_cpu_affinity_is_stable())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lb_simple_dynamic_cpu_affinity_freeze() {
+    lock_stats::dynamic_cpu_affinity_freeze();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lb_simple_dynamic_cpu_affinity_begin_measurement() {
+    lock_stats::dynamic_cpu_affinity_begin_measurement_for_thread();
+}

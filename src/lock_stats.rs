@@ -39,6 +39,10 @@ const DYNAMIC_CPU_CONFIRM_WINDOWS_ENV_KEYS: [&str; 4] = [
     "LOCK_STATS_DYNAMIC_CPU_CONTROL_WINDOWS",
     "LB_SIMPLE_DYNAMIC_CPU_CONTROL_WINDOWS",
 ];
+const DYNAMIC_CPU_STABLE_WINDOWS_ENV_KEYS: [&str; 2] = [
+    "LOCK_STATS_DYNAMIC_CPU_STABLE_WINDOWS",
+    "LB_SIMPLE_DYNAMIC_CPU_STABLE_WINDOWS",
+];
 const HEATMAP_MAX_NS_ENV_KEYS: [&str; 3] = [
     "LOCK_STATS_HEATMAP_MAX_BIN_NS",
     "LOCK_STATS_HEATMAP_MAX_NS",
@@ -57,11 +61,11 @@ const DEFAULT_HEATMAP_WINDOW_NS: u64 = 1_000_000;
 const DEFAULT_HEATMAP_MIN_WINDOW_SAMPLES: u64 = 1;
 const DEFAULT_DYNAMIC_CPU_MIN_WINDOW_SAMPLES: u64 = 1;
 const DEFAULT_DYNAMIC_CPU_CONFIRM_WINDOWS: u64 = 3;
+const DEFAULT_DYNAMIC_CPU_STABLE_WINDOWS: u64 = 9;
 const DEFAULT_HEATMAP_MAX_NS: u64 = 1 << 20;
 const DEFAULT_TIMING_SAMPLE_STRIDE: u64 = 8;
 const HEATMAP_WINDOW_EWMA_ALPHA: f64 = 0.2;
-const DYNAMIC_CPU_TARGET_HYSTERESIS: f64 = 0.75;
-const DYNAMIC_CPU_MAX_STEP_PER_WINDOW: usize = 1;
+const DYNAMIC_CPU_DISCARD_WINDOWS_AFTER_UPDATE: u64 = 20;
 pub const ADMISSION_CPU_NONE: u32 = u32::MAX;
 
 /// Per-thread lock scheduling context, read by BPF via bpf_probe_read_user.
@@ -170,6 +174,7 @@ struct HeatmapConfig {
     dynamic_cpu_affinity: bool,
     dynamic_cpu_min_window_samples: u64,
     dynamic_cpu_confirm_windows: u64,
+    dynamic_cpu_stable_windows: u64,
 }
 
 impl HeatmapConfig {
@@ -182,6 +187,7 @@ impl HeatmapConfig {
         dynamic_cpu_affinity: bool,
         dynamic_cpu_min_window_samples: u64,
         dynamic_cpu_confirm_windows: u64,
+        dynamic_cpu_stable_windows: u64,
     ) -> Self {
         let max_ns = max_ns.max(1);
         Self {
@@ -194,6 +200,7 @@ impl HeatmapConfig {
             dynamic_cpu_affinity,
             dynamic_cpu_min_window_samples: dynamic_cpu_min_window_samples.max(1),
             dynamic_cpu_confirm_windows: dynamic_cpu_confirm_windows.max(1),
+            dynamic_cpu_stable_windows: dynamic_cpu_stable_windows.max(1),
         }
     }
 }
@@ -230,6 +237,12 @@ struct WindowControlState {
     last_dynamic_cpu_count: Option<usize>,
     pending_dynamic_cpu_count: Option<usize>,
     pending_dynamic_cpu_confirmations: u64,
+    stable_dynamic_cpu_count: bool,
+    stable_dynamic_cpu_confirmations: u64,
+    stable_dynamic_cpu_target_sum: f64,
+    stable_dynamic_cpu_target_samples: u64,
+    dynamic_cpu_discard_windows_remaining: u64,
+    dynamic_cpu_affinity_frozen: bool,
 }
 
 impl HeatmapState {
@@ -288,6 +301,10 @@ impl HeatmapState {
             .control
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        if control.dynamic_cpu_affinity_frozen {
+            return None;
+        }
+
         let mut dynamic_cpu_count = None;
 
         while control.next_window_index < current_window_index {
@@ -297,6 +314,10 @@ impl HeatmapState {
             let stats =
                 window_series_stats_for_window(windows, window_index, self.config.max_bin_index);
             if stats.sample_count < self.config.dynamic_cpu_min_window_samples {
+                continue;
+            }
+            if control.dynamic_cpu_discard_windows_remaining != 0 {
+                control.dynamic_cpu_discard_windows_remaining -= 1;
                 continue;
             }
 
@@ -311,8 +332,13 @@ impl HeatmapState {
                 self.confirmed_dynamic_cpu_count(&mut control, critical_ewma, outside_ewma);
             if let Some(cpu_count) = dynamic_cpu_count {
                 control.last_dynamic_cpu_count = Some(cpu_count);
-                control.pending_dynamic_cpu_count = None;
-                control.pending_dynamic_cpu_confirmations = 0;
+                control.critical_mean_ewma = None;
+                control.outside_mean_ewma = None;
+                clear_pending_dynamic_cpu_change(&mut control);
+                control.stable_dynamic_cpu_count = false;
+                reset_dynamic_cpu_stability(&mut control);
+                control.dynamic_cpu_discard_windows_remaining =
+                    DYNAMIC_CPU_DISCARD_WINDOWS_AFTER_UPDATE;
             }
         }
 
@@ -326,12 +352,13 @@ impl HeatmapState {
         outside_ewma: f64,
     ) -> Option<usize> {
         let target = dynamic_cpu_target_from_window_ewma(critical_ewma, outside_ewma)?;
-        let candidate = stabilized_dynamic_cpu_target(control.last_dynamic_cpu_count, target)?;
-        if Some(candidate) == control.last_dynamic_cpu_count {
-            control.pending_dynamic_cpu_count = None;
-            control.pending_dynamic_cpu_confirmations = 0;
-            return None;
+        if control.last_dynamic_cpu_count.is_some() && !control.stable_dynamic_cpu_count {
+            return self.record_dynamic_cpu_unchanged_window(control, target);
         }
+
+        let Some(candidate) = dynamic_cpu_candidate(control, target) else {
+            return self.record_dynamic_cpu_unchanged_window(control, target);
+        };
 
         if Some(candidate) == control.pending_dynamic_cpu_count {
             control.pending_dynamic_cpu_confirmations += 1;
@@ -340,10 +367,49 @@ impl HeatmapState {
             control.pending_dynamic_cpu_confirmations = 1;
         }
 
-        if control.pending_dynamic_cpu_confirmations >= self.config.dynamic_cpu_confirm_windows {
+        let required_confirm_windows = if control.stable_dynamic_cpu_count {
+            self.config.dynamic_cpu_stable_windows
+        } else {
+            self.config.dynamic_cpu_confirm_windows
+        };
+        if control.pending_dynamic_cpu_confirmations >= required_confirm_windows {
             Some(candidate)
         } else {
+            self.record_dynamic_cpu_unchanged_window(control, target)
+        }
+    }
+
+    fn record_dynamic_cpu_unchanged_window(
+        &self,
+        control: &mut WindowControlState,
+        target: f64,
+    ) -> Option<usize> {
+        let Some(current_cpu_count) = control.last_dynamic_cpu_count else {
+            return None;
+        };
+
+        if control.stable_dynamic_cpu_count {
+            return None;
+        }
+
+        control.stable_dynamic_cpu_confirmations += 1;
+        control.stable_dynamic_cpu_target_sum += target;
+        control.stable_dynamic_cpu_target_samples += 1;
+        if control.stable_dynamic_cpu_confirmations < self.config.dynamic_cpu_stable_windows {
+            return None;
+        }
+
+        clear_pending_dynamic_cpu_change(control);
+        let averaged_target = control.stable_dynamic_cpu_target_sum
+            / control.stable_dynamic_cpu_target_samples as f64;
+        let averaged_cpu_count =
+            stabilized_dynamic_cpu_target(Some(current_cpu_count), averaged_target)?;
+        if averaged_cpu_count == current_cpu_count {
+            clear_pending_dynamic_cpu_change(control);
+            control.stable_dynamic_cpu_count = true;
             None
+        } else {
+            Some(averaged_cpu_count)
         }
     }
 }
@@ -545,6 +611,10 @@ fn heatmap_state() -> Option<&'static HeatmapState> {
                 &DYNAMIC_CPU_CONFIRM_WINDOWS_ENV_KEYS,
                 DEFAULT_DYNAMIC_CPU_CONFIRM_WINDOWS,
             );
+            let dynamic_cpu_stable_windows = parse_env_u64(
+                &DYNAMIC_CPU_STABLE_WINDOWS_ENV_KEYS,
+                DEFAULT_DYNAMIC_CPU_STABLE_WINDOWS,
+            );
             Some(HeatmapState::new(HeatmapConfig::new(
                 path,
                 sample_stride,
@@ -554,6 +624,7 @@ fn heatmap_state() -> Option<&'static HeatmapState> {
                 dynamic_cpu_affinity,
                 dynamic_cpu_min_window_samples,
                 dynamic_cpu_confirm_windows,
+                dynamic_cpu_stable_windows,
             )))
         })
         .as_ref()
@@ -606,6 +677,28 @@ fn dynamic_cpu_target_from_window_ewma(critical_ns: f64, outside_ns: f64) -> Opt
     Some(target)
 }
 
+fn dynamic_cpu_candidate(control: &mut WindowControlState, target: f64) -> Option<usize> {
+    let current_cpu_count = control.last_dynamic_cpu_count;
+    let candidate = stabilized_dynamic_cpu_target(current_cpu_count, target)?;
+    if Some(candidate) == current_cpu_count {
+        clear_pending_dynamic_cpu_change(control);
+        return None;
+    }
+
+    Some(candidate)
+}
+
+fn clear_pending_dynamic_cpu_change(control: &mut WindowControlState) {
+    control.pending_dynamic_cpu_count = None;
+    control.pending_dynamic_cpu_confirmations = 0;
+}
+
+fn reset_dynamic_cpu_stability(control: &mut WindowControlState) {
+    control.stable_dynamic_cpu_confirmations = 0;
+    control.stable_dynamic_cpu_target_sum = 0.0;
+    control.stable_dynamic_cpu_target_samples = 0;
+}
+
 #[cfg(test)]
 fn dynamic_cpu_count_from_window_ewma(critical_ns: f64, outside_ns: f64) -> Option<usize> {
     let target = dynamic_cpu_target_from_window_ewma(critical_ns, outside_ns)?;
@@ -622,47 +715,16 @@ fn stabilized_dynamic_cpu_count(
     stabilized_dynamic_cpu_target(previous_cpu_count, target)
 }
 
-fn stabilized_dynamic_cpu_target(previous_cpu_count: Option<usize>, target: f64) -> Option<usize> {
+fn stabilized_dynamic_cpu_target(_previous_cpu_count: Option<usize>, target: f64) -> Option<usize> {
     if !target.is_finite() || target < 1.0 {
         return None;
     }
 
-    let desired_cpu_count = dynamic_cpu_count_from_target(target);
-    let Some(previous_cpu_count) = previous_cpu_count else {
-        return Some(desired_cpu_count);
-    };
-
-    if desired_cpu_count == previous_cpu_count {
-        return Some(previous_cpu_count);
-    }
-
-    let previous_target = previous_cpu_count as f64;
-    if (target - previous_target).abs() < DYNAMIC_CPU_TARGET_HYSTERESIS {
-        return Some(previous_cpu_count);
-    }
-
-    Some(limit_dynamic_cpu_step(
-        previous_cpu_count,
-        desired_cpu_count,
-        DYNAMIC_CPU_MAX_STEP_PER_WINDOW,
-    ))
+    Some(dynamic_cpu_count_from_target(target))
 }
 
 fn dynamic_cpu_count_from_target(target: f64) -> usize {
     target.round().clamp(1.0, usize::MAX as f64) as usize
-}
-
-fn limit_dynamic_cpu_step(
-    previous_cpu_count: usize,
-    desired_cpu_count: usize,
-    max_step: usize,
-) -> usize {
-    let max_step = max_step.max(1);
-    if desired_cpu_count > previous_cpu_count {
-        previous_cpu_count + (desired_cpu_count - previous_cpu_count).min(max_step)
-    } else {
-        previous_cpu_count - (previous_cpu_count - desired_cpu_count).min(max_step)
-    }
 }
 
 fn update_dynamic_cpu_affinity(dynamic_cpu_count: usize) {
@@ -682,6 +744,54 @@ fn update_dynamic_cpu_affinity(dynamic_cpu_count: usize) {
             }
         }
     }
+}
+
+pub fn dynamic_cpu_affinity_is_stable() -> bool {
+    let Some(state) = heatmap_state() else {
+        return true;
+    };
+    if !state.config.dynamic_cpu_affinity {
+        return true;
+    }
+
+    let control = state
+        .control
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    control.last_dynamic_cpu_count.is_some() && control.stable_dynamic_cpu_count
+}
+
+pub fn dynamic_cpu_affinity_freeze() {
+    let Some(state) = heatmap_state() else {
+        return;
+    };
+    if !state.config.dynamic_cpu_affinity {
+        return;
+    }
+
+    let mut control = state
+        .control
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    control.dynamic_cpu_affinity_frozen = true;
+    clear_pending_dynamic_cpu_change(&mut control);
+    reset_dynamic_cpu_stability(&mut control);
+    control.stable_dynamic_cpu_count = control.last_dynamic_cpu_count.is_some();
+}
+
+pub fn dynamic_cpu_affinity_begin_measurement_for_thread() {
+    cpu_affinity::ensure_current_thread_affinity();
+
+    unsafe {
+        let ctx = &mut *thread_ctx();
+        let aux = &mut *thread_aux();
+        finish_outside_gap_sample(aux);
+        reset_thread_measurement_state(ctx, aux);
+    }
+    unsafe {
+        libc::sched_yield();
+    }
+    cpu_affinity::ensure_current_thread_affinity();
 }
 
 #[inline(always)]
@@ -815,6 +925,25 @@ fn sync_aux_to_ctx(ctx: &mut LockSchedThreadCtx, aux: &ThreadStatsAux) {
     ctx.hold_ns_total = wait_time_total_to_ns(aux.hold_total);
     ctx.hold_start_ns = convert_optional_sample_to_ns(aux.hold_start_sample);
     ctx.lock_count = aux.lock_count;
+}
+
+fn reset_thread_measurement_state(ctx: &mut LockSchedThreadCtx, aux: &mut ThreadStatsAux) {
+    let now_sample = wait_time_start();
+    *aux = ThreadStatsAux::new();
+    aux.thread_start_sample = now_sample;
+
+    ctx.thread_start_ns = wait_time_to_ns(now_sample);
+    ctx.thread_elapsed_ns_total = 0;
+    ctx.wait_ns_total = 0;
+    ctx.wait_start_ns = 0;
+    ctx.hold_ns_total = 0;
+    ctx.hold_start_ns = 0;
+    ctx.lock_count = 0;
+    ctx.admission_owned = 0;
+    ctx.admission_cpu = ADMISSION_CPU_NONE;
+    ctx.admission_requeue_home = 0;
+    ctx.in_critical_section = 0;
+    ctx.slow_path_pending = 0;
 }
 
 fn write_heatmap_csv(label: &str, state: &HeatmapState) -> io::Result<HeatmapWriteSummary> {
@@ -1047,6 +1176,10 @@ pub fn print_process_stats(label: &str) {
                 "dynamic_cpu_confirm_windows: {}",
                 state.config.dynamic_cpu_confirm_windows
             );
+            println!(
+                "dynamic_cpu_stable_windows: {}",
+                state.config.dynamic_cpu_stable_windows
+            );
         }
     }
 }
@@ -1219,14 +1352,15 @@ mod tests {
 
     use super::{
         ADMISSION_CPU_NONE, DEFAULT_TIMING_SAMPLE_STRIDE, HEATMAP_WINDOW_EWMA_ALPHA, HeatmapConfig,
-        HeatmapState, ThreadStatsAux, admission_state_snapshot, advance_periodic_sample,
-        clear_admission_state, decide_operation_sampling, dynamic_cpu_count_from_window_ewma,
-        finish_outside_gap_sample, grant_slow_path_admission, heatmap_bin_index,
-        heatmap_bin_lower_ns, heatmap_bin_midpoint_ns, heatmap_bin_upper_ns,
-        mark_critical_section_entered, mark_slow_path_pending, outside_sample_stride,
-        parse_timing_sample_stride, record_post_unlock, refresh_thread_elapsed_for_aux,
-        sampled_heatmap_stride, stabilized_dynamic_cpu_count, stabilized_dynamic_cpu_target,
-        thread_ctx, write_heatmap_csv_to_writer,
+        HeatmapState, ThreadStatsAux, WindowControlState, admission_state_snapshot,
+        advance_periodic_sample, clear_admission_state, decide_operation_sampling,
+        dynamic_cpu_candidate, dynamic_cpu_count_from_window_ewma, finish_outside_gap_sample,
+        grant_slow_path_admission, heatmap_bin_index, heatmap_bin_lower_ns,
+        heatmap_bin_midpoint_ns, heatmap_bin_upper_ns, mark_critical_section_entered,
+        mark_slow_path_pending, outside_sample_stride, parse_timing_sample_stride,
+        record_post_unlock, refresh_thread_elapsed_for_aux, sampled_heatmap_stride,
+        stabilized_dynamic_cpu_count, stabilized_dynamic_cpu_target, thread_ctx,
+        write_heatmap_csv_to_writer,
     };
 
     fn reset_thread_ctx_for_test() {
@@ -1472,8 +1606,17 @@ mod tests {
 
     #[test]
     fn heatmap_csv_writes_only_nonzero_bins() {
-        let config =
-            HeatmapConfig::new(Some(PathBuf::from("heatmap.csv")), 1, 2, 2, 8, false, 2, 1);
+        let config = HeatmapConfig::new(
+            Some(PathBuf::from("heatmap.csv")),
+            1,
+            2,
+            2,
+            8,
+            false,
+            2,
+            1,
+            9,
+        );
         let state = HeatmapState::new(config);
         state.record_sample(100, 1, 4);
         state.record_sample(101, 1, 4);
@@ -1499,7 +1642,7 @@ mod tests {
 
     #[test]
     fn dynamic_control_uses_only_completed_valid_windows() {
-        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 2, 1);
+        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 2, 1, 9);
         let state = HeatmapState::new(config);
         let mut windows = BTreeMap::new();
         windows.insert((0, 1, 1), 2);
@@ -1521,26 +1664,86 @@ mod tests {
     }
 
     #[test]
-    fn stabilized_dynamic_cpu_count_does_not_use_initial_k_as_anchor() {
+    fn stabilized_dynamic_cpu_count_jumps_directly_to_formula_target() {
         assert_eq!(stabilized_dynamic_cpu_count(None, 100.0, 100.0), Some(2));
         assert_eq!(stabilized_dynamic_cpu_count(Some(2), 100.0, 101.0), Some(2));
         assert_eq!(
             stabilized_dynamic_cpu_count(Some(2), 100.0, 10_000.0),
-            Some(3)
+            Some(101)
+        );
+        assert_eq!(
+            stabilized_dynamic_cpu_count(Some(16), 100.0, 10_000.0),
+            Some(101)
         );
     }
 
     #[test]
-    fn stabilized_dynamic_cpu_target_holds_near_integer_boundary() {
-        assert_eq!(stabilized_dynamic_cpu_target(Some(8), 8.60), Some(8));
-        assert_eq!(stabilized_dynamic_cpu_target(Some(8), 8.80), Some(9));
-        assert_eq!(stabilized_dynamic_cpu_target(Some(9), 8.40), Some(9));
-        assert_eq!(stabilized_dynamic_cpu_target(Some(9), 8.20), Some(8));
+    fn stabilized_dynamic_cpu_target_has_no_boundary_anchor() {
+        assert_eq!(stabilized_dynamic_cpu_target(None, 8.40), Some(8));
+        assert_eq!(stabilized_dynamic_cpu_target(None, 8.60), Some(9));
+        assert_eq!(stabilized_dynamic_cpu_count(Some(8), 100.0, 740.0), Some(8));
+        assert_eq!(stabilized_dynamic_cpu_count(Some(9), 100.0, 740.0), Some(8));
+        assert_eq!(stabilized_dynamic_cpu_count(Some(8), 100.0, 760.0), Some(9));
+        assert_eq!(stabilized_dynamic_cpu_count(Some(9), 100.0, 760.0), Some(9));
+    }
+
+    #[test]
+    fn stabilized_dynamic_cpu_target_converges_to_same_count_without_hysteresis() {
+        let mut from_low = 2;
+        let mut from_high = 16;
+
+        for _ in 0..8 {
+            from_low = stabilized_dynamic_cpu_target(Some(from_low), 11.0).unwrap();
+            from_high = stabilized_dynamic_cpu_target(Some(from_high), 11.0).unwrap();
+        }
+
+        assert_eq!(from_low, 11);
+        assert_eq!(from_high, 11);
+    }
+
+    #[test]
+    fn stable_dynamic_cpu_count_ignores_same_rounded_target() {
+        let mut control = WindowControlState {
+            last_dynamic_cpu_count: Some(9),
+            stable_dynamic_cpu_count: true,
+            ..WindowControlState::default()
+        };
+
+        assert_eq!(dynamic_cpu_candidate(&mut control, 8.60), None);
+        assert!(control.stable_dynamic_cpu_count);
+        assert_eq!(dynamic_cpu_candidate(&mut control, 8.10), Some(8));
+        assert!(control.stable_dynamic_cpu_count);
+        assert_eq!(dynamic_cpu_candidate(&mut control, 13.20), Some(13));
+        assert!(control.stable_dynamic_cpu_count);
+    }
+
+    #[test]
+    fn dynamic_control_requires_nine_large_windows_to_leave_stable_state() {
+        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 1, 3, 9);
+        let state = HeatmapState::new(config);
+        let mut control = WindowControlState {
+            last_dynamic_cpu_count: Some(9),
+            stable_dynamic_cpu_count: true,
+            ..WindowControlState::default()
+        };
+
+        for _ in 0..8 {
+            assert_eq!(
+                state.confirmed_dynamic_cpu_count(&mut control, 100.0, 1_220.0),
+                None
+            );
+            assert!(control.stable_dynamic_cpu_count);
+        }
+
+        assert_eq!(
+            state.confirmed_dynamic_cpu_count(&mut control, 100.0, 1_220.0),
+            Some(13)
+        );
     }
 
     #[test]
     fn dynamic_control_requires_three_consecutive_confirmations() {
-        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 2, 3);
+        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 2, 3, 9);
         let state = HeatmapState::new(config);
         let mut windows = BTreeMap::new();
         windows.insert((0, 1, 3), 2);
@@ -1550,5 +1753,126 @@ mod tests {
         assert_eq!(state.next_dynamic_cpu_count(&windows, 1), None);
         assert_eq!(state.next_dynamic_cpu_count(&windows, 2), None);
         assert_eq!(state.next_dynamic_cpu_count(&windows, 3), Some(7));
+    }
+
+    #[test]
+    fn dynamic_control_jumps_directly_to_large_stable_window_average() {
+        for initial_cpu_count in [2, 16] {
+            let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 1, 3, 9);
+            let state = HeatmapState::new(config);
+            let mut control = WindowControlState {
+                last_dynamic_cpu_count: Some(initial_cpu_count),
+                ..WindowControlState::default()
+            };
+
+            for _ in 0..8 {
+                assert_eq!(
+                    state.confirmed_dynamic_cpu_count(&mut control, 100.0, 10_000.0),
+                    None
+                );
+            }
+
+            assert_eq!(
+                state.confirmed_dynamic_cpu_count(&mut control, 100.0, 10_000.0),
+                Some(101)
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_control_enters_stable_after_nine_unchanged_windows() {
+        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 1, 3, 9);
+        let state = HeatmapState::new(config);
+        let mut control = WindowControlState {
+            last_dynamic_cpu_count: Some(7),
+            ..WindowControlState::default()
+        };
+
+        for _ in 0..8 {
+            assert_eq!(
+                state.confirmed_dynamic_cpu_count(&mut control, 1.0, 5.5),
+                None
+            );
+            assert!(!control.stable_dynamic_cpu_count);
+        }
+
+        assert_eq!(
+            state.confirmed_dynamic_cpu_count(&mut control, 1.0, 5.5),
+            None
+        );
+        assert!(control.stable_dynamic_cpu_count);
+    }
+
+    #[test]
+    fn dynamic_control_counts_unconfirmed_drift_toward_stable_state() {
+        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 1, 3, 9);
+        let state = HeatmapState::new(config);
+        let mut control = WindowControlState {
+            last_dynamic_cpu_count: Some(8),
+            ..WindowControlState::default()
+        };
+
+        for index in 0..8 {
+            let outside_ewma = if index % 2 == 0 { 760.0 } else { 640.0 };
+            assert_eq!(
+                state.confirmed_dynamic_cpu_count(&mut control, 100.0, outside_ewma),
+                None
+            );
+            assert!(!control.stable_dynamic_cpu_count);
+        }
+
+        assert_eq!(
+            state.confirmed_dynamic_cpu_count(&mut control, 100.0, 760.0),
+            None
+        );
+        assert!(control.stable_dynamic_cpu_count);
+        assert_eq!(control.pending_dynamic_cpu_count, None);
+        assert_eq!(control.pending_dynamic_cpu_confirmations, 0);
+    }
+
+    #[test]
+    fn dynamic_control_calibrates_small_drift_with_stable_window_average() {
+        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 1, 3, 9);
+        let state = HeatmapState::new(config);
+        let mut control = WindowControlState {
+            last_dynamic_cpu_count: Some(13),
+            ..WindowControlState::default()
+        };
+
+        for _ in 0..8 {
+            assert_eq!(
+                state.confirmed_dynamic_cpu_count(&mut control, 100.0, 1_000.0),
+                None
+            );
+        }
+
+        assert_eq!(
+            state.confirmed_dynamic_cpu_count(&mut control, 100.0, 1_000.0),
+            Some(11)
+        );
+        assert!(!control.stable_dynamic_cpu_count);
+    }
+
+    #[test]
+    fn dynamic_control_applies_small_average_increase_after_stable_window() {
+        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 1, 3, 9);
+        let state = HeatmapState::new(config);
+        let mut control = WindowControlState {
+            last_dynamic_cpu_count: Some(9),
+            ..WindowControlState::default()
+        };
+
+        for _ in 0..8 {
+            assert_eq!(
+                state.confirmed_dynamic_cpu_count(&mut control, 100.0, 1_000.0),
+                None
+            );
+        }
+
+        assert_eq!(
+            state.confirmed_dynamic_cpu_count(&mut control, 100.0, 1_000.0),
+            Some(11)
+        );
+        assert!(!control.stable_dynamic_cpu_count);
     }
 }

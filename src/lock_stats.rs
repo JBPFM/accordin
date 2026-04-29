@@ -47,6 +47,7 @@ const DEFAULT_HEATMAP_MIN_WINDOW_SAMPLES: u64 = 1;
 const DEFAULT_HEATMAP_MAX_NS: u64 = 1 << 20;
 const DEFAULT_TIMING_SAMPLE_STRIDE: u64 = 8;
 const HEATMAP_WINDOW_EWMA_ALPHA: f64 = 0.2;
+pub const ADMISSION_CPU_NONE: u32 = u32::MAX;
 
 /// Per-thread lock scheduling context, read by BPF via bpf_probe_read_user.
 #[repr(C)]
@@ -58,6 +59,11 @@ pub struct LockSchedThreadCtx {
     pub hold_ns_total: u64,
     pub hold_start_ns: u64,
     pub lock_count: u64,
+    pub admission_owned: u32,
+    pub admission_cpu: u32,
+    pub admission_requeue_home: u32,
+    pub in_critical_section: u32,
+    pub slow_path_pending: u32,
 }
 
 impl LockSchedThreadCtx {
@@ -70,6 +76,11 @@ impl LockSchedThreadCtx {
             hold_ns_total: 0,
             hold_start_ns: 0,
             lock_count: 0,
+            admission_owned: 0,
+            admission_cpu: ADMISSION_CPU_NONE,
+            admission_requeue_home: 0,
+            in_critical_section: 0,
+            slow_path_pending: 0,
         }
     }
 }
@@ -238,6 +249,75 @@ static PROCESS_OUTSIDE_GAP_SAMPLES: AtomicU64 = AtomicU64::new(0);
 /// Returns a pointer to the current thread's LockSchedThreadCtx.
 pub fn thread_ctx() -> *mut LockSchedThreadCtx {
     THREAD_CTX.with(|ctx| ctx.get())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionStateSnapshot {
+    pub admission_owned: bool,
+    pub admission_cpu: u32,
+    pub admission_requeue_home: bool,
+    pub in_critical_section: bool,
+    pub slow_path_pending: bool,
+}
+
+#[inline(always)]
+pub fn thread_has_admission() -> bool {
+    unsafe { (*thread_ctx()).admission_owned != 0 }
+}
+
+#[inline(always)]
+pub fn mark_slow_path_pending() {
+    unsafe {
+        let ctx = thread_ctx();
+        (*ctx).slow_path_pending = 1;
+        (*ctx).in_critical_section = 0;
+    }
+}
+
+#[inline(always)]
+pub fn grant_slow_path_admission(cpu: u32) {
+    unsafe {
+        let ctx = thread_ctx();
+        (*ctx).admission_owned = 1;
+        (*ctx).admission_cpu = cpu;
+        (*ctx).admission_requeue_home = 0;
+    }
+}
+
+#[inline(always)]
+pub fn mark_critical_section_entered() {
+    unsafe {
+        let ctx = thread_ctx();
+        (*ctx).slow_path_pending = 0;
+        (*ctx).in_critical_section = 1;
+        (*ctx).admission_requeue_home = 0;
+    }
+}
+
+#[inline(always)]
+pub fn clear_admission_state() {
+    unsafe {
+        let ctx = thread_ctx();
+        (*ctx).admission_owned = 0;
+        (*ctx).admission_cpu = ADMISSION_CPU_NONE;
+        (*ctx).admission_requeue_home = 0;
+        (*ctx).in_critical_section = 0;
+        (*ctx).slow_path_pending = 0;
+    }
+}
+
+#[inline(always)]
+pub fn admission_state_snapshot() -> AdmissionStateSnapshot {
+    unsafe {
+        let ctx = thread_ctx();
+        AdmissionStateSnapshot {
+            admission_owned: (*ctx).admission_owned != 0,
+            admission_cpu: (*ctx).admission_cpu,
+            admission_requeue_home: (*ctx).admission_requeue_home != 0,
+            in_critical_section: (*ctx).in_critical_section != 0,
+            slow_path_pending: (*ctx).slow_path_pending != 0,
+        }
+    }
 }
 
 #[inline(always)]
@@ -862,13 +942,21 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DEFAULT_TIMING_SAMPLE_STRIDE, HEATMAP_WINDOW_EWMA_ALPHA, HeatmapConfig, HeatmapState,
-        ThreadStatsAux, advance_periodic_sample, decide_operation_sampling,
-        finish_outside_gap_sample, heatmap_bin_index, heatmap_bin_lower_ns,
-        heatmap_bin_midpoint_ns, heatmap_bin_upper_ns, outside_sample_stride,
-        parse_timing_sample_stride, record_post_unlock, refresh_thread_elapsed_for_aux,
-        sampled_heatmap_stride, write_heatmap_csv_to_writer,
+        ADMISSION_CPU_NONE, DEFAULT_TIMING_SAMPLE_STRIDE, HEATMAP_WINDOW_EWMA_ALPHA, HeatmapConfig,
+        HeatmapState, ThreadStatsAux, admission_state_snapshot, advance_periodic_sample,
+        clear_admission_state, decide_operation_sampling, finish_outside_gap_sample,
+        grant_slow_path_admission, heatmap_bin_index, heatmap_bin_lower_ns,
+        heatmap_bin_midpoint_ns, heatmap_bin_upper_ns, mark_critical_section_entered,
+        mark_slow_path_pending, outside_sample_stride, parse_timing_sample_stride,
+        record_post_unlock, refresh_thread_elapsed_for_aux, sampled_heatmap_stride, thread_ctx,
+        write_heatmap_csv_to_writer,
     };
+
+    fn reset_thread_ctx_for_test() {
+        unsafe {
+            *thread_ctx() = super::LockSchedThreadCtx::new();
+        }
+    }
 
     #[test]
     fn refresh_thread_elapsed_tracks_raw_wait_time_units() {
@@ -1037,6 +1125,59 @@ mod tests {
             assert!(!(*aux).op_sample_decided);
             assert!(!(*aux).op_sampled);
         }
+    }
+
+    #[test]
+    fn admission_helpers_track_pending_grant_and_release() {
+        reset_thread_ctx_for_test();
+
+        mark_slow_path_pending();
+        assert_eq!(
+            admission_state_snapshot(),
+            super::AdmissionStateSnapshot {
+                admission_owned: false,
+                admission_cpu: ADMISSION_CPU_NONE,
+                admission_requeue_home: false,
+                in_critical_section: false,
+                slow_path_pending: true,
+            }
+        );
+
+        grant_slow_path_admission(7);
+        assert_eq!(
+            admission_state_snapshot(),
+            super::AdmissionStateSnapshot {
+                admission_owned: true,
+                admission_cpu: 7,
+                admission_requeue_home: false,
+                in_critical_section: false,
+                slow_path_pending: true,
+            }
+        );
+
+        mark_critical_section_entered();
+        assert_eq!(
+            admission_state_snapshot(),
+            super::AdmissionStateSnapshot {
+                admission_owned: true,
+                admission_cpu: 7,
+                admission_requeue_home: false,
+                in_critical_section: true,
+                slow_path_pending: false,
+            }
+        );
+
+        clear_admission_state();
+        assert_eq!(
+            admission_state_snapshot(),
+            super::AdmissionStateSnapshot {
+                admission_owned: false,
+                admission_cpu: ADMISSION_CPU_NONE,
+                admission_requeue_home: false,
+                in_critical_section: false,
+                slow_path_pending: false,
+            }
+        );
     }
 
     #[test]

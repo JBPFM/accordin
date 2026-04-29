@@ -17,6 +17,7 @@ exclude = ["bench/mutexbench_rust"]
 
 [dependencies]
 anyhow = "1.0.65"
+lb_shared = { path = "src/lb_shared" }
 libbpf-rs = "=0.26.0-beta.1"
 libc = "0.2.177"
 log = "0.4.17"

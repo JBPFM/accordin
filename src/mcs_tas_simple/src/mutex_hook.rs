@@ -94,6 +94,8 @@ thread_local! {
 /// Ensure the current thread is registered in the BPF map (idempotent).
 #[inline(always)]
 fn ensure_registered() {
+    lb_shared::cpu_affinity::ensure_current_thread_affinity();
+
     REGISTERED.with(|r| {
         if !r.get() {
             record_thread_start();

@@ -961,6 +961,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcs_tse"
+version = "0.1.0"
+dependencies = [
+ "lb_shared",
+ "libc",
+ "log",
+ "simplelog",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

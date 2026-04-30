@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -28,6 +28,7 @@ impl WaitElement {
 
 thread_local! {
     static THREAD_ELEMENT: WaitElement = const { WaitElement::new() };
+    static HELD_LOCK: Cell<Option<HeldLockContext>> = const { Cell::new(None) };
     static HELD_LOCKS: RefCell<Vec<HeldLockContext>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -51,12 +52,29 @@ struct HeldLockContext {
 }
 
 fn push_lock_context(lock: *const ReciprocatingLockRaw, context: LockContext) {
-    HELD_LOCKS.with(|held| {
-        held.borrow_mut().push(HeldLockContext { lock, context });
+    let held_context = HeldLockContext { lock, context };
+    HELD_LOCK.with(|held| {
+        if held.get().is_none() {
+            held.set(Some(held_context));
+        } else {
+            HELD_LOCKS.with(|held| {
+                held.borrow_mut().push(held_context);
+            });
+        }
     });
 }
 
 fn pop_lock_context(lock: *const ReciprocatingLockRaw) -> LockContext {
+    if let Some(context) = HELD_LOCK.with(|held| match held.get() {
+        Some(context) if ptr::eq(context.lock, lock) => {
+            held.set(None);
+            Some(context.context)
+        }
+        _ => None,
+    }) {
+        return context;
+    }
+
     HELD_LOCKS.with(|held| {
         let mut held = held.borrow_mut();
         let pos = held
@@ -174,7 +192,7 @@ impl ReciprocatingLockRaw {
             .compare_exchange(
                 ptr::null_mut(),
                 element,
-                Ordering::AcqRel,
+                Ordering::Acquire,
                 Ordering::Relaxed,
             )
             .is_err()

@@ -204,7 +204,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::{McsLockRaw, Node};
-    use crate::bpf_intf;
     use crate::lock_backend::LockBackend;
     use crate::lock_stats::{ADMISSION_CPU_NONE, admission_state_snapshot, clear_admission_state};
 
@@ -212,18 +211,6 @@ mod tests {
     fn node_layout_stays_cache_aligned() {
         assert_eq!(std::mem::size_of::<Node>(), 64);
         assert_eq!(std::mem::align_of::<Node>(), 64);
-    }
-
-    #[test]
-    fn thread_ctx_layout_matches_bindgen_contract() {
-        assert_eq!(
-            std::mem::size_of::<crate::lock_stats::LockSchedThreadCtx>(),
-            std::mem::size_of::<bpf_intf::lock_sched_thread_ctx>(),
-        );
-        assert_eq!(
-            std::mem::align_of::<crate::lock_stats::LockSchedThreadCtx>(),
-            std::mem::align_of::<bpf_intf::lock_sched_thread_ctx>(),
-        );
     }
 
     #[test]

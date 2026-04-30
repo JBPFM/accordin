@@ -205,3 +205,8 @@ pub fn pause() {
         std::thread::yield_now();
     }
 }
+
+#[inline(always)]
+pub fn compiler_barrier() {
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}

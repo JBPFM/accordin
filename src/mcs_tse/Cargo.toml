@@ -1,0 +1,18 @@
+[package]
+name = "mcs_tse"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[lib]
+name = "mcs_tse"
+crate-type = ["cdylib"]
+
+[dependencies]
+lb_shared = { path = "../lb_shared" }
+libc = "0.2.177"
+log = "0.4.17"
+simplelog = "0.12"
+
+[features]
+perf-symbols = []

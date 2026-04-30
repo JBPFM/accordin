@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ from bench_csv_schema import (  # noqa: E402
 THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
 PLOT_THREADS = tuple(thread for thread in THREADS if thread >= 4)
 DECOMPOSITION_THREADS = (128, 192, 256)
-DECOMPOSITION_LOCK_KEYS = ("mcs", "mcs_extension", "mcs-tas", "flexguard", "accordin")
+DECOMPOSITION_LOCK_KEYS = ("mcs", "mcs_extension", "mcs-tas", "malthusian", "flexguard", "accordin")
 CRITICAL_NS = 300
 OUTSIDE_NS = 3000
 DURATION_MS = 5000
@@ -70,17 +71,39 @@ class LockSpec:
         return (self.key,)
 
 
+@dataclass(frozen=True)
+class FlexguardInterposeBuildSpec:
+    make_target: str | None = None
+    make_vars: tuple[str, ...] = ()
+    clean_first: bool = False
+
+
 LOCKS = (
     LockSpec("MCS", "mcs"),
     LockSpec("MCS-TP", "mcstp"),
     LockSpec("MCS-TAS", "mcs-tas"),
+    LockSpec("Reciprocating", "reciprocating", optional=True),
     LockSpec("Accordin (K=11)", "accordin", optional=True, result_dirs=("accordin", "mcs_tas_simple")),
     LockSpec("MCS + TSE", "mcs_extension"),
+    LockSpec("Malthusian", "malthusian", optional=True),
     LockSpec("FlexGuard", "flexguard"),
 )
 
-BASE_LOCK_KEYS = ("mcs", "mcstp", "mcs-tas", "flexguard")
-FLEXGUARD_INTERPOSE_KEYS = ("mcstp", "flexguard")
+BASE_LOCK_KEYS = ("mcs", "mcstp", "mcs-tas", "reciprocating", "malthusian", "flexguard")
+FLEXGUARD_INTERPOSE_KEYS = ("mcstp", "malthusian", "flexguard")
+FLEXGUARD_INTERPOSE_BUILD_SPECS = {
+    "flexguard": FlexguardInterposeBuildSpec(make_target="build/interpose_flexguard.sh"),
+    "mcstp": FlexguardInterposeBuildSpec(
+        make_vars=("LOCK_VERSION=MCSTP", "ADD_PADDING=1", "USE_REAL_PTHREAD=1"),
+        clean_first=True,
+    ),
+    "malthusian": FlexguardInterposeBuildSpec(
+        make_vars=("LOCK_VERSION=MALTHUSIAN", "ADD_PADDING=1", "USE_REAL_PTHREAD=1"),
+        clean_first=True,
+    ),
+}
+LOCKS_BY_KEY = {lock.key: lock for lock in LOCKS}
+SUPPLEMENT_DEFAULT_LOCK_KEYS = ("reciprocating", "malthusian")
 
 COMBINED_FIELDS = (
     "lock_label",
@@ -113,7 +136,31 @@ class CommandLogger:
         self.result_root = result_root
         self.log_dir = result_root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.records: list[dict[str, object]] = []
+        self.manifest_path = result_root / "commands.json"
+        self.records: list[dict[str, object]] = self.load_existing_records()
+
+    def load_existing_records(self) -> list[dict[str, object]]:
+        if not self.manifest_path.is_file():
+            return []
+        with self.manifest_path.open("r", encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+            raise RuntimeError(f"Existing command manifest must be a JSON list of objects: {self.manifest_path}")
+        return list(records)
+
+    def resolve_log_path(self, log_name: str) -> Path:
+        log_path = self.log_dir / log_name
+        if not log_path.exists():
+            return log_path
+
+        stem = log_path.stem
+        suffix = log_path.suffix
+        index = 1
+        while True:
+            candidate = self.log_dir / f"{stem}_{index}{suffix}"
+            if not candidate.exists():
+                return candidate
+            index += 1
 
     def run(
         self,
@@ -123,7 +170,7 @@ class CommandLogger:
         cwd: Path = REPO_ROOT,
         env: dict[str, str] | None = None,
     ) -> None:
-        log_path = self.log_dir / log_name
+        log_path = self.resolve_log_path(log_name)
         started_at = dt.datetime.now(dt.timezone.utc)
         record: dict[str, object] = {
             "command": cmd,
@@ -162,7 +209,7 @@ class CommandLogger:
             log_file.write(f"\nfinished_at: {finished_at.isoformat()}\n")
             log_file.write(f"returncode: {returncode}\n")
 
-        record["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        record["finished_at"] = finished_at.isoformat()
         record["returncode"] = returncode
         self.records.append(record)
         self.write_manifest()
@@ -174,8 +221,7 @@ class CommandLogger:
             )
 
     def write_manifest(self) -> None:
-        manifest_path = self.result_root / "commands.json"
-        with manifest_path.open("w", encoding="utf-8") as f:
+        with self.manifest_path.open("w", encoding="utf-8") as f:
             json.dump(self.records, f, indent=2)
             f.write("\n")
 
@@ -195,13 +241,14 @@ Examples:
   python3 experiments/run_experiment_one.py --output-root experiments/results/experiment1_manual
   python3 experiments/run_experiment_one.py --mcs-tas-simple-taskset-cpus 0,2,4,8,10,12,14,16,18,20,22
   python3 experiments/run_experiment_one.py --plot-only experiments/results/experiment1_manual
+  python3 experiments/run_experiment_one.py --output-root experiments/results/experiment1_20260423_194548 --supplement-locks
 """,
     )
     parser.add_argument(
         "--output-root",
         type=Path,
         default=None,
-        help="Directory for a new run. Default: experiments/results/experiment1_<timestamp>.",
+        help="Directory for a new run or supplement target root. Default: experiments/results/experiment1_<timestamp>.",
     )
     parser.add_argument(
         "--plot-only",
@@ -209,6 +256,20 @@ Examples:
         default=None,
         metavar="RESULT_ROOT",
         help="Skip benchmark execution and regenerate combined CSV and PNGs from RESULT_ROOT.",
+    )
+    parser.add_argument(
+        "--supplement-locks",
+        nargs="?",
+        const=",".join(SUPPLEMENT_DEFAULT_LOCK_KEYS),
+        default=None,
+        metavar="LOCKS",
+        help=(
+            "Run only the selected base-sweep locks inside --output-root, then regenerate combined CSV and PNGs. "
+            f"Default when the flag is provided without a value: {','.join(SUPPLEMENT_DEFAULT_LOCK_KEYS)}. "
+            f"Supported locks: {','.join(BASE_LOCK_KEYS)}. "
+            "Other experiment-one lock results must already exist under --output-root for plotting. "
+            "Existing target lock results cause an error unless --force is used, and non-target lock directories are left untouched."
+        ),
     )
     parser.add_argument(
         "--mcs-extension-mode",
@@ -239,7 +300,7 @@ Examples:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Allow benchmark output into an existing non-empty output root.",
+        help="Allow benchmark output into an existing non-empty output root, and in supplement mode allow overwriting target lock results.",
     )
     return parser.parse_args()
 
@@ -251,6 +312,27 @@ def resolve_path(path: Path) -> Path:
 def default_result_root() -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     return REPO_ROOT / "experiments" / "results" / f"experiment1_{timestamp}"
+
+
+def parse_supplement_lock_keys(value: str) -> tuple[str, ...]:
+    requested_keys = [item.strip().lower() for item in value.split(",") if item.strip()]
+    if not requested_keys:
+        raise ValueError("--supplement-locks requires at least one lock key.")
+
+    invalid_keys = [key for key in requested_keys if key not in BASE_LOCK_KEYS]
+    if invalid_keys:
+        supported = ",".join(BASE_LOCK_KEYS)
+        invalid = ",".join(invalid_keys)
+        raise ValueError(f"--supplement-locks only supports base-sweep locks ({supported}). Invalid: {invalid}")
+
+    unique_keys: list[str] = []
+    seen: set[str] = set()
+    for key in requested_keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_keys.append(key)
+    return tuple(unique_keys)
 
 
 def write_settings(
@@ -279,6 +361,27 @@ def write_settings(
         f.write("\n")
 
 
+def write_settings_if_missing(
+    result_root: Path,
+    mcs_extension_mode: str,
+    sudo_mode: str,
+    mcs_tas_simple_taskset_enabled: bool,
+    mcs_tas_simple_taskset_cpus: str,
+) -> None:
+    settings_path = result_root / "settings.json"
+    if settings_path.exists():
+        if not settings_path.is_file():
+            raise RuntimeError(f"Settings path exists but is not a file: {settings_path}")
+        return
+    write_settings(
+        result_root,
+        mcs_extension_mode,
+        sudo_mode,
+        mcs_tas_simple_taskset_enabled,
+        mcs_tas_simple_taskset_cpus,
+    )
+
+
 def ensure_executable(path: Path, description: str) -> None:
     if not path.is_file() or not os.access(path, os.X_OK):
         raise RuntimeError(f"{description} is not executable: {path}")
@@ -295,31 +398,89 @@ def flexguard_interpose_path(key: str) -> Path:
     return FLEXGUARD_DIR / "build" / f"interpose_{key}.sh"
 
 
+def flexguard_interpose_library_path(key: str) -> Path:
+    return FLEXGUARD_DIR / "build" / f"interpose_{key}.so"
+
+
 def ensure_flexguard_interpose(key: str, logger: CommandLogger) -> None:
     script = flexguard_interpose_path(key)
-    if script.is_file() and os.access(script, os.X_OK):
+    library = flexguard_interpose_library_path(key)
+    if script.is_file() and os.access(script, os.X_OK) and library.is_file():
         return
 
-    target = f"build/interpose_{key}.sh"
-    try:
-        logger.run(["make", "-C", str(FLEXGUARD_DIR), target], log_name=f"build_flexguard_{key}.log")
-    except CommandError as exc:
-        raise RuntimeError(
-            f"Required bench/flexguard script cannot be built: {script}. "
-            f"The attempted Makefile target was {target}; see {exc.log_path}."
-        ) from exc
+    spec = FLEXGUARD_INTERPOSE_BUILD_SPECS.get(
+        key,
+        FlexguardInterposeBuildSpec(make_target=f"build/interpose_{key}.sh"),
+    )
+    if spec.make_target is not None:
+        try:
+            logger.run(
+                ["make", "-C", str(FLEXGUARD_DIR), spec.make_target],
+                log_name=f"build_flexguard_{key}.log",
+            )
+        except CommandError as exc:
+            raise RuntimeError(
+                f"Required bench/flexguard interpose helper cannot be built: {script}. "
+                f"The attempted Makefile target was {spec.make_target}; see {exc.log_path}."
+            ) from exc
+    else:
+        if spec.clean_first:
+            try:
+                logger.run(
+                    ["make", "-C", str(FLEXGUARD_DIR), "clean"],
+                    log_name=f"build_flexguard_{key}_clean.log",
+                )
+            except CommandError as exc:
+                raise RuntimeError(
+                    f"Required bench/flexguard interpose helper could not be cleaned before rebuild: {script}. "
+                    f"See {exc.log_path}."
+                ) from exc
+
+        build_cmd = ["make", "-C", str(FLEXGUARD_DIR), *spec.make_vars, "interpose.so", "interpose.sh"]
+        try:
+            logger.run(build_cmd, log_name=f"build_flexguard_{key}.log")
+        except CommandError as exc:
+            raise RuntimeError(
+                f"Required bench/flexguard interpose helper cannot be built: {script}. "
+                f"The attempted build command was {shlex.join(build_cmd)}; see {exc.log_path}."
+            ) from exc
+
+        source_script = FLEXGUARD_DIR / "interpose.sh"
+        source_library = FLEXGUARD_DIR / "interpose.so"
+        if not source_script.is_file() or not os.access(source_script, os.X_OK):
+            raise RuntimeError(
+                f"Required bench/flexguard helper script was not produced as an executable file: {source_script}"
+            )
+        if not source_library.is_file():
+            raise RuntimeError(
+                f"Required bench/flexguard helper library was not produced: {source_library}"
+            )
+        library.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_script, script)
+        shutil.copy2(source_library, library)
 
     if not script.is_file() or not os.access(script, os.X_OK):
         raise RuntimeError(
             f"Required bench/flexguard script was not produced as an executable file: {script}"
         )
+    if not library.is_file():
+        raise RuntimeError(f"Required bench/flexguard library was not produced: {library}")
 
 
-def ensure_inputs(logger: CommandLogger) -> None:
+def ensure_inputs(
+    logger: CommandLogger,
+    *,
+    lock_keys: Iterable[str] = BASE_LOCK_KEYS,
+    include_single_sweep: bool = True,
+) -> None:
     ensure_executable(SWEEP_MULTI, "multi-lock sweep script")
-    ensure_executable(SWEEP_SINGLE, "single-lock sweep script")
+    if include_single_sweep:
+        ensure_executable(SWEEP_SINGLE, "single-lock sweep script")
     ensure_mutex_bench(logger)
+    requested_lock_keys = set(lock_keys)
     for key in FLEXGUARD_INTERPOSE_KEYS:
+        if key not in requested_lock_keys:
+            continue
         ensure_flexguard_interpose(key, logger)
 
 
@@ -405,6 +566,33 @@ def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandL
         *common_sweep_args(),
     ]
     logger.run(taskset_cmd, log_name="sweep_mcs_tas_simple_taskset.log")
+
+
+def run_supplement_benchmarks(
+    result_root: Path,
+    args: argparse.Namespace,
+    lock_keys: tuple[str, ...],
+    logger: CommandLogger,
+) -> None:
+    env = {"FLEXGUARD_DIR": str(FLEXGUARD_DIR)}
+    supplement_cmd = [
+        str(SWEEP_MULTI),
+        "--locks",
+        ",".join(lock_keys),
+        "--output-root",
+        str(result_root),
+        "--sudo-mode",
+        args.sudo_mode,
+        "--timeslice-extension",
+        "off",
+        "--",
+        *common_sweep_args(),
+    ]
+    logger.run(
+        supplement_cmd,
+        log_name=f"sweep_supplement_{'_'.join(lock_keys)}.log",
+        env=env,
+    )
 
 
 def load_combined_rows(result_root: Path) -> list[dict[str, str]]:
@@ -915,18 +1103,32 @@ def plot_hold_handoff_decomposition(
         (int(row["threads"]), row["lock_key"]): row
         for row in selected_rows
     }
-    missing = [
-        (thread, lock_key)
-        for thread in DECOMPOSITION_THREADS
-        for lock_key in DECOMPOSITION_LOCK_KEYS
-        if (thread, lock_key) not in row_by_key
-    ]
+    lock_by_key = {lock.key: lock for lock in LOCKS}
+    optional_lock_keys = {lock.key for lock in LOCKS if lock.optional}
+    active_lock_keys: list[str] = []
+    skipped_optional_lock_keys: list[str] = []
+    missing: list[tuple[int, str]] = []
+    for lock_key in DECOMPOSITION_LOCK_KEYS:
+        missing_threads = [
+            thread for thread in DECOMPOSITION_THREADS if (thread, lock_key) not in row_by_key
+        ]
+        if not missing_threads:
+            active_lock_keys.append(lock_key)
+            continue
+        if lock_key in optional_lock_keys:
+            skipped_optional_lock_keys.append(lock_key)
+            continue
+        missing.extend((thread, lock_key) for thread in missing_threads)
     if missing:
         missing_text = ", ".join(f"{thread}:{lock_key}" for thread, lock_key in missing)
         raise RuntimeError(f"Missing decomposition rows: {missing_text}")
+    if not active_lock_keys:
+        raise RuntimeError("No complete lock series matched the hold/handoff decomposition plot inputs.")
+    if skipped_optional_lock_keys:
+        skipped_labels = ", ".join(lock_by_key[lock_key].label for lock_key in skipped_optional_lock_keys)
+        print(f"Skipping decomposition locks without complete data: {skipped_labels}", flush=True)
 
-    lock_by_key = {lock.key: lock for lock in LOCKS}
-    group_stride = len(DECOMPOSITION_LOCK_KEYS) + 1.7
+    group_stride = len(active_lock_keys) + 1.7
     bar_width = 0.72
     x_values: list[float] = []
     x_labels: list[str] = []
@@ -936,9 +1138,9 @@ def plot_hold_handoff_decomposition(
 
     for group_index, thread in enumerate(DECOMPOSITION_THREADS):
         group_start = group_index * group_stride
-        positions = [group_start + method_index for method_index in range(len(DECOMPOSITION_LOCK_KEYS))]
+        positions = [group_start + method_index for method_index in range(len(active_lock_keys))]
         group_centers.append((sum(positions) / len(positions), thread))
-        for position, lock_key in zip(positions, DECOMPOSITION_LOCK_KEYS, strict=True):
+        for position, lock_key in zip(positions, active_lock_keys, strict=True):
             row = row_by_key[(thread, lock_key)]
             x_values.append(position)
             x_labels.append(lock_by_key[lock_key].label)
@@ -1062,6 +1264,35 @@ def ensure_output_root(path: Path, force: bool) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def ensure_supplement_output_root(path: Path) -> None:
+    if path.exists() and not path.is_dir():
+        raise RuntimeError(f"Supplement output root exists but is not a directory: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def lock_has_existing_results(result_root: Path, lock_key: str) -> bool:
+    lock = LOCKS_BY_KEY[lock_key]
+    for dir_name in lock.result_dir_names():
+        lock_dir = result_root / dir_name
+        if (lock_dir / "raw.csv").exists() or (lock_dir / "summary.csv").exists():
+            return True
+    return False
+
+
+def ensure_supplement_targets(result_root: Path, lock_keys: Iterable[str], force: bool) -> None:
+    if force:
+        return
+
+    existing_locks = [LOCKS_BY_KEY[lock_key].label for lock_key in lock_keys if lock_has_existing_results(result_root, lock_key)]
+    if not existing_locks:
+        return
+
+    raise RuntimeError(
+        "Supplement target locks already have results under the output root. "
+        f"Refusing to overwrite without --force: {', '.join(existing_locks)}"
+    )
+
+
 def print_outputs(result_root: Path, combined_path: Path, plot_paths: Iterable[Path]) -> None:
     print(f"Result root: {result_root}")
     print(f"Combined CSV: {combined_path}")
@@ -1071,6 +1302,23 @@ def print_outputs(result_root: Path, combined_path: Path, plot_paths: Iterable[P
 
 def main() -> int:
     args = parse_args()
+    if args.output_root is not None and args.plot_only is not None:
+        print("--output-root cannot be used together with --plot-only.", file=sys.stderr)
+        return 2
+    if args.supplement_locks is not None and args.plot_only is not None:
+        print("--supplement-locks cannot be used together with --plot-only.", file=sys.stderr)
+        return 2
+
+    supplement_lock_keys: tuple[str, ...] | None = None
+    if args.supplement_locks is not None:
+        if args.output_root is None:
+            print("--supplement-locks requires --output-root.", file=sys.stderr)
+            return 2
+        try:
+            supplement_lock_keys = parse_supplement_lock_keys(args.supplement_locks)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     try:
         if args.plot_only is not None:
@@ -1085,17 +1333,31 @@ def main() -> int:
             return 0
 
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
-        ensure_output_root(result_root, args.force)
-        write_settings(
-            result_root,
-            args.mcs_extension_mode,
-            args.sudo_mode,
-            not args.skip_mcs_tas_simple_taskset,
-            args.mcs_tas_simple_taskset_cpus,
-        )
-        logger = CommandLogger(result_root)
-        ensure_inputs(logger)
-        run_benchmarks(result_root, args, logger)
+        if supplement_lock_keys is not None:
+            ensure_supplement_output_root(result_root)
+            ensure_supplement_targets(result_root, supplement_lock_keys, args.force)
+            write_settings_if_missing(
+                result_root,
+                args.mcs_extension_mode,
+                args.sudo_mode,
+                not args.skip_mcs_tas_simple_taskset,
+                args.mcs_tas_simple_taskset_cpus,
+            )
+            logger = CommandLogger(result_root)
+            ensure_inputs(logger, lock_keys=supplement_lock_keys, include_single_sweep=False)
+            run_supplement_benchmarks(result_root, args, supplement_lock_keys, logger)
+        else:
+            ensure_output_root(result_root, args.force)
+            write_settings(
+                result_root,
+                args.mcs_extension_mode,
+                args.sudo_mode,
+                not args.skip_mcs_tas_simple_taskset,
+                args.mcs_tas_simple_taskset_cpus,
+            )
+            logger = CommandLogger(result_root)
+            ensure_inputs(logger)
+            run_benchmarks(result_root, args, logger)
         rows = load_combined_rows(result_root)
         combined_path = write_combined_csv(result_root, rows)
         plot_paths = write_plots(result_root, rows)

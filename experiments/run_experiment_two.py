@@ -22,8 +22,9 @@ FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
 FLEXGUARD_BUILD_DIR = FLEXGUARD_DIR / "build"
 MAKE_ALL_SCRIPT = FLEXGUARD_DIR / "scripts" / "make_all.sh"
 PTHREAD_HOST_BINARY = FLEXGUARD_BUILD_DIR / "buckets_pthread_host"
-MCS_TAS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
+MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
+DEFAULT_ACCORDIN_K = "2"
 DEFAULT_THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
 DEFAULT_LOCKS = (
     "mcs",
@@ -31,7 +32,7 @@ DEFAULT_LOCKS = (
     "mcs-tas",
     "mcs_extension",
     "flexguard",
-    "mcs_tas_accordin",
+    "mcs_accordin",
     "reciprocating",
     "malthusian",
 )
@@ -91,7 +92,7 @@ WORKLOAD_LABELS = {
 }
 LOCK_ALIASES = {
     "mcstas": "mcs-tas",
-    "accordin": "mcs_tas_accordin",
+    "accordin": "mcs_accordin",
 }
 LOCK_LABELS = {
     "flexguard": "FlexGuard",
@@ -99,7 +100,7 @@ LOCK_LABELS = {
     "mcs-tas": "MCS-TAS",
     "mcstas": "MCS-TAS",
     "mcs": "MCS",
-    "mcs_tas_accordin": "MCS-TAS Simple",
+    "mcs_accordin": "MCS-TAS Simple",
     "accordin": "MCS-TAS Simple",
     "mcs_extension": "MCS + TSE",
     "reciprocating": "Reciprocating",
@@ -109,7 +110,7 @@ LOCK_LABELS = {
 DIRECT_BINARY_LOCK_KEYS = {
     "mcs-tas": "mcstas",
 }
-ROOT_REQUIRED_LOCKS = {"flexguard", "mcs_tas_accordin"}
+ROOT_REQUIRED_LOCKS = {"flexguard", "mcs_accordin"}
 
 
 @dataclass(frozen=True)
@@ -282,8 +283,8 @@ Lock mapping notes:
   malthusian uses build/buckets_malthusian directly.
   mcstp and flexguard run the pthread host through build/interpose_<lock>.sh.
   mcs_extension runs the pthread host with LD_PRELOAD=target/release/libmcs_tse.so.
-  mcs_tas_accordin runs the pthread host with LD_PRELOAD=target/release/libmcs_tas_accordin.so.
-  accordin remains accepted as an alias for mcs_tas_accordin.
+  mcs_accordin runs the pthread host with LD_PRELOAD=target/release/libmcs_accordin.so.
+  accordin remains accepted as an alias for mcs_accordin.
   mutex remains available and uses the pthread host without LD_PRELOAD.
 
 Examples:
@@ -327,7 +328,7 @@ Examples:
             "Comma-separated experiment2 lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Supported mappings: mcs, mcs-tas/mcstas, reciprocating, malthusian, "
-            "mcstp, mcs_extension, flexguard, mcs_tas_accordin/accordin, mutex. "
+            "mcstp, mcs_extension, flexguard, mcs_accordin/accordin, mutex. "
             "Unknown keys fall back to build/buckets_<lock>."
         ),
     )
@@ -571,13 +572,13 @@ def lock_execution_spec(lock: str) -> LockExecutionSpec:
             wrapper_script=wrapper_script_path("flexguard"),
             wrapper_library=FLEXGUARD_BUILD_DIR / "interpose_flexguard.so",
         )
-    if normalized == "mcs_tas_accordin":
+    if normalized == "mcs_accordin":
         return LockExecutionSpec(
             key=normalized,
             label=label,
             mode="ld_preload",
             pthread_host_binary=PTHREAD_HOST_BINARY,
-            preload_library=MCS_TAS_ACCORDIN_PRELOAD_LIBRARY,
+            preload_library=MCS_ACCORDIN_PRELOAD_LIBRARY,
         )
     if normalized == "mcs_extension":
         return LockExecutionSpec(
@@ -828,10 +829,10 @@ def build_pthread_host(logger: CommandLogger) -> None:
     logger.run(["make", "clean"], log_name="build_buckets_pthread_host_post_clean.log", cwd=FLEXGUARD_DIR)
 
 
-def build_mcs_tas_accordin_preload(logger: CommandLogger) -> None:
+def build_mcs_accordin_preload(logger: CommandLogger) -> None:
     logger.run(
-        ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
-        log_name="build_mcs_tas_accordin_release.log",
+        ["cargo", "build", "-p", "mcs_accordin", "--release"],
+        log_name="build_mcs_accordin_release.log",
         cwd=REPO_ROOT,
     )
 
@@ -870,8 +871,8 @@ def ensure_benchmark_artifacts(
         build_with_make_all(logger)
     if any(issue.artifact_kind == "pthread host" for issue in issues):
         build_pthread_host(logger)
-    if any(issue.lock_key == "mcs_tas_accordin" and issue.artifact_kind == "preload library" for issue in issues):
-        build_mcs_tas_accordin_preload(logger)
+    if any(issue.lock_key == "mcs_accordin" and issue.artifact_kind == "preload library" for issue in issues):
+        build_mcs_accordin_preload(logger)
     if any(issue.lock_key == "mcs_extension" and issue.artifact_kind == "preload library" for issue in issues):
         build_mcs_extension_preload(logger)
 
@@ -1003,11 +1004,18 @@ def combine_ld_preload(preload_library: Path) -> str:
     return str(preload_library)
 
 
+def accordin_preload_env(preload_library: Path) -> dict[str, str]:
+    env = {"LD_PRELOAD": combine_ld_preload(preload_library)}
+    if "ACCORDIN_CPU_MASK_K" not in os.environ and "K" not in os.environ:
+        env["K"] = DEFAULT_ACCORDIN_K
+    return env
+
+
 def wrap_root_command(cmd: list[str], env: dict[str, str] | None) -> tuple[list[str], dict[str, str] | None]:
     if os.geteuid() == 0:
         return cmd, env
     if shutil.which("sudo") is None:
-        raise RuntimeError("sudo is required to run mcs_tas_accordin because it loads a sched_ext eBPF scheduler.")
+        raise RuntimeError("sudo is required to run mcs_accordin because it loads a sched_ext eBPF scheduler.")
 
     env_args = [f"{key}={value}" for key, value in sorted((env or {}).items())]
     if env_args:
@@ -1035,7 +1043,10 @@ def benchmark_command(
         assert spec.pthread_host_binary is not None
         assert spec.preload_library is not None
         cmd = [str(spec.pthread_host_binary), *benchmark_args]
-        env = {"LD_PRELOAD": combine_ld_preload(spec.preload_library)}
+        if spec.key == "mcs_accordin":
+            env = accordin_preload_env(spec.preload_library)
+        else:
+            env = {"LD_PRELOAD": combine_ld_preload(spec.preload_library)}
     elif spec.mode == "pthread_host":
         assert spec.pthread_host_binary is not None
         cmd = [str(spec.pthread_host_binary), *benchmark_args]

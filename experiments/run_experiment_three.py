@@ -105,6 +105,7 @@ SUMMARY_FIELDS = (
 
 SETUP_PATTERN = re.compile(r"Setup time:\s*(\d+)")
 BENCHMARK_PATTERN = re.compile(r"Benchmark time:\s*(\d+)")
+BASE_DIR_PATTERN = re.compile(r"^BASE_DIR=(?P<quote>[\"']?)(?P<value>.*?)(?P=quote)$", re.MULTILINE)
 
 LOCK_LABELS = {
     "stock": "Stock",
@@ -116,8 +117,7 @@ LOCK_LABELS = {
     "malthusian": "Malthusian",
     "reciprocating": "Reciprocating",
     "accordin": "Accordin",
-    "mcs_accordin": "Accordin",
-    "mcs_tas_accordin": "MCS-TAS Simple",
+    "mcs_accordin": "MCS-TAS Simple",
 }
 BENCHMARK_LABELS = {
     "dedup": "PARSEC dedup",
@@ -125,13 +125,15 @@ BENCHMARK_LABELS = {
 }
 ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
-MCS_TAS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
+MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
+DEFAULT_ACCORDIN_K = "2"
+BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
+ROOT_REQUIRED_PRELOAD_LOCKS = {"accordin", "mcs_accordin"}
 LOCK_ALIASES = {
     "accordin": "accordin",
-    "mcs_accordin": "accordin",
     "mcs-tas": "mcstas",
     "mcs_extension": "mcs_extension",
-    "mcs_tas_accordin": "mcs_tas_accordin",
+    "mcs_accordin": "mcs_accordin",
     "stock": "stock",
 }
 LOCK_ORDER = (
@@ -143,7 +145,7 @@ LOCK_ORDER = (
     "flexguard",
     "accordin",
     "reciprocating",
-    "mcs_tas_accordin",
+    "mcs_accordin",
 )
 
 
@@ -323,7 +325,7 @@ Examples:
             "Comma-separated lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Use stock to run without interpose. "
-            "Aliases: mcs-tas == mcstas, mcs_accordin == accordin."
+            "Aliases: mcs-tas == mcstas."
         ),
     )
     parser.add_argument(
@@ -431,6 +433,17 @@ def combine_ld_preload(preload_library: Path) -> str:
     return f"{preload_library}:{existing}" if existing else str(preload_library)
 
 
+def accordin_preload_env(preload_library: Path) -> dict[str, str]:
+    env = {"LD_PRELOAD": combine_ld_preload(preload_library)}
+    if "ACCORDIN_CPU_MASK_K" in os.environ:
+        env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
+    if "K" in os.environ:
+        env["K"] = os.environ["K"]
+    if "ACCORDIN_CPU_MASK_K" not in env and "K" not in env:
+        env["K"] = DEFAULT_ACCORDIN_K
+    return env
+
+
 def parse_csv_ints(value: str) -> tuple[int, ...]:
     items = tuple(int(item.strip()) for item in value.split(",") if item.strip())
     if not items:
@@ -508,16 +521,75 @@ def interpose_library_path(lock: str) -> Path:
     return FLEXGUARD_BUILD_DIR / f"interpose_{lock}.so"
 
 
-def missing_interpose_locks(locks: Iterable[str]) -> list[str]:
-    missing: list[str] = []
+def interpose_needs_sudo(lock: str) -> bool:
+    return lock.startswith(BPF_INTERPOSE_LOCK_PREFIXES)
+
+
+def with_sudo_env(cmd: list[str], env: dict[str, str] | None) -> tuple[list[str], None]:
+    sudo_cmd = ["sudo", "-n", "env"]
+    if env is not None:
+        sudo_cmd.extend(f"{key}={value}" for key, value in sorted(env.items()))
+    sudo_cmd.extend(cmd)
+    return sudo_cmd, None
+
+
+def interpose_command(lock: str, env: dict[str, str] | None = None) -> tuple[list[str], dict[str, str] | None]:
+    cmd = [str(interpose_script_path(lock))]
+    if interpose_needs_sudo(lock):
+        return with_sudo_env(cmd, env)
+    return cmd, env
+
+
+def benchmark_command(lock: str, cmd: list[str], env: dict[str, str] | None) -> tuple[list[str], dict[str, str] | None]:
+    if env is not None and lock in ROOT_REQUIRED_PRELOAD_LOCKS:
+        return with_sudo_env(cmd, env)
+    return cmd, env
+
+
+def interpose_script_base_dir(script: Path) -> Path | None:
+    try:
+        content = script.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = BASE_DIR_PATTERN.search(content)
+    if match is None:
+        return None
+    value = match.group("value").strip()
+    if not value:
+        return None
+    return Path(value).expanduser().resolve()
+
+
+def interpose_helper_error(lock: str) -> str | None:
+    script = interpose_script_path(lock)
+    library = interpose_library_path(lock)
+
+    if not script.is_file():
+        return f"{lock} wrapper is missing: {script}"
+    if not os.access(script, os.X_OK):
+        return f"{lock} wrapper is not executable: {script}"
+
+    script_base_dir = interpose_script_base_dir(script)
+    expected_base_dir = FLEXGUARD_DIR.resolve()
+    if script_base_dir != expected_base_dir:
+        if script_base_dir is None:
+            return f"{lock} wrapper does not declare BASE_DIR: {script}"
+        return f"{lock} wrapper BASE_DIR points to {script_base_dir}, expected {expected_base_dir}"
+
+    if not library.is_file():
+        return f"{lock} preload library is missing: {library}"
+    return None
+
+
+def invalid_interpose_helpers(locks: Iterable[str]) -> list[str]:
+    invalid: list[str] = []
     for lock in locks:
-        if lock in {"stock", "accordin", "mcs_extension", "mcs_tas_accordin"}:
+        if lock in {"stock", "accordin", "mcs_extension", "mcs_accordin"}:
             continue
-        script = interpose_script_path(lock)
-        library = interpose_library_path(lock)
-        if not script.is_file() or not os.access(script, os.X_OK) or not library.is_file():
-            missing.append(lock)
-    return missing
+        error = interpose_helper_error(lock)
+        if error is not None:
+            invalid.append(error)
+    return invalid
 
 
 def ensure_accordin_preload(
@@ -564,26 +636,26 @@ def ensure_mcs_extension_preload(
         raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_EXTENSION_PRELOAD_LIBRARY}")
 
 
-def ensure_mcs_tas_accordin_preload(
+def ensure_mcs_accordin_preload(
     *,
     build_missing: bool,
     logger: CommandLogger,
 ) -> None:
-    if MCS_TAS_ACCORDIN_PRELOAD_LIBRARY.is_file():
+    if MCS_ACCORDIN_PRELOAD_LIBRARY.is_file():
         return
     if not build_missing:
         raise RuntimeError(
-            f"LD_PRELOAD helper is missing: {MCS_TAS_ACCORDIN_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_tas_accordin --release or rerun with --build-missing."
+            f"LD_PRELOAD helper is missing: {MCS_ACCORDIN_PRELOAD_LIBRARY}. "
+            "Run cargo build -p mcs_accordin --release or rerun with --build-missing."
         )
 
     logger.run(
-        ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
-        log_name="build_mcs_tas_accordin.log",
+        ["cargo", "build", "-p", "mcs_accordin", "--release"],
+        log_name="build_mcs_accordin.log",
         cwd=REPO_ROOT,
     )
-    if not MCS_TAS_ACCORDIN_PRELOAD_LIBRARY.is_file():
-        raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_TAS_ACCORDIN_PRELOAD_LIBRARY}")
+    if not MCS_ACCORDIN_PRELOAD_LIBRARY.is_file():
+        raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_ACCORDIN_PRELOAD_LIBRARY}")
 
 
 def ensure_interpose_helpers(
@@ -592,14 +664,14 @@ def ensure_interpose_helpers(
     build_missing: bool,
     logger: CommandLogger,
 ) -> None:
-    missing = missing_interpose_locks(locks)
-    if not missing:
+    invalid = invalid_interpose_helpers(locks)
+    if not invalid:
         return
 
     if not build_missing:
         raise RuntimeError(
-            "Interpose helpers are missing: "
-            f"{', '.join(missing)}. Run bench/flexguard/scripts/make_all.sh or rerun with --build-missing."
+            "Interpose helpers are missing or stale: "
+            f"{'; '.join(invalid)}. Run bench/flexguard/scripts/make_all.sh or rerun with --build-missing."
         )
 
     if not MAKE_ALL_SCRIPT.is_file():
@@ -611,11 +683,11 @@ def ensure_interpose_helpers(
         cwd=FLEXGUARD_DIR,
     )
 
-    missing_after_build = missing_interpose_locks(locks)
-    if missing_after_build:
+    invalid_after_build = invalid_interpose_helpers(locks)
+    if invalid_after_build:
         raise RuntimeError(
-            "Interpose helpers are still missing after build: "
-            f"{', '.join(missing_after_build)}"
+            "Interpose helpers are still missing or stale after build: "
+            f"{'; '.join(invalid_after_build)}"
         )
 
 
@@ -853,14 +925,13 @@ def build_dedup_command(
     cmd: list[str] = []
     if lock != "stock":
         if lock == "accordin":
-            env = combine_ld_preload(ACCORDIN_PRELOAD_LIBRARY)
+            env = accordin_preload_env(ACCORDIN_PRELOAD_LIBRARY)
         elif lock == "mcs_extension":
-            env = combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)
-        elif lock == "mcs_tas_accordin":
-            env = combine_ld_preload(MCS_TAS_ACCORDIN_PRELOAD_LIBRARY)
+            env = {"LD_PRELOAD": combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)}
+        elif lock == "mcs_accordin":
+            env = accordin_preload_env(MCS_ACCORDIN_PRELOAD_LIBRARY)
         else:
-            env = None
-            cmd.append(str(interpose_script_path(lock)))
+            cmd, env = interpose_command(lock)
     else:
         env = None
     cmd.extend(
@@ -874,9 +945,7 @@ def build_dedup_command(
             f"-o{output_path}",
         ]
     )
-    if env is None:
-        return cmd, None
-    return cmd, {"LD_PRELOAD": env}
+    return benchmark_command(lock, cmd, env)
 
 
 def build_streamcluster_command(
@@ -890,14 +959,13 @@ def build_streamcluster_command(
     cmd: list[str] = []
     if lock != "stock":
         if lock == "accordin":
-            env = combine_ld_preload(ACCORDIN_PRELOAD_LIBRARY)
+            env = accordin_preload_env(ACCORDIN_PRELOAD_LIBRARY)
         elif lock == "mcs_extension":
-            env = combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)
-        elif lock == "mcs_tas_accordin":
-            env = combine_ld_preload(MCS_TAS_ACCORDIN_PRELOAD_LIBRARY)
+            env = {"LD_PRELOAD": combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)}
+        elif lock == "mcs_accordin":
+            env = accordin_preload_env(MCS_ACCORDIN_PRELOAD_LIBRARY)
         else:
-            env = None
-            cmd.append(str(interpose_script_path(lock)))
+            cmd, env = interpose_command(lock)
     else:
         env = None
     cmd.extend(
@@ -914,9 +982,7 @@ def build_streamcluster_command(
             str(threads),
         ]
     )
-    if env is None:
-        return cmd, None
-    return cmd, {"LD_PRELOAD": env}
+    return benchmark_command(lock, cmd, env)
 
 
 def temp_output_path(
@@ -1235,8 +1301,8 @@ def main() -> int:
             ensure_accordin_preload(build_missing=args.build_missing, logger=logger)
         if "mcs_extension" in locks:
             ensure_mcs_extension_preload(build_missing=args.build_missing, logger=logger)
-        if "mcs_tas_accordin" in locks:
-            ensure_mcs_tas_accordin_preload(build_missing=args.build_missing, logger=logger)
+        if "mcs_accordin" in locks:
+            ensure_mcs_accordin_preload(build_missing=args.build_missing, logger=logger)
         ensure_parsec_binaries(benchmarks, build_missing=args.build_missing, logger=logger)
         if "dedup" in benchmarks:
             ensure_dedup_input(dedup_input)

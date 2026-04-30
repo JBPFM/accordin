@@ -17,10 +17,8 @@ const HEATMAP_SAMPLE_STRIDE_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_HEATMAP_SAMPLE_STRIDE",
     "ACCORDIN_HEATMAP_SAMPLE_STRIDE",
 ];
-const HEATMAP_WINDOW_NS_ENV_KEYS: [&str; 2] = [
-    "LOCK_STATS_HEATMAP_WINDOW_NS",
-    "ACCORDIN_HEATMAP_WINDOW_NS",
-];
+const HEATMAP_WINDOW_NS_ENV_KEYS: [&str; 2] =
+    ["LOCK_STATS_HEATMAP_WINDOW_NS", "ACCORDIN_HEATMAP_WINDOW_NS"];
 const HEATMAP_WINDOW_SAMPLES_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_HEATMAP_WINDOW_SAMPLES",
     "ACCORDIN_HEATMAP_WINDOW_SAMPLES",
@@ -528,6 +526,13 @@ fn parse_timing_sample_stride(value: Option<&str>) -> u64 {
 }
 
 #[inline(always)]
+fn sampling_enabled() -> bool {
+    static SAMPLING_ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *SAMPLING_ENABLED.get_or_init(cpu_affinity::configured_cpu_count_env_present)
+}
+
+#[inline(always)]
 fn timing_sample_stride() -> u64 {
     static TIMING_SAMPLE_STRIDE: OnceLock<u64> = OnceLock::new();
 
@@ -560,12 +565,12 @@ fn heatmap_state() -> Option<&'static HeatmapState> {
 
     HEATMAP_STATE
         .get_or_init(|| {
-            let path = first_env_string(&HEATMAP_PATH_ENV_KEYS).map(PathBuf::from);
-            let dynamic_cpu_affinity = cpu_affinity::configured_cpu_count_env_present();
-            if path.is_none() && !dynamic_cpu_affinity {
+            let dynamic_cpu_affinity = sampling_enabled();
+            if !dynamic_cpu_affinity {
                 return None;
             }
 
+            let path = first_env_string(&HEATMAP_PATH_ENV_KEYS).map(PathBuf::from);
             let sample_stride = parse_env_u64(
                 &HEATMAP_SAMPLE_STRIDE_ENV_KEYS,
                 DEFAULT_HEATMAP_SAMPLE_STRIDE,
@@ -830,7 +835,19 @@ fn advance_periodic_sample(countdown: &mut u64, stride: u64) -> bool {
 
 #[inline(always)]
 fn decide_operation_sampling(aux: &mut ThreadStatsAux) {
+    decide_operation_sampling_with_enabled(aux, sampling_enabled());
+}
+
+#[inline(always)]
+fn decide_operation_sampling_with_enabled(aux: &mut ThreadStatsAux, enabled: bool) {
     if aux.op_sample_decided {
+        return;
+    }
+
+    if !enabled {
+        aux.op_timing_sampled = false;
+        aux.op_sampled = false;
+        aux.op_sample_decided = true;
         return;
     }
 
@@ -850,7 +867,12 @@ fn finish_operation_sampling(aux: &mut ThreadStatsAux) {
 
 #[inline(always)]
 fn begin_outside_gap_sample(aux: &mut ThreadStatsAux) -> bool {
-    advance_periodic_sample(&mut aux.outside_sample_countdown, outside_sample_stride())
+    begin_outside_gap_sample_with_enabled(aux, sampling_enabled())
+}
+
+#[inline(always)]
+fn begin_outside_gap_sample_with_enabled(aux: &mut ThreadStatsAux, enabled: bool) -> bool {
+    enabled && advance_periodic_sample(&mut aux.outside_sample_countdown, outside_sample_stride())
 }
 
 #[inline(always)]
@@ -1330,7 +1352,8 @@ mod tests {
     use super::{
         ADMISSION_CPU_NONE, DEFAULT_TIMING_SAMPLE_STRIDE, HEATMAP_WINDOW_EWMA_ALPHA, HeatmapConfig,
         HeatmapState, ThreadStatsAux, WindowControlState, advance_periodic_sample,
-        clear_admission_state, decide_operation_sampling, dynamic_cpu_candidate,
+        begin_outside_gap_sample_with_enabled, clear_admission_state,
+        decide_operation_sampling_with_enabled, dynamic_cpu_candidate,
         dynamic_cpu_count_from_window_ewma, finish_outside_gap_sample, grant_slow_path_admission,
         heatmap_bin_index, heatmap_bin_lower_ns, heatmap_bin_midpoint_ns, heatmap_bin_upper_ns,
         mark_critical_section_entered, mark_slow_path_pending, outside_sample_stride,
@@ -1458,14 +1481,37 @@ mod tests {
     }
 
     #[test]
-    fn outside_pending_forces_full_sample_without_timing_weight() {
+    fn sampling_gate_blocks_operation_samples_when_disabled() {
+        let mut aux = ThreadStatsAux {
+            outside_sample_pending: true,
+            timing_sample_countdown: 0,
+            ..ThreadStatsAux::new()
+        };
+
+        decide_operation_sampling_with_enabled(&mut aux, false);
+
+        assert!(!aux.op_sampled);
+        assert!(!aux.op_timing_sampled);
+        assert!(aux.op_sample_decided);
+    }
+
+    #[test]
+    fn outside_gap_sampling_gate_blocks_samples_when_disabled() {
+        let mut aux = ThreadStatsAux::new();
+
+        assert!(!begin_outside_gap_sample_with_enabled(&mut aux, false));
+        assert_eq!(aux.outside_sample_countdown, 0);
+    }
+
+    #[test]
+    fn outside_pending_forces_full_sample_without_timing_weight_when_enabled() {
         let mut aux = ThreadStatsAux {
             outside_sample_pending: true,
             timing_sample_countdown: 3,
             ..ThreadStatsAux::new()
         };
 
-        decide_operation_sampling(&mut aux);
+        decide_operation_sampling_with_enabled(&mut aux, true);
 
         assert!(aux.op_sampled);
         assert!(!aux.op_timing_sampled);
@@ -1506,7 +1552,6 @@ mod tests {
             assert_eq!((*aux).hold_start_sample, 0);
             assert!(!(*aux).op_sample_decided);
             assert!(!(*aux).op_sampled);
-            assert!((*aux).outside_sample_pending);
             assert_eq!((*aux).outside_wait_total, 0);
         }
     }

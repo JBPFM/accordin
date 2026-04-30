@@ -1,7 +1,7 @@
-use std::cell::UnsafeCell;
-use std::mem::size_of;
+use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::arch::pause;
 use crate::lock_backend::LockBackend;
@@ -15,22 +15,20 @@ struct CacheAligned<T>(T);
 
 #[repr(C, align(128))]
 pub struct WaitElement {
-    gate: AtomicI32,
-    _pad: [u8; 128 - size_of::<AtomicI32>()],
+    gate: AtomicPtr<WaitElement>,
 }
 
 impl WaitElement {
     pub const fn new() -> Self {
         Self {
-            gate: AtomicI32::new(0),
-            _pad: [0; 128 - size_of::<AtomicI32>()],
+            gate: AtomicPtr::new(ptr::null_mut()),
         }
     }
 }
 
 thread_local! {
-    static THREAD_ELEMENT: UnsafeCell<WaitElement> =
-        const { UnsafeCell::new(WaitElement::new()) };
+    static THREAD_ELEMENT: WaitElement = const { WaitElement::new() };
+    static HELD_LOCKS: RefCell<Vec<HeldLockContext>> = const { RefCell::new(Vec::new()) };
 }
 
 const LOCKED_EMPTY: *mut WaitElement = 1usize as *mut WaitElement;
@@ -38,25 +36,51 @@ const LOCKED_EMPTY: *mut WaitElement = 1usize as *mut WaitElement;
 /// Reciprocating lock with cache-aligned shared state variables.
 pub struct ReciprocatingLockRaw {
     arv: CacheAligned<AtomicPtr<WaitElement>>,
-    terminus: CacheAligned<AtomicPtr<WaitElement>>,
-    succ: UnsafeCell<*mut WaitElement>,
 }
 
-unsafe impl Sync for ReciprocatingLockRaw {}
-unsafe impl Send for ReciprocatingLockRaw {}
+#[derive(Clone, Copy)]
+struct LockContext {
+    succ: *mut WaitElement,
+    eos: *mut WaitElement,
+}
+
+#[derive(Clone, Copy)]
+struct HeldLockContext {
+    lock: *const ReciprocatingLockRaw,
+    context: LockContext,
+}
+
+fn push_lock_context(lock: *const ReciprocatingLockRaw, context: LockContext) {
+    HELD_LOCKS.with(|held| {
+        held.borrow_mut().push(HeldLockContext { lock, context });
+    });
+}
+
+fn pop_lock_context(lock: *const ReciprocatingLockRaw) -> LockContext {
+    HELD_LOCKS.with(|held| {
+        let mut held = held.borrow_mut();
+        let pos = held
+            .iter()
+            .rposition(|context| ptr::eq(context.lock, lock))
+            .expect("unlock called without a matching reciprocating lock acquisition");
+        held.swap_remove(pos).context
+    })
+}
 
 impl ReciprocatingLockRaw {
     pub const fn new() -> Self {
         Self {
             arv: CacheAligned(AtomicPtr::new(ptr::null_mut())),
-            terminus: CacheAligned(AtomicPtr::new(ptr::null_mut())),
-            succ: UnsafeCell::new(ptr::null_mut()),
         }
     }
 
     #[inline(always)]
     fn thread_element() -> *mut WaitElement {
-        THREAD_ELEMENT.with(|element| element.get())
+        THREAD_ELEMENT.with(|element| {
+            let ptr = element as *const WaitElement as *mut WaitElement;
+            debug_assert_eq!((ptr as usize) & 1, 0);
+            ptr
+        })
     }
 
     #[inline(always)]
@@ -90,51 +114,48 @@ impl ReciprocatingLockRaw {
         grant_slow_path_admission(Self::current_cpu());
     }
 
-    #[inline(always)]
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
-    fn lock_body(&self) {
+    fn acquire_context(&self) -> LockContext {
         let element = Self::thread_element();
         unsafe {
-            (*element).gate.store(0, Ordering::Relaxed);
+            (*element).gate.store(ptr::null_mut(), Ordering::Relaxed);
         }
 
-        let tail = self.arv.0.swap(element, Ordering::SeqCst);
+        let tail = self.arv.0.swap(element, Ordering::AcqRel);
         debug_assert_ne!(tail, element);
 
-        if tail.is_null() {
-            unsafe {
-                *self.succ.get() = ptr::null_mut();
-            }
-            self.terminus.0.store(element, Ordering::SeqCst);
-            return;
-        }
+        let mut succ = ptr::null_mut();
+        let mut eos = element;
 
-        let mut successor = Self::untag_low_bit(tail);
+        if !tail.is_null() {
+            succ = Self::untag_low_bit(tail);
+            debug_assert_ne!(succ, element);
 
-        unsafe {
-            while (*element).gate.load(Ordering::Acquire) == 0 {
+            loop {
+                eos = unsafe { (*element).gate.load(Ordering::Acquire) };
+                if !eos.is_null() {
+                    break;
+                }
                 pause();
             }
+
+            debug_assert_ne!(eos, element);
+            if succ == eos {
+                succ = ptr::null_mut();
+                eos = LOCKED_EMPTY;
+            }
         }
 
-        let eos = self.terminus.0.load(Ordering::SeqCst);
-        debug_assert!(!eos.is_null());
-        if tail == eos {
-            successor = ptr::null_mut();
-            self.terminus.0.store(LOCKED_EMPTY, Ordering::SeqCst);
-        }
-
-        unsafe {
-            *self.succ.get() = successor;
-        }
+        LockContext { succ, eos }
     }
 
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn lock_slow(&self) {
         self.ensure_slow_path_admission();
-        self.lock_body();
+        let context = self.acquire_context();
+        push_lock_context(self, context);
         mark_critical_section_entered();
     }
 
@@ -144,68 +165,94 @@ impl ReciprocatingLockRaw {
     fn try_lock_fast(&self) -> bool {
         let element = Self::thread_element();
         unsafe {
-            (*element).gate.store(0, Ordering::Relaxed);
+            (*element).gate.store(ptr::null_mut(), Ordering::Relaxed);
         }
 
         if self
             .arv
             .0
-            .compare_exchange(ptr::null_mut(), element, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                ptr::null_mut(),
+                element,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
             .is_err()
         {
             return false;
         }
 
-        unsafe {
-            *self.succ.get() = ptr::null_mut();
-        }
-        self.terminus.0.store(element, Ordering::SeqCst);
+        push_lock_context(
+            self,
+            LockContext {
+                succ: ptr::null_mut(),
+                eos: element,
+            },
+        );
         true
     }
 
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
-    fn unlock_fast(&self) {
-        debug_assert!(!self.arv.0.load(Ordering::SeqCst).is_null());
+    unsafe fn unlock_with_context(&self, context: LockContext) {
+        debug_assert!(!context.eos.is_null());
 
-        let succ = unsafe { *self.succ.get() };
-        if !succ.is_null() {
+        if !context.succ.is_null() {
+            debug_assert_ne!(context.succ, LOCKED_EMPTY);
             unsafe {
-                (*succ).gate.store(1, Ordering::Release);
+                (*context.succ).gate.store(context.eos, Ordering::Release);
             }
-            clear_admission_state();
             return;
         }
-
-        let eos = self.terminus.0.load(Ordering::SeqCst);
-        debug_assert!(!eos.is_null());
 
         if self
             .arv
             .0
-            .compare_exchange(eos, ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                context.eos,
+                ptr::null_mut(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
-            clear_admission_state();
             return;
         }
 
-        let mut waiter = self.arv.0.swap(LOCKED_EMPTY, Ordering::SeqCst);
-        while waiter == LOCKED_EMPTY {
-            pause();
-            waiter = self.arv.0.load(Ordering::SeqCst);
-        }
-        while waiter.is_null() {
-            pause();
-            waiter = self.arv.0.load(Ordering::SeqCst);
-        }
+        let waiter = self.arv.0.swap(LOCKED_EMPTY, Ordering::AcqRel);
 
+        debug_assert!(!waiter.is_null());
         debug_assert_ne!(waiter, LOCKED_EMPTY);
-        debug_assert_ne!(waiter, eos);
+        debug_assert_ne!(waiter, context.eos);
         unsafe {
-            (*waiter).gate.store(1, Ordering::Release);
+            (*waiter).gate.store(context.eos, Ordering::Release);
+        }
+    }
+
+    #[cfg_attr(feature = "perf-symbols", inline(never))]
+    #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
+    fn unlock_fast(&self) {
+        let context = pop_lock_context(self);
+        unsafe {
+            self.unlock_with_context(context);
         }
         clear_admission_state();
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn lock_guard(&self) -> ReciprocatingGuard<'_> {
+        ReciprocatingGuard {
+            lock: self,
+            context: Some(self.acquire_context()),
+            _not_send: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn is_locked_relaxed(&self) -> bool {
+        !self.arv.0.load(Ordering::Relaxed).is_null()
     }
 }
 
@@ -226,6 +273,43 @@ impl LockBackend for ReciprocatingLockRaw {
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock(&self) {
         self.unlock_fast();
+    }
+}
+
+impl Default for ReciprocatingLockRaw {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[must_use = "dropping the guard immediately unlocks the ReciprocatingLockRaw"]
+#[allow(dead_code)]
+pub struct ReciprocatingGuard<'a> {
+    lock: &'a ReciprocatingLockRaw,
+    context: Option<LockContext>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl ReciprocatingGuard<'_> {
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn unlock(mut self) {
+        if let Some(context) = self.context.take() {
+            unsafe {
+                self.lock.unlock_with_context(context);
+            }
+        }
+    }
+}
+
+impl Drop for ReciprocatingGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if let Some(context) = self.context.take() {
+            unsafe {
+                self.lock.unlock_with_context(context);
+            }
+        }
     }
 }
 
@@ -389,9 +473,6 @@ mod tests {
             handle.join().unwrap();
         }
 
-        assert_eq!(
-            unsafe { *shared.value.get() },
-            threads * iterations
-        );
+        assert_eq!(unsafe { *shared.value.get() }, threads * iterations);
     }
 }

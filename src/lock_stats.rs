@@ -431,15 +431,6 @@ pub fn thread_ctx() -> *mut LockSchedThreadCtx {
     THREAD_CTX.with(|ctx| ctx.get())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AdmissionStateSnapshot {
-    pub admission_owned: bool,
-    pub admission_cpu: u32,
-    pub admission_requeue_home: bool,
-    pub in_critical_section: bool,
-    pub slow_path_pending: bool,
-}
-
 #[inline(always)]
 pub fn thread_has_admission() -> bool {
     unsafe { (*thread_ctx()).admission_owned != 0 }
@@ -483,20 +474,6 @@ pub fn clear_admission_state() {
         (*ctx).admission_requeue_home = 0;
         (*ctx).in_critical_section = 0;
         (*ctx).slow_path_pending = 0;
-    }
-}
-
-#[inline(always)]
-pub fn admission_state_snapshot() -> AdmissionStateSnapshot {
-    unsafe {
-        let ctx = thread_ctx();
-        AdmissionStateSnapshot {
-            admission_owned: (*ctx).admission_owned != 0,
-            admission_cpu: (*ctx).admission_cpu,
-            admission_requeue_home: (*ctx).admission_requeue_home != 0,
-            in_critical_section: (*ctx).in_critical_section != 0,
-            slow_path_pending: (*ctx).slow_path_pending != 0,
-        }
     }
 }
 
@@ -1352,20 +1329,41 @@ mod tests {
 
     use super::{
         ADMISSION_CPU_NONE, DEFAULT_TIMING_SAMPLE_STRIDE, HEATMAP_WINDOW_EWMA_ALPHA, HeatmapConfig,
-        HeatmapState, ThreadStatsAux, WindowControlState, admission_state_snapshot,
-        advance_periodic_sample, clear_admission_state, decide_operation_sampling,
-        dynamic_cpu_candidate, dynamic_cpu_count_from_window_ewma, finish_outside_gap_sample,
-        grant_slow_path_admission, heatmap_bin_index, heatmap_bin_lower_ns,
-        heatmap_bin_midpoint_ns, heatmap_bin_upper_ns, mark_critical_section_entered,
-        mark_slow_path_pending, outside_sample_stride, parse_timing_sample_stride,
-        record_post_unlock, refresh_thread_elapsed_for_aux, sampled_heatmap_stride,
-        stabilized_dynamic_cpu_count, stabilized_dynamic_cpu_target, thread_ctx,
-        write_heatmap_csv_to_writer,
+        HeatmapState, ThreadStatsAux, WindowControlState, advance_periodic_sample,
+        clear_admission_state, decide_operation_sampling, dynamic_cpu_candidate,
+        dynamic_cpu_count_from_window_ewma, finish_outside_gap_sample, grant_slow_path_admission,
+        heatmap_bin_index, heatmap_bin_lower_ns, heatmap_bin_midpoint_ns, heatmap_bin_upper_ns,
+        mark_critical_section_entered, mark_slow_path_pending, outside_sample_stride,
+        parse_timing_sample_stride, record_post_unlock, refresh_thread_elapsed_for_aux,
+        sampled_heatmap_stride, stabilized_dynamic_cpu_count, stabilized_dynamic_cpu_target,
+        thread_ctx, write_heatmap_csv_to_writer,
     };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct AdmissionStateSnapshot {
+        admission_owned: bool,
+        admission_cpu: u32,
+        admission_requeue_home: bool,
+        in_critical_section: bool,
+        slow_path_pending: bool,
+    }
 
     fn reset_thread_ctx_for_test() {
         unsafe {
             *thread_ctx() = super::LockSchedThreadCtx::new();
+        }
+    }
+
+    fn admission_state_snapshot() -> AdmissionStateSnapshot {
+        unsafe {
+            let ctx = thread_ctx();
+            AdmissionStateSnapshot {
+                admission_owned: (*ctx).admission_owned != 0,
+                admission_cpu: (*ctx).admission_cpu,
+                admission_requeue_home: (*ctx).admission_requeue_home != 0,
+                in_critical_section: (*ctx).in_critical_section != 0,
+                slow_path_pending: (*ctx).slow_path_pending != 0,
+            }
         }
     }
 
@@ -1545,7 +1543,7 @@ mod tests {
         mark_slow_path_pending();
         assert_eq!(
             admission_state_snapshot(),
-            super::AdmissionStateSnapshot {
+            AdmissionStateSnapshot {
                 admission_owned: false,
                 admission_cpu: ADMISSION_CPU_NONE,
                 admission_requeue_home: false,
@@ -1557,7 +1555,7 @@ mod tests {
         grant_slow_path_admission(7);
         assert_eq!(
             admission_state_snapshot(),
-            super::AdmissionStateSnapshot {
+            AdmissionStateSnapshot {
                 admission_owned: true,
                 admission_cpu: 7,
                 admission_requeue_home: false,
@@ -1569,7 +1567,7 @@ mod tests {
         mark_critical_section_entered();
         assert_eq!(
             admission_state_snapshot(),
-            super::AdmissionStateSnapshot {
+            AdmissionStateSnapshot {
                 admission_owned: true,
                 admission_cpu: 7,
                 admission_requeue_home: false,
@@ -1581,7 +1579,7 @@ mod tests {
         clear_admission_state();
         assert_eq!(
             admission_state_snapshot(),
-            super::AdmissionStateSnapshot {
+            AdmissionStateSnapshot {
                 admission_owned: false,
                 admission_cpu: ADMISSION_CPU_NONE,
                 admission_requeue_home: false,

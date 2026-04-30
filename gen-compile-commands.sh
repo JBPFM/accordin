@@ -83,7 +83,7 @@ detect_multiarch_include_dir() {
 
 emit_sources_for_target() {
     case "$1" in
-        mcs_tas_simple)
+        mcs_simple|mcs_tas_simple|ttas_simple)
             printf '%s\n' "$SCRIPT_DIR/src/bpf/main.bpf.c"
             ;;
         libflexguard|flexguard_simple)

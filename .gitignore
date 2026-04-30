@@ -10,4 +10,4 @@ results
 .dmux/
 .dmux-hooks
 .claude
-tmp
+experiments/__pycache__

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a standalone `libflexguard.so` Rust `cdylib` that exports `pthread_mutex_*` / `pthread_cond_*`, reuses the existing `lb_simple` scheduler load path, and links `src/bpf/main.bpf.c` with `src/bpf/flexguard.bpf.c` into one BPF skeleton.
+**Goal:** Build a standalone `libflexguard.so` Rust `cdylib` that exports `pthread_mutex_*` / `pthread_cond_*`, reuses the existing `accordin` scheduler load path, and links `src/bpf/main.bpf.c` with `src/bpf/flexguard.bpf.c` into one BPF skeleton.
 
 **Architecture:** Add a new Cargo workspace member under `crates/libflexguard` and reuse the existing root modules via `#[path = ...]` so the first implementation stays small. The new target gets its own `build.rs`, generated skeleton, target-local hook module, and dual-thread-registration path that writes both scheduler `thread_ctx_addr_map` entries and FlexGuard `nodes_map` entries.
 
@@ -194,7 +194,7 @@ pub mod bpf_intf { include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs")); }
 mod mutex_hook;
 ```
 
-Keep the constructor and scheduler state pattern from `src/lib.rs` so the new shared library loads on `LD_PRELOAD` exactly like `liblb_simple.so`.
+Keep the constructor and scheduler state pattern from `src/lib.rs` so the new shared library loads on `LD_PRELOAD` exactly like `libaccordin.so`.
 
 - [ ] **Step 5: Re-run the tests to verify they pass**
 
@@ -307,4 +307,4 @@ Expected: benchmark completes successfully and produces both CSV files.
 - [ ] **Step 5: Run the existing library test suite as a regression guard**
 
 Run: `cargo test --lib`
-Expected: PASS so `liblb_simple.so` behavior remains intact.
+Expected: PASS so `libaccordin.so` behavior remains intact.

@@ -4,7 +4,7 @@
 
 **Goal:** Add workload-shift detection and warm-started SSC admission so the scheduler can react to sustained lock-pressure changes without spending most short runs ramping up from `ssc_active_count=2`.
 
-**Architecture:** Extend the existing BPF voting state with a wait-ratio EWMA baseline, resize holdoff, and a simple search phase enum. Reuse the quorum point in `lb_simple_tick()` to compute shift signals from per-window run/wait aggregates, switch between fast seek and bounded refinement, and seed the initial SSC width from topology publication so short mutexbench runs reach a useful core count faster.
+**Architecture:** Extend the existing BPF voting state with a wait-ratio EWMA baseline, resize holdoff, and a simple search phase enum. Reuse the quorum point in `accordin_tick()` to compute shift signals from per-window run/wait aggregates, switch between fast seek and bounded refinement, and seed the initial SSC width from topology publication so short mutexbench runs reach a useful core count faster.
 
 **Tech Stack:** sched_ext BPF C, BPF global data/maps, Rust source-level tests, cargo test
 
@@ -63,7 +63,7 @@ Expected: PASS
 
 - [ ] **Step 1: Write the failing test**
 
-Add source-level tests asserting `lb_simple_tick()`:
+Add source-level tests asserting `accordin_tick()`:
 - calls a workload-shift helper after quorum forms
 - resets to fast search on confirmed shift
 - applies refinement bounds instead of unconditional doubling/halving
@@ -102,14 +102,14 @@ Introduce:
 
 - [ ] **Step 2: Implement quorum-side helpers**
 
-Add helpers so `lb_simple_tick()` can:
+Add helpers so `accordin_tick()` can:
 - normalize per-window wait ratio
 - detect confirmed workload shifts
 - enter seek/refine tracking modes
 
 - [ ] **Step 3: Implement phase-aware active-count changes**
 
-Update `lb_simple_tick()` so quorum decisions:
+Update `accordin_tick()` so quorum decisions:
 - keep multiplicative search in seek mode
 - switch to bounded refinement after the first clear regression
 - reset back to seek mode when shift detection fires

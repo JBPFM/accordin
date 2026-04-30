@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-LIB_PATH="/mnt/home/jz/lb_critical/target/debug/liblb_simple.so"
+LIB_PATH="/mnt/home/jz/lb_critical/target/debug/libaccordin.so"
 DB_BENCH="/mnt/home/jz/test/test/leveldb/build/db_bench"
 
 if [[ ! -f "$LIB_PATH" ]]; then
@@ -14,7 +14,7 @@ if [[ ! -x "$DB_BENCH" ]]; then
     exit 1
 fi
 
-echo "=== Running db_bench with lb_simple scheduler ==="
+echo "=== Running db_bench with accordin scheduler ==="
 echo "Pinned to CPU 0, 80 threads, 50000 operations"
 echo ""
 

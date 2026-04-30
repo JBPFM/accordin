@@ -77,7 +77,7 @@ The hold-related counters are still collected and published because they remain 
 
 ## Files Changed
 
-### [src/bpf/main.bpf.c](/home/jz/Projects/lb_simple/.codex/worktree/handofftime/src/bpf/main.bpf.c)
+### [src/bpf/main.bpf.c](/home/jz/Projects/accordin/.codex/worktree/handofftime/src/bpf/main.bpf.c)
 
 - updated the file-level description to match the new controller behavior
 - computes `ssc_wait_ratio` in `simple_tick()`
@@ -85,7 +85,7 @@ The hold-related counters are still collected and published because they remain 
 - restores `tc->admitted = 1` below threshold
 - removes the workload-shift reset branch
 
-### [src/bpf/stats.bpf.h](/home/jz/Projects/lb_simple/.codex/worktree/handofftime/src/bpf/stats.bpf.h)
+### [src/bpf/stats.bpf.h](/home/jz/Projects/accordin/.codex/worktree/handofftime/src/bpf/stats.bpf.h)
 
 - adds `SSC_WAIT_RATIO_THRESHOLD`
 - adds `compute_ssc_wait_ratio(void)`
@@ -94,7 +94,7 @@ The hold-related counters are still collected and published because they remain 
 - removes workload-shift detection helpers
 - keeps vote-window accumulation for run, wait, hold, hold samples, and lock count
 
-### [src/bpf/maps.bpf.h](/home/jz/Projects/lb_simple/.codex/worktree/handofftime/src/bpf/maps.bpf.h)
+### [src/bpf/maps.bpf.h](/home/jz/Projects/accordin/.codex/worktree/handofftime/src/bpf/maps.bpf.h)
 
 - retains vote-window sums for:
   - `ssc_vote_sum_run`
@@ -104,12 +104,12 @@ The hold-related counters are still collected and published because they remain 
   - `ssc_vote_sum_lock_count`
 - removes obsolete useful-fraction and shift-detection globals
 
-### [src/bpf/intf.h](/home/jz/Projects/lb_simple/.codex/worktree/handofftime/src/bpf/intf.h)
+### [src/bpf/intf.h](/home/jz/Projects/accordin/.codex/worktree/handofftime/src/bpf/intf.h)
 
 - keeps the outermost-hold bookkeeping fields added earlier
 - includes the `last_hold_ns`, `last_hold_sample_count`, and `last_lock_count` snapshots used by BPF window accounting
 
-### [src/lib.rs](/home/jz/Projects/lb_simple/.codex/worktree/handofftime/src/lib.rs)
+### [src/lib.rs](/home/jz/Projects/accordin/.codex/worktree/handofftime/src/lib.rs)
 
 - updates source-shape tests to lock in the finished semantics:
   - wait-ratio gate exists
@@ -143,5 +143,5 @@ This change does not:
 At the time this summary was written:
 
 - the implementation changes were present in the working tree and uncommitted
-- [results-tmp/](/home/jz/Projects/lb_simple/.codex/worktree/handofftime/results-tmp) remained untouched by this documentation change
-- the matching implementation plan is [2026-04-01-wait-ratio-lock-ops-gate.md](/home/jz/Projects/lb_simple/.codex/worktree/handofftime/docs/superpowers/plans/2026-04-01-wait-ratio-lock-ops-gate.md)
+- [results-tmp/](/home/jz/Projects/accordin/.codex/worktree/handofftime/results-tmp) remained untouched by this documentation change
+- the matching implementation plan is [2026-04-01-wait-ratio-lock-ops-gate.md](/home/jz/Projects/accordin/.codex/worktree/handofftime/docs/superpowers/plans/2026-04-01-wait-ratio-lock-ops-gate.md)

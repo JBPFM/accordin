@@ -47,7 +47,7 @@ Expected: PASS
 
 - [ ] **Step 1: Write the failing test**
 
-Add source-level tests asserting `lb_simple_tick`:
+Add source-level tests asserting `accordin_tick`:
 - publishes SSC-core data into vote state
 - checks majority quorum with `publish_count * 2 > ssc_active_count`
 - doubles and halves `ssc_active_count` through consecutive comparisons

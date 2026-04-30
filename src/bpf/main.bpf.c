@@ -199,7 +199,7 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
     task_ctx->must_run_on_admission_cpu = 0;
 }
 
-s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
+s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
   struct task_scx_ctx *task_ctx;
   struct lock_sched_thread_ctx user_ctx = {};
@@ -233,7 +233,7 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
   return cpu;
 }
 
-void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
+void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   struct task_scx_ctx *task_ctx;
   struct lock_sched_thread_ctx user_ctx = {};
   bool have_user = false;
@@ -275,7 +275,7 @@ void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
   scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
 }
 
-void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev) {
+void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   __u32 *owner;
 
   (void)prev;
@@ -289,15 +289,15 @@ void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev) {
   scx_bpf_dsq_move_to_local(READY_DSQ_ID);
 }
 
-void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p) {
+void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
   refresh_running_state(p);
 }
 
-void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
+void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
   refresh_running_state(p);
 }
 
-void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable) {
+void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   struct task_scx_ctx *task_ctx;
   struct lock_sched_thread_ctx user_ctx = {};
   bool have_user = false;
@@ -324,7 +324,7 @@ void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable) {
   task_ctx->must_run_on_admission_cpu = 1;
 }
 
-void BPF_STRUCT_OPS(lb_simple_exit_task, struct task_struct *p,
+void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
                     struct scx_exit_task_args *args) {
   struct task_scx_ctx *task_ctx;
   __u32 pid = p->pid;
@@ -339,7 +339,7 @@ void BPF_STRUCT_OPS(lb_simple_exit_task, struct task_struct *p,
   bpf_task_storage_delete(&task_ctx_map, p);
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) {
+s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   __u32 cpu;
   __u32 nr_cpus = scx_bpf_nr_cpu_ids();
   s32 ret;
@@ -360,16 +360,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) {
   return 0;
 }
 
-void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei) {
+void BPF_STRUCT_OPS(accordin_exit, struct scx_exit_info *ei) {
   UEI_RECORD(uei, ei);
 }
 
-SCX_OPS_DEFINE(lb_simple_ops, .select_cpu = (void *)lb_simple_select_cpu,
-               .enqueue = (void *)lb_simple_enqueue,
-               .dispatch = (void *)lb_simple_dispatch,
-               .running = (void *)lb_simple_running,
-               .tick = (void *)lb_simple_tick,
-               .stopping = (void *)lb_simple_stopping,
-               .exit_task = (void *)lb_simple_exit_task,
-               .init = (void *)lb_simple_init, .exit = (void *)lb_simple_exit,
-               .name = "lb_simple");
+SCX_OPS_DEFINE(accordin_ops, .select_cpu = (void *)accordin_select_cpu,
+               .enqueue = (void *)accordin_enqueue,
+               .dispatch = (void *)accordin_dispatch,
+               .running = (void *)accordin_running,
+               .tick = (void *)accordin_tick,
+               .stopping = (void *)accordin_stopping,
+               .exit_task = (void *)accordin_exit_task,
+               .init = (void *)accordin_init, .exit = (void *)accordin_exit,
+               .name = "accordin");

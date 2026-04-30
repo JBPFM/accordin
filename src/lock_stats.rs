@@ -12,49 +12,49 @@ use crate::arch::{
 };
 use crate::cpu_affinity;
 
-const HEATMAP_PATH_ENV_KEYS: [&str; 2] = ["LOCK_STATS_HEATMAP_PATH", "LB_SIMPLE_HEATMAP_PATH"];
+const HEATMAP_PATH_ENV_KEYS: [&str; 2] = ["LOCK_STATS_HEATMAP_PATH", "ACCORDIN_HEATMAP_PATH"];
 const HEATMAP_SAMPLE_STRIDE_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_HEATMAP_SAMPLE_STRIDE",
-    "LB_SIMPLE_HEATMAP_SAMPLE_STRIDE",
+    "ACCORDIN_HEATMAP_SAMPLE_STRIDE",
 ];
 const HEATMAP_WINDOW_NS_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_HEATMAP_WINDOW_NS",
-    "LB_SIMPLE_HEATMAP_WINDOW_NS",
+    "ACCORDIN_HEATMAP_WINDOW_NS",
 ];
 const HEATMAP_WINDOW_SAMPLES_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_HEATMAP_WINDOW_SAMPLES",
-    "LB_SIMPLE_HEATMAP_WINDOW_SAMPLES",
+    "ACCORDIN_HEATMAP_WINDOW_SAMPLES",
 ];
 const HEATMAP_MIN_WINDOW_SAMPLES_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_HEATMAP_MIN_WINDOW_SAMPLES",
-    "LB_SIMPLE_HEATMAP_MIN_WINDOW_SAMPLES",
+    "ACCORDIN_HEATMAP_MIN_WINDOW_SAMPLES",
 ];
 const DYNAMIC_CPU_MIN_WINDOW_SAMPLES_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_DYNAMIC_CPU_MIN_WINDOW_SAMPLES",
-    "LB_SIMPLE_DYNAMIC_CPU_MIN_WINDOW_SAMPLES",
+    "ACCORDIN_DYNAMIC_CPU_MIN_WINDOW_SAMPLES",
 ];
 const DYNAMIC_CPU_CONFIRM_WINDOWS_ENV_KEYS: [&str; 4] = [
     "LOCK_STATS_DYNAMIC_CPU_CONFIRM_WINDOWS",
-    "LB_SIMPLE_DYNAMIC_CPU_CONFIRM_WINDOWS",
+    "ACCORDIN_DYNAMIC_CPU_CONFIRM_WINDOWS",
     "LOCK_STATS_DYNAMIC_CPU_CONTROL_WINDOWS",
-    "LB_SIMPLE_DYNAMIC_CPU_CONTROL_WINDOWS",
+    "ACCORDIN_DYNAMIC_CPU_CONTROL_WINDOWS",
 ];
 const DYNAMIC_CPU_STABLE_WINDOWS_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_DYNAMIC_CPU_STABLE_WINDOWS",
-    "LB_SIMPLE_DYNAMIC_CPU_STABLE_WINDOWS",
+    "ACCORDIN_DYNAMIC_CPU_STABLE_WINDOWS",
 ];
 const HEATMAP_MAX_NS_ENV_KEYS: [&str; 3] = [
     "LOCK_STATS_HEATMAP_MAX_BIN_NS",
     "LOCK_STATS_HEATMAP_MAX_NS",
-    "LB_SIMPLE_HEATMAP_MAX_BIN_NS",
+    "ACCORDIN_HEATMAP_MAX_BIN_NS",
 ];
 const TIMING_SAMPLE_STRIDE_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_TIMING_SAMPLE_STRIDE",
-    "LB_SIMPLE_TIMING_SAMPLE_STRIDE",
+    "ACCORDIN_TIMING_SAMPLE_STRIDE",
 ];
 const OUTSIDE_SAMPLE_STRIDE_ENV_KEYS: [&str; 2] = [
     "LOCK_STATS_OUTSIDE_SAMPLE_STRIDE",
-    "LB_SIMPLE_OUTSIDE_SAMPLE_STRIDE",
+    "ACCORDIN_OUTSIDE_SAMPLE_STRIDE",
 ];
 const DEFAULT_HEATMAP_SAMPLE_STRIDE: u64 = 64;
 const DEFAULT_HEATMAP_WINDOW_NS: u64 = 1_000_000;
@@ -1621,15 +1621,15 @@ mod tests {
         state.record_sample(103, 0, 0);
 
         let mut out = Vec::new();
-        let summary = write_heatmap_csv_to_writer(&mut out, "lb_simple", &state).unwrap();
+        let summary = write_heatmap_csv_to_writer(&mut out, "accordin", &state).unwrap();
         let csv = String::from_utf8(out).unwrap();
 
         assert!(csv.contains(
             "stats_label,window_index,window_start_ns,window_end_ns,window_sample_count,window_valid,window_avg_critical_ns_est,window_avg_outside_ns_est,window_avg_critical_ns_ewma,window_avg_outside_ns_ewma,critical_bin_index,critical_bin_lo_ns,critical_bin_hi_ns,outside_bin_index,outside_bin_lo_ns,outside_bin_hi_ns,count"
         ));
-        assert!(csv.contains("lb_simple,0,100,102,2,1,1.00,5.50,1.00,5.50,1,1,1,3,4,7,2"));
+        assert!(csv.contains("accordin,0,100,102,2,1,1.00,5.50,1.00,5.50,1,1,1,3,4,7,2"));
         assert!(csv.contains(&format!(
-            "lb_simple,1,102,104,1,0,0.00,0.00,{:.2},{:.2},0,0,0,0,0,0,1",
+            "accordin,1,102,104,1,0,0.00,0.00,{:.2},{:.2},0,0,0,0,0,0,1",
             1.0 * (1.0 - HEATMAP_WINDOW_EWMA_ALPHA),
             5.5 * (1.0 - HEATMAP_WINDOW_EWMA_ALPHA),
         )));

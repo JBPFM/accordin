@@ -3,6 +3,20 @@
 version = 4
 
 [[package]]
+name = "accordin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lb_shared",
+ "libbpf-rs",
+ "libc",
+ "log",
+ "scx_cargo",
+ "scx_utils",
+ "simplelog",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -812,20 +826,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lb_simple"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "lb_shared",
- "libbpf-rs",
- "libc",
- "log",
- "scx_cargo",
- "scx_utils",
- "simplelog",
-]
-
-[[package]]
 name = "libbpf-cargo"
 version = "0.26.0-beta.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -921,7 +921,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 
 [[package]]
-name = "mcs_simple"
+name = "mcs_accordin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -941,7 +941,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcs_tas_simple"
+name = "mcs_tas_accordin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1262,7 +1262,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 
 [[package]]
-name = "reciprocating_simple"
+name = "reciprocating_accordin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1829,7 +1829,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ttas_simple"
+name = "ttas_accordin"
 version = "0.1.0"
 dependencies = [
  "anyhow",

@@ -1,11 +1,11 @@
 [package]
-name = "mcs_simple"
+name = "mcs_accordin"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
 
 [lib]
-name = "mcs_simple"
+name = "mcs_accordin"
 crate-type = ["cdylib"]
 
 [dependencies]

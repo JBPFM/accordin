@@ -42,8 +42,8 @@ OUTSIDE_NS = 3000
 DURATION_MS = 5000
 WARMUP_DURATION_MS = 1000
 REPEATS = 4
-DEFAULT_MCS_TAS_SIMPLE_TASKSET_CPUS = "0,2,4,8,10,12,14,16,18,20,22"
-MCS_TAS_SIMPLE_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_simple.so"
+DEFAULT_MCS_TAS_ACCORDIN_TASKSET_CPUS = "0,2,4,8,10,12,14,16,18,20,22"
+MCS_TAS_ACCORDIN_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
 FOCUS_LOCK_KEYS = ("accordin", "flexguard")
 PIECEWISE_Y_THRESHOLD_NS = 1000.0
 PIECEWISE_Y_LINEAR_SCALE = 3.0
@@ -83,7 +83,7 @@ LOCKS = (
     LockSpec("MCS-TP", "mcstp"),
     LockSpec("MCS-TAS", "mcs-tas"),
     LockSpec("Reciprocating", "reciprocating", optional=True),
-    LockSpec("Accordin (K=11)", "accordin", optional=True, result_dirs=("accordin", "mcs_tas_simple")),
+    LockSpec("Accordin (K=11)", "accordin", optional=True, result_dirs=("accordin", "mcs_tas_accordin")),
     LockSpec("MCS + TSE", "mcs_extension"),
     LockSpec("Malthusian", "malthusian", optional=True),
     LockSpec("FlexGuard", "flexguard"),
@@ -234,12 +234,12 @@ def parse_args() -> argparse.Namespace:
 Default benchmark settings:
   critical-ns={CRITICAL_NS}, outside-ns={OUTSIDE_NS}, duration=5s, warmup=1s, repeats={REPEATS}
   threads={','.join(str(v) for v in THREADS)}
-  default full run includes mcs_tas_simple under taskset CPUs={DEFAULT_MCS_TAS_SIMPLE_TASKSET_CPUS}
+  default full run includes mcs_tas_accordin under taskset CPUs={DEFAULT_MCS_TAS_ACCORDIN_TASKSET_CPUS}
 
 Examples:
   python3 experiments/run_experiment_one.py
   python3 experiments/run_experiment_one.py --output-root experiments/results/experiment1_manual
-  python3 experiments/run_experiment_one.py --mcs-tas-simple-taskset-cpus 0,2,4,8,10,12,14,16,18,20,22
+  python3 experiments/run_experiment_one.py --mcs-tas-accordin-taskset-cpus 0,2,4,8,10,12,14,16,18,20,22
   python3 experiments/run_experiment_one.py --plot-only experiments/results/experiment1_manual
   python3 experiments/run_experiment_one.py --output-root experiments/results/experiment1_20260423_194548 --supplement-locks
 """,
@@ -284,18 +284,18 @@ Examples:
         help="Sudo policy forwarded to the multi-lock sweep. Default: auto.",
     )
     parser.add_argument(
-        "--mcs-tas-simple-taskset-cpus",
-        default=DEFAULT_MCS_TAS_SIMPLE_TASKSET_CPUS,
+        "--mcs-tas-accordin-taskset-cpus",
+        default=DEFAULT_MCS_TAS_ACCORDIN_TASKSET_CPUS,
         metavar="CPU_LIST",
         help=(
-            "CPU list passed to taskset for the mcs_tas_simple series. "
-            f"Default: {DEFAULT_MCS_TAS_SIMPLE_TASKSET_CPUS}."
+            "CPU list passed to taskset for the mcs_tas_accordin series. "
+            f"Default: {DEFAULT_MCS_TAS_ACCORDIN_TASKSET_CPUS}."
         ),
     )
     parser.add_argument(
-        "--skip-mcs-tas-simple-taskset",
+        "--skip-mcs-tas-accordin-taskset",
         action="store_true",
-        help="Skip only the taskset mcs_tas_simple series. Default full run includes it.",
+        help="Skip only the taskset mcs_tas_accordin series. Default full run includes it.",
     )
     parser.add_argument(
         "--force",
@@ -339,8 +339,8 @@ def write_settings(
     result_root: Path,
     mcs_extension_mode: str,
     sudo_mode: str,
-    mcs_tas_simple_taskset_enabled: bool,
-    mcs_tas_simple_taskset_cpus: str,
+    mcs_tas_accordin_taskset_enabled: bool,
+    mcs_tas_accordin_taskset_cpus: str,
 ) -> None:
     settings = {
         "threads": list(THREADS),
@@ -351,8 +351,8 @@ def write_settings(
         "repeats": REPEATS,
         "mcs_extension_mode": mcs_extension_mode,
         "sudo_mode": sudo_mode,
-        "mcs_tas_simple_taskset_enabled": mcs_tas_simple_taskset_enabled,
-        "mcs_tas_simple_taskset_cpus": mcs_tas_simple_taskset_cpus,
+        "mcs_tas_accordin_taskset_enabled": mcs_tas_accordin_taskset_enabled,
+        "mcs_tas_accordin_taskset_cpus": mcs_tas_accordin_taskset_cpus,
         "locks": [{"label": lock.label, "key": lock.key} for lock in LOCKS],
         "flexguard_dir": str(FLEXGUARD_DIR),
     }
@@ -365,8 +365,8 @@ def write_settings_if_missing(
     result_root: Path,
     mcs_extension_mode: str,
     sudo_mode: str,
-    mcs_tas_simple_taskset_enabled: bool,
-    mcs_tas_simple_taskset_cpus: str,
+    mcs_tas_accordin_taskset_enabled: bool,
+    mcs_tas_accordin_taskset_cpus: str,
 ) -> None:
     settings_path = result_root / "settings.json"
     if settings_path.exists():
@@ -377,8 +377,8 @@ def write_settings_if_missing(
         result_root,
         mcs_extension_mode,
         sudo_mode,
-        mcs_tas_simple_taskset_enabled,
-        mcs_tas_simple_taskset_cpus,
+        mcs_tas_accordin_taskset_enabled,
+        mcs_tas_accordin_taskset_cpus,
     )
 
 
@@ -501,15 +501,15 @@ def common_sweep_args() -> list[str]:
     ]
 
 
-def ensure_mcs_tas_simple(logger: CommandLogger) -> None:
-    if not MCS_TAS_SIMPLE_RELEASE_LIB.is_file():
+def ensure_mcs_tas_accordin(logger: CommandLogger) -> None:
+    if not MCS_TAS_ACCORDIN_RELEASE_LIB.is_file():
         logger.run(
-            ["cargo", "build", "-p", "mcs_tas_simple", "--release"],
-            log_name="build_mcs_tas_simple.log",
+            ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
+            log_name="build_mcs_tas_accordin.log",
         )
 
-    if not MCS_TAS_SIMPLE_RELEASE_LIB.is_file():
-        raise RuntimeError(f"mcs_tas_simple library was not produced: {MCS_TAS_SIMPLE_RELEASE_LIB}")
+    if not MCS_TAS_ACCORDIN_RELEASE_LIB.is_file():
+        raise RuntimeError(f"mcs_tas_accordin library was not produced: {MCS_TAS_ACCORDIN_RELEASE_LIB}")
 
 
 def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandLogger) -> None:
@@ -545,17 +545,17 @@ def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandL
     ]
     logger.run(extension_cmd, log_name="sweep_mcs_extension.log")
 
-    if args.skip_mcs_tas_simple_taskset:
+    if args.skip_mcs_tas_accordin_taskset:
         return
 
-    ensure_mcs_tas_simple(logger)
+    ensure_mcs_tas_accordin(logger)
     taskset_cmd = [
         "taskset",
         "-c",
-        args.mcs_tas_simple_taskset_cpus,
+        args.mcs_tas_accordin_taskset_cpus,
         str(SWEEP_MULTI),
         "--locks",
-        "mcs_tas_simple",
+        "mcs_tas_accordin",
         "--output-root",
         str(result_root),
         "--sudo-mode",
@@ -565,7 +565,7 @@ def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandL
         "--",
         *common_sweep_args(),
     ]
-    logger.run(taskset_cmd, log_name="sweep_mcs_tas_simple_taskset.log")
+    logger.run(taskset_cmd, log_name="sweep_mcs_tas_accordin_taskset.log")
 
 
 def run_supplement_benchmarks(
@@ -1340,8 +1340,8 @@ def main() -> int:
                 result_root,
                 args.mcs_extension_mode,
                 args.sudo_mode,
-                not args.skip_mcs_tas_simple_taskset,
-                args.mcs_tas_simple_taskset_cpus,
+                not args.skip_mcs_tas_accordin_taskset,
+                args.mcs_tas_accordin_taskset_cpus,
             )
             logger = CommandLogger(result_root)
             ensure_inputs(logger, lock_keys=supplement_lock_keys, include_single_sweep=False)
@@ -1352,8 +1352,8 @@ def main() -> int:
                 result_root,
                 args.mcs_extension_mode,
                 args.sudo_mode,
-                not args.skip_mcs_tas_simple_taskset,
-                args.mcs_tas_simple_taskset_cpus,
+                not args.skip_mcs_tas_accordin_taskset,
+                args.mcs_tas_accordin_taskset_cpus,
             )
             logger = CommandLogger(result_root)
             ensure_inputs(logger)

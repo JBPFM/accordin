@@ -12,14 +12,14 @@
 
 除非特别说明，下面的实验默认使用：
 
-- `LB_SIMPLE_DISABLE_BPF=1`
+- `ACCORDIN_DISABLE_BPF=1`
 - `LOCK_STATS_HEATMAP_SAMPLE_STRIDE=64`
 - 基于时间窗口的 heatmap 导出
 - 使用 unlock-gap 公式计算 `outside_ns`
 
 ## 当前导出内容
 
-当前 [`src/lock_stats.rs`](/mnt/home/jz/lb_simple/.codex/worktree/handwrite/src/lock_stats.rs) 会为每个窗口导出 heatmap 行，包含：
+当前 [`src/lock_stats.rs`](/mnt/home/jz/accordin/.codex/worktree/handwrite/src/lock_stats.rs) 会为每个窗口导出 heatmap 行，包含：
 
 - `window_sample_count`
 - `window_valid`

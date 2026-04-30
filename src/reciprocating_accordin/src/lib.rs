@@ -8,8 +8,8 @@ pub mod bpf_intf {
 }
 pub use lb_shared::lock_backend;
 pub use lb_shared::lock_stats;
-mod mcs;
 mod mutex_hook;
+mod reciprocating;
 
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
@@ -19,10 +19,10 @@ use libbpf_rs::{Link, MapHandle, OpenObject};
 use log::info;
 use scx_utils::{scx_ops_attach, scx_ops_load, scx_ops_open};
 
-const SCHEDULER_NAME: &str = "mcs_simple";
-const DISABLE_BPF_ENV: &str = "MCS_SIMPLE_DISABLE_BPF";
-const STATS_ONLY_ENV: &str = "MCS_SIMPLE_STATS_ONLY";
-const DEBUG_COUNTERS_ENV: &str = "MCS_SIMPLE_DEBUG_COUNTERS";
+const SCHEDULER_NAME: &str = "reciprocating_accordin";
+const DISABLE_BPF_ENV: &str = "RECIPROCATING_ACCORDIN_DISABLE_BPF";
+const STATS_ONLY_ENV: &str = "RECIPROCATING_ACCORDIN_STATS_ONLY";
+const DEBUG_COUNTERS_ENV: &str = "RECIPROCATING_ACCORDIN_DEBUG_COUNTERS";
 
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
 
@@ -41,13 +41,13 @@ fn init_scheduler(debug: bool, _stats_only: bool, _debug_counters: bool) -> Resu
     let open_object: &'static mut MaybeUninit<OpenObject> =
         Box::leak(Box::new(MaybeUninit::uninit()));
 
-    let mut skel = scx_ops_open!(skel_builder, open_object, lb_simple_ops, None)?;
-    let mut skel = scx_ops_load!(skel, lb_simple_ops, uei)?;
+    let mut skel = scx_ops_open!(skel_builder, open_object, accordin_ops, None)?;
+    let mut skel = scx_ops_load!(skel, accordin_ops, uei)?;
 
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
     mutex_hook::set_thread_ctx_map(thread_ctx_map);
 
-    let link = scx_ops_attach!(skel, lb_simple_ops)?;
+    let link = scx_ops_attach!(skel, accordin_ops)?;
 
     info!("{SCHEDULER_NAME} scheduler started via LD_PRELOAD");
     Ok(SchedulerState {
@@ -89,7 +89,7 @@ fn init_ebpf() {
         simplelog::ColorChoice::Auto,
     );
 
-    lb_shared::cpu_affinity::init_from_env("mcs_simple");
+    lb_shared::cpu_affinity::init_from_env("reciprocating_accordin");
 
     if env_flag(DISABLE_BPF_ENV) {
         info!(
@@ -97,7 +97,7 @@ fn init_ebpf() {
             DISABLE_BPF_ENV
         );
         eprintln!(
-            "[mcs_simple] eBPF scheduler disabled by {}",
+            "[reciprocating_accordin] eBPF scheduler disabled by {}",
             DISABLE_BPF_ENV
         );
         return;
@@ -114,7 +114,7 @@ fn init_ebpf() {
                     STATS_ONLY_ENV
                 );
                 eprintln!(
-                    "[mcs_simple] stats-only env {} requested but ignored by minimal BPF controller",
+                    "[reciprocating_accordin] stats-only env {} requested but ignored by minimal BPF controller",
                     STATS_ONLY_ENV
                 );
             }
@@ -124,15 +124,15 @@ fn init_ebpf() {
                     DEBUG_COUNTERS_ENV
                 );
                 eprintln!(
-                    "[mcs_simple] debug-counter env {} requested but ignored by minimal BPF controller",
+                    "[reciprocating_accordin] debug-counter env {} requested but ignored by minimal BPF controller",
                     DEBUG_COUNTERS_ENV
                 );
             }
-            eprintln!("[mcs_simple] eBPF scheduler loaded successfully");
+            eprintln!("[reciprocating_accordin] eBPF scheduler loaded successfully");
             state
         }
         Err(e) => {
-            eprintln!("[mcs_simple] Failed to load eBPF scheduler: {:#}", e);
+            eprintln!("[reciprocating_accordin] Failed to load eBPF scheduler: {:#}", e);
             panic!("eBPF initialization failed");
         }
     });
@@ -151,22 +151,35 @@ static INIT: extern "C" fn() = {
 #[used]
 static FINI: extern "C" fn() = {
     extern "C" fn fini() {
-        lock_stats::print_process_stats("mcs_simple");
+        lock_stats::print_process_stats("reciprocating_accordin");
     }
     fini
 };
 
-#[unsafe(no_mangle)]
-pub extern "C" fn lb_simple_dynamic_cpu_affinity_is_stable() -> libc::c_int {
-    i32::from(lock_stats::dynamic_cpu_affinity_is_stable())
-}
+#[cfg(test)]
+mod tests {
+    use super::env_flag;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn lb_simple_dynamic_cpu_affinity_freeze() {
-    lock_stats::dynamic_cpu_affinity_freeze();
-}
+    #[test]
+    fn env_flag_defaults_to_false() {
+        let key = "RECIPROCATING_ACCORDIN_TEST_ENV_FLAG_MISSING";
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert!(!env_flag(key));
+    }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn lb_simple_dynamic_cpu_affinity_begin_measurement() {
-    lock_stats::dynamic_cpu_affinity_begin_measurement_for_thread();
+    #[test]
+    fn env_flag_accepts_common_truthy_values() {
+        let key = "RECIPROCATING_ACCORDIN_TEST_ENV_FLAG_TRUTHY";
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            assert!(env_flag(key), "expected truthy value {value}");
+        }
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
 }

@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-project_name="lb_simple"
+project_name="accordin"
 
 sed -i "s/scx_bin/${project_name}/g" Cargo.toml
 sed -i "s/scx_bin/${project_name}/g" gen-compile-commands.sh

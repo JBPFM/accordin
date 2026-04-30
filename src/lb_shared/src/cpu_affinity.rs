@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-pub const CPU_MASK_K_ENV: &str = "LB_SIMPLE_CPU_MASK_K";
+pub const CPU_MASK_K_ENV: &str = "ACCORDIN_CPU_MASK_K";
 pub const CPU_MASK_K_SHORT_ENV: &str = "K";
 
 #[derive(Debug)]

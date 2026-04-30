@@ -83,13 +83,13 @@ detect_multiarch_include_dir() {
 
 emit_sources_for_target() {
     case "$1" in
-        mcs_simple|mcs_tas_simple|ttas_simple)
+        mcs_accordin|mcs_tas_accordin|ttas_accordin)
             printf '%s\n' "$SCRIPT_DIR/src/bpf/main.bpf.c"
             ;;
-        reciprocating_simple)
+        reciprocating_accordin)
             printf '%s\n' "$SCRIPT_DIR/src/bpf/main.bpf.c"
             ;;
-        libflexguard|flexguard_simple)
+        libflexguard|flexguard_accordin)
             printf '%s\n' \
                 "$SCRIPT_DIR/src/bpf/main.bpf.c" \
                 "$SCRIPT_DIR/src/bpf/flexguard.bpf.c"
@@ -103,7 +103,7 @@ emit_sources_for_target() {
 display_target_name() {
     case "$1" in
         libflexguard)
-            printf '%s' "flexguard_simple"
+            printf '%s' "flexguard_accordin"
             ;;
         *)
             printf '%s' "$1"

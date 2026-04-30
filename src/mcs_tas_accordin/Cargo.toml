@@ -1,11 +1,11 @@
 [package]
-name = "reciprocating_simple"
+name = "mcs_tas_accordin"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
 
 [lib]
-name = "reciprocating_simple"
+name = "mcs_tas_accordin"
 crate-type = ["cdylib"]
 
 [dependencies]
@@ -16,9 +16,9 @@ crossbeam = "0.8.4"
 lb_shared = { path = "../lb_shared" }
 libbpf-rs = "=0.26.0-beta.1"
 log = "0.4.17"
-scx_stats = { version = "1.0.17" }
-scx_stats_derive = { version = "1.0.17" }
-scx_utils = { version = "1.0.22", features = ["autopower"] }
+scx_stats = {version = "1.0.17" }
+scx_stats_derive = {version = "1.0.17" }
+scx_utils = {version = "1.0.22", features = ["autopower"] }
 serde = { version = "1.0.215", features = ["derive"] }
 simplelog = "0.12"
 libc = "0.2.177"

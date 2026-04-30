@@ -1,11 +1,11 @@
 [package]
-name = "ttas_simple"
+name = "ttas_accordin"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
 
 [lib]
-name = "ttas_simple"
+name = "ttas_accordin"
 crate-type = ["cdylib"]
 
 [dependencies]

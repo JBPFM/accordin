@@ -116,22 +116,22 @@ LOCK_LABELS = {
     "malthusian": "Malthusian",
     "reciprocating": "Reciprocating",
     "accordin": "Accordin",
-    "mcs_simple": "Accordin",
-    "mcs_tas_simple": "MCS-TAS Simple",
+    "mcs_accordin": "Accordin",
+    "mcs_tas_accordin": "MCS-TAS Simple",
 }
 BENCHMARK_LABELS = {
     "dedup": "PARSEC dedup",
     "streamcluster": "PARSEC streamcluster",
 }
-ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_simple.so"
+ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
-MCS_TAS_SIMPLE_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_simple.so"
+MCS_TAS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
 LOCK_ALIASES = {
     "accordin": "accordin",
-    "mcs_simple": "accordin",
+    "mcs_accordin": "accordin",
     "mcs-tas": "mcstas",
     "mcs_extension": "mcs_extension",
-    "mcs_tas_simple": "mcs_tas_simple",
+    "mcs_tas_accordin": "mcs_tas_accordin",
     "stock": "stock",
 }
 LOCK_ORDER = (
@@ -143,7 +143,7 @@ LOCK_ORDER = (
     "flexguard",
     "accordin",
     "reciprocating",
-    "mcs_tas_simple",
+    "mcs_tas_accordin",
 )
 
 
@@ -323,7 +323,7 @@ Examples:
             "Comma-separated lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Use stock to run without interpose. "
-            "Aliases: mcs-tas == mcstas, mcs_simple == accordin."
+            "Aliases: mcs-tas == mcstas, mcs_accordin == accordin."
         ),
     )
     parser.add_argument(
@@ -511,7 +511,7 @@ def interpose_library_path(lock: str) -> Path:
 def missing_interpose_locks(locks: Iterable[str]) -> list[str]:
     missing: list[str] = []
     for lock in locks:
-        if lock in {"stock", "accordin", "mcs_extension", "mcs_tas_simple"}:
+        if lock in {"stock", "accordin", "mcs_extension", "mcs_tas_accordin"}:
             continue
         script = interpose_script_path(lock)
         library = interpose_library_path(lock)
@@ -530,12 +530,12 @@ def ensure_accordin_preload(
     if not build_missing:
         raise RuntimeError(
             f"LD_PRELOAD helper is missing: {ACCORDIN_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_simple --release or rerun with --build-missing."
+            "Run cargo build -p mcs_accordin --release or rerun with --build-missing."
         )
 
     logger.run(
-        ["cargo", "build", "-p", "mcs_simple", "--release"],
-        log_name="build_mcs_simple.log",
+        ["cargo", "build", "-p", "mcs_accordin", "--release"],
+        log_name="build_mcs_accordin.log",
         cwd=REPO_ROOT,
     )
     if not ACCORDIN_PRELOAD_LIBRARY.is_file():
@@ -564,26 +564,26 @@ def ensure_mcs_extension_preload(
         raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_EXTENSION_PRELOAD_LIBRARY}")
 
 
-def ensure_mcs_tas_simple_preload(
+def ensure_mcs_tas_accordin_preload(
     *,
     build_missing: bool,
     logger: CommandLogger,
 ) -> None:
-    if MCS_TAS_SIMPLE_PRELOAD_LIBRARY.is_file():
+    if MCS_TAS_ACCORDIN_PRELOAD_LIBRARY.is_file():
         return
     if not build_missing:
         raise RuntimeError(
-            f"LD_PRELOAD helper is missing: {MCS_TAS_SIMPLE_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_tas_simple --release or rerun with --build-missing."
+            f"LD_PRELOAD helper is missing: {MCS_TAS_ACCORDIN_PRELOAD_LIBRARY}. "
+            "Run cargo build -p mcs_tas_accordin --release or rerun with --build-missing."
         )
 
     logger.run(
-        ["cargo", "build", "-p", "mcs_tas_simple", "--release"],
-        log_name="build_mcs_tas_simple.log",
+        ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
+        log_name="build_mcs_tas_accordin.log",
         cwd=REPO_ROOT,
     )
-    if not MCS_TAS_SIMPLE_PRELOAD_LIBRARY.is_file():
-        raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_TAS_SIMPLE_PRELOAD_LIBRARY}")
+    if not MCS_TAS_ACCORDIN_PRELOAD_LIBRARY.is_file():
+        raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_TAS_ACCORDIN_PRELOAD_LIBRARY}")
 
 
 def ensure_interpose_helpers(
@@ -856,8 +856,8 @@ def build_dedup_command(
             env = combine_ld_preload(ACCORDIN_PRELOAD_LIBRARY)
         elif lock == "mcs_extension":
             env = combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)
-        elif lock == "mcs_tas_simple":
-            env = combine_ld_preload(MCS_TAS_SIMPLE_PRELOAD_LIBRARY)
+        elif lock == "mcs_tas_accordin":
+            env = combine_ld_preload(MCS_TAS_ACCORDIN_PRELOAD_LIBRARY)
         else:
             env = None
             cmd.append(str(interpose_script_path(lock)))
@@ -893,8 +893,8 @@ def build_streamcluster_command(
             env = combine_ld_preload(ACCORDIN_PRELOAD_LIBRARY)
         elif lock == "mcs_extension":
             env = combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)
-        elif lock == "mcs_tas_simple":
-            env = combine_ld_preload(MCS_TAS_SIMPLE_PRELOAD_LIBRARY)
+        elif lock == "mcs_tas_accordin":
+            env = combine_ld_preload(MCS_TAS_ACCORDIN_PRELOAD_LIBRARY)
         else:
             env = None
             cmd.append(str(interpose_script_path(lock)))
@@ -1235,8 +1235,8 @@ def main() -> int:
             ensure_accordin_preload(build_missing=args.build_missing, logger=logger)
         if "mcs_extension" in locks:
             ensure_mcs_extension_preload(build_missing=args.build_missing, logger=logger)
-        if "mcs_tas_simple" in locks:
-            ensure_mcs_tas_simple_preload(build_missing=args.build_missing, logger=logger)
+        if "mcs_tas_accordin" in locks:
+            ensure_mcs_tas_accordin_preload(build_missing=args.build_missing, logger=logger)
         ensure_parsec_binaries(benchmarks, build_missing=args.build_missing, logger=logger)
         if "dedup" in benchmarks:
             ensure_dedup_input(dedup_input)

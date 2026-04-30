@@ -11,9 +11,9 @@ We want to add a new lock backend implemented in `src/flexguard.rs` and ship it 
 This library must:
 
 - export `pthread_mutex_*` and `pthread_cond_*` interposition symbols for `LD_PRELOAD`
-- keep the existing `lb_simple` scheduler loading behavior
+- keep the existing `accordin` scheduler loading behavior
 - build `src/bpf/main.bpf.c` and `src/bpf/flexguard.bpf.c` into one linked BPF object for the `libflexguard.so` target
-- coexist with the existing `liblb_simple.so` build instead of replacing it
+- coexist with the existing `libaccordin.so` build instead of replacing it
 
 The current tree already contains most of the ingredients:
 
@@ -23,7 +23,7 @@ The current tree already contains most of the ingredients:
 - FlexGuard userspace runtime in `src/flexguard.rs`
 - FlexGuard BPF probe in `src/bpf/flexguard.bpf.c`
 
-The missing piece is a target boundary that combines them into an independently built shared object without breaking the existing `lb_simple` artifact.
+The missing piece is a target boundary that combines them into an independently built shared object without breaking the existing `accordin` artifact.
 
 ## Goals
 
@@ -31,13 +31,13 @@ The missing piece is a target boundary that combines them into an independently 
 2. Export `pthread_mutex_*` and `pthread_cond_*` hooks suitable for `LD_PRELOAD`.
 3. Reuse the existing scheduler lifecycle and `main.bpf.c` admission/stats logic.
 4. Link `main.bpf.c` and `flexguard.bpf.c` into one generated BPF skeleton for the new target.
-5. Keep `liblb_simple.so` buildable and behaviorally unchanged.
+5. Keep `libaccordin.so` buildable and behaviorally unchanged.
 
 ## Non-Goals
 
 This work does not:
 
-- replace the existing `lb_simple` backend
+- replace the existing `accordin` backend
 - add runtime backend switching inside a single shared object
 - redesign the scheduler control logic in `main.bpf.c`
 - refactor all shared code into a perfect common crate on the first pass
@@ -56,7 +56,7 @@ That crate will:
 - own its own `build.rs`
 - reuse existing source modules from the repository root via `#[path = "..."]` on the first pass to keep the diff small
 
-This gives `libflexguard.so` an independent Cargo target while preserving the current root crate that produces `liblb_simple.so`.
+This gives `libflexguard.so` an independent Cargo target while preserving the current root crate that produces `libaccordin.so`.
 
 ### 2. BPF build model
 
@@ -85,7 +85,7 @@ No other semantic change is required in `flexguard.bpf.c` for this step.
 
 ### 4. Userspace initialization flow
 
-`libflexguard.so` keeps the same high-level library-load flow as the current `lb_simple` library:
+`libflexguard.so` keeps the same high-level library-load flow as the current `accordin` library:
 
 1. library constructor runs on load
 2. BPF skeleton is opened, loaded, and attached
@@ -136,9 +136,9 @@ That can be done either by renaming the raw lock type in `src/flexguard.rs` or b
 
 ### 7. Thread registration model
 
-This is the main functional difference from `liblb_simple.so`.
+This is the main functional difference from `libaccordin.so`.
 
-The current `lb_simple` path registers each thread into `thread_ctx_addr_map` so BPF can consume scheduler statistics.
+The current `accordin` path registers each thread into `thread_ctx_addr_map` so BPF can consume scheduler statistics.
 
 The `libflexguard.so` path must register each thread into **both**:
 
@@ -191,9 +191,9 @@ If the resulting duplication between the two shared libraries becomes awkward, a
 
 ### Expected untouched behavior
 
-- existing `src/lib.rs` initialization semantics for `liblb_simple.so`
+- existing `src/lib.rs` initialization semantics for `libaccordin.so`
 - existing `main.bpf.c` scheduler logic
-- existing `liblb_simple.so` release build
+- existing `libaccordin.so` release build
 
 ## Data Flow
 
@@ -274,4 +274,4 @@ The work is complete when all of the following are true:
 - its initialization flow matches the current scheduler-loading behavior
 - FlexGuard userspace runtime is wired to the BPF state exposed by the shared skeleton
 - thread registration for the FlexGuard target uses `nodes_map`
-- the existing `liblb_simple.so` target still builds and behaves as before
+- the existing `libaccordin.so` target still builds and behaves as before

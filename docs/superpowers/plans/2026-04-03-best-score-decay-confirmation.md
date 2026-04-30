@@ -4,7 +4,7 @@
 
 **Goal:** Make `ssc_best_score` forget early outlier peaks over time and require two mature windows before a new width can rewrite the best-score anchor.
 
-**Architecture:** Keep the existing seek/refine controller shape, but change best-anchor maintenance from a permanent historical peak into a slowly decaying anchor with candidate confirmation. Add two small BPF globals for pending candidate state, add helper functions in `stats.bpf.h` for decay/reset/promotion, and update `lb_simple_tick()` so mature-window decisions decay `ssc_best_score` before comparing scores and stop overwriting the best anchor immediately on single-window spikes.
+**Architecture:** Keep the existing seek/refine controller shape, but change best-anchor maintenance from a permanent historical peak into a slowly decaying anchor with candidate confirmation. Add two small BPF globals for pending candidate state, add helper functions in `stats.bpf.h` for decay/reset/promotion, and update `accordin_tick()` so mature-window decisions decay `ssc_best_score` before comparing scores and stop overwriting the best anchor immediately on single-window spikes.
 
 **Tech Stack:** sched_ext BPF C, BPF global state in `.bss`, Rust source-shape tests in `src/lib.rs`, `cargo test`, `cargo build`
 
@@ -221,7 +221,7 @@ Run:
 cargo test --lib best_score_decay_quorum_logic_requires_decay_and_two_window_confirmation
 ```
 
-Expected: FAIL because `lb_simple_tick()` still rewrites `ssc_best_score` inline and does not decay the anchor before promotion.
+Expected: FAIL because `accordin_tick()` still rewrites `ssc_best_score` inline and does not decay the anchor before promotion.
 
 - [ ] **Step 3: Write the minimal implementation**
 

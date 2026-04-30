@@ -19,9 +19,9 @@ use libbpf_rs::{Link, MapHandle, OpenObject};
 use log::info;
 use scx_utils::{scx_ops_attach, scx_ops_load, scx_ops_open};
 
-const SCHEDULER_NAME: &str = "flexguard_simple";
-const DISABLE_BPF_ENV: &str = "LB_SIMPLE_DISABLE_BPF";
-const STATS_ONLY_ENV: &str = "LB_SIMPLE_STATS_ONLY";
+const SCHEDULER_NAME: &str = "flexguard_accordin";
+const DISABLE_BPF_ENV: &str = "ACCORDIN_DISABLE_BPF";
+const STATS_ONLY_ENV: &str = "ACCORDIN_STATS_ONLY";
 
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
 
@@ -41,8 +41,8 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
     let open_object: &'static mut MaybeUninit<OpenObject> =
         Box::leak(Box::new(MaybeUninit::uninit()));
 
-    let mut skel = scx_ops_open!(skel_builder, open_object, lb_simple_ops, None)?;
-    let mut skel = scx_ops_load!(skel, lb_simple_ops, uei)?;
+    let mut skel = scx_ops_open!(skel_builder, open_object, accordin_ops, None)?;
+    let mut skel = scx_ops_load!(skel, accordin_ops, uei)?;
 
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
     let nodes_map = MapHandle::try_from(&skel.maps.nodes_map)?;
@@ -57,7 +57,7 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
         flexguard::install_bpf_runtime(qnodes, num_preempted_holders, preempted_flags);
     }
 
-    let scheduler_link = scx_ops_attach!(skel, lb_simple_ops)?;
+    let scheduler_link = scx_ops_attach!(skel, accordin_ops)?;
     let flexguard_link = skel.links.sched_switch_btf.take();
 
     info!("{SCHEDULER_NAME} scheduler started via LD_PRELOAD");
@@ -102,7 +102,7 @@ fn init_ebpf() {
         simplelog::ColorChoice::Auto,
     );
 
-    lb_shared::cpu_affinity::init_from_env("flexguard_simple");
+    lb_shared::cpu_affinity::init_from_env("flexguard_accordin");
 
     if env_flag(DISABLE_BPF_ENV) {
         info!(
@@ -110,7 +110,7 @@ fn init_ebpf() {
             DISABLE_BPF_ENV
         );
         eprintln!(
-            "[flexguard_simple] eBPF scheduler disabled by {}",
+            "[flexguard_accordin] eBPF scheduler disabled by {}",
             DISABLE_BPF_ENV
         );
         return;
@@ -126,15 +126,15 @@ fn init_ebpf() {
                     STATS_ONLY_ENV
                 );
                 eprintln!(
-                    "[flexguard_simple] stats-only env {} requested but ignored by minimal BPF controller",
+                    "[flexguard_accordin] stats-only env {} requested but ignored by minimal BPF controller",
                     STATS_ONLY_ENV
                 );
             }
-            eprintln!("[flexguard_simple] eBPF scheduler loaded successfully");
+            eprintln!("[flexguard_accordin] eBPF scheduler loaded successfully");
             state
         }
         Err(e) => {
-            eprintln!("[flexguard_simple] Failed to load eBPF scheduler: {:#}", e);
+            eprintln!("[flexguard_accordin] Failed to load eBPF scheduler: {:#}", e);
             panic!("eBPF initialization failed");
         }
     });
@@ -153,22 +153,22 @@ static INIT: extern "C" fn() = {
 #[used]
 static FINI: extern "C" fn() = {
     extern "C" fn fini() {
-        lock_stats::print_process_stats("flexguard_simple");
+        lock_stats::print_process_stats("flexguard_accordin");
     }
     fini
 };
 
 #[unsafe(no_mangle)]
-pub extern "C" fn lb_simple_dynamic_cpu_affinity_is_stable() -> libc::c_int {
+pub extern "C" fn accordin_dynamic_cpu_affinity_is_stable() -> libc::c_int {
     i32::from(lock_stats::dynamic_cpu_affinity_is_stable())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn lb_simple_dynamic_cpu_affinity_freeze() {
+pub extern "C" fn accordin_dynamic_cpu_affinity_freeze() {
     lock_stats::dynamic_cpu_affinity_freeze();
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn lb_simple_dynamic_cpu_affinity_begin_measurement() {
+pub extern "C" fn accordin_dynamic_cpu_affinity_begin_measurement() {
     lock_stats::dynamic_cpu_affinity_begin_measurement_for_thread();
 }

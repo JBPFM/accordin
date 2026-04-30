@@ -6,7 +6,7 @@
 
 ## Context
 
-The `lb_simple` controller still shows major stability outliers at the fixed `SSC_UNLOCK_GATE_THRESHOLD = 320000ULL` baseline even after fixing the helper-level stale-anchor bug in `ssc_set_active_count()`.
+The `accordin` controller still shows major stability outliers at the fixed `SSC_UNLOCK_GATE_THRESHOLD = 320000ULL` baseline even after fixing the helper-level stale-anchor bug in `ssc_set_active_count()`.
 
 Fresh runtime evidence from `bench/mutexbench/results-tmp/debug_snapshots_envfix_20260402T0300Z/` shows that the dominant failure mode is not repeated threshold mis-tuning. Instead, the controller enters `SSC_SEARCH_REFINE` and then remains there while repeatedly observing:
 
@@ -16,7 +16,7 @@ Fresh runtime evidence from `bench/mutexbench/results-tmp/debug_snapshots_envfix
 
 Representative evidence:
 
-- benchmark outliers remain in `bench/mutexbench/results-tmp/debug_snapshots_envfix_20260402T0300Z/lb_simple/raw.csv`
+- benchmark outliers remain in `bench/mutexbench/results-tmp/debug_snapshots_envfix_20260402T0300Z/accordin/raw.csv`
 - `dbg_refine_single_point` and `dbg_refine_noop_targets` climb rapidly in captured `.bss` snapshots
 - `dbg_refine_entries` stays comparatively low, which suggests the controller is not repeatedly re-entering refine, but rather getting stuck there
 
@@ -125,7 +125,7 @@ After implementation, verify with:
 1. `cargo test --lib`
 2. `rtk cargo build --release`
 3. a fresh fixed-320k long benchmark run
-4. a debug-counter benchmark run with `LB_SIMPLE_DEBUG_COUNTERS=1`
+4. a debug-counter benchmark run with `ACCORDIN_DEBUG_COUNTERS=1`
 
 Success criteria:
 

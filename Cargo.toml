@@ -1,33 +1,33 @@
 [package]
-name = "lb_simple"
+name = "accordin"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
 build = "build.rs"
 
 [lib]
-name = "lb_simple"
+name = "accordin"
 crate-type = ["cdylib"]
 
 [workspace]
 resolver = "3"
 members = [
     "src/lb_shared",
-    "src/mcs_simple",
-    "src/mcs_tas_simple",
+    "src/mcs_accordin",
+    "src/mcs_tas_accordin",
     "src/mcs_tse",
-    "src/ttas_simple",
-    "src/reciprocating_simple",
+    "src/ttas_accordin",
+    "src/reciprocating_accordin",
     "src/libflexguard",
 ]
 default-members = [
     ".",
     "src/lb_shared",
-    "src/mcs_simple",
-    "src/mcs_tas_simple",
+    "src/mcs_accordin",
+    "src/mcs_tas_accordin",
     "src/mcs_tse",
-    "src/ttas_simple",
-    "src/reciprocating_simple",
+    "src/ttas_accordin",
+    "src/reciprocating_accordin",
     "src/libflexguard",
 ]
 exclude = ["bench/mutexbench_rust"]

@@ -2,14 +2,14 @@
 
 ## 1. 文档目的
 
-本文档描述 `lb_simple` 当前已经实现的锁感知调度器设计，而不是早期的 `target_local / target_remote` 目标并发度方案。
+本文档描述 `accordin` 当前已经实现的锁感知调度器设计，而不是早期的 `target_local / target_remote` 目标并发度方案。
 
 当前实现的核心目标是：
 
 - 在高锁竞争负载下，用锁等待信号识别“应该降并发”的线程。
 - 把明显在等锁的线程暂时放入 `SSC_DSQ`，把 CPU 让给更可能做有用工作的线程。
 - 用一组可动态伸缩的 “SSC core” 专门从 `SSC_DSQ` 拉任务运行，形成简单、可测的反馈回路。
-- 保持用户态锁路径尽量轻量，使 `LB_SIMPLE_DISABLE_BPF=1` 和 `LB_SIMPLE_STATS_ONLY=1` 成为可靠的拆分基线。
+- 保持用户态锁路径尽量轻量，使 `ACCORDIN_DISABLE_BPF=1` 和 `ACCORDIN_STATS_ONLY=1` 成为可靠的拆分基线。
 
 当前实现不追求：
 
@@ -21,7 +21,7 @@
 
 ## 2. 总体结构
 
-`lb_simple` 由三个部分组成：
+`accordin` 由三个部分组成：
 
 1. 用户态锁库：
    - 以 `LD_PRELOAD` 形式拦截 `pthread_mutex_*` / `pthread_cond_*`。
@@ -89,7 +89,7 @@ struct lock_sched_thread_ctx {
 3. 把 `tid -> ctx_ptr` 注册到 `thread_ctx_addr_map`。
 4. 在线程退出时删除该 map 项。
 
-因此，只有真正使用 lb_simple 锁路径的线程才会被 BPF 建立 `task_scx_ctx`。
+因此，只有真正使用 accordin 锁路径的线程才会被 BPF 建立 `task_scx_ctx`。
 
 ---
 
@@ -294,9 +294,9 @@ score = ssc_active_count * useful_run / ssc_vote_sum_run * 1024
 
 - 默认模式：
   - 加载 BPF，启用 `SSC_DSQ`、自 parking 和 `SSC core` 投票。
-- `LB_SIMPLE_STATS_ONLY=1`
+- `ACCORDIN_STATS_ONLY=1`
   - 仍加载 BPF 和记账，但不消费 `SSC_DSQ`，只保留统计路径。
-- `LB_SIMPLE_DISABLE_BPF=1`
+- `ACCORDIN_DISABLE_BPF=1`
   - 完全不加载 BPF，只使用用户态 MCS-TAS 锁替换。
 
 这三种模式构成了性能拆分实验的基线。
@@ -324,9 +324,9 @@ score = ssc_active_count * useful_run / ssc_vote_sum_run * 1024
 | 模式 | 吞吐量 | ns/op | 平均等待 | handoff | steady CPU | steady cores |
 |---|---:|---:|---:|---:|---:|---:|
 | `mcs-tas` | 1.707M ops/s | 585.76 | 18.36us | 194.37ns | 3195.33% | 31.95 |
-| `lb_simple_no_bpf` | 1.655M ops/s | 604.23 | 18.95us | 218.83ns | 3192.33% | 31.92 |
-| `lb_simple_stats_only` | 1.610M ops/s | 620.96 | 19.48us | 227.39ns | 3198.67% | 31.99 |
-| `lb_simple_full` | 0.567M ops/s | 1763.63 | 112.15us | 2536.51ns | 596.63% | 5.97 |
+| `accordin_no_bpf` | 1.655M ops/s | 604.23 | 18.95us | 218.83ns | 3192.33% | 31.92 |
+| `accordin_stats_only` | 1.610M ops/s | 620.96 | 19.48us | 227.39ns | 3198.67% | 31.99 |
+| `accordin_full` | 0.567M ops/s | 1763.63 | 112.15us | 2536.51ns | 596.63% | 5.97 |
 
 对应拆分：
 
@@ -340,9 +340,9 @@ score = ssc_active_count * useful_run / ssc_vote_sum_run * 1024
 | 模式 | 吞吐量 | ns/op | 平均等待 | handoff | steady CPU | steady cores |
 |---|---:|---:|---:|---:|---:|---:|
 | `mcs-tas` | 1.645M ops/s | 607.99 | 19.05us | 211.03ns | 3195.75% | 31.96 |
-| `lb_simple_no_bpf` | 1.624M ops/s | 615.93 | 19.33us | 228.39ns | 3196.89% | 31.97 |
-| `lb_simple_stats_only` | 1.609M ops/s | 621.56 | 19.49us | 228.00ns | 3189.90% | 31.90 |
-| `lb_simple_full` | 1.558M ops/s | 642.00 | 19.86us | 297.03ns | 642.13% | 6.42 |
+| `accordin_no_bpf` | 1.624M ops/s | 615.93 | 19.33us | 228.39ns | 3196.89% | 31.97 |
+| `accordin_stats_only` | 1.609M ops/s | 621.56 | 19.49us | 228.00ns | 3189.90% | 31.90 |
+| `accordin_full` | 1.558M ops/s | 642.00 | 19.86us | 297.03ns | 642.13% | 6.42 |
 
 对应拆分：
 
@@ -353,8 +353,8 @@ score = ssc_active_count * useful_run / ssc_vote_sum_run * 1024
 
 当前可得出的结论：
 
-- 纯用户态锁替换依然基本没有额外成本；`lb_simple_no_bpf` 与 `mcs-tas` 保持同一量级。
-- 开启 timeslice extension 后，`lb_simple_full` 吞吐从 `0.567M` 提升到 `1.558M ops/s`，`ns/op` 从 `1763.63` 降到 `642.00`。
+- 纯用户态锁替换依然基本没有额外成本；`accordin_no_bpf` 与 `mcs-tas` 保持同一量级。
+- 开启 timeslice extension 后，`accordin_full` 吞吐从 `0.567M` 提升到 `1.558M ops/s`，`ns/op` 从 `1763.63` 降到 `642.00`。
 - 总额外开销从 `1177.88ns/op` 降到 `34.00ns/op`，其中剩余调度器开销从 `1142.68ns/op` 降到 `20.44ns/op`。
 - full mode 仍然观察到明显 CPU limiting，但与基线相比的吞吐差距已经缩小到约 `5.30%`，不再是原来那种吞吐塌陷。
 

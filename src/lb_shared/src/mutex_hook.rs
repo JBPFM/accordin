@@ -25,7 +25,7 @@ macro_rules! export_mutex_hooks {
         mod exported_mutex_hooks {
             use std::cell::{Cell, UnsafeCell};
             use std::hint::spin_loop;
-            use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+            use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
             use $crate::lock_stats::{
                 record_hold_end_sample, record_lock_acquired, record_post_unlock,
@@ -38,11 +38,18 @@ macro_rules! export_mutex_hooks {
 
             struct HookState {
                 lock: <Backend as MutexHookBackend>::LockState,
-                real_mutex: UnsafeCell<libc::pthread_mutex_t>,
             }
 
             unsafe impl Send for HookState {}
             unsafe impl Sync for HookState {}
+
+            struct CondState {
+                seq: AtomicU32,
+                target: AtomicU32,
+            }
+
+            unsafe impl Send for CondState {}
+            unsafe impl Sync for CondState {}
 
             struct ThreadCtxGuard;
 
@@ -72,32 +79,6 @@ macro_rules! export_mutex_hooks {
                 });
             }
 
-            macro_rules! real {
-                ($name:ident) => {{
-                    #[allow(unused_unsafe)]
-                    {
-                        static REAL: AtomicPtr<std::ffi::c_void> =
-                            AtomicPtr::new(std::ptr::null_mut());
-                        let mut ptr = REAL.load(Ordering::Relaxed);
-                        if ptr.is_null() {
-                            ptr = unsafe {
-                                libc::dlsym(
-                                    libc::RTLD_NEXT,
-                                    concat!(stringify!($name), "\0").as_ptr()
-                                        as *const libc::c_char,
-                                )
-                            };
-                            assert!(
-                                !ptr.is_null(),
-                                concat!("dlsym failed for ", stringify!($name))
-                            );
-                            REAL.store(ptr, Ordering::Release);
-                        }
-                        unsafe { std::mem::transmute::<*mut std::ffi::c_void, _>(ptr) }
-                    }
-                }};
-            }
-
             #[inline(always)]
             fn lock_with_stats(lock: &<Backend as MutexHookBackend>::LockState) {
                 if Backend::try_lock(lock) {
@@ -118,10 +99,19 @@ macro_rules! export_mutex_hooks {
             }
 
             const SENTINEL: usize = 1;
+            const FUTEX_WAIT_PRIVATE: libc::c_int = 128;
+            const FUTEX_WAKE_PRIVATE: libc::c_int = 129;
+            const FUTEX_WAIT_BITSET_PRIVATE_REALTIME: libc::c_int = 9 | 128 | 256;
+            const FUTEX_BITSET_MATCH_ANY: libc::c_uint = libc::c_uint::MAX;
 
             #[inline(always)]
             unsafe fn state_atomic(mutex: *mut libc::pthread_mutex_t) -> &'static AtomicUsize {
                 unsafe { &*(mutex as *const AtomicUsize) }
+            }
+
+            #[inline(always)]
+            unsafe fn cond_atomic(cond: *mut libc::pthread_cond_t) -> &'static AtomicUsize {
+                unsafe { &*(cond as *const AtomicUsize) }
             }
 
             #[inline(always)]
@@ -168,23 +158,61 @@ macro_rules! export_mutex_hooks {
 
                     let state = Box::new(HookState {
                         lock: Backend::create_state(),
-                        real_mutex: unsafe { UnsafeCell::new(std::mem::zeroed()) },
                     });
                     let ptr = Box::into_raw(state);
 
-                    let real_init: unsafe extern "C" fn(
-                        *mut libc::pthread_mutex_t,
-                        *const libc::pthread_mutexattr_t,
-                    ) -> libc::c_int = real!(pthread_mutex_init);
-                    let ret = unsafe { real_init((*ptr).real_mutex.get(), std::ptr::null()) };
-                    if ret != 0 {
-                        unsafe {
-                            drop(Box::from_raw(ptr));
-                        }
-                        atomic.store(0, Ordering::Release);
-                        return Err(ret);
+                    atomic.store(ptr as usize, Ordering::Release);
+                    return Ok(ptr);
+                }
+            }
+
+            #[inline(always)]
+            unsafe fn ensure_cond_state(
+                cond: *mut libc::pthread_cond_t,
+            ) -> Result<*mut CondState, libc::c_int> {
+                if cond.is_null() {
+                    return Err(libc::EINVAL);
+                }
+
+                let val = unsafe { cond_atomic(cond) }.load(Ordering::Acquire);
+                if likely(val > SENTINEL) {
+                    return Ok(val as *mut CondState);
+                }
+                unsafe { ensure_cond_state_slow(cond, val) }
+            }
+
+            #[cold]
+            #[inline(never)]
+            unsafe fn ensure_cond_state_slow(
+                cond: *mut libc::pthread_cond_t,
+                initial: usize,
+            ) -> Result<*mut CondState, libc::c_int> {
+                let atomic = unsafe { cond_atomic(cond) };
+                let mut val = initial;
+                loop {
+                    if val > SENTINEL {
+                        return Ok(val as *mut CondState);
                     }
 
+                    if val == SENTINEL {
+                        spin_loop();
+                        val = atomic.load(Ordering::Acquire);
+                        continue;
+                    }
+
+                    if atomic
+                        .compare_exchange(0, SENTINEL, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        val = atomic.load(Ordering::Acquire);
+                        continue;
+                    }
+
+                    let state = Box::new(CondState {
+                        seq: AtomicU32::new(0),
+                        target: AtomicU32::new(0),
+                    });
+                    let ptr = Box::into_raw(state);
                     atomic.store(ptr as usize, Ordering::Release);
                     return Ok(ptr);
                 }
@@ -202,6 +230,55 @@ macro_rules! export_mutex_hooks {
             #[inline(never)]
             const fn cold_path() {}
 
+            #[inline(always)]
+            unsafe fn futex_wait(addr: *const AtomicU32, expected: u32) -> libc::c_long {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        addr as *const u32,
+                        FUTEX_WAIT_PRIVATE,
+                        expected,
+                        std::ptr::null::<libc::timespec>(),
+                    )
+                }
+            }
+
+            #[inline(always)]
+            unsafe fn futex_wait_until_realtime(
+                addr: *const AtomicU32,
+                expected: u32,
+                abstime: *const libc::timespec,
+            ) -> libc::c_long {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        addr as *const u32,
+                        FUTEX_WAIT_BITSET_PRIVATE_REALTIME,
+                        expected,
+                        abstime,
+                        std::ptr::null::<libc::c_void>(),
+                        FUTEX_BITSET_MATCH_ANY,
+                    )
+                }
+            }
+
+            #[inline(always)]
+            unsafe fn futex_wake(addr: *const AtomicU32, count: libc::c_int) -> libc::c_long {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        addr as *const u32,
+                        FUTEX_WAKE_PRIVATE,
+                        count,
+                    )
+                }
+            }
+
+            #[inline(always)]
+            fn wait_should_continue(target: u32, seq: u32) -> bool {
+                target.wrapping_sub(seq) < (u32::MAX / 2) && target != seq
+            }
+
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn pthread_mutex_init(
                 mutex: *mut libc::pthread_mutex_t,
@@ -214,19 +291,8 @@ macro_rules! export_mutex_hooks {
 
                     let state = Box::new(HookState {
                         lock: Backend::create_state(),
-                        real_mutex: UnsafeCell::new(std::mem::zeroed()),
                     });
                     let ptr = Box::into_raw(state);
-
-                    let real_init: unsafe extern "C" fn(
-                        *mut libc::pthread_mutex_t,
-                        *const libc::pthread_mutexattr_t,
-                    ) -> libc::c_int = real!(pthread_mutex_init);
-                    let ret = real_init((*ptr).real_mutex.get(), attr);
-                    if ret != 0 {
-                        drop(Box::from_raw(ptr));
-                        return ret;
-                    }
 
                     std::ptr::write_bytes(
                         mutex as *mut u8,
@@ -251,13 +317,6 @@ macro_rules! export_mutex_hooks {
                     let val = atomic.load(Ordering::Acquire);
                     if val > SENTINEL {
                         let ptr = val as *mut HookState;
-                        let real_destroy: unsafe extern "C" fn(
-                            *mut libc::pthread_mutex_t,
-                        ) -> libc::c_int = real!(pthread_mutex_destroy);
-                        let ret = real_destroy((*ptr).real_mutex.get());
-                        if ret != 0 {
-                            return ret;
-                        }
                         drop(Box::from_raw(ptr));
                         atomic.store(0, Ordering::Release);
                     }
@@ -321,40 +380,76 @@ macro_rules! export_mutex_hooks {
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn pthread_cond_init(
                 cond: *mut libc::pthread_cond_t,
-                attr: *const libc::pthread_condattr_t,
+                _attr: *const libc::pthread_condattr_t,
             ) -> libc::c_int {
-                let f: unsafe extern "C" fn(
-                    *mut libc::pthread_cond_t,
-                    *const libc::pthread_condattr_t,
-                ) -> libc::c_int = real!(pthread_cond_init);
-                unsafe { f(cond, attr) }
+                unsafe {
+                    if cond.is_null() {
+                        return libc::EINVAL;
+                    }
+
+                    let state = Box::new(CondState {
+                        seq: AtomicU32::new(0),
+                        target: AtomicU32::new(0),
+                    });
+                    let ptr = Box::into_raw(state);
+                    std::ptr::write_bytes(
+                        cond as *mut u8,
+                        0,
+                        std::mem::size_of::<libc::pthread_cond_t>(),
+                    );
+                    (*(cond as *mut usize)) = ptr as usize;
+                    0
+                }
             }
 
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn pthread_cond_destroy(
                 cond: *mut libc::pthread_cond_t,
             ) -> libc::c_int {
-                let f: unsafe extern "C" fn(*mut libc::pthread_cond_t) -> libc::c_int =
-                    real!(pthread_cond_destroy);
-                unsafe { f(cond) }
+                unsafe {
+                    if cond.is_null() {
+                        return libc::EINVAL;
+                    }
+
+                    let atomic = cond_atomic(cond);
+                    let val = atomic.load(Ordering::Acquire);
+                    if val > SENTINEL {
+                        drop(Box::from_raw(val as *mut CondState));
+                        atomic.store(0, Ordering::Release);
+                    }
+                    0
+                }
             }
 
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn pthread_cond_signal(
                 cond: *mut libc::pthread_cond_t,
             ) -> libc::c_int {
-                let f: unsafe extern "C" fn(*mut libc::pthread_cond_t) -> libc::c_int =
-                    real!(pthread_cond_signal);
-                unsafe { f(cond) }
+                unsafe {
+                    let cond_state = match ensure_cond_state(cond) {
+                        Ok(state) => state,
+                        Err(ret) => return ret,
+                    };
+                    (*cond_state).seq.fetch_add(1, Ordering::Release);
+                    futex_wake(&(*cond_state).seq, 1);
+                    0
+                }
             }
 
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn pthread_cond_broadcast(
                 cond: *mut libc::pthread_cond_t,
             ) -> libc::c_int {
-                let f: unsafe extern "C" fn(*mut libc::pthread_cond_t) -> libc::c_int =
-                    real!(pthread_cond_broadcast);
-                unsafe { f(cond) }
+                unsafe {
+                    let cond_state = match ensure_cond_state(cond) {
+                        Ok(state) => state,
+                        Err(ret) => return ret,
+                    };
+                    let target = (*cond_state).target.load(Ordering::Acquire);
+                    (*cond_state).seq.store(target, Ordering::Release);
+                    futex_wake(&(*cond_state).seq, libc::c_int::MAX);
+                    0
+                }
             }
 
             #[unsafe(no_mangle)]
@@ -367,24 +462,19 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    let real_mu = (*state).real_mutex.get();
-
-                    let real_lock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
-                        real!(pthread_mutex_lock);
-                    let real_unlock: unsafe extern "C" fn(
-                        *mut libc::pthread_mutex_t,
-                    ) -> libc::c_int = real!(pthread_mutex_unlock);
-                    let real_wait: unsafe extern "C" fn(
-                        *mut libc::pthread_cond_t,
-                        *mut libc::pthread_mutex_t,
-                    ) -> libc::c_int = real!(pthread_cond_wait);
-
-                    real_lock(real_mu);
+                    let cond_state = match ensure_cond_state(cond) {
+                        Ok(state) => state,
+                        Err(ret) => return ret,
+                    };
+                    let target = (*cond_state).target.fetch_add(1, Ordering::Relaxed) + 1;
+                    let mut seq = (*cond_state).seq.load(Ordering::Acquire);
                     unlock_with_stats(&(*state).lock);
-                    let ret = real_wait(cond, real_mu);
-                    real_unlock(real_mu);
+                    while wait_should_continue(target, seq) {
+                        futex_wait(&(*cond_state).seq, seq);
+                        seq = (*cond_state).seq.load(Ordering::Acquire);
+                    }
                     lock_with_stats(&(*state).lock);
-                    ret
+                    0
                 }
             }
 
@@ -395,27 +485,32 @@ macro_rules! export_mutex_hooks {
                 abstime: *const libc::timespec,
             ) -> libc::c_int {
                 unsafe {
+                    if abstime.is_null() {
+                        return libc::EINVAL;
+                    }
+
                     let state = match ensure_state(user_mutex) {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    let real_mu = (*state).real_mutex.get();
-
-                    let real_lock: unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int =
-                        real!(pthread_mutex_lock);
-                    let real_unlock: unsafe extern "C" fn(
-                        *mut libc::pthread_mutex_t,
-                    ) -> libc::c_int = real!(pthread_mutex_unlock);
-                    let real_timedwait: unsafe extern "C" fn(
-                        *mut libc::pthread_cond_t,
-                        *mut libc::pthread_mutex_t,
-                        *const libc::timespec,
-                    ) -> libc::c_int = real!(pthread_cond_timedwait);
-
-                    real_lock(real_mu);
+                    let cond_state = match ensure_cond_state(cond) {
+                        Ok(state) => state,
+                        Err(ret) => return ret,
+                    };
+                    let target = (*cond_state).target.fetch_add(1, Ordering::Relaxed) + 1;
+                    let mut seq = (*cond_state).seq.load(Ordering::Acquire);
+                    let mut ret = 0;
                     unlock_with_stats(&(*state).lock);
-                    let ret = real_timedwait(cond, real_mu, abstime);
-                    real_unlock(real_mu);
+                    while wait_should_continue(target, seq) {
+                        if futex_wait_until_realtime(&(*cond_state).seq, seq, abstime) != 0 {
+                            let errno = *libc::__errno_location();
+                            if errno == libc::ETIMEDOUT {
+                                ret = libc::ETIMEDOUT;
+                                break;
+                            }
+                        }
+                        seq = (*cond_state).seq.load(Ordering::Acquire);
+                    }
                     lock_with_stats(&(*state).lock);
                     ret
                 }

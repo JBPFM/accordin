@@ -32,17 +32,24 @@ from bench_csv_schema import (  # noqa: E402
     load_plot_rows,
 )
 
+from machine_config import (  # noqa: E402
+    ACTIVE_MACHINE_CONFIG,
+    DECOMPOSITION_THREAD_COUNTS,
+    DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
+    DEFAULT_THREAD_COUNTS,
+    MACHINE_PHYSICAL_CORES,
+    PROFILE_ENV,
+)
 
-THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
+THREADS = DEFAULT_THREAD_COUNTS
 PLOT_THREADS = tuple(thread for thread in THREADS if thread >= 4)
-DECOMPOSITION_THREADS = (128, 192, 256)
+DECOMPOSITION_THREADS = DECOMPOSITION_THREAD_COUNTS
 DECOMPOSITION_LOCK_KEYS = ("mcs", "mcs_extension", "mcs-tas", "malthusian", "flexguard", "accordin")
 CRITICAL_NS = 300
 OUTSIDE_NS = 3000
 DURATION_MS = 5000
 WARMUP_DURATION_MS = 1000
 REPEATS = 4
-DEFAULT_MCS_ACCORDIN_TASKSET_CPUS = "0,2,4,8,10,12,14,16,18,20,22"
 MCS_ACCORDIN_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 FOCUS_LOCK_KEYS = ("accordin", "flexguard")
 PIECEWISE_Y_THRESHOLD_NS = 1000.0
@@ -52,7 +59,7 @@ BROKEN_Y_UPPER_MIN = 1e5
 BROKEN_LOWER_AXIS_PADDING = 1.2
 DECOMPOSITION_HOLD_COLOR = "#74a9cf"
 DECOMPOSITION_HANDOFF_COLOR = "#ef8a62"
-MACHINE_CORE_COUNT = 96
+MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
 THREAD_AXIS_MIN = PLOT_THREADS[0] / 1.08
 THREAD_AXIS_MAX = PLOT_THREADS[-1] * 1.25
 OVERSUBSCRIBED_LABEL_X = (MACHINE_CORE_COUNT * THREAD_AXIS_MAX) ** 0.5
@@ -233,13 +240,15 @@ def parse_args() -> argparse.Namespace:
         epilog=f"""\
 Default benchmark settings:
   critical-ns={CRITICAL_NS}, outside-ns={OUTSIDE_NS}, duration=5s, warmup=1s, repeats={REPEATS}
+  machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})
   threads={','.join(str(v) for v in THREADS)}
   default full run includes mcs_accordin under taskset CPUs={DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
 
 Examples:
   python3 experiments/run_experiment_one.py
   python3 experiments/run_experiment_one.py --output-root experiments/results/experiment1_manual
-  python3 experiments/run_experiment_one.py --mcs-accordin-taskset-cpus 0,2,4,8,10,12,14,16,18,20,22
+  python3 experiments/run_experiment_one.py --mcs-accordin-taskset-cpus {DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
+  {PROFILE_ENV}=original python3 experiments/run_experiment_one.py
   python3 experiments/run_experiment_one.py --plot-only experiments/results/experiment1_manual
   python3 experiments/run_experiment_one.py --output-root experiments/results/experiment1_20260423_194548 --supplement-locks
 """,
@@ -344,6 +353,8 @@ def write_settings(
 ) -> None:
     settings = {
         "threads": list(THREADS),
+        "machine_profile": ACTIVE_MACHINE_CONFIG.name,
+        "machine_profile_env": PROFILE_ENV,
         "critical_ns": CRITICAL_NS,
         "outside_ns": OUTSIDE_NS,
         "duration_ms": DURATION_MS,
@@ -1149,9 +1160,12 @@ def plot_hold_handoff_decomposition(
 
     totals = [hold + handoff for hold, handoff in zip(hold_values, handoff_values, strict=True)]
     normal_totals = [value for value in totals if value < BROKEN_Y_UPPER_MIN]
-    lower_ylim = (0.0, max(normal_totals) * 1.15)
+    lower_ylim = (0.0, max(normal_totals or totals) * 1.15)
     upper_values = [value for value in totals if value >= BROKEN_Y_UPPER_MIN]
-    upper_ylim = (BROKEN_Y_UPPER_MIN, max(upper_values) * 1.08)
+    upper_ylim = (
+        BROKEN_Y_UPPER_MIN,
+        max(upper_values) * 1.08 if upper_values else BROKEN_Y_UPPER_MIN * 1.08,
+    )
 
     fig, (upper_ax, lower_ax) = plt.subplots(
         2,

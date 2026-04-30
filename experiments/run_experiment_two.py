@@ -16,6 +16,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
+from machine_config import ACTIVE_MACHINE_CONFIG, DEFAULT_THREAD_COUNTS, MACHINE_PHYSICAL_CORES, PROFILE_ENV
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
@@ -24,7 +26,7 @@ MAKE_ALL_SCRIPT = FLEXGUARD_DIR / "scripts" / "make_all.sh"
 PTHREAD_HOST_BINARY = FLEXGUARD_BUILD_DIR / "buckets_pthread_host"
 MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
-DEFAULT_THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
+DEFAULT_THREADS = DEFAULT_THREAD_COUNTS
 DEFAULT_LOCKS = (
     "mcs",
     "mcstp",
@@ -43,7 +45,7 @@ DEFAULT_MAX_VALUE = 100000
 DEFAULT_OFFSET_CHANGES = 40
 DEFAULT_NON_CRITICAL_CYCLES = 0
 DEFAULT_ZIPF_ALPHA = 10.0
-MACHINE_CORE_COUNT = 96
+MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
 REQUIRED_BUCKET_OPTIONS = ("--distribution", "--zipf-alpha")
 REQUIRED_PTHREAD_HOST_SYMBOLS = (
     "pthread_mutex_init",
@@ -269,6 +271,7 @@ def parse_args() -> argparse.Namespace:
         epilog=f"""\
 Default benchmark settings:
   locks={','.join(DEFAULT_LOCKS)}
+  machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
   duration-ms={DEFAULT_DURATION_MS}, repeats={DEFAULT_REPEATS}, buckets={DEFAULT_BUCKETS}
   max-value={DEFAULT_MAX_VALUE}, offset-changes={DEFAULT_OFFSET_CHANGES}
@@ -290,6 +293,7 @@ Examples:
   python3 experiments/run_experiment_two.py
   python3 experiments/run_experiment_two.py --output-root experiments/results/experiment2_manual
   python3 experiments/run_experiment_two.py --threads 1,2,4 --duration-ms 1000 --repeats 1
+  {PROFILE_ENV}=original python3 experiments/run_experiment_two.py
   python3 experiments/run_experiment_two.py --plot-only experiments/results/experiment2_manual
 """,
     )
@@ -911,6 +915,8 @@ def write_settings(
             for spec in lock_specs
         ],
         "threads": list(threads),
+        "machine_profile": ACTIVE_MACHINE_CONFIG.name,
+        "machine_profile_env": PROFILE_ENV,
         "workloads": [{"key": key, "label": label} for key, label in WORKLOAD_LABELS.items()],
         "duration_ms": args.duration_ms,
         "repeats": args.repeats,

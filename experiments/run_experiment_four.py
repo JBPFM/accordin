@@ -16,6 +16,7 @@ from typing import Iterable
 
 import run_experiment_one as experiment_one
 import run_experiment_three as experiment_three
+import machine_config
 
 
 REPO_ROOT = experiment_three.REPO_ROOT
@@ -37,9 +38,9 @@ DEFAULT_JEMALLOC_CANDIDATES = (
     Path("/lib/x86_64-linux-gnu/libjemalloc.so.2"),
 )
 PER_LOCK_MAX_THREADS = {
-    "mcs": 128,
-    "mcstp": 128,
-    "mcs_extension": 128,
+    "mcs": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
+    "mcstp": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
+    "mcs_extension": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
 }
 
 RAW_FIELDS = (
@@ -91,6 +92,7 @@ def parse_args() -> argparse.Namespace:
 Default benchmark settings:
   benchmarks={','.join(DEFAULT_BENCHMARKS)}
   locks={','.join(DEFAULT_LOCKS)}
+  machine-profile={machine_config.ACTIVE_MACHINE_CONFIG.name} (override with {machine_config.PROFILE_ENV})
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
   repeats={DEFAULT_REPEATS}, num={DEFAULT_NUM}, total_ops={DEFAULT_TOTAL_OPS}
   leveldb={DEFAULT_LEVELDB_DIR} (tag {LEVELDB_VERSION})
@@ -103,6 +105,7 @@ Default benchmark settings:
 Examples:
   python3 experiments/run_experiment_four.py
   python3 experiments/run_experiment_four.py --locks stock --threads 1 --repeats 1 --benchmarks fillseq --num 1000
+  {machine_config.PROFILE_ENV}=original python3 experiments/run_experiment_four.py
   python3 experiments/run_experiment_four.py --plot-only experiments/results/experiment4_manual
 """,
     )
@@ -691,6 +694,8 @@ def write_settings(
         "benchmarks": [{"key": benchmark, "label": benchmark_label(benchmark)} for benchmark in benchmarks],
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
         "threads": list(threads),
+        "machine_profile": machine_config.ACTIVE_MACHINE_CONFIG.name,
+        "machine_profile_env": machine_config.PROFILE_ENV,
         "per_lock_max_threads": {
             lock: max_threads for lock, max_threads in PER_LOCK_MAX_THREADS.items() if lock in locks
         },

@@ -18,6 +18,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
+from machine_config import ACTIVE_MACHINE_CONFIG, DEFAULT_THREAD_COUNTS, MACHINE_PHYSICAL_CORES, PROFILE_ENV
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
@@ -69,7 +71,7 @@ DEFAULT_LOCKS = (
     "flexguard",
     "accordin",
 )
-DEFAULT_THREADS = (8, 16, 32, 64)
+DEFAULT_THREADS = DEFAULT_THREAD_COUNTS
 DEFAULT_REPEATS = 3
 DEFAULT_DEDUP_COMPRESSION = "gzip"
 DEFAULT_STREAMCLUSTER_MIN_CENTERS = 10
@@ -79,7 +81,7 @@ DEFAULT_STREAMCLUSTER_NUM_POINTS = 32768
 DEFAULT_STREAMCLUSTER_CHUNKSIZE = 32768
 DEFAULT_STREAMCLUSTER_CLUSTERSIZE = 2000
 DEFAULT_STREAMCLUSTER_INPUT = "none"
-MACHINE_CORE_COUNT = 96
+MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
 
 RAW_FIELDS = (
     "benchmark",
@@ -272,6 +274,7 @@ def parse_args() -> argparse.Namespace:
 Default benchmark settings:
   benchmarks={','.join(DEFAULT_BENCHMARKS)}
   locks={','.join(DEFAULT_LOCKS)}
+  machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
   repeats={DEFAULT_REPEATS}, dedup-compression={DEFAULT_DEDUP_COMPRESSION}
   streamcluster min/max={DEFAULT_STREAMCLUSTER_MIN_CENTERS}/{DEFAULT_STREAMCLUSTER_MAX_CENTERS}
@@ -281,6 +284,7 @@ Default benchmark settings:
 Examples:
   python3 experiments/run_experiment_three.py
   python3 experiments/run_experiment_three.py --benchmarks streamcluster --locks stock --threads 1 --repeats 1 --streamcluster-dimensions 16 --streamcluster-num-points 64 --streamcluster-chunksize 64 --streamcluster-clustersize 16
+  {PROFILE_ENV}=original python3 experiments/run_experiment_three.py
   python3 experiments/run_experiment_three.py --plot-only experiments/results/experiment3_manual
 """,
     )
@@ -849,6 +853,8 @@ def write_settings(
         ],
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
         "threads": list(threads),
+        "machine_profile": ACTIVE_MACHINE_CONFIG.name,
+        "machine_profile_env": PROFILE_ENV,
         "repeats": args.repeats,
         "build_missing": args.build_missing,
         "source": calibration.source,

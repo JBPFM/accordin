@@ -24,7 +24,6 @@ MAKE_ALL_SCRIPT = FLEXGUARD_DIR / "scripts" / "make_all.sh"
 PTHREAD_HOST_BINARY = FLEXGUARD_BUILD_DIR / "buckets_pthread_host"
 MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
-DEFAULT_ACCORDIN_K = "2"
 DEFAULT_THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
 DEFAULT_LOCKS = (
     "mcs",
@@ -1006,8 +1005,10 @@ def combine_ld_preload(preload_library: Path) -> str:
 
 def accordin_preload_env(preload_library: Path) -> dict[str, str]:
     env = {"LD_PRELOAD": combine_ld_preload(preload_library)}
-    if "ACCORDIN_CPU_MASK_K" not in os.environ and "K" not in os.environ:
-        env["K"] = DEFAULT_ACCORDIN_K
+    if "ACCORDIN_CPU_MASK_K" in os.environ:
+        env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
+    if "K" in os.environ:
+        env["K"] = os.environ["K"]
     return env
 
 

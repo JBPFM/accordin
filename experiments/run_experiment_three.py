@@ -126,7 +126,6 @@ BENCHMARK_LABELS = {
 ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
-DEFAULT_ACCORDIN_K = "2"
 BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
 ROOT_REQUIRED_PRELOAD_LOCKS = {"accordin", "mcs_accordin"}
 LOCK_ALIASES = {
@@ -439,8 +438,6 @@ def accordin_preload_env(preload_library: Path) -> dict[str, str]:
         env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
     if "K" in os.environ:
         env["K"] = os.environ["K"]
-    if "ACCORDIN_CPU_MASK_K" not in env and "K" not in env:
-        env["K"] = DEFAULT_ACCORDIN_K
     return env
 
 

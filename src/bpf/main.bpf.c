@@ -13,6 +13,13 @@ static __always_inline bool valid_cpu(s32 cpu) {
   return cpu >= 0 && cpu < MAX_CPUS;
 }
 
+static __always_inline bool task_cpu_allowed(struct task_struct *p, __u32 cpu) {
+  if (cpu >= MAX_CPUS)
+    return false;
+
+  return bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
+}
+
 static __always_inline __u64 inactive_dsq_id(__u32 cpu) {
   return INACTIVE_DSQ_BASE + cpu;
 }
@@ -140,22 +147,43 @@ static __always_inline bool grant_admission(struct task_struct *p,
   return true;
 }
 
-static __always_inline __u32 requested_cpu(struct task_struct *p,
-                                           struct task_scx_ctx *task_ctx,
-                                           s32 fallback_cpu) {
+static __always_inline __u32 pick_allowed_cpu(struct task_struct *p,
+                                              s32 fallback_cpu) {
   s32 cpu;
 
-  if (task_ctx->admission_cpu < MAX_CPUS)
-    return task_ctx->admission_cpu;
-
-  if (valid_cpu(fallback_cpu))
+  if (valid_cpu(fallback_cpu) && task_cpu_allowed(p, (__u32)fallback_cpu))
     return fallback_cpu;
 
   cpu = scx_bpf_task_cpu(p);
+  if (valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
+    return cpu;
+
+  cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
   if (valid_cpu(cpu))
     return cpu;
 
-  return 0;
+  cpu = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
+  if (valid_cpu(cpu))
+    return cpu;
+
+  return ADMISSION_CPU_NONE;
+}
+
+static __always_inline __u32 requested_cpu(struct task_struct *p,
+                                           struct task_scx_ctx *task_ctx,
+                                           s32 fallback_cpu) {
+  if (task_ctx->admission_cpu < MAX_CPUS &&
+      task_cpu_allowed(p, task_ctx->admission_cpu))
+    return task_ctx->admission_cpu;
+
+  return pick_allowed_cpu(p, fallback_cpu);
+}
+
+static __always_inline void clear_invalid_admission_cpu(
+    struct task_struct *p, struct task_scx_ctx *task_ctx) {
+  if (task_ctx->admission_cpu < MAX_CPUS &&
+      !task_cpu_allowed(p, task_ctx->admission_cpu))
+    release_admission(p, task_ctx);
 }
 
 static __always_inline bool slow_path_requested(
@@ -211,12 +239,15 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   if (task_ctx)
     have_user = read_user_ctx(p, task_ctx, &user_ctx);
 
+  if (task_ctx)
+    clear_invalid_admission_cpu(p, task_ctx);
+
   if (task_ctx && task_ctx->admission_cpu < MAX_CPUS &&
       (task_ctx->holds_admission || task_ctx->must_run_on_admission_cpu))
     return (s32)task_ctx->admission_cpu;
 
   if (task_ctx && slow_path_requested(task_ctx, have_user, &user_ctx) &&
-      valid_cpu(prev_cpu)) {
+      valid_cpu(prev_cpu) && task_cpu_allowed(p, (__u32)prev_cpu)) {
     task_ctx->admission_cpu = (__u32)prev_cpu;
     return prev_cpu;
   }
@@ -247,6 +278,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx);
 
+  clear_invalid_admission_cpu(p, task_ctx);
+
   if (should_release_from_user(task_ctx, have_user, &user_ctx))
     release_admission(p, task_ctx);
 
@@ -259,6 +292,10 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
   if (slow_path_requested(task_ctx, have_user, &user_ctx)) {
     cpu = requested_cpu(p, task_ctx, -1);
+    if (cpu >= MAX_CPUS) {
+      scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+      return;
+    }
     task_ctx->admission_cpu = cpu;
 
     if (grant_admission(p, task_ctx, cpu)) {

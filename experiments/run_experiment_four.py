@@ -37,6 +37,8 @@ PER_LOCK_MAX_THREADS = {
     "mcs": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
     "mcstp": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
     "mcs_extension": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
+    "malthusian": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
+    "reciprocating": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
 }
 
 RAW_FIELDS = (
@@ -142,7 +144,7 @@ Examples:
             "Comma-separated lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Use stock to run without interpose. "
-            "Aliases: mcs-tas == mcstas, mcs_tas_accordin == accordin."
+            "Aliases: mcs-tas == mcstas, accordin/mcs_accordin == mcs_tas_accordin."
         ),
     )
     parser.add_argument(
@@ -396,23 +398,19 @@ def ensure_lock_helpers(
     logger: experiment_three.CommandLogger,
 ) -> None:
     experiment_three.ensure_interpose_helpers(locks, build_missing=build_missing, logger=logger)
-    if "accordin" in locks:
+    if "mcs_tas_accordin" in locks:
         experiment_three.ensure_accordin_preload(build_missing=build_missing, logger=logger)
     if "mcs_extension" in locks:
         experiment_three.ensure_mcs_extension_preload(build_missing=build_missing, logger=logger)
-    if "mcs_accordin" in locks:
-        experiment_three.ensure_mcs_accordin_preload(build_missing=build_missing, logger=logger)
 
 
 def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str] | None]:
     if lock == "stock":
         return [], None
-    if lock == "accordin":
+    if lock == "mcs_tas_accordin":
         return [], accordin_preload_env(experiment_three.ACCORDIN_PRELOAD_LIBRARY)
     if lock == "mcs_extension":
         return [], preload_env(experiment_three.MCS_EXTENSION_PRELOAD_LIBRARY)
-    if lock == "mcs_accordin":
-        return [], accordin_preload_env(experiment_three.MCS_ACCORDIN_PRELOAD_LIBRARY)
     return experiment_three.interpose_command(lock)
 
 

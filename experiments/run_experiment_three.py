@@ -69,7 +69,9 @@ DEFAULT_LOCKS = (
     "mcs-tas",
     "mcs_extension",
     "flexguard",
-    "accordin",
+    "malthusian",
+    "reciprocating",
+    "mcs_tas_accordin",
 )
 DEFAULT_THREADS = DEFAULT_THREAD_COUNTS
 DEFAULT_REPEATS = 3
@@ -82,6 +84,13 @@ DEFAULT_STREAMCLUSTER_CHUNKSIZE = 32768
 DEFAULT_STREAMCLUSTER_CLUSTERSIZE = 2000
 DEFAULT_STREAMCLUSTER_INPUT = "none"
 MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
+PER_LOCK_MAX_THREADS = {
+    "mcs": 128,
+    "mcstp": 128,
+    "mcs_extension": 128,
+    "malthusian": 128,
+    "reciprocating": 128,
+}
 
 RAW_FIELDS = (
     "benchmark",
@@ -120,7 +129,6 @@ LOCK_LABELS = {
     "reciprocating": "Reciprocating",
     "accordin": "Accordin",
     "mcs_tas_accordin": "Accordin",
-    "mcs_accordin": "MCS Accordin",
 }
 BENCHMARK_LABELS = {
     "dedup": "PARSEC dedup",
@@ -128,15 +136,14 @@ BENCHMARK_LABELS = {
 }
 ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
-MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
-ROOT_REQUIRED_PRELOAD_LOCKS = {"accordin", "mcs_accordin"}
+ROOT_REQUIRED_PRELOAD_LOCKS = {"mcs_tas_accordin"}
 LOCK_ALIASES = {
-    "accordin": "accordin",
-    "mcs_tas_accordin": "accordin",
+    "accordin": "mcs_tas_accordin",
+    "mcs_tas_accordin": "mcs_tas_accordin",
     "mcs-tas": "mcstas",
     "mcs_extension": "mcs_extension",
-    "mcs_accordin": "mcs_accordin",
+    "mcs_accordin": "mcs_tas_accordin",
     "stock": "stock",
 }
 LOCK_ORDER = (
@@ -146,10 +153,14 @@ LOCK_ORDER = (
     "mcstas",
     "mcs_extension",
     "flexguard",
+    "malthusian",
+    "reciprocating",
     "mcs_tas_accordin",
     "accordin",
-    "reciprocating",
-    "mcs_accordin",
+)
+RESULT_LOG_PATTERN = re.compile(
+    rf"^(?P<benchmark>.+)_(?P<lock>{'|'.join(re.escape(lock) for lock in sorted(LOCK_ORDER, key=len, reverse=True))})_"
+    r"(?P<threads>\d+)_r(?P<repeat>\d+)\.log$"
 )
 
 
@@ -180,11 +191,21 @@ class CommandError(RuntimeError):
 
 
 class CommandLogger:
-    def __init__(self, result_root: Path) -> None:
+    def __init__(self, result_root: Path, *, resume: bool = False) -> None:
         self.result_root = result_root
         self.log_dir = result_root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.records: list[dict[str, object]] = []
+        self.records = self.load_records() if resume else []
+
+    def load_records(self) -> list[dict[str, object]]:
+        path = self.result_root / "commands.json"
+        if not path.is_file():
+            return []
+        with path.open("r", encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, list):
+            raise RuntimeError(f"commands.json is not a command-record list: {path}")
+        return records
 
     def run(
         self,
@@ -283,6 +304,7 @@ Default benchmark settings:
   streamcluster min/max={DEFAULT_STREAMCLUSTER_MIN_CENTERS}/{DEFAULT_STREAMCLUSTER_MAX_CENTERS}
   streamcluster dimensions={DEFAULT_STREAMCLUSTER_DIMENSIONS}, num-points={DEFAULT_STREAMCLUSTER_NUM_POINTS}
   streamcluster chunksize={DEFAULT_STREAMCLUSTER_CHUNKSIZE}, clustersize={DEFAULT_STREAMCLUSTER_CLUSTERSIZE}
+  per_lock_max_threads={','.join(f"{lock}:{max_threads}" for lock, max_threads in PER_LOCK_MAX_THREADS.items())}
 
 Examples:
   python3 experiments/run_experiment_three.py
@@ -310,6 +332,14 @@ Examples:
         help="Allow benchmark output into an existing non-empty output root.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an existing --output-root by parsing successful logs in commands.json, "
+            "skipping completed points, and appending new command records."
+        ),
+    )
+    parser.add_argument(
         "--build-missing",
         action="store_true",
         help="Build missing interpose helpers or PARSEC binaries before running.",
@@ -331,7 +361,7 @@ Examples:
             "Comma-separated lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Use stock to run without interpose. "
-            "Aliases: mcs-tas == mcstas, mcs_tas_accordin == accordin."
+            "Aliases: mcs-tas == mcstas, accordin/mcs_accordin == mcs_tas_accordin."
         ),
     )
     parser.add_argument(
@@ -479,10 +509,10 @@ def default_result_root() -> Path:
     return REPO_ROOT / "experiments" / "results" / f"experiment3_{timestamp}"
 
 
-def ensure_output_root(path: Path, force: bool) -> None:
+def ensure_output_root(path: Path, force: bool, resume: bool = False) -> None:
     if path.exists() and not path.is_dir():
         raise RuntimeError(f"Output root exists but is not a directory: {path}")
-    if path.exists() and any(path.iterdir()) and not force:
+    if path.exists() and any(path.iterdir()) and not force and not resume:
         raise RuntimeError(f"Output root already exists and is not empty: {path}. Use --force to write there.")
     path.mkdir(parents=True, exist_ok=True)
 
@@ -499,6 +529,13 @@ def lock_sort_key(lock: str) -> tuple[int, str]:
     if lock in LOCK_ORDER:
         return (LOCK_ORDER.index(lock), lock)
     return (len(LOCK_ORDER), lock)
+
+
+def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:
+    max_threads = PER_LOCK_MAX_THREADS.get(lock)
+    if max_threads is None:
+        return threads
+    return tuple(thread for thread in threads if thread <= max_threads)
 
 
 def benchmark_binary_path(benchmark: str) -> Path:
@@ -588,7 +625,7 @@ def interpose_helper_error(lock: str) -> str | None:
 def invalid_interpose_helpers(locks: Iterable[str]) -> list[str]:
     invalid: list[str] = []
     for lock in locks:
-        if lock in {"stock", "accordin", "mcs_extension", "mcs_accordin"}:
+        if lock in {"stock", "mcs_tas_accordin", "mcs_extension"}:
             continue
         error = interpose_helper_error(lock)
         if error is not None:
@@ -638,28 +675,6 @@ def ensure_mcs_extension_preload(
     )
     if not MCS_EXTENSION_PRELOAD_LIBRARY.is_file():
         raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_EXTENSION_PRELOAD_LIBRARY}")
-
-
-def ensure_mcs_accordin_preload(
-    *,
-    build_missing: bool,
-    logger: CommandLogger,
-) -> None:
-    if MCS_ACCORDIN_PRELOAD_LIBRARY.is_file():
-        return
-    if not build_missing:
-        raise RuntimeError(
-            f"LD_PRELOAD helper is missing: {MCS_ACCORDIN_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_accordin --release or rerun with --build-missing."
-        )
-
-    logger.run(
-        ["cargo", "build", "-p", "mcs_accordin", "--release"],
-        log_name="build_mcs_accordin.log",
-        cwd=REPO_ROOT,
-    )
-    if not MCS_ACCORDIN_PRELOAD_LIBRARY.is_file():
-        raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_ACCORDIN_PRELOAD_LIBRARY}")
 
 
 def ensure_interpose_helpers(
@@ -856,6 +871,8 @@ def write_settings(
         ],
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
         "threads": list(threads),
+        "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
+        "per_lock_max_threads": PER_LOCK_MAX_THREADS,
         "machine_profile": ACTIVE_MACHINE_CONFIG.name,
         "machine_profile_env": PROFILE_ENV,
         "repeats": args.repeats,
@@ -930,12 +947,10 @@ def build_dedup_command(
 ) -> tuple[list[str], dict[str, str] | None]:
     cmd: list[str] = []
     if lock != "stock":
-        if lock == "accordin":
+        if lock == "mcs_tas_accordin":
             env = accordin_preload_env(ACCORDIN_PRELOAD_LIBRARY)
         elif lock == "mcs_extension":
             env = {"LD_PRELOAD": combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)}
-        elif lock == "mcs_accordin":
-            env = accordin_preload_env(MCS_ACCORDIN_PRELOAD_LIBRARY)
         else:
             cmd, env = interpose_command(lock)
     else:
@@ -964,12 +979,10 @@ def build_streamcluster_command(
 ) -> tuple[list[str], dict[str, str] | None]:
     cmd: list[str] = []
     if lock != "stock":
-        if lock == "accordin":
+        if lock == "mcs_tas_accordin":
             env = accordin_preload_env(ACCORDIN_PRELOAD_LIBRARY)
         elif lock == "mcs_extension":
             env = {"LD_PRELOAD": combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)}
-        elif lock == "mcs_accordin":
-            env = accordin_preload_env(MCS_ACCORDIN_PRELOAD_LIBRARY)
         else:
             cmd, env = interpose_command(lock)
     else:
@@ -989,6 +1002,100 @@ def build_streamcluster_command(
         ]
     )
     return benchmark_command(lock, cmd, env)
+
+
+def parse_result_log_name(log_path: Path) -> tuple[str, str, int, int] | None:
+    match = RESULT_LOG_PATTERN.match(log_path.name)
+    if match is None:
+        return None
+    return (
+        match.group("benchmark"),
+        match.group("lock"),
+        int(match.group("threads")),
+        int(match.group("repeat")),
+    )
+
+
+def target_keys(
+    *,
+    benchmarks: tuple[str, ...],
+    locks: tuple[str, ...],
+    threads: tuple[int, ...],
+    repeats: int,
+) -> list[tuple[str, str, int, int]]:
+    return [
+        (benchmark, lock, thread, repeat)
+        for benchmark in benchmarks
+        for lock in locks
+        for thread in runnable_threads_for_lock(lock, threads)
+        for repeat in range(1, repeats + 1)
+    ]
+
+
+def row_from_completed_record(
+    result_root: Path,
+    record: dict[str, object],
+    calibration: TscCalibration,
+) -> tuple[tuple[str, str, int, int], dict[str, str]] | None:
+    if record.get("returncode") != 0:
+        return None
+    log_path_text = record.get("log_path")
+    if not isinstance(log_path_text, str):
+        return None
+    log_path = Path(log_path_text)
+    identity = parse_result_log_name(log_path)
+    if identity is None or not log_path.is_file():
+        return None
+
+    benchmark, lock, threads, repeat = identity
+    output = log_path.read_text(encoding="utf-8", errors="replace")
+    parsed = parse_benchmark_output(output)
+    setup_time_ms = cycles_to_ms(parsed.setup_cycles, calibration)
+    run_time_ms = cycles_to_ms(parsed.benchmark_cycles, calibration)
+
+    wall_value = record.get("wall_seconds")
+    wall_seconds = float(wall_value) if isinstance(wall_value, (int, float)) else parse_log_wall_seconds(output)
+    if run_time_ms is None:
+        run_time_ms = wall_seconds * 1000.0
+
+    key = (benchmark, lock, threads, repeat)
+    return key, {
+        "benchmark": benchmark,
+        "lock": lock,
+        "threads": str(threads),
+        "repeat": str(repeat),
+        "setup_cycles": str(parsed.setup_cycles),
+        "benchmark_cycles": str(parsed.benchmark_cycles),
+        "setup_time_ms": "" if setup_time_ms is None else format_float(setup_time_ms),
+        "run_time_ms": format_float(run_time_ms),
+        "wall_seconds": format_float(wall_seconds),
+        "command_log": str(log_path.relative_to(result_root)),
+    }
+
+
+def parse_log_wall_seconds(output: str) -> float:
+    for line in reversed(output.splitlines()):
+        if line.startswith("wall_seconds:"):
+            return float(line.split(":", 1)[1].strip())
+    raise RuntimeError("Completed log did not contain wall_seconds.")
+
+
+def completed_rows_from_records(
+    result_root: Path,
+    records: list[dict[str, object]],
+    calibration: TscCalibration,
+    ordered_targets: list[tuple[str, str, int, int]],
+) -> list[dict[str, str]]:
+    target_set = set(ordered_targets)
+    rows_by_key: dict[tuple[str, str, int, int], dict[str, str]] = {}
+    for record in records:
+        completed = row_from_completed_record(result_root, record, calibration)
+        if completed is None:
+            continue
+        key, row = completed
+        if key in target_set:
+            rows_by_key[key] = row
+    return [rows_by_key[key] for key in ordered_targets if key in rows_by_key]
 
 
 def temp_output_path(
@@ -1024,13 +1131,25 @@ def run_benchmarks(
     calibration: TscCalibration,
     args: argparse.Namespace,
     logger: CommandLogger,
+    existing_rows: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, str]] = list(existing_rows or [])
+    completed_keys = {
+        (row["benchmark"], row["lock"], int(row["threads"]), int(row["repeat"]))
+        for row in rows
+    }
 
     for benchmark in benchmarks:
         for lock in locks:
-            for thread in threads:
+            for thread in runnable_threads_for_lock(lock, threads):
                 for repeat in range(1, args.repeats + 1):
+                    key = (benchmark, lock, thread, repeat)
+                    if key in completed_keys:
+                        print(
+                            f"Skipping completed {benchmark}/{lock}/{thread}/r{repeat}",
+                            flush=True,
+                        )
+                        continue
                     output_path = temp_output_path(
                         result_root,
                         benchmark=benchmark,
@@ -1272,6 +1391,12 @@ def main() -> int:
         if args.output_root is not None and args.plot_only is not None:
             print("--output-root cannot be used together with --plot-only.", file=sys.stderr)
             return 2
+        if args.resume and args.plot_only is not None:
+            print("--resume cannot be used together with --plot-only.", file=sys.stderr)
+            return 2
+        if args.resume and args.output_root is None:
+            print("--resume requires --output-root.", file=sys.stderr)
+            return 2
         if args.streamcluster_min_centers > args.streamcluster_max_centers:
             print("--streamcluster-min-centers cannot be greater than --streamcluster-max-centers.", file=sys.stderr)
             return 2
@@ -1300,15 +1425,13 @@ def main() -> int:
             return 0
 
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
-        ensure_output_root(result_root, args.force)
-        logger = CommandLogger(result_root)
+        ensure_output_root(result_root, args.force, args.resume)
+        logger = CommandLogger(result_root, resume=args.resume)
         ensure_interpose_helpers(locks, build_missing=args.build_missing, logger=logger)
-        if "accordin" in locks:
+        if "mcs_tas_accordin" in locks:
             ensure_accordin_preload(build_missing=args.build_missing, logger=logger)
         if "mcs_extension" in locks:
             ensure_mcs_extension_preload(build_missing=args.build_missing, logger=logger)
-        if "mcs_accordin" in locks:
-            ensure_mcs_accordin_preload(build_missing=args.build_missing, logger=logger)
         ensure_parsec_binaries(benchmarks, build_missing=args.build_missing, logger=logger)
         if "dedup" in benchmarks:
             ensure_dedup_input(dedup_input)
@@ -1324,6 +1447,17 @@ def main() -> int:
             calibration=calibration,
             args=args,
         )
+        ordered_targets = target_keys(
+            benchmarks=benchmarks,
+            locks=locks,
+            threads=threads,
+            repeats=args.repeats,
+        )
+        existing_rows = (
+            completed_rows_from_records(result_root, logger.records, calibration, ordered_targets)
+            if args.resume
+            else []
+        )
         raw_rows = run_benchmarks(
             result_root,
             benchmarks=benchmarks,
@@ -1334,6 +1468,7 @@ def main() -> int:
             calibration=calibration,
             args=args,
             logger=logger,
+            existing_rows=existing_rows,
         )
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)

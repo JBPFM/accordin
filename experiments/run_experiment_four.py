@@ -33,10 +33,6 @@ DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
 DEFAULT_INIT_EXISTING_BENCHMARKS = ("readrandom", "readseq", "overwrite")
-DEFAULT_JEMALLOC_CANDIDATES = (
-    Path("/usr/local/lib/libjemalloc.so.2"),
-    Path("/lib/x86_64-linux-gnu/libjemalloc.so.2"),
-)
 PER_LOCK_MAX_THREADS = {
     "mcs": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
     "mcstp": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
@@ -100,7 +96,6 @@ Default benchmark settings:
   db_bench={DEFAULT_DB_BENCH}
   fill_benchmark={DEFAULT_FILL_BENCHMARK}
   init_existing_benchmarks={','.join(DEFAULT_INIT_EXISTING_BENCHMARKS)}
-  jemalloc=auto; disabled when FlexGuard pthread interpose locks are present, otherwise first existing candidate from {','.join(str(path) for path in DEFAULT_JEMALLOC_CANDIDATES)}
   per_lock_max_threads={','.join(f"{lock}:{max_threads}" for lock, max_threads in PER_LOCK_MAX_THREADS.items())}
 
 Examples:
@@ -212,17 +207,6 @@ Examples:
             f"Default: {','.join(DEFAULT_INIT_EXISTING_BENCHMARKS)}."
         ),
     )
-    parser.add_argument(
-        "--jemalloc-library",
-        default=None,
-        metavar="PATH",
-        help=(
-            "jemalloc library to LD_PRELOAD for LevelDB runs. "
-            "Default: disabled when FlexGuard pthread interpose locks are present; otherwise first existing candidate from "
-            f"{','.join(str(path) for path in DEFAULT_JEMALLOC_CANDIDATES)}. "
-            "Use none to disable."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -251,60 +235,30 @@ def resolve_path(path: Path) -> Path:
     return experiment_three.resolve_path(path)
 
 
-def validate_jemalloc_library(path: Path) -> Path:
-    resolved = resolve_path(path)
-    if not resolved.is_file():
-        raise RuntimeError(
-            f"jemalloc is enabled, but the library was not found: {resolved}. "
-            "Use --jemalloc-library PATH or --jemalloc-library none."
-        )
-    if not os.access(resolved, os.R_OK):
-        raise RuntimeError(
-            f"jemalloc is enabled, but the library is not readable: {resolved}. "
-            "Use --jemalloc-library PATH or --jemalloc-library none."
-        )
-    return resolved
-
-
-def resolve_jemalloc_library(value: str | None) -> Path | None:
-    if value is not None:
-        stripped = value.strip()
-        if stripped.lower() == "none":
-            return None
-        if not stripped:
-            raise RuntimeError("--jemalloc-library must be a path or none.")
-        return validate_jemalloc_library(Path(stripped))
-
-    for candidate in DEFAULT_JEMALLOC_CANDIDATES:
-        if candidate.exists():
-            return validate_jemalloc_library(candidate)
-
-    candidates = ", ".join(str(path) for path in DEFAULT_JEMALLOC_CANDIDATES)
-    raise RuntimeError(
-        "jemalloc is enabled by default, but no candidate library was found. "
-        f"Checked: {candidates}. Use --jemalloc-library PATH or --jemalloc-library none."
-    )
-
-
-def uses_flexguard_pthread_interpose(locks: tuple[str, ...]) -> bool:
-    preload_only_locks = {"stock", "accordin", "mcs_extension", "mcs_accordin"}
-    return any(lock not in preload_only_locks for lock in locks)
+def existing_ld_preload_entries() -> tuple[str, ...]:
+    existing = os.environ.get("LD_PRELOAD", "").strip()
+    if not existing:
+        return ()
+    return tuple(entry for entry in existing.split(":") if entry)
 
 
 def merge_ld_preload_entries(*libraries: Path | None) -> str | None:
     entries = [str(library) for library in libraries if library is not None]
+    entries.extend(existing_ld_preload_entries())
     return ":".join(entries) if entries else None
 
 
-def preload_env(*libraries: Path | None) -> dict[str, str]:
+def preload_env(*libraries: Path | None) -> dict[str, str] | None:
     ld_preload = merge_ld_preload_entries(*libraries)
     if ld_preload is None:
-        return {"LD_PRELOAD": ""}
+        return None
     return {"LD_PRELOAD": ld_preload}
 
 
-def accordin_preload_env(preload_library: Path, jemalloc_library: Path | None) -> dict[str, str]:
-    env = preload_env(preload_library, jemalloc_library)
+def accordin_preload_env(preload_library: Path) -> dict[str, str]:
+    env = preload_env(preload_library)
+    if env is None:
+        env = {}
     if "ACCORDIN_CPU_MASK_K" in os.environ:
         env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
     if "K" in os.environ:
@@ -450,16 +404,16 @@ def ensure_lock_helpers(
         experiment_three.ensure_mcs_accordin_preload(build_missing=build_missing, logger=logger)
 
 
-def lock_command_prefix(lock: str, jemalloc_library: Path | None) -> tuple[list[str], dict[str, str] | None]:
+def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str] | None]:
     if lock == "stock":
-        return [], preload_env(jemalloc_library)
+        return [], None
     if lock == "accordin":
-        return [], accordin_preload_env(experiment_three.ACCORDIN_PRELOAD_LIBRARY, jemalloc_library)
+        return [], accordin_preload_env(experiment_three.ACCORDIN_PRELOAD_LIBRARY)
     if lock == "mcs_extension":
-        return [], preload_env(experiment_three.MCS_EXTENSION_PRELOAD_LIBRARY, jemalloc_library)
+        return [], preload_env(experiment_three.MCS_EXTENSION_PRELOAD_LIBRARY)
     if lock == "mcs_accordin":
-        return [], accordin_preload_env(experiment_three.MCS_ACCORDIN_PRELOAD_LIBRARY, jemalloc_library)
-    return experiment_three.interpose_command(lock, env=preload_env(jemalloc_library))
+        return [], accordin_preload_env(experiment_three.MCS_ACCORDIN_PRELOAD_LIBRARY)
+    return experiment_three.interpose_command(lock)
 
 
 def build_db_bench_args(
@@ -494,10 +448,9 @@ def build_measured_command(
     threads: int,
     num: int,
     use_existing_db: bool,
-    jemalloc_library: Path | None,
     reads: int | None = None,
 ) -> tuple[list[str], dict[str, str] | None]:
-    cmd, env = lock_command_prefix(lock, jemalloc_library)
+    cmd, env = lock_command_prefix(lock)
     cmd.extend(
         build_db_bench_args(
             db_bench=db_bench,
@@ -574,11 +527,9 @@ def run_benchmarks(
     fill_benchmark: str,
     init_existing_benchmarks: tuple[str, ...],
     logger: experiment_three.CommandLogger,
-    jemalloc_library: Path | None,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     init_benchmarks = set(init_existing_benchmarks)
-    init_env = preload_env(jemalloc_library)
 
     for benchmark in benchmarks:
         use_existing_db = benchmark in init_benchmarks
@@ -611,7 +562,6 @@ def run_benchmarks(
                                     f"{thread:03d}_r{repeat}.log"
                                 ),
                                 cwd=REPO_ROOT,
-                                env=init_env,
                             )
 
                         cmd, env = build_measured_command(
@@ -623,7 +573,6 @@ def run_benchmarks(
                             num=db_bench_num,
                             reads=reads_per_thread,
                             use_existing_db=use_existing_db,
-                            jemalloc_library=jemalloc_library,
                         )
                         result = logger.run(
                             cmd,
@@ -679,7 +628,6 @@ def write_settings(
     fill_benchmark: str,
     init_existing_benchmarks: tuple[str, ...],
     build_missing: bool,
-    jemalloc_library: Path | None,
 ) -> None:
     settings = {
         "benchmarks": [{"key": benchmark, "label": benchmark_label(benchmark)} for benchmark in benchmarks],
@@ -700,10 +648,6 @@ def write_settings(
         "leveldb_version": LEVELDB_VERSION if leveldb_dir == DEFAULT_LEVELDB_DIR else "custom",
         "fill_benchmark": fill_benchmark,
         "init_existing_benchmarks": list(init_existing_benchmarks),
-        "jemalloc": {
-            "enabled": jemalloc_library is not None,
-            "library": None if jemalloc_library is None else str(jemalloc_library),
-        },
         "flexguard_dir": str(FLEXGUARD_DIR),
         "machine_core_count": experiment_three.MACHINE_CORE_COUNT,
     }
@@ -918,10 +862,6 @@ def main() -> int:
             print_outputs(result_root, raw_path, summary_path, plot_paths)
             return 0
 
-        if args.jemalloc_library is None and uses_flexguard_pthread_interpose(locks):
-            jemalloc_library = None
-        else:
-            jemalloc_library = resolve_jemalloc_library(args.jemalloc_library)
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         experiment_three.ensure_output_root(result_root, args.force)
         logger = experiment_three.CommandLogger(result_root)
@@ -942,7 +882,6 @@ def main() -> int:
             fill_benchmark=fill_benchmark,
             init_existing_benchmarks=init_existing_benchmarks,
             build_missing=args.build_missing,
-            jemalloc_library=jemalloc_library,
         )
         raw_rows = run_benchmarks(
             result_root,
@@ -956,7 +895,6 @@ def main() -> int:
             fill_benchmark=fill_benchmark,
             init_existing_benchmarks=init_existing_benchmarks,
             logger=logger,
-            jemalloc_library=jemalloc_library,
         )
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)

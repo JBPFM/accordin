@@ -2,12 +2,11 @@ use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
+use crate::admission::{
+    mark_critical_section_entered, mark_critical_section_exit, mark_slow_path_pending,
+};
 use crate::arch::pause;
 use crate::lock_backend::LockBackend;
-use crate::lock_stats::{
-    ADMISSION_CPU_NONE, clear_admission_state, grant_slow_path_admission,
-    mark_critical_section_entered, mark_slow_path_pending, thread_has_admission,
-};
 
 // we remove sample cause in some high contention env wait can occupy full timeslice
 // or we can reserve a fast path in low contention
@@ -67,29 +66,9 @@ impl McsTasLockRaw {
     }
 
     #[inline(always)]
-    fn current_cpu() -> u32 {
-        let cpu = unsafe { libc::sched_getcpu() };
-        assert!(
-            cpu >= 0,
-            "sched_getcpu failed while caching slow-path admission"
-        );
-        let cpu = cpu as u32;
-        assert!(
-            cpu != ADMISSION_CPU_NONE,
-            "current CPU collided with admission sentinel"
-        );
-        cpu
-    }
-
-    #[inline(always)]
     fn ensure_slow_path_admission(&self) {
         mark_slow_path_pending();
-        if thread_has_admission() {
-            return;
-        }
-
         std::thread::yield_now();
-        grant_slow_path_admission(Self::current_cpu());
     }
 
     #[cfg_attr(feature = "perf-symbols", inline(never))]
@@ -172,7 +151,7 @@ impl McsTasLockRaw {
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock_fast(&self) {
         self.locked.0.store(false, Ordering::Release);
-        clear_admission_state();
+        mark_critical_section_exit();
     }
 }
 
@@ -199,36 +178,10 @@ impl LockBackend for McsTasLockRaw {
 #[cfg(test)]
 mod tests {
     use super::Node;
-    use crate::bpf_intf;
-    use crate::lock_stats::{ADMISSION_CPU_NONE, clear_admission_state, thread_ctx};
 
     #[test]
     fn node_layout_stays_cache_aligned() {
         assert_eq!(std::mem::size_of::<Node>(), 64);
         assert_eq!(std::mem::align_of::<Node>(), 64);
-    }
-
-    #[test]
-    fn thread_ctx_layout_matches_bindgen_contract() {
-        assert_eq!(
-            std::mem::size_of::<crate::lock_stats::LockSchedThreadCtx>(),
-            std::mem::size_of::<bpf_intf::lock_sched_thread_ctx>(),
-        );
-        assert_eq!(
-            std::mem::align_of::<crate::lock_stats::LockSchedThreadCtx>(),
-            std::mem::align_of::<bpf_intf::lock_sched_thread_ctx>(),
-        );
-    }
-
-    #[test]
-    fn clearing_admission_restores_sentinel_cpu() {
-        clear_admission_state();
-        unsafe {
-            let ctx = &*thread_ctx();
-            assert_eq!(ctx.admission_owned, 0);
-            assert_eq!(ctx.admission_cpu, ADMISSION_CPU_NONE);
-            assert_eq!(ctx.in_critical_section, 0);
-            assert_eq!(ctx.slow_path_pending, 0);
-        }
     }
 }

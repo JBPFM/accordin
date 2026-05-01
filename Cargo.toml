@@ -18,7 +18,6 @@ members = [
     "src/mcs_tse",
     "src/ttas_accordin",
     "src/reciprocating_accordin",
-    "src/libflexguard",
 ]
 default-members = [
     ".",
@@ -28,7 +27,6 @@ default-members = [
     "src/mcs_tse",
     "src/ttas_accordin",
     "src/reciprocating_accordin",
-    "src/libflexguard",
 ]
 exclude = ["bench/mutexbench_rust"]
 

@@ -6,6 +6,7 @@ pub use lb_shared::arch;
 pub mod bpf_intf {
     include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"));
 }
+pub use lb_shared::admission;
 pub use lb_shared::lock_backend;
 pub use lb_shared::lock_stats;
 mod mutex_hook;
@@ -45,7 +46,7 @@ fn init_scheduler(debug: bool, _stats_only: bool, _debug_counters: bool) -> Resu
     let mut skel = scx_ops_load!(skel, accordin_ops, uei)?;
 
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
-    mutex_hook::set_thread_ctx_map(thread_ctx_map);
+    lb_shared::mutex_hook::set_thread_ctx_map(thread_ctx_map);
 
     let link = scx_ops_attach!(skel, accordin_ops)?;
 

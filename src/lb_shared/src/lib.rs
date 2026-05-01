@@ -1,6 +1,8 @@
 #[path = "../../arch.rs"]
 pub mod arch;
 
+pub mod admission;
+
 pub mod cpu_affinity;
 
 #[path = "../../lock_backend.rs"]

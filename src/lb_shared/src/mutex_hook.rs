@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+use std::sync::OnceLock;
+
+use libbpf_rs::{MapCore, MapFlags, MapHandle};
+
 pub trait MutexHookBackend {
     type LockState;
 
@@ -9,19 +13,73 @@ pub trait MutexHookBackend {
     fn unlock(state: &Self::LockState);
 }
 
-pub trait ThreadRegistration {
-    fn register_current_thread() -> bool;
-    fn unregister_current_thread();
-}
+static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
 
 #[inline(always)]
 pub fn current_tid() -> u32 {
     unsafe { libc::syscall(libc::SYS_gettid) as u32 }
 }
 
+pub fn set_thread_ctx_map(map: MapHandle) {
+    let _ = THREAD_CTX_MAP.set(map);
+}
+
+trait ThreadCtxMapOps {
+    fn update_entry(&self, key: &[u8], value: &[u8], flags: MapFlags) -> bool;
+    fn delete_entry(&self, key: &[u8]) -> bool;
+}
+
+impl ThreadCtxMapOps for MapHandle {
+    fn update_entry(&self, key: &[u8], value: &[u8], flags: MapFlags) -> bool {
+        self.update(key, value, flags).is_ok()
+    }
+
+    fn delete_entry(&self, key: &[u8]) -> bool {
+        self.delete(key).is_ok()
+    }
+}
+
+fn register_thread_ctx_with_map<M>(map: &M, tid: u32, admission_word_ptr: u64) -> bool
+where
+    M: ThreadCtxMapOps + ?Sized,
+{
+    map.update_entry(
+        &tid.to_ne_bytes(),
+        &admission_word_ptr.to_ne_bytes(),
+        MapFlags::ANY,
+    )
+}
+
+fn unregister_thread_ctx_with_map<M>(map: &M, tid: u32) -> bool
+where
+    M: ThreadCtxMapOps + ?Sized,
+{
+    map.delete_entry(&tid.to_ne_bytes())
+}
+
+#[doc(hidden)]
+pub fn register_current_thread() -> bool {
+    let Some(map) = THREAD_CTX_MAP.get() else {
+        return false;
+    };
+
+    let tid = current_tid();
+    let admission_word_ptr = crate::admission::user_word_addr() as u64;
+    register_thread_ctx_with_map(map, tid, admission_word_ptr)
+}
+
+#[doc(hidden)]
+pub fn unregister_current_thread() {
+    let Some(map) = THREAD_CTX_MAP.get() else {
+        return;
+    };
+
+    let _ = unregister_thread_ctx_with_map(map, current_tid());
+}
+
 #[macro_export]
 macro_rules! export_mutex_hooks {
-    ($backend:ty, $thread_registration:ty) => {
+    ($backend:ty) => {
         mod exported_mutex_hooks {
             use std::cell::{Cell, UnsafeCell};
             use std::hint::spin_loop;
@@ -31,10 +89,9 @@ macro_rules! export_mutex_hooks {
                 record_hold_end_sample, record_lock_acquired, record_post_unlock,
                 record_thread_start, record_wait_end, record_wait_start,
             };
-            use $crate::mutex_hook::{MutexHookBackend, ThreadRegistration};
+            use $crate::mutex_hook::MutexHookBackend;
 
             type Backend = $backend;
-            type Registration = $thread_registration;
 
             struct HookState {
                 lock: <Backend as MutexHookBackend>::LockState,
@@ -56,7 +113,7 @@ macro_rules! export_mutex_hooks {
             impl Drop for ThreadCtxGuard {
                 fn drop(&mut self) {
                     $crate::lock_stats::flush_current_thread_stats();
-                    Registration::unregister_current_thread();
+                    $crate::mutex_hook::unregister_current_thread();
                 }
             }
 
@@ -72,7 +129,7 @@ macro_rules! export_mutex_hooks {
                 REGISTERED.with(|registered| {
                     if !registered.get() {
                         record_thread_start();
-                        let _ = Registration::register_current_thread();
+                        let _ = $crate::mutex_hook::register_current_thread();
                         _GUARD.with(|guard| unsafe { *guard.get() = Some(ThreadCtxGuard) });
                         registered.set(true);
                     }
@@ -517,4 +574,84 @@ macro_rules! export_mutex_hooks {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use libbpf_rs::MapFlags;
+
+    use super::{ThreadCtxMapOps, register_thread_ctx_with_map, unregister_thread_ctx_with_map};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum MapCall {
+        Update {
+            key: Vec<u8>,
+            value: Vec<u8>,
+            flags: MapFlags,
+        },
+        Delete {
+            key: Vec<u8>,
+        },
+    }
+
+    #[derive(Default)]
+    struct RecordingMap {
+        calls: RefCell<Vec<MapCall>>,
+    }
+
+    impl ThreadCtxMapOps for RecordingMap {
+        fn update_entry(&self, key: &[u8], value: &[u8], flags: MapFlags) -> bool {
+            self.calls.borrow_mut().push(MapCall::Update {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                flags,
+            });
+            true
+        }
+
+        fn delete_entry(&self, key: &[u8]) -> bool {
+            self.calls
+                .borrow_mut()
+                .push(MapCall::Delete { key: key.to_vec() });
+            true
+        }
+    }
+
+    impl RecordingMap {
+        fn calls(&self) -> Vec<MapCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn register_thread_ctx_uses_map_helper_update() {
+        let map = RecordingMap::default();
+
+        assert!(register_thread_ctx_with_map(&map, 7, 0x1122_3344_5566_7788,));
+
+        assert_eq!(
+            map.calls(),
+            vec![MapCall::Update {
+                key: 7u32.to_ne_bytes().to_vec(),
+                value: 0x1122_3344_5566_7788u64.to_ne_bytes().to_vec(),
+                flags: MapFlags::ANY,
+            }]
+        );
+    }
+
+    #[test]
+    fn unregister_thread_ctx_uses_map_helper_delete() {
+        let map = RecordingMap::default();
+
+        assert!(unregister_thread_ctx_with_map(&map, 11));
+
+        assert_eq!(
+            map.calls(),
+            vec![MapCall::Delete {
+                key: 11u32.to_ne_bytes().to_vec(),
+            }]
+        );
+    }
 }

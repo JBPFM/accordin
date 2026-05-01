@@ -98,23 +98,28 @@ static __always_inline bool refresh_user_ctx_ptr(struct task_struct *p,
 
 static __always_inline bool read_user_ctx(struct task_struct *p,
                                           struct task_scx_ctx *task_ctx,
-                                          struct lock_sched_thread_ctx *user_ctx) {
+                                          __u32 *user_ctx_word) {
   if (!refresh_user_ctx_ptr(p, task_ctx))
     return false;
 
-  if (bpf_probe_read_user(user_ctx, sizeof(*user_ctx),
+  if (bpf_probe_read_user(user_ctx_word, sizeof(*user_ctx_word),
                           (const void *)(unsigned long)task_ctx->user_ctx_ptr))
     return false;
 
-  task_ctx->slow_path_pending = user_ctx->slow_path_pending;
-  task_ctx->in_critical_section = user_ctx->in_critical_section;
   return true;
 }
 
-static __always_inline bool user_explicit_release(
-    const struct lock_sched_thread_ctx *user_ctx) {
-  return !user_ctx->admission_owned && !user_ctx->slow_path_pending &&
-         !user_ctx->in_critical_section;
+static __always_inline bool user_slow_path_pending(__u32 user_ctx_word) {
+  return user_ctx_word & USER_ADMISSION_SLOW_PATH_PENDING;
+}
+
+static __always_inline bool user_in_critical_section(__u32 user_ctx_word) {
+  return user_ctx_word & USER_ADMISSION_IN_CRITICAL_SECTION;
+}
+
+static __always_inline bool user_explicit_release(__u32 user_ctx_word) {
+  return !user_slow_path_pending(user_ctx_word) &&
+         !user_in_critical_section(user_ctx_word);
 }
 
 static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx) {
@@ -122,8 +127,6 @@ static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx)
   task_ctx->holds_admission = 0;
   task_ctx->must_run_on_admission_cpu = 0;
   task_ctx->inactive_wait = 0;
-  task_ctx->slow_path_pending = 0;
-  task_ctx->in_critical_section = 0;
   task_ctx->admission_cpu = ADMISSION_CPU_NONE;
 }
 
@@ -205,33 +208,30 @@ static __always_inline void clear_invalid_admission_cpu(
 }
 
 static __always_inline bool slow_path_requested(
-    const struct task_scx_ctx *task_ctx, bool have_user,
-    const struct lock_sched_thread_ctx *user_ctx) {
+    const struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
   if (task_ctx->holds_admission)
     return false;
 
   if (have_user)
-    return user_ctx->slow_path_pending;
+    return user_slow_path_pending(user_ctx_word);
 
-  return task_ctx->slow_path_pending;
+  return false;
 }
 
 static __always_inline bool should_release_from_user(
-    const struct task_scx_ctx *task_ctx, bool have_user,
-    const struct lock_sched_thread_ctx *user_ctx) {
+    const struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
   if (!task_ctx->holds_admission || !have_user)
     return false;
 
-  return user_explicit_release(user_ctx);
+  return user_explicit_release(user_ctx_word);
 }
 
 static __always_inline bool task_in_critical_section(
-    const struct task_scx_ctx *task_ctx, bool have_user,
-    const struct lock_sched_thread_ctx *user_ctx) {
+    const struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
   if (have_user)
-    return user_ctx->in_critical_section;
+    return user_in_critical_section(user_ctx_word);
 
-  return task_ctx->in_critical_section;
+  return false;
 }
 
 static __always_inline void protect_critical_section(struct task_struct *p,
@@ -253,7 +253,7 @@ static __always_inline void protect_critical_section(struct task_struct *p,
 
 static __always_inline void refresh_running_state(struct task_struct *p) {
   struct task_scx_ctx *task_ctx;
-  struct lock_sched_thread_ctx user_ctx = {};
+  __u32 user_ctx_word = 0;
   bool have_user = false;
   __u32 cpu = bpf_get_smp_processor_id();
 
@@ -261,8 +261,8 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
   if (!task_ctx)
     return;
 
-  have_user = read_user_ctx(p, task_ctx, &user_ctx);
-  if (should_release_from_user(task_ctx, have_user, &user_ctx)) {
+  have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
+  if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
     return;
   }
@@ -274,14 +274,14 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
 s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
   struct task_scx_ctx *task_ctx;
-  struct lock_sched_thread_ctx user_ctx = {};
+  __u32 user_ctx_word = 0;
   bool is_idle = false;
   bool have_user = false;
   s32 cpu;
 
   task_ctx = get_task_ctx(p);
   if (task_ctx)
-    have_user = read_user_ctx(p, task_ctx, &user_ctx);
+    have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
 
   if (task_ctx)
     clear_invalid_admission_cpu(p, task_ctx);
@@ -290,7 +290,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
       (task_ctx->holds_admission || task_ctx->must_run_on_admission_cpu))
     return (s32)task_ctx->admission_cpu;
 
-  if (task_ctx && slow_path_requested(task_ctx, have_user, &user_ctx) &&
+  if (task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word) &&
       valid_cpu(prev_cpu) && task_cpu_allowed(p, (__u32)prev_cpu)) {
     task_ctx->admission_cpu = (__u32)prev_cpu;
     return prev_cpu;
@@ -298,11 +298,11 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
 
   cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-  if (task_ctx && slow_path_requested(task_ctx, have_user, &user_ctx) &&
+  if (task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word) &&
       valid_cpu(cpu))
     task_ctx->admission_cpu = (__u32)cpu;
 
-  if (is_idle && !(task_ctx && slow_path_requested(task_ctx, have_user, &user_ctx)))
+  if (is_idle && !(task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word)))
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
   return cpu;
@@ -310,7 +310,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   struct task_scx_ctx *task_ctx;
-  struct lock_sched_thread_ctx user_ctx = {};
+  __u32 user_ctx_word = 0;
   bool have_user = false;
   __u32 cpu;
 
@@ -320,11 +320,11 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     return;
   }
 
-  have_user = read_user_ctx(p, task_ctx, &user_ctx);
+  have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
 
   clear_invalid_admission_cpu(p, task_ctx);
 
-  if (should_release_from_user(task_ctx, have_user, &user_ctx))
+  if (should_release_from_user(task_ctx, have_user, user_ctx_word))
     release_admission(p, task_ctx);
 
   if (task_ctx->admission_cpu < MAX_CPUS &&
@@ -334,7 +334,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     return;
   }
 
-  if (slow_path_requested(task_ctx, have_user, &user_ctx)) {
+  if (slow_path_requested(task_ctx, have_user, user_ctx_word)) {
     cpu = requested_cpu(p, task_ctx, -1);
     if (cpu >= MAX_CPUS) {
       scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
@@ -387,21 +387,21 @@ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
 
 void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   struct task_scx_ctx *task_ctx;
-  struct lock_sched_thread_ctx user_ctx = {};
+  __u32 user_ctx_word = 0;
   bool have_user = false;
 
   task_ctx = lookup_task_ctx(p);
   if (!task_ctx)
     return;
 
-  have_user = read_user_ctx(p, task_ctx, &user_ctx);
+  have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
 
-  if (should_release_from_user(task_ctx, have_user, &user_ctx)) {
+  if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
     return;
   }
 
-  if (runnable && task_in_critical_section(task_ctx, have_user, &user_ctx)) {
+  if (runnable && task_in_critical_section(task_ctx, have_user, user_ctx_word)) {
     protect_critical_section(p, task_ctx);
     return;
   }

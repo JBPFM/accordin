@@ -22,7 +22,7 @@ struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, MAX_TASKS);
   __type(key, __u32);   /* pid (tid) */
-  __type(value, __u64); /* user-space pointer to lock_sched_thread_ctx */
+  __type(value, __u64); /* user-space pointer to admission word */
 } thread_ctx_addr_map SEC(".maps");
 
 struct {

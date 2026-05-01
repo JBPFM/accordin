@@ -1,3 +1,4 @@
+pub use lb_shared::admission;
 pub use lb_shared::arch;
 pub use lb_shared::lock_backend;
 pub use lb_shared::lock_stats;

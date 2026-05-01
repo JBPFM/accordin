@@ -63,6 +63,7 @@ const DEFAULT_DYNAMIC_CPU_STABLE_WINDOWS: u64 = 9;
 const DEFAULT_HEATMAP_MAX_NS: u64 = 1 << 20;
 const DEFAULT_TIMING_SAMPLE_STRIDE: u64 = 8;
 const HEATMAP_WINDOW_EWMA_ALPHA: f64 = 0.2;
+const DYNAMIC_CPU_TARGET_HYSTERESIS: f64 = 0.25;
 const DYNAMIC_CPU_DISCARD_WINDOWS_AFTER_UPDATE: u64 = 20;
 pub const ADMISSION_CPU_NONE: u32 = u32::MAX;
 
@@ -206,8 +207,14 @@ impl HeatmapConfig {
 struct HeatmapState {
     config: HeatmapConfig,
     base_window_ns: AtomicU64,
-    windows: Mutex<BTreeMap<(u64, usize, usize), u64>>,
+    windows: Mutex<HeatmapSamples>,
     control: Mutex<WindowControlState>,
+}
+
+#[derive(Default)]
+struct HeatmapSamples {
+    bins: BTreeMap<(u64, usize, usize), u64>,
+    series: BTreeMap<u64, WindowSeriesStats>,
 }
 
 struct HeatmapWriteSummary {
@@ -248,7 +255,7 @@ impl HeatmapState {
         Self {
             config,
             base_window_ns: AtomicU64::new(0),
-            windows: Mutex::new(BTreeMap::new()),
+            windows: Mutex::new(HeatmapSamples::default()),
             control: Mutex::new(WindowControlState::default()),
         }
     }
@@ -269,21 +276,25 @@ impl HeatmapState {
         }
 
         let window_index = sample_time_ns.saturating_sub(base_window_ns) / self.config.window_ns;
-        let critical_bin = heatmap_bin_index(critical_ns, self.config.max_bin_index);
-        let outside_bin = heatmap_bin_index(outside_ns, self.config.max_bin_index);
-        let mut windows = self
+        let mut samples = self
             .windows
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        *windows
-            .entry((window_index, critical_bin, outside_bin))
-            .or_insert(0) += 1;
+        if self.config.path.is_some() {
+            let critical_bin = heatmap_bin_index(critical_ns, self.config.max_bin_index);
+            let outside_bin = heatmap_bin_index(outside_ns, self.config.max_bin_index);
+            *samples
+                .bins
+                .entry((window_index, critical_bin, outside_bin))
+                .or_insert(0) += 1;
+        }
+        record_window_series_sample(&mut samples.series, window_index, critical_ns, outside_ns);
         let dynamic_cpu_count = if self.config.dynamic_cpu_affinity {
-            self.next_dynamic_cpu_count(&windows, window_index)
+            self.next_dynamic_cpu_count(&samples.series, window_index)
         } else {
             None
         };
-        drop(windows);
+        drop(samples);
 
         if let Some(dynamic_cpu_count) = dynamic_cpu_count {
             update_dynamic_cpu_affinity(dynamic_cpu_count);
@@ -292,7 +303,7 @@ impl HeatmapState {
 
     fn next_dynamic_cpu_count(
         &self,
-        windows: &BTreeMap<(u64, usize, usize), u64>,
+        window_series: &BTreeMap<u64, WindowSeriesStats>,
         current_window_index: u64,
     ) -> Option<usize> {
         let mut control = self
@@ -309,8 +320,7 @@ impl HeatmapState {
             let window_index = control.next_window_index;
             control.next_window_index += 1;
 
-            let stats =
-                window_series_stats_for_window(windows, window_index, self.config.max_bin_index);
+            let stats = window_series_stats_for_window(window_series, window_index);
             if stats.sample_count < self.config.dynamic_cpu_min_window_samples {
                 continue;
             }
@@ -613,25 +623,31 @@ fn heatmap_state() -> Option<&'static HeatmapState> {
 }
 
 fn window_series_stats_for_window(
-    windows: &BTreeMap<(u64, usize, usize), u64>,
+    window_series: &BTreeMap<u64, WindowSeriesStats>,
     window_index: u64,
-    max_bin_index: usize,
 ) -> WindowSeriesStats {
-    let mut stats = WindowSeriesStats::default();
-    for (&(_, critical_bin, outside_bin), &count) in
-        windows.range((window_index, 0, 0)..=(window_index, usize::MAX, usize::MAX))
-    {
-        let count_f64 = count as f64;
-        stats.sample_count += count;
-        stats.critical_sum_est += heatmap_bin_midpoint_ns(critical_bin, max_bin_index) * count_f64;
-        stats.outside_sum_est += heatmap_bin_midpoint_ns(outside_bin, max_bin_index) * count_f64;
-    }
+    let mut stats = window_series
+        .get(&window_index)
+        .copied()
+        .unwrap_or_default();
     if stats.sample_count != 0 {
         let sample_count_f64 = stats.sample_count as f64;
         stats.critical_mean_est = stats.critical_sum_est / sample_count_f64;
         stats.outside_mean_est = stats.outside_sum_est / sample_count_f64;
     }
     stats
+}
+
+fn record_window_series_sample(
+    window_series: &mut BTreeMap<u64, WindowSeriesStats>,
+    window_index: u64,
+    critical_ns: u64,
+    outside_ns: u64,
+) {
+    let stats = window_series.entry(window_index).or_default();
+    stats.sample_count += 1;
+    stats.critical_sum_est += critical_ns as f64;
+    stats.outside_sum_est += outside_ns as f64;
 }
 
 #[inline(always)]
@@ -697,9 +713,18 @@ fn stabilized_dynamic_cpu_count(
     stabilized_dynamic_cpu_target(previous_cpu_count, target)
 }
 
-fn stabilized_dynamic_cpu_target(_previous_cpu_count: Option<usize>, target: f64) -> Option<usize> {
+fn stabilized_dynamic_cpu_target(previous_cpu_count: Option<usize>, target: f64) -> Option<usize> {
     if !target.is_finite() || target < 1.0 {
         return None;
+    }
+
+    if let Some(previous_cpu_count) = previous_cpu_count {
+        let previous_target = previous_cpu_count as f64;
+        let lower_bound = (previous_target - 0.5 - DYNAMIC_CPU_TARGET_HYSTERESIS).max(1.0);
+        let upper_bound = previous_target + 0.5 + DYNAMIC_CPU_TARGET_HYSTERESIS;
+        if target >= lower_bound && target < upper_bound {
+            return Some(previous_cpu_count);
+        }
     }
 
     Some(dynamic_cpu_count_from_target(target))
@@ -975,11 +1000,12 @@ fn write_heatmap_csv_to_writer<W: Write>(
     )?;
 
     let snapshot = {
-        let windows = state
+        let samples = state
             .windows
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        windows
+        samples
+            .bins
             .iter()
             .map(|(&(window_index, critical_bin, outside_bin), &count)| {
                 (window_index, critical_bin, outside_bin, count)
@@ -1360,8 +1386,9 @@ mod tests {
         heatmap_bin_index, heatmap_bin_lower_ns, heatmap_bin_midpoint_ns, heatmap_bin_upper_ns,
         mark_critical_section_entered, mark_slow_path_pending, outside_sample_stride,
         parse_timing_sample_stride, record_lock_acquired, record_post_unlock,
-        refresh_thread_elapsed_for_aux, sampled_heatmap_stride, stabilized_dynamic_cpu_count,
-        stabilized_dynamic_cpu_target, thread_ctx, write_heatmap_csv_to_writer,
+        record_window_series_sample, refresh_thread_elapsed_for_aux, sampled_heatmap_stride,
+        stabilized_dynamic_cpu_count, stabilized_dynamic_cpu_target, thread_ctx,
+        window_series_stats_for_window, write_heatmap_csv_to_writer,
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1704,16 +1731,47 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_control_without_heatmap_path_does_not_record_bins() {
+        let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 2, 1, 9);
+        let state = HeatmapState::new(config);
+
+        state.record_sample(100, 300, 3_000);
+        state.record_sample(103, 300, 3_000);
+
+        let samples = state.windows.lock().unwrap();
+        assert!(samples.bins.is_empty());
+        assert_eq!(samples.series.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_window_stats_use_exact_samples_not_heatmap_midpoints() {
+        let mut windows = BTreeMap::new();
+        record_window_series_sample(&mut windows, 0, 240, 3_000);
+        record_window_series_sample(&mut windows, 0, 300, 3_000);
+
+        let stats = window_series_stats_for_window(&windows, 0);
+
+        assert_eq!(stats.sample_count, 2);
+        assert_eq!(stats.critical_mean_est, 270.0);
+        assert_eq!(stats.outside_mean_est, 3_000.0);
+        assert_eq!(
+            dynamic_cpu_count_from_window_ewma(stats.critical_mean_est, stats.outside_mean_est),
+            Some(12)
+        );
+    }
+
+    #[test]
     fn dynamic_control_uses_only_completed_valid_windows() {
         let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 2, 1, 9);
         let state = HeatmapState::new(config);
         let mut windows = BTreeMap::new();
-        windows.insert((0, 1, 1), 2);
+        record_window_series_sample(&mut windows, 0, 1, 1);
+        record_window_series_sample(&mut windows, 0, 1, 1);
 
         assert_eq!(state.next_dynamic_cpu_count(&windows, 0), None);
         assert_eq!(state.next_dynamic_cpu_count(&windows, 1), Some(2));
 
-        windows.insert((1, 1, 3), 1);
+        record_window_series_sample(&mut windows, 1, 1, 5);
         assert_eq!(state.next_dynamic_cpu_count(&windows, 2), None);
     }
 
@@ -1741,17 +1799,17 @@ mod tests {
     }
 
     #[test]
-    fn stabilized_dynamic_cpu_target_has_no_boundary_anchor() {
+    fn stabilized_dynamic_cpu_target_holds_previous_count_inside_hysteresis_band() {
         assert_eq!(stabilized_dynamic_cpu_target(None, 8.40), Some(8));
         assert_eq!(stabilized_dynamic_cpu_target(None, 8.60), Some(9));
-        assert_eq!(stabilized_dynamic_cpu_count(Some(8), 100.0, 740.0), Some(8));
-        assert_eq!(stabilized_dynamic_cpu_count(Some(9), 100.0, 740.0), Some(8));
-        assert_eq!(stabilized_dynamic_cpu_count(Some(8), 100.0, 760.0), Some(9));
-        assert_eq!(stabilized_dynamic_cpu_count(Some(9), 100.0, 760.0), Some(9));
+        assert_eq!(stabilized_dynamic_cpu_target(Some(8), 8.74), Some(8));
+        assert_eq!(stabilized_dynamic_cpu_target(Some(8), 8.76), Some(9));
+        assert_eq!(stabilized_dynamic_cpu_target(Some(9), 8.24), Some(8));
+        assert_eq!(stabilized_dynamic_cpu_target(Some(9), 8.26), Some(9));
     }
 
     #[test]
-    fn stabilized_dynamic_cpu_target_converges_to_same_count_without_hysteresis() {
+    fn stabilized_dynamic_cpu_target_converges_to_same_count_with_hysteresis() {
         let mut from_low = 2;
         let mut from_high = 16;
 
@@ -1809,9 +1867,10 @@ mod tests {
         let config = HeatmapConfig::new(None, 1, 2, 2, 8, true, 2, 3, 9);
         let state = HeatmapState::new(config);
         let mut windows = BTreeMap::new();
-        windows.insert((0, 1, 3), 2);
-        windows.insert((1, 1, 3), 2);
-        windows.insert((2, 1, 3), 2);
+        for window_index in 0..3 {
+            record_window_series_sample(&mut windows, window_index, 100, 550);
+            record_window_series_sample(&mut windows, window_index, 100, 550);
+        }
 
         assert_eq!(state.next_dynamic_cpu_count(&windows, 1), None);
         assert_eq!(state.next_dynamic_cpu_count(&windows, 2), None);

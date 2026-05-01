@@ -9,6 +9,8 @@ UEI_DEFINE(uei);
 
 #include "maps.bpf.h"
 
+#define INACTIVE_DRAIN_INTERVAL 64U
+
 static __always_inline bool valid_cpu(s32 cpu) {
   return cpu >= 0 && cpu < MAX_CPUS;
 }
@@ -60,6 +62,22 @@ static __always_inline __u32 *lookup_cpu_owner(__u32 cpu) {
     return 0;
 
   return bpf_map_lookup_elem(&cpu_admission_owner_map, &cpu);
+}
+
+static __always_inline bool should_drain_inactive(__u32 cpu, __u32 *owner) {
+  __u32 *seq;
+  __u32 next;
+
+  if (!owner || !*owner)
+    return true;
+
+  seq = bpf_map_lookup_elem(&cpu_dispatch_seq_map, &cpu);
+  if (!seq)
+    return false;
+
+  next = *seq + 1;
+  *seq = next;
+  return (next & (INACTIVE_DRAIN_INTERVAL - 1)) == 0;
 }
 
 static __always_inline bool refresh_user_ctx_ptr(struct task_struct *p,
@@ -207,6 +225,32 @@ static __always_inline bool should_release_from_user(
   return user_explicit_release(user_ctx);
 }
 
+static __always_inline bool task_in_critical_section(
+    const struct task_scx_ctx *task_ctx, bool have_user,
+    const struct lock_sched_thread_ctx *user_ctx) {
+  if (have_user)
+    return user_ctx->in_critical_section;
+
+  return task_ctx->in_critical_section;
+}
+
+static __always_inline void protect_critical_section(struct task_struct *p,
+                                                     struct task_scx_ctx *task_ctx) {
+  __u32 cpu = task_ctx->admission_cpu;
+
+  if (cpu >= MAX_CPUS || !task_cpu_allowed(p, cpu))
+    cpu = pick_allowed_cpu(p, bpf_get_smp_processor_id());
+
+  if (cpu >= MAX_CPUS)
+    return;
+
+  task_ctx->admission_cpu = cpu;
+  if (!task_ctx->holds_admission)
+    grant_admission(p, task_ctx, cpu);
+
+  task_ctx->must_run_on_admission_cpu = 1;
+}
+
 static __always_inline void refresh_running_state(struct task_struct *p) {
   struct task_scx_ctx *task_ctx;
   struct lock_sched_thread_ctx user_ctx = {};
@@ -314,16 +358,23 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   __u32 *owner;
+  __u64 inactive_dsq;
 
   (void)prev;
 
   if (valid_cpu(cpu)) {
+    inactive_dsq = inactive_dsq_id((__u32)cpu);
     owner = lookup_cpu_owner((__u32)cpu);
-    if (owner && !*owner && scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
+    if (should_drain_inactive((__u32)cpu, owner) &&
+        scx_bpf_dsq_move_to_local(inactive_dsq))
       return;
   }
 
-  scx_bpf_dsq_move_to_local(READY_DSQ_ID);
+  if (scx_bpf_dsq_move_to_local(READY_DSQ_ID))
+    return;
+
+  if (valid_cpu(cpu))
+    scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu));
 }
 
 void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
@@ -339,10 +390,8 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   struct lock_sched_thread_ctx user_ctx = {};
   bool have_user = false;
 
-  (void)runnable;
-
   task_ctx = lookup_task_ctx(p);
-  if (!task_ctx || !task_ctx->holds_admission)
+  if (!task_ctx)
     return;
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx);
@@ -352,11 +401,13 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
     return;
   }
 
-  if ((have_user && user_ctx.in_critical_section) ||
-      (!have_user && task_ctx->in_critical_section)) {
-    release_admission(p, task_ctx);
+  if (runnable && task_in_critical_section(task_ctx, have_user, &user_ctx)) {
+    protect_critical_section(p, task_ctx);
     return;
   }
+
+  if (!task_ctx->holds_admission)
+    return;
 
   task_ctx->must_run_on_admission_cpu = 1;
 }

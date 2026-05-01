@@ -1225,6 +1225,8 @@ pub fn record_wait_end(wait_start: u64) {
 
 #[inline(always)]
 pub fn record_lock_acquired() {
+    mark_critical_section_entered();
+
     unsafe {
         let aux = &mut *thread_aux();
         decide_operation_sampling(aux);
@@ -1357,9 +1359,9 @@ mod tests {
         dynamic_cpu_count_from_window_ewma, finish_outside_gap_sample, grant_slow_path_admission,
         heatmap_bin_index, heatmap_bin_lower_ns, heatmap_bin_midpoint_ns, heatmap_bin_upper_ns,
         mark_critical_section_entered, mark_slow_path_pending, outside_sample_stride,
-        parse_timing_sample_stride, record_post_unlock, refresh_thread_elapsed_for_aux,
-        sampled_heatmap_stride, stabilized_dynamic_cpu_count, stabilized_dynamic_cpu_target,
-        thread_ctx, write_heatmap_csv_to_writer,
+        parse_timing_sample_stride, record_lock_acquired, record_post_unlock,
+        refresh_thread_elapsed_for_aux, sampled_heatmap_stride, stabilized_dynamic_cpu_count,
+        stabilized_dynamic_cpu_target, thread_ctx, write_heatmap_csv_to_writer,
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1629,6 +1631,24 @@ mod tests {
                 admission_cpu: ADMISSION_CPU_NONE,
                 admission_requeue_home: false,
                 in_critical_section: false,
+                slow_path_pending: false,
+            }
+        );
+    }
+
+    #[test]
+    fn record_lock_acquired_marks_unsampled_fast_path_critical_section() {
+        reset_thread_ctx_for_test();
+
+        record_lock_acquired();
+
+        assert_eq!(
+            admission_state_snapshot(),
+            AdmissionStateSnapshot {
+                admission_owned: false,
+                admission_cpu: ADMISSION_CPU_NONE,
+                admission_requeue_home: false,
+                in_critical_section: true,
                 slow_path_pending: false,
             }
         );

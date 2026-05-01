@@ -4,4 +4,4 @@ else
   SUDO="sudo"
 fi
 
-$SUDO LD_PRELOAD="./target/release/libaccordin.so" taskset -c 0 ~/test/test/leveldb/build/db_bench --benchmarks=readrandom --threads=80 --num=$1
+$SUDO LD_PRELOAD="./target/release/libaccordin.so" ~/Projects/tests/leveldb/build/db_bench --benchmarks=readrandom --threads=256 --num=$1

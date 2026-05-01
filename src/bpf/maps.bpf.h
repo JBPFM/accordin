@@ -34,6 +34,13 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, MAX_CPUS);
+  __type(key, __u32);
+  __type(value, __u32);
+} cpu_dispatch_seq_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, STAT_NR);
   __type(key, __u32);
   __type(value, __u64);

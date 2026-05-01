@@ -22,7 +22,7 @@ class MachineConfig:
 
 CURRENT_MACHINE = MachineConfig(
     name="current-20c40t",
-    physical_cores=20,
+    physical_cores=40,
     logical_cpus=40,
     thread_counts=(1, 2, 4, 8, 16, 20, 32, 40, 64, 96),
     decomposition_threads=(40, 64, 96),
@@ -97,6 +97,27 @@ def select_machine_config() -> MachineConfig:
     if logical_cpus <= CURRENT_MACHINE.logical_cpus or physical_cores == CURRENT_MACHINE.physical_cores:
         return CURRENT_MACHINE
     return ORIGINAL_MACHINE
+
+
+def first_oversubscribed_thread_count(thread_counts: tuple[int, ...], physical_cores: int) -> int | None:
+    oversubscribed = [thread for thread in thread_counts if thread > physical_cores]
+    if not oversubscribed:
+        return None
+    return min(oversubscribed)
+
+
+def limit_to_single_oversubscribed_thread_count(
+    thread_counts: tuple[int, ...],
+    physical_cores: int,
+) -> tuple[int, ...]:
+    first_oversubscribed = first_oversubscribed_thread_count(thread_counts, physical_cores)
+    if first_oversubscribed is None:
+        return thread_counts
+    return tuple(
+        thread
+        for thread in thread_counts
+        if thread <= physical_cores or thread == first_oversubscribed
+    )
 
 
 ACTIVE_MACHINE_CONFIG = select_machine_config()

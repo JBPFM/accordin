@@ -18,7 +18,13 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
-from machine_config import ACTIVE_MACHINE_CONFIG, DEFAULT_THREAD_COUNTS, MACHINE_PHYSICAL_CORES, PROFILE_ENV
+from machine_config import (
+    ACTIVE_MACHINE_CONFIG,
+    DEFAULT_THREAD_COUNTS,
+    MACHINE_PHYSICAL_CORES,
+    PROFILE_ENV,
+    limit_to_single_oversubscribed_thread_count,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -84,12 +90,12 @@ DEFAULT_STREAMCLUSTER_CHUNKSIZE = 32768
 DEFAULT_STREAMCLUSTER_CLUSTERSIZE = 2000
 DEFAULT_STREAMCLUSTER_INPUT = "none"
 MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
+SINGLE_OVERSUBSCRIBED_LOCKS = ("mcs", "mcstp", "mcs_extension", "malthusian", "reciprocating")
 PER_LOCK_MAX_THREADS = {
-    "mcs": 128,
-    "mcstp": 128,
-    "mcs_extension": 128,
-    "malthusian": 128,
-    "reciprocating": 128,
+    lock: max(
+        limit_to_single_oversubscribed_thread_count(DEFAULT_THREADS, MACHINE_CORE_COUNT)
+    )
+    for lock in SINGLE_OVERSUBSCRIBED_LOCKS
 }
 
 RAW_FIELDS = (
@@ -143,6 +149,8 @@ LOCK_ALIASES = {
     "mcs_tas_accordin": "mcs_tas_accordin",
     "mcs-tas": "mcstas",
     "mcs_extension": "mcs_extension",
+    "mcs-tse": "mcs_extension",
+    "mcs_tse": "mcs_extension",
     "mcs_accordin": "mcs_tas_accordin",
     "stock": "stock",
 }
@@ -361,7 +369,8 @@ Examples:
             "Comma-separated lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Use stock to run without interpose. "
-            "Aliases: mcs-tas == mcstas, accordin/mcs_accordin == mcs_tas_accordin."
+            "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
+            "accordin/mcs_accordin == mcs_tas_accordin."
         ),
     )
     parser.add_argument(
@@ -532,10 +541,20 @@ def lock_sort_key(lock: str) -> tuple[int, str]:
 
 
 def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:
-    max_threads = PER_LOCK_MAX_THREADS.get(lock)
-    if max_threads is None:
+    if lock not in SINGLE_OVERSUBSCRIBED_LOCKS:
         return threads
-    return tuple(thread for thread in threads if thread <= max_threads)
+    return limit_to_single_oversubscribed_thread_count(threads, MACHINE_CORE_COUNT)
+
+
+def per_lock_max_threads_for_settings(
+    locks: tuple[str, ...],
+    threads: tuple[int, ...],
+) -> dict[str, int]:
+    return {
+        lock: max(runnable_threads_for_lock(lock, threads))
+        for lock in locks
+        if lock in SINGLE_OVERSUBSCRIBED_LOCKS
+    }
 
 
 def benchmark_binary_path(benchmark: str) -> Path:
@@ -872,7 +891,8 @@ def write_settings(
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
         "threads": list(threads),
         "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
-        "per_lock_max_threads": PER_LOCK_MAX_THREADS,
+        "single_oversubscribed_locks": list(SINGLE_OVERSUBSCRIBED_LOCKS),
+        "per_lock_max_threads": per_lock_max_threads_for_settings(locks, threads),
         "machine_profile": ACTIVE_MACHINE_CONFIG.name,
         "machine_profile_env": PROFILE_ENV,
         "repeats": args.repeats,

@@ -172,6 +172,11 @@ def filtered_settings(settings: dict, excluded_locks: set[str]) -> dict:
         return settings
     settings = dict(settings)
     settings["locks"] = [lock for lock in settings["locks"] if lock["key"] not in excluded_locks]
+    settings["single_oversubscribed_locks"] = [
+        lock
+        for lock in settings.get("single_oversubscribed_locks", [])
+        if lock not in excluded_locks
+    ]
     settings["per_lock_max_threads"] = {
         lock: max_threads
         for lock, max_threads in settings.get("per_lock_max_threads", {}).items()

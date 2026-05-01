@@ -33,12 +33,15 @@ DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
 DEFAULT_INIT_EXISTING_BENCHMARKS = ("readrandom", "readseq", "overwrite")
+SINGLE_OVERSUBSCRIBED_LOCKS = experiment_three.SINGLE_OVERSUBSCRIBED_LOCKS
 PER_LOCK_MAX_THREADS = {
-    "mcs": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
-    "mcstp": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
-    "mcs_extension": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
-    "malthusian": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
-    "reciprocating": machine_config.LEVELDB_PER_LOCK_MAX_THREADS,
+    lock: max(
+        machine_config.limit_to_single_oversubscribed_thread_count(
+            DEFAULT_THREADS,
+            experiment_three.MACHINE_CORE_COUNT,
+        )
+    )
+    for lock in SINGLE_OVERSUBSCRIBED_LOCKS
 }
 
 RAW_FIELDS = (
@@ -144,7 +147,8 @@ Examples:
             "Comma-separated lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Use stock to run without interpose. "
-            "Aliases: mcs-tas == mcstas, accordin/mcs_accordin == mcs_tas_accordin."
+            "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
+            "accordin/mcs_accordin == mcs_tas_accordin."
         ),
     )
     parser.add_argument(
@@ -282,10 +286,23 @@ def lock_sort_key(lock: str) -> tuple[int, str]:
 
 
 def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:
-    max_threads = PER_LOCK_MAX_THREADS.get(lock)
-    if max_threads is None:
+    if lock not in SINGLE_OVERSUBSCRIBED_LOCKS:
         return threads
-    return tuple(thread for thread in threads if thread <= max_threads)
+    return machine_config.limit_to_single_oversubscribed_thread_count(
+        threads,
+        experiment_three.MACHINE_CORE_COUNT,
+    )
+
+
+def per_lock_max_threads_for_settings(
+    locks: tuple[str, ...],
+    threads: tuple[int, ...],
+) -> dict[str, int]:
+    return {
+        lock: max(runnable_threads_for_lock(lock, threads))
+        for lock in locks
+        if lock in SINGLE_OVERSUBSCRIBED_LOCKS
+    }
 
 
 def ceil_div(numerator: int, denominator: int) -> int:
@@ -633,9 +650,8 @@ def write_settings(
         "threads": list(threads),
         "machine_profile": machine_config.ACTIVE_MACHINE_CONFIG.name,
         "machine_profile_env": machine_config.PROFILE_ENV,
-        "per_lock_max_threads": {
-            lock: max_threads for lock, max_threads in PER_LOCK_MAX_THREADS.items() if lock in locks
-        },
+        "single_oversubscribed_locks": list(SINGLE_OVERSUBSCRIBED_LOCKS),
+        "per_lock_max_threads": per_lock_max_threads_for_settings(locks, threads),
         "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
         "repeats": repeats,
         "num": num,

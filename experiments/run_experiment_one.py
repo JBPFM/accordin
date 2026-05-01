@@ -39,11 +39,22 @@ from machine_config import (  # noqa: E402
     DEFAULT_THREAD_COUNTS,
     MACHINE_PHYSICAL_CORES,
     PROFILE_ENV,
+    limit_to_single_oversubscribed_thread_count,
 )
 
+MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
 THREADS = DEFAULT_THREAD_COUNTS
 PLOT_THREADS = tuple(thread for thread in THREADS if thread >= 4)
-DECOMPOSITION_THREADS = DECOMPOSITION_THREAD_COUNTS
+SINGLE_OVERSUBSCRIBED_THREADS = tuple(
+    thread
+    for thread in limit_to_single_oversubscribed_thread_count(THREADS, MACHINE_CORE_COUNT)
+    if thread > MACHINE_CORE_COUNT
+)
+DECOMPOSITION_THREADS = tuple(
+    thread
+    for thread in DECOMPOSITION_THREAD_COUNTS
+    if thread in SINGLE_OVERSUBSCRIBED_THREADS
+) or SINGLE_OVERSUBSCRIBED_THREADS
 DECOMPOSITION_LOCK_KEYS = ("mcs", "mcs_extension", "mcs-tas", "malthusian", "flexguard", "accordin")
 CRITICAL_NS = 300
 OUTSIDE_NS = 3000
@@ -61,7 +72,6 @@ BROKEN_Y_UPPER_MIN = 1e5
 BROKEN_LOWER_AXIS_PADDING = 1.2
 DECOMPOSITION_HOLD_COLOR = "#74a9cf"
 DECOMPOSITION_HANDOFF_COLOR = "#ef8a62"
-MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
 THREAD_AXIS_MIN = PLOT_THREADS[0] / 1.08
 THREAD_AXIS_MAX = PLOT_THREADS[-1] * 1.25
 OVERSUBSCRIBED_LABEL_X = (MACHINE_CORE_COUNT * THREAD_AXIS_MAX) ** 0.5
@@ -99,6 +109,7 @@ LOCKS = (
 )
 
 BASE_LOCK_KEYS = ("mcs", "mcstp", "mcs-tas", "reciprocating", "malthusian", "flexguard")
+SINGLE_OVERSUBSCRIBED_LOCK_KEYS = ("mcs", "mcstp", "mcs_extension", "malthusian", "reciprocating")
 FLEXGUARD_INTERPOSE_KEYS = ("mcstp", "malthusian", "flexguard")
 FLEXGUARD_INTERPOSE_BUILD_SPECS = {
     "flexguard": FlexguardInterposeBuildSpec(make_target="build/interpose_flexguard.sh"),
@@ -244,6 +255,7 @@ Default benchmark settings:
   critical-ns={CRITICAL_NS}, outside-ns={OUTSIDE_NS}, duration=5s, warmup=1s, repeats={REPEATS}
   machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})
   threads={','.join(str(v) for v in THREADS)}
+  single-overload locks={','.join(SINGLE_OVERSUBSCRIBED_LOCK_KEYS)} use threads={','.join(str(v) for v in runnable_threads_for_lock("mcs"))}
   default full run includes accordin ({ACCORDIN_TASKSET_LOCK}) under taskset CPUs={DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
 
 Examples:
@@ -346,6 +358,12 @@ def parse_supplement_lock_keys(value: str) -> tuple[str, ...]:
     return tuple(unique_keys)
 
 
+def runnable_threads_for_lock(lock_key: str, threads: tuple[int, ...] = THREADS) -> tuple[int, ...]:
+    if lock_key not in SINGLE_OVERSUBSCRIBED_LOCK_KEYS:
+        return threads
+    return limit_to_single_oversubscribed_thread_count(threads, MACHINE_CORE_COUNT)
+
+
 def write_settings(
     result_root: Path,
     mcs_extension_mode: str,
@@ -362,6 +380,12 @@ def write_settings(
         "duration_ms": DURATION_MS,
         "warmup_duration_ms": WARMUP_DURATION_MS,
         "repeats": REPEATS,
+        "single_oversubscribed_locks": list(SINGLE_OVERSUBSCRIBED_LOCK_KEYS),
+        "runnable_threads_by_lock": {
+            lock.key: list(runnable_threads_for_lock(lock.key))
+            for lock in LOCKS
+        },
+        "decomposition_threads": list(DECOMPOSITION_THREADS),
         "mcs_extension_mode": mcs_extension_mode,
         "sudo_mode": sudo_mode,
         "accordin_taskset_lock": ACCORDIN_TASKSET_LOCK,
@@ -498,10 +522,10 @@ def ensure_inputs(
         ensure_flexguard_interpose(key, logger)
 
 
-def common_sweep_args() -> list[str]:
+def common_sweep_args(threads: tuple[int, ...] = THREADS) -> list[str]:
     return [
         "--threads",
-        ",".join(str(v) for v in THREADS),
+        ",".join(str(v) for v in threads),
         "--critical-ns",
         str(CRITICAL_NS),
         "--outside-ns",
@@ -513,6 +537,56 @@ def common_sweep_args() -> list[str]:
         "--repeats",
         str(REPEATS),
     ]
+
+
+def lock_thread_groups(lock_keys: tuple[str, ...]) -> list[tuple[tuple[str, ...], tuple[int, ...]]]:
+    groups: list[tuple[list[str], tuple[int, ...]]] = []
+    for lock_key in lock_keys:
+        threads = runnable_threads_for_lock(lock_key)
+        for group_lock_keys, group_threads in groups:
+            if group_threads == threads:
+                group_lock_keys.append(lock_key)
+                break
+        else:
+            groups.append(([lock_key], threads))
+    return [(tuple(group_lock_keys), group_threads) for group_lock_keys, group_threads in groups]
+
+
+def thread_group_log_suffix(threads: tuple[int, ...]) -> str:
+    if threads == THREADS:
+        return "full"
+    return "single_oversubscribed"
+
+
+def run_multi_lock_sweeps(
+    result_root: Path,
+    args: argparse.Namespace,
+    lock_keys: tuple[str, ...],
+    logger: CommandLogger,
+    *,
+    log_prefix: str,
+) -> None:
+    env = {"FLEXGUARD_DIR": str(FLEXGUARD_DIR)}
+    groups = lock_thread_groups(lock_keys)
+    for group_lock_keys, threads in groups:
+        sweep_cmd = [
+            str(SWEEP_MULTI),
+            "--locks",
+            ",".join(group_lock_keys),
+            "--output-root",
+            str(result_root),
+            "--sudo-mode",
+            args.sudo_mode,
+            "--timeslice-extension",
+            "off",
+            "--",
+            *common_sweep_args(threads),
+        ]
+        if len(groups) == 1:
+            log_name = f"{log_prefix}.log"
+        else:
+            log_name = f"{log_prefix}_{thread_group_log_suffix(threads)}.log"
+        logger.run(sweep_cmd, log_name=log_name, env=env)
 
 
 def ensure_accordin_taskset_preload(logger: CommandLogger) -> None:
@@ -527,27 +601,19 @@ def ensure_accordin_taskset_preload(logger: CommandLogger) -> None:
 
 
 def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandLogger) -> None:
-    env = {"FLEXGUARD_DIR": str(FLEXGUARD_DIR)}
-    base_cmd = [
-        str(SWEEP_MULTI),
-        "--locks",
-        ",".join(BASE_LOCK_KEYS),
-        "--output-root",
-        str(result_root),
-        "--sudo-mode",
-        args.sudo_mode,
-        "--timeslice-extension",
-        "off",
-        "--",
-        *common_sweep_args(),
-    ]
-    logger.run(base_cmd, log_name="sweep_base_locks.log", env=env)
+    run_multi_lock_sweeps(
+        result_root,
+        args,
+        BASE_LOCK_KEYS,
+        logger,
+        log_prefix="sweep_base_locks",
+    )
 
     extension_dir = result_root / "mcs_extension"
     extension_dir.mkdir(parents=True, exist_ok=True)
     extension_cmd = [
         str(SWEEP_SINGLE),
-        *common_sweep_args(),
+        *common_sweep_args(runnable_threads_for_lock("mcs_extension")),
         "--lock-kind",
         "mcs",
         "--timeslice-extension",
@@ -588,24 +654,12 @@ def run_supplement_benchmarks(
     lock_keys: tuple[str, ...],
     logger: CommandLogger,
 ) -> None:
-    env = {"FLEXGUARD_DIR": str(FLEXGUARD_DIR)}
-    supplement_cmd = [
-        str(SWEEP_MULTI),
-        "--locks",
-        ",".join(lock_keys),
-        "--output-root",
-        str(result_root),
-        "--sudo-mode",
-        args.sudo_mode,
-        "--timeslice-extension",
-        "off",
-        "--",
-        *common_sweep_args(),
-    ]
-    logger.run(
-        supplement_cmd,
-        log_name=f"sweep_supplement_{'_'.join(lock_keys)}.log",
-        env=env,
+    run_multi_lock_sweeps(
+        result_root,
+        args,
+        lock_keys,
+        logger,
+        log_prefix=f"sweep_supplement_{'_'.join(lock_keys)}",
     )
 
 

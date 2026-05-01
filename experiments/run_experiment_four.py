@@ -66,6 +66,7 @@ SUMMARY_FIELDS = (
     "lock",
     "threads",
     "mean_latency_micros_per_op",
+    "mean_ops_per_second",
     "mean_init_wall_seconds",
     "mean_wall_seconds",
     "runs",
@@ -290,30 +291,20 @@ def uses_flexguard_pthread_interpose(locks: tuple[str, ...]) -> bool:
     return any(lock not in preload_only_locks for lock in locks)
 
 
-def existing_ld_preload_entries() -> tuple[str, ...]:
-    existing = os.environ.get("LD_PRELOAD", "").strip()
-    if not existing:
-        return ()
-    return tuple(entry for entry in existing.split(":") if entry)
-
-
 def merge_ld_preload_entries(*libraries: Path | None) -> str | None:
     entries = [str(library) for library in libraries if library is not None]
-    entries.extend(existing_ld_preload_entries())
     return ":".join(entries) if entries else None
 
 
-def preload_env(*libraries: Path | None) -> dict[str, str] | None:
+def preload_env(*libraries: Path | None) -> dict[str, str]:
     ld_preload = merge_ld_preload_entries(*libraries)
     if ld_preload is None:
-        return None
+        return {"LD_PRELOAD": ""}
     return {"LD_PRELOAD": ld_preload}
 
 
 def accordin_preload_env(preload_library: Path, jemalloc_library: Path | None) -> dict[str, str]:
     env = preload_env(preload_library, jemalloc_library)
-    if env is None:
-        env = {}
     if "ACCORDIN_CPU_MASK_K" in os.environ:
         env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
     if "K" in os.environ:
@@ -760,6 +751,29 @@ def mean_field(rows: list[dict[str, str]], field: str) -> str:
     return format_float(mean(values))
 
 
+def row_ops_per_second(row: dict[str, str]) -> float | None:
+    effective_total_ops = row["effective_total_ops"].strip()
+    wall_seconds = row["wall_seconds"].strip()
+    if effective_total_ops and wall_seconds:
+        wall = float(wall_seconds)
+        if wall > 0:
+            return float(effective_total_ops) / wall
+
+    latency = row["latency_micros_per_op"].strip()
+    if latency:
+        latency_micros = float(latency)
+        if latency_micros > 0:
+            return 1_000_000.0 / latency_micros
+    return None
+
+
+def mean_ops_per_second(rows: list[dict[str, str]]) -> str:
+    values = [ops for row in rows if (ops := row_ops_per_second(row)) is not None]
+    if not values:
+        return ""
+    return format_float(mean(values))
+
+
 def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     groups: dict[tuple[str, str, int], list[dict[str, str]]] = {}
     for row in rows:
@@ -778,6 +792,7 @@ def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
                 "lock": lock,
                 "threads": str(thread_count),
                 "mean_latency_micros_per_op": mean_field(group_rows, "latency_micros_per_op"),
+                "mean_ops_per_second": mean_ops_per_second(group_rows),
                 "mean_init_wall_seconds": mean_field(group_rows, "init_wall_seconds"),
                 "mean_wall_seconds": mean_field(group_rows, "wall_seconds"),
                 "runs": str(len(group_rows)),
@@ -799,7 +814,7 @@ def unique_threads(summary_rows: list[dict[str, str]], benchmark: str) -> list[i
     return sorted({int(row["threads"]) for row in summary_rows if row["benchmark"] == benchmark})
 
 
-def plot_latency(summary_rows: list[dict[str, str]], *, benchmark: str, output_path: Path) -> None:
+def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path: Path) -> None:
     try:
         import matplotlib
     except ModuleNotFoundError as exc:
@@ -812,7 +827,7 @@ def plot_latency(summary_rows: list[dict[str, str]], *, benchmark: str, output_p
     rows = [
         row
         for row in summary_rows
-        if row["benchmark"] == benchmark and row["mean_latency_micros_per_op"].strip()
+        if row["benchmark"] == benchmark and row["mean_ops_per_second"].strip()
     ]
     if not rows:
         raise RuntimeError(f"No summary rows available for benchmark {benchmark}.")
@@ -823,7 +838,7 @@ def plot_latency(summary_rows: list[dict[str, str]], *, benchmark: str, output_p
 
     for lock in lock_keys:
         points = [
-            (int(row["threads"]), float(row["mean_latency_micros_per_op"]))
+            (int(row["threads"]), float(row["mean_ops_per_second"]))
             for row in rows
             if row["lock"] == lock
         ]
@@ -839,9 +854,9 @@ def plot_latency(summary_rows: list[dict[str, str]], *, benchmark: str, output_p
             label=lock_label(lock),
         )
 
-    ax.set_title(f"Latency vs Threads: {benchmark_label(benchmark)}")
+    ax.set_title(f"Throughput vs Threads: {benchmark_label(benchmark)}")
     ax.set_xlabel("Threads")
-    ax.set_ylabel("Mean latency (micros/op, lower is better)")
+    ax.set_ylabel("Mean throughput (ops/s, higher is better)")
     experiment_three.add_thread_axis_formatting(ax, thread_values)
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.grid(True, axis="y", alpha=0.28)
@@ -856,8 +871,8 @@ def write_plots(result_root: Path, summary_rows: list[dict[str, str]]) -> list[P
     plot_paths: list[Path] = []
     benchmarks = sorted({row["benchmark"] for row in summary_rows}, key=benchmark_sort_key)
     for benchmark in benchmarks:
-        output_path = result_root / f"latency_vs_threads_{safe_name(benchmark)}.png"
-        plot_latency(summary_rows, benchmark=benchmark, output_path=output_path)
+        output_path = result_root / f"ops_vs_threads_{safe_name(benchmark)}.png"
+        plot_ops(summary_rows, benchmark=benchmark, output_path=output_path)
         plot_paths.append(output_path)
     if not plot_paths:
         raise RuntimeError("No summary rows were available for plotting.")

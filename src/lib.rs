@@ -4,11 +4,12 @@
 
 mod bpf_skel;
 pub use bpf_skel::*;
-mod arch;
 pub mod bpf_intf;
+pub use lb_shared::admission;
+pub use lb_shared::arch;
 pub use lb_shared::cpu_affinity;
-mod lock_backend;
-mod lock_stats;
+pub use lb_shared::lock_backend;
+pub use lb_shared::lock_stats;
 #[path = "mcs_tas_accordin/src/mcs_tas.rs"]
 mod mcs_tas;
 mod mutex_hook;
@@ -47,7 +48,7 @@ fn init_scheduler(debug: bool, _stats_only: bool, _debug_counters: bool) -> Resu
     let mut skel = scx_ops_load!(skel, accordin_ops, uei)?;
 
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
-    mutex_hook::set_thread_ctx_map(thread_ctx_map);
+    lb_shared::mutex_hook::set_thread_ctx_map(thread_ctx_map);
 
     let link = scx_ops_attach!(skel, accordin_ops)?;
 

@@ -2,7 +2,7 @@
 
 use crate::lock_backend::LockBackend;
 use crate::mcs::McsLockRaw;
-use lb_shared::mutex_hook::{MutexHookBackend, ThreadRegistration};
+use lb_shared::mutex_hook::MutexHookBackend;
 use lb_shared::timeslice_extension::{CriticalSectionTimesliceExtension, TimesliceExtensionMode};
 
 struct McsTseLockState {
@@ -49,14 +49,4 @@ impl MutexHookBackend for McsTseBackend {
     }
 }
 
-struct NoThreadRegistration;
-
-impl ThreadRegistration for NoThreadRegistration {
-    fn register_current_thread() -> bool {
-        true
-    }
-
-    fn unregister_current_thread() {}
-}
-
-lb_shared::export_mutex_hooks!(super::McsTseBackend, super::NoThreadRegistration);
+lb_shared::export_mutex_hooks!(super::McsTseBackend);

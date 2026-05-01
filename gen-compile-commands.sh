@@ -89,11 +89,6 @@ emit_sources_for_target() {
         reciprocating_accordin)
             printf '%s\n' "$SCRIPT_DIR/src/bpf/main.bpf.c"
             ;;
-        libflexguard|flexguard_accordin)
-            printf '%s\n' \
-                "$SCRIPT_DIR/src/bpf/main.bpf.c" \
-                "$SCRIPT_DIR/src/bpf/flexguard.bpf.c"
-            ;;
         *)
             return 1
             ;;
@@ -101,14 +96,7 @@ emit_sources_for_target() {
 }
 
 display_target_name() {
-    case "$1" in
-        libflexguard)
-            printf '%s' "flexguard_accordin"
-            ;;
-        *)
-            printf '%s' "$1"
-            ;;
-    esac
+    printf '%s' "$1"
 }
 
 collect_latest_build_out_dirs

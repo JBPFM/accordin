@@ -10,6 +10,7 @@ UEI_DEFINE(uei);
 #include "maps.bpf.h"
 
 #define INACTIVE_DRAIN_INTERVAL 64U
+#define INACTIVE_STEAL_SCAN 8U
 
 static __always_inline bool valid_cpu(s32 cpu) {
   return cpu >= 0 && cpu < MAX_CPUS;
@@ -78,6 +79,33 @@ static __always_inline bool should_drain_inactive(__u32 cpu, __u32 *owner) {
   next = *seq + 1;
   *seq = next;
   return (next & (INACTIVE_DRAIN_INTERVAL - 1)) == 0;
+}
+
+static __always_inline bool steal_inactive(__u32 cpu) {
+  __u32 nr_cpus = scx_bpf_nr_cpu_ids();
+  __u32 i;
+
+  if (nr_cpus > MAX_CPUS)
+    nr_cpus = MAX_CPUS;
+
+  if (nr_cpus <= 1)
+    return false;
+
+#pragma unroll
+  for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
+    __u32 victim = cpu + i;
+
+    if (i >= nr_cpus)
+      break;
+
+    if (victim >= nr_cpus)
+      victim -= nr_cpus;
+
+    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(victim)))
+      return true;
+  }
+
+  return false;
 }
 
 static __always_inline bool refresh_user_ctx_ptr(struct task_struct *p,
@@ -358,23 +386,25 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   __u32 *owner;
-  __u64 inactive_dsq;
-
   (void)prev;
 
   if (valid_cpu(cpu)) {
-    inactive_dsq = inactive_dsq_id((__u32)cpu);
     owner = lookup_cpu_owner((__u32)cpu);
     if (should_drain_inactive((__u32)cpu, owner) &&
-        scx_bpf_dsq_move_to_local(inactive_dsq))
+        scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
       return;
   }
 
   if (scx_bpf_dsq_move_to_local(READY_DSQ_ID))
     return;
 
-  if (valid_cpu(cpu))
-    scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu));
+  if (!valid_cpu(cpu))
+    return;
+
+  if (scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
+    return;
+
+  steal_inactive((__u32)cpu);
 }
 
 void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {

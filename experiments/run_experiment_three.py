@@ -119,19 +119,21 @@ LOCK_LABELS = {
     "malthusian": "Malthusian",
     "reciprocating": "Reciprocating",
     "accordin": "Accordin",
-    "mcs_accordin": "MCS-TAS Simple",
+    "mcs_tas_accordin": "Accordin",
+    "mcs_accordin": "MCS Accordin",
 }
 BENCHMARK_LABELS = {
     "dedup": "PARSEC dedup",
     "streamcluster": "PARSEC streamcluster",
 }
-ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
+ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
 ROOT_REQUIRED_PRELOAD_LOCKS = {"accordin", "mcs_accordin"}
 LOCK_ALIASES = {
     "accordin": "accordin",
+    "mcs_tas_accordin": "accordin",
     "mcs-tas": "mcstas",
     "mcs_extension": "mcs_extension",
     "mcs_accordin": "mcs_accordin",
@@ -144,6 +146,7 @@ LOCK_ORDER = (
     "mcstas",
     "mcs_extension",
     "flexguard",
+    "mcs_tas_accordin",
     "accordin",
     "reciprocating",
     "mcs_accordin",
@@ -328,7 +331,7 @@ Examples:
             "Comma-separated lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Use stock to run without interpose. "
-            "Aliases: mcs-tas == mcstas."
+            "Aliases: mcs-tas == mcstas, mcs_tas_accordin == accordin."
         ),
     )
     parser.add_argument(
@@ -603,12 +606,12 @@ def ensure_accordin_preload(
     if not build_missing:
         raise RuntimeError(
             f"LD_PRELOAD helper is missing: {ACCORDIN_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_accordin --release or rerun with --build-missing."
+            "Run cargo build -p mcs_tas_accordin --release or rerun with --build-missing."
         )
 
     logger.run(
-        ["cargo", "build", "-p", "mcs_accordin", "--release"],
-        log_name="build_mcs_accordin.log",
+        ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
+        log_name="build_mcs_tas_accordin.log",
         cwd=REPO_ROOT,
     )
     if not ACCORDIN_PRELOAD_LIBRARY.is_file():

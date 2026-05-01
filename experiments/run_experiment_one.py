@@ -50,7 +50,9 @@ OUTSIDE_NS = 3000
 DURATION_MS = 5000
 WARMUP_DURATION_MS = 1000
 REPEATS = 4
-MCS_ACCORDIN_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
+ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin"
+ACCORDIN_TASKSET_PACKAGE = "mcs_tas_accordin"
+ACCORDIN_TASKSET_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
 FOCUS_LOCK_KEYS = ("accordin", "flexguard")
 PIECEWISE_Y_THRESHOLD_NS = 1000.0
 PIECEWISE_Y_LINEAR_SCALE = 3.0
@@ -90,7 +92,7 @@ LOCKS = (
     LockSpec("MCS-TP", "mcstp"),
     LockSpec("MCS-TAS", "mcs-tas"),
     LockSpec("Reciprocating", "reciprocating", optional=True),
-    LockSpec("Accordin (K=11)", "accordin", optional=True, result_dirs=("accordin", "mcs_accordin")),
+    LockSpec("Accordin (K=11)", "accordin", optional=True, result_dirs=("mcs_tas_accordin", "accordin", "mcs_accordin")),
     LockSpec("MCS + TSE", "mcs_extension"),
     LockSpec("Malthusian", "malthusian", optional=True),
     LockSpec("FlexGuard", "flexguard"),
@@ -242,7 +244,7 @@ Default benchmark settings:
   critical-ns={CRITICAL_NS}, outside-ns={OUTSIDE_NS}, duration=5s, warmup=1s, repeats={REPEATS}
   machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})
   threads={','.join(str(v) for v in THREADS)}
-  default full run includes mcs_accordin under taskset CPUs={DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
+  default full run includes accordin ({ACCORDIN_TASKSET_LOCK}) under taskset CPUs={DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
 
 Examples:
   python3 experiments/run_experiment_one.py
@@ -297,14 +299,14 @@ Examples:
         default=DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
         metavar="CPU_LIST",
         help=(
-            "CPU list passed to taskset for the mcs_accordin series. "
+            f"CPU list passed to taskset for the accordin ({ACCORDIN_TASKSET_LOCK}) series. "
             f"Default: {DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}."
         ),
     )
     parser.add_argument(
         "--skip-mcs-accordin-taskset",
         action="store_true",
-        help="Skip only the taskset mcs_accordin series. Default full run includes it.",
+        help=f"Skip only the taskset accordin ({ACCORDIN_TASKSET_LOCK}) series. Default full run includes it.",
     )
     parser.add_argument(
         "--force",
@@ -362,6 +364,7 @@ def write_settings(
         "repeats": REPEATS,
         "mcs_extension_mode": mcs_extension_mode,
         "sudo_mode": sudo_mode,
+        "accordin_taskset_lock": ACCORDIN_TASKSET_LOCK,
         "mcs_accordin_taskset_enabled": mcs_accordin_taskset_enabled,
         "mcs_accordin_taskset_cpus": mcs_accordin_taskset_cpus,
         "locks": [{"label": lock.label, "key": lock.key} for lock in LOCKS],
@@ -512,15 +515,15 @@ def common_sweep_args() -> list[str]:
     ]
 
 
-def ensure_mcs_accordin(logger: CommandLogger) -> None:
-    if not MCS_ACCORDIN_RELEASE_LIB.is_file():
+def ensure_accordin_taskset_preload(logger: CommandLogger) -> None:
+    if not ACCORDIN_TASKSET_RELEASE_LIB.is_file():
         logger.run(
-            ["cargo", "build", "-p", "mcs_accordin", "--release"],
-            log_name="build_mcs_accordin.log",
+            ["cargo", "build", "-p", ACCORDIN_TASKSET_PACKAGE, "--release"],
+            log_name=f"build_{ACCORDIN_TASKSET_PACKAGE}.log",
         )
 
-    if not MCS_ACCORDIN_RELEASE_LIB.is_file():
-        raise RuntimeError(f"mcs_accordin library was not produced: {MCS_ACCORDIN_RELEASE_LIB}")
+    if not ACCORDIN_TASKSET_RELEASE_LIB.is_file():
+        raise RuntimeError(f"{ACCORDIN_TASKSET_PACKAGE} library was not produced: {ACCORDIN_TASKSET_RELEASE_LIB}")
 
 
 def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandLogger) -> None:
@@ -559,14 +562,14 @@ def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandL
     if args.skip_mcs_accordin_taskset:
         return
 
-    ensure_mcs_accordin(logger)
+    ensure_accordin_taskset_preload(logger)
     taskset_cmd = [
         "taskset",
         "-c",
         args.mcs_accordin_taskset_cpus,
         str(SWEEP_MULTI),
         "--locks",
-        "mcs_accordin",
+        ACCORDIN_TASKSET_LOCK,
         "--output-root",
         str(result_root),
         "--sudo-mode",
@@ -576,7 +579,7 @@ def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandL
         "--",
         *common_sweep_args(),
     ]
-    logger.run(taskset_cmd, log_name="sweep_mcs_accordin_taskset.log")
+    logger.run(taskset_cmd, log_name="sweep_accordin_taskset.log")
 
 
 def run_supplement_benchmarks(

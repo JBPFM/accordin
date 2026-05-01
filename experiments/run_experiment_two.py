@@ -24,6 +24,7 @@ FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
 FLEXGUARD_BUILD_DIR = FLEXGUARD_DIR / "build"
 MAKE_ALL_SCRIPT = FLEXGUARD_DIR / "scripts" / "make_all.sh"
 PTHREAD_HOST_BINARY = FLEXGUARD_BUILD_DIR / "buckets_pthread_host"
+ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
 MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 DEFAULT_THREADS = DEFAULT_THREAD_COUNTS
@@ -33,7 +34,7 @@ DEFAULT_LOCKS = (
     "mcs-tas",
     "mcs_extension",
     "flexguard",
-    "mcs_accordin",
+    "accordin",
     "reciprocating",
     "malthusian",
 )
@@ -93,7 +94,7 @@ WORKLOAD_LABELS = {
 }
 LOCK_ALIASES = {
     "mcstas": "mcs-tas",
-    "accordin": "mcs_accordin",
+    "mcs_tas_accordin": "accordin",
 }
 LOCK_LABELS = {
     "flexguard": "FlexGuard",
@@ -101,8 +102,9 @@ LOCK_LABELS = {
     "mcs-tas": "MCS-TAS",
     "mcstas": "MCS-TAS",
     "mcs": "MCS",
-    "mcs_accordin": "MCS-TAS Simple",
-    "accordin": "MCS-TAS Simple",
+    "accordin": "Accordin",
+    "mcs_tas_accordin": "Accordin",
+    "mcs_accordin": "MCS Accordin",
     "mcs_extension": "MCS + TSE",
     "reciprocating": "Reciprocating",
     "malthusian": "Malthusian",
@@ -111,7 +113,7 @@ LOCK_LABELS = {
 DIRECT_BINARY_LOCK_KEYS = {
     "mcs-tas": "mcstas",
 }
-ROOT_REQUIRED_LOCKS = {"flexguard", "mcs_accordin"}
+ROOT_REQUIRED_LOCKS = {"flexguard", "accordin", "mcs_accordin"}
 
 
 @dataclass(frozen=True)
@@ -285,8 +287,9 @@ Lock mapping notes:
   malthusian uses build/buckets_malthusian directly.
   mcstp and flexguard run the pthread host through build/interpose_<lock>.sh.
   mcs_extension runs the pthread host with LD_PRELOAD=target/release/libmcs_tse.so.
+  accordin runs the pthread host with LD_PRELOAD=target/release/libmcs_tas_accordin.so.
+  mcs_tas_accordin remains accepted as an alias for accordin.
   mcs_accordin runs the pthread host with LD_PRELOAD=target/release/libmcs_accordin.so.
-  accordin remains accepted as an alias for mcs_accordin.
   mutex remains available and uses the pthread host without LD_PRELOAD.
 
 Examples:
@@ -331,7 +334,7 @@ Examples:
             "Comma-separated experiment2 lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Supported mappings: mcs, mcs-tas/mcstas, reciprocating, malthusian, "
-            "mcstp, mcs_extension, flexguard, mcs_accordin/accordin, mutex. "
+            "mcstp, mcs_extension, flexguard, accordin/mcs_tas_accordin, mcs_accordin, mutex. "
             "Unknown keys fall back to build/buckets_<lock>."
         ),
     )
@@ -574,6 +577,14 @@ def lock_execution_spec(lock: str) -> LockExecutionSpec:
             pthread_host_binary=PTHREAD_HOST_BINARY,
             wrapper_script=wrapper_script_path("flexguard"),
             wrapper_library=FLEXGUARD_BUILD_DIR / "interpose_flexguard.so",
+        )
+    if normalized == "accordin":
+        return LockExecutionSpec(
+            key=normalized,
+            label=label,
+            mode="ld_preload",
+            pthread_host_binary=PTHREAD_HOST_BINARY,
+            preload_library=ACCORDIN_PRELOAD_LIBRARY,
         )
     if normalized == "mcs_accordin":
         return LockExecutionSpec(
@@ -832,6 +843,14 @@ def build_pthread_host(logger: CommandLogger) -> None:
     logger.run(["make", "clean"], log_name="build_buckets_pthread_host_post_clean.log", cwd=FLEXGUARD_DIR)
 
 
+def build_accordin_preload(logger: CommandLogger) -> None:
+    logger.run(
+        ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
+        log_name="build_mcs_tas_accordin_release.log",
+        cwd=REPO_ROOT,
+    )
+
+
 def build_mcs_accordin_preload(logger: CommandLogger) -> None:
     logger.run(
         ["cargo", "build", "-p", "mcs_accordin", "--release"],
@@ -874,6 +893,8 @@ def ensure_benchmark_artifacts(
         build_with_make_all(logger)
     if any(issue.artifact_kind == "pthread host" for issue in issues):
         build_pthread_host(logger)
+    if any(issue.lock_key == "accordin" and issue.artifact_kind == "preload library" for issue in issues):
+        build_accordin_preload(logger)
     if any(issue.lock_key == "mcs_accordin" and issue.artifact_kind == "preload library" for issue in issues):
         build_mcs_accordin_preload(logger)
     if any(issue.lock_key == "mcs_extension" and issue.artifact_kind == "preload library" for issue in issues):
@@ -1022,7 +1043,7 @@ def wrap_root_command(cmd: list[str], env: dict[str, str] | None) -> tuple[list[
     if os.geteuid() == 0:
         return cmd, env
     if shutil.which("sudo") is None:
-        raise RuntimeError("sudo is required to run mcs_accordin because it loads a sched_ext eBPF scheduler.")
+        raise RuntimeError("sudo is required to run Accordin preload locks because they load sched_ext eBPF schedulers.")
 
     env_args = [f"{key}={value}" for key, value in sorted((env or {}).items())]
     if env_args:
@@ -1050,7 +1071,7 @@ def benchmark_command(
         assert spec.pthread_host_binary is not None
         assert spec.preload_library is not None
         cmd = [str(spec.pthread_host_binary), *benchmark_args]
-        if spec.key == "mcs_accordin":
+        if spec.key in {"accordin", "mcs_accordin"}:
             env = accordin_preload_env(spec.preload_library)
         else:
             env = {"LD_PRELOAD": combine_ld_preload(spec.preload_library)}

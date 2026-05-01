@@ -142,7 +142,7 @@ Examples:
             "Comma-separated lock keys. "
             f"Default: {','.join(DEFAULT_LOCKS)}. "
             "Use stock to run without interpose. "
-            "Aliases: mcs-tas == mcstas."
+            "Aliases: mcs-tas == mcstas, mcs_tas_accordin == accordin."
         ),
     )
     parser.add_argument(

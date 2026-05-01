@@ -7,3 +7,6 @@
 [submodule "bench/mutexbench_rust"]
 	path = bench/mutexbench_rust
 	url = git@github.com:JerryMouseZ/mutexbench_rust.git
+[submodule "third_party/leveldb-1.23"]
+	path = third_party/leveldb-1.23
+	url = https://github.com/google/leveldb.git

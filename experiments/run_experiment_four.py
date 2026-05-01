@@ -20,8 +20,9 @@ import run_experiment_three as experiment_three
 
 REPO_ROOT = experiment_three.REPO_ROOT
 FLEXGUARD_DIR = experiment_three.FLEXGUARD_DIR
-LEVELDB_DIR = FLEXGUARD_DIR / "ext" / "leveldb-1.20"
-DEFAULT_DB_BENCH = LEVELDB_DIR / "out-static" / "db_bench"
+LEVELDB_VERSION = "1.23"
+DEFAULT_LEVELDB_DIR = REPO_ROOT / "third_party" / f"leveldb-{LEVELDB_VERSION}"
+DEFAULT_DB_BENCH = DEFAULT_LEVELDB_DIR / "build" / "db_bench"
 
 DEFAULT_BENCHMARKS = ("readrandom", "fillrandom")
 DEFAULT_LOCKS = experiment_three.DEFAULT_LOCKS
@@ -92,10 +93,11 @@ Default benchmark settings:
   locks={','.join(DEFAULT_LOCKS)}
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
   repeats={DEFAULT_REPEATS}, num={DEFAULT_NUM}, total_ops={DEFAULT_TOTAL_OPS}
+  leveldb={DEFAULT_LEVELDB_DIR} (tag {LEVELDB_VERSION})
   db_bench={DEFAULT_DB_BENCH}
   fill_benchmark={DEFAULT_FILL_BENCHMARK}
   init_existing_benchmarks={','.join(DEFAULT_INIT_EXISTING_BENCHMARKS)}
-  jemalloc=enabled, candidates={','.join(str(path) for path in DEFAULT_JEMALLOC_CANDIDATES)}
+  jemalloc=auto; disabled when FlexGuard pthread interpose locks are present, otherwise first existing candidate from {','.join(str(path) for path in DEFAULT_JEMALLOC_CANDIDATES)}
   per_lock_max_threads={','.join(f"{lock}:{max_threads}" for lock, max_threads in PER_LOCK_MAX_THREADS.items())}
 
 Examples:
@@ -179,8 +181,17 @@ Examples:
     parser.add_argument(
         "--db-bench",
         type=Path,
-        default=DEFAULT_DB_BENCH,
-        help=f"Path to db_bench. Default: {DEFAULT_DB_BENCH}.",
+        default=None,
+        help="Path to db_bench. Default: <leveldb-dir>/build/db_bench.",
+    )
+    parser.add_argument(
+        "--leveldb-dir",
+        type=Path,
+        default=DEFAULT_LEVELDB_DIR,
+        help=(
+            "LevelDB source directory used when --db-bench is omitted or --build-missing builds db_bench. "
+            f"Default: {DEFAULT_LEVELDB_DIR}."
+        ),
     )
     parser.add_argument(
         "--fill-benchmark",
@@ -203,7 +214,7 @@ Examples:
         metavar="PATH",
         help=(
             "jemalloc library to LD_PRELOAD for LevelDB runs. "
-            "Default: first existing candidate from "
+            "Default: disabled when FlexGuard pthread interpose locks are present; otherwise first existing candidate from "
             f"{','.join(str(path) for path in DEFAULT_JEMALLOC_CANDIDATES)}. "
             "Use none to disable."
         ),
@@ -269,6 +280,11 @@ def resolve_jemalloc_library(value: str | None) -> Path | None:
         "jemalloc is enabled by default, but no candidate library was found. "
         f"Checked: {candidates}. Use --jemalloc-library PATH or --jemalloc-library none."
     )
+
+
+def uses_flexguard_pthread_interpose(locks: tuple[str, ...]) -> bool:
+    preload_only_locks = {"stock", "accordin", "mcs_extension", "mcs_accordin"}
+    return any(lock not in preload_only_locks for lock in locks)
 
 
 def existing_ld_preload_entries() -> tuple[str, ...]:
@@ -340,17 +356,86 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
-def ensure_db_bench(db_bench: Path, *, build_missing: bool, logger: experiment_three.CommandLogger) -> None:
+def default_db_bench_for_leveldb(leveldb_dir: Path) -> Path:
+    return leveldb_dir / "build" / "db_bench"
+
+
+def ensure_leveldb_source(
+    leveldb_dir: Path,
+    *,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    if (leveldb_dir / "CMakeLists.txt").is_file():
+        return
+    if not build_missing:
+        raise RuntimeError(
+            f"LevelDB source directory is missing or incomplete: {leveldb_dir}. "
+            "Rerun with --build-missing or initialize the submodule manually."
+        )
+    if leveldb_dir != DEFAULT_LEVELDB_DIR:
+        raise RuntimeError(f"Cannot initialize a custom LevelDB source directory: {leveldb_dir}")
+
+    logger.run(
+        [
+            "git",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--depth",
+            "1",
+            str(leveldb_dir.relative_to(REPO_ROOT)),
+        ],
+        log_name="init_leveldb_submodule.log",
+        cwd=REPO_ROOT,
+    )
+    if not (leveldb_dir / "CMakeLists.txt").is_file():
+        raise RuntimeError(f"LevelDB source directory is still unavailable after submodule init: {leveldb_dir}")
+
+
+def ensure_db_bench(
+    db_bench: Path,
+    *,
+    leveldb_dir: Path,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> None:
     if db_bench.is_file() and os.access(db_bench, os.X_OK):
         return
     if not build_missing:
         raise RuntimeError(f"LevelDB db_bench is missing or not executable: {db_bench}. Rerun with --build-missing.")
-    if db_bench != DEFAULT_DB_BENCH:
+    if db_bench != default_db_bench_for_leveldb(leveldb_dir):
         raise RuntimeError(f"Cannot build a custom db_bench path: {db_bench}")
+
+    ensure_leveldb_source(leveldb_dir, build_missing=build_missing, logger=logger)
     logger.run(
-        ["make", "out-static/db_bench"],
+        [
+            "cmake",
+            "-S",
+            str(leveldb_dir),
+            "-B",
+            str(leveldb_dir / "build"),
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_CXX_STANDARD=17",
+            "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+            "-DLEVELDB_BUILD_TESTS=OFF",
+            "-DLEVELDB_BUILD_BENCHMARKS=ON",
+        ],
+        log_name="configure_leveldb.log",
+        cwd=REPO_ROOT,
+    )
+    logger.run(
+        [
+            "cmake",
+            "--build",
+            str(leveldb_dir / "build"),
+            "--target",
+            "db_bench",
+            "--parallel",
+        ],
         log_name="build_leveldb_db_bench.log",
-        cwd=LEVELDB_DIR,
+        cwd=REPO_ROOT,
     )
     if not db_bench.is_file() or not os.access(db_bench, os.X_OK):
         raise RuntimeError(f"LevelDB db_bench is still unavailable after build: {db_bench}")
@@ -596,6 +681,7 @@ def write_settings(
     num: int,
     total_ops: int,
     db_bench: Path,
+    leveldb_dir: Path,
     fill_benchmark: str,
     init_existing_benchmarks: tuple[str, ...],
     build_missing: bool,
@@ -614,7 +700,8 @@ def write_settings(
         "total_ops": total_ops,
         "build_missing": build_missing,
         "db_bench": str(db_bench),
-        "leveldb_dir": str(LEVELDB_DIR),
+        "leveldb_dir": str(leveldb_dir),
+        "leveldb_version": LEVELDB_VERSION if leveldb_dir == DEFAULT_LEVELDB_DIR else "custom",
         "fill_benchmark": fill_benchmark,
         "init_existing_benchmarks": list(init_existing_benchmarks),
         "jemalloc": {
@@ -793,7 +880,8 @@ def main() -> int:
             tuple(dict.fromkeys(experiment_three.normalize_lock(lock) for lock in parse_csv_strings(args.locks)))
         )
         threads = parse_csv_ints(args.threads)
-        db_bench = resolve_path(args.db_bench)
+        leveldb_dir = resolve_path(args.leveldb_dir)
+        db_bench = resolve_path(args.db_bench) if args.db_bench is not None else default_db_bench_for_leveldb(leveldb_dir)
         fill_benchmark = validate_benchmark_names((args.fill_benchmark,))[0]
         init_existing_benchmarks = parse_init_existing_benchmarks(args.init_existing_benchmarks)
 
@@ -810,13 +898,16 @@ def main() -> int:
             print_outputs(result_root, raw_path, summary_path, plot_paths)
             return 0
 
-        jemalloc_library = resolve_jemalloc_library(args.jemalloc_library)
+        if args.jemalloc_library is None and uses_flexguard_pthread_interpose(locks):
+            jemalloc_library = None
+        else:
+            jemalloc_library = resolve_jemalloc_library(args.jemalloc_library)
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         experiment_three.ensure_output_root(result_root, args.force)
         logger = experiment_three.CommandLogger(result_root)
 
         ensure_lock_helpers(locks, build_missing=args.build_missing, logger=logger)
-        ensure_db_bench(db_bench, build_missing=args.build_missing, logger=logger)
+        ensure_db_bench(db_bench, leveldb_dir=leveldb_dir, build_missing=args.build_missing, logger=logger)
 
         write_settings(
             result_root,
@@ -827,6 +918,7 @@ def main() -> int:
             num=args.num,
             total_ops=args.total_ops,
             db_bench=db_bench,
+            leveldb_dir=leveldb_dir,
             fill_benchmark=fill_benchmark,
             init_existing_benchmarks=init_existing_benchmarks,
             build_missing=args.build_missing,

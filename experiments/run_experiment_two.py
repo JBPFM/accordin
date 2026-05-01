@@ -6,152 +6,135 @@ import csv
 import datetime as dt
 import json
 import os
-import re
 import shlex
-import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Iterable
-
-from machine_config import ACTIVE_MACHINE_CONFIG, DEFAULT_THREAD_COUNTS, MACHINE_PHYSICAL_CORES, PROFILE_ENV
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
-FLEXGUARD_BUILD_DIR = FLEXGUARD_DIR / "build"
-MAKE_ALL_SCRIPT = FLEXGUARD_DIR / "scripts" / "make_all.sh"
-PTHREAD_HOST_BINARY = FLEXGUARD_BUILD_DIR / "buckets_pthread_host"
-ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
-MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
-MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
-DEFAULT_THREADS = DEFAULT_THREAD_COUNTS
-DEFAULT_LOCKS = (
-    "mcs",
-    "mcstp",
-    "mcs-tas",
-    "mcs_extension",
-    "flexguard",
-    "accordin",
-    "reciprocating",
-    "malthusian",
-)
-WORKLOAD_ORDER = ("uniform", "zipf")
+MUTEXBENCH_DIR = REPO_ROOT / "bench" / "mutexbench"
+SWEEP_SCRIPT = MUTEXBENCH_DIR / "scripts" / "sweep_mutex_throughput.sh"
+MCS_TSE_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
+MCS_TSE_DEBUG_LIB = REPO_ROOT / "target" / "debug" / "libmcs_tse.so"
+
+DEFAULT_LOCKS = ("mcs_tse", "mcs_tas")
+DEFAULT_CRITICAL_NS = 300
+DEFAULT_OUTSIDE_NS = 3000
 DEFAULT_DURATION_MS = 5000
-DEFAULT_REPEATS = 3
-DEFAULT_BUCKETS = 100
-DEFAULT_MAX_VALUE = 100000
-DEFAULT_OFFSET_CHANGES = 40
-DEFAULT_NON_CRITICAL_CYCLES = 0
-DEFAULT_ZIPF_ALPHA = 10.0
-MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
-REQUIRED_BUCKET_OPTIONS = ("--distribution", "--zipf-alpha")
-REQUIRED_PTHREAD_HOST_SYMBOLS = (
-    "pthread_mutex_init",
-    "pthread_mutex_lock",
-    "pthread_mutex_unlock",
-)
-PTHREAD_HOST_STALE_INPUTS = (
-    FLEXGUARD_DIR / "bmarks" / "buckets.c",
-    FLEXGUARD_DIR / "include" / "utils.h",
-    FLEXGUARD_DIR / "include" / "lock_if.h",
-    FLEXGUARD_DIR / "src" / "hash_map.c",
-)
-THROUGHPUT_PATTERN = re.compile(r"^#Throughput:\s*([0-9]+(?:\.[0-9]+)?)\s+CS/s$")
-BUCKET_PATTERN = re.compile(
-    r"^#Bucket\s+(\d+):\s+(\d+)\s+/\s+(\d+)\s+successful reads,\s+(\d+)\s+writes$"
-)
-UNRECOGNIZED_OPTION_PATTERN = re.compile(r"unrecognized option '([^']+)'")
+DEFAULT_WARMUP_DURATION_MS = 1000
+DEFAULT_REPEATS = 4
+EXPERIMENT_ONE_STYLE_THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
+
 RAW_FIELDS = (
     "lock",
-    "workload",
+    "lock_label",
     "threads",
-    "buckets",
-    "max_value",
-    "offset_changes",
-    "non_critical_cycles",
-    "duration_ms",
+    "cpu_count",
+    "cpu_list",
+    "numa_nodes",
+    "critical_ns",
+    "outside_ns",
     "repeat",
-    "throughput_cs_per_sec",
-    "hot_bucket_operation_share",
-    "hottest_bucket_id",
-    "total_bucket_operations",
+    "throughput_ops_per_sec",
+    "elapsed_seconds",
+    "total_operations",
+    "avg_lock_hold_ns",
+    "avg_wait_ns_estimated",
+    "avg_lock_handoff_ns_estimated",
+    "lock_hold_samples",
+    "avg_cpu_pct",
+    "source_raw",
     "command_log",
 )
+
 SUMMARY_FIELDS = (
     "lock",
-    "workload",
+    "lock_label",
     "threads",
-    "mean_throughput_cs_per_sec",
-    "mean_hot_bucket_operation_share",
+    "cpu_count",
+    "cpu_list",
+    "numa_nodes",
+    "critical_ns",
+    "outside_ns",
     "runs",
+    "mean_throughput_ops_per_sec",
+    "mean_elapsed_seconds",
+    "mean_total_operations",
+    "mean_avg_lock_hold_ns",
+    "mean_avg_wait_ns_estimated",
+    "mean_avg_lock_handoff_ns_estimated",
+    "mean_lock_hold_samples",
+    "mean_avg_cpu_pct",
 )
-WORKLOAD_LABELS = {
-    "uniform": "Uniform",
-    "zipf": "Zipf (skewed hot locks)",
+
+FALLBACK_TOPOLOGIES: dict[str, dict[int, tuple[int, ...]]] = {
+    "current-20c40t": {
+        0: tuple(range(0, 40, 2)),
+        1: tuple(range(1, 40, 2)),
+    },
+    "current-48c96t": {
+        0: tuple(range(0, 96, 2)),
+        1: tuple(range(1, 96, 2)),
+    },
 }
-LOCK_ALIASES = {
-    "mcstas": "mcs-tas",
-    "mcs_tas_accordin": "accordin",
+
+TOPOLOGY_ALIASES = {
+    "auto": "auto",
+    "current": "auto",
+    "local": "auto",
+    "small": "current-20c40t",
+    "20c40t": "current-20c40t",
+    "current-20c40t": "current-20c40t",
+    "large": "current-48c96t",
+    "original": "current-48c96t",
+    "48c96t": "current-48c96t",
+    "96cpu": "current-48c96t",
+    "current-48c96t": "current-48c96t",
 }
-LOCK_LABELS = {
-    "flexguard": "FlexGuard",
-    "mcstp": "MCS-TP",
-    "mcs-tas": "MCS-TAS",
-    "mcstas": "MCS-TAS",
-    "mcs": "MCS",
-    "accordin": "Accordin",
-    "mcs_tas_accordin": "Accordin",
-    "mcs_accordin": "MCS Accordin",
-    "mcs_extension": "MCS + TSE",
-    "reciprocating": "Reciprocating",
-    "malthusian": "Malthusian",
-    "mutex": "Mutex",
-}
-DIRECT_BINARY_LOCK_KEYS = {
-    "mcs-tas": "mcstas",
-}
-ROOT_REQUIRED_LOCKS = {"flexguard", "accordin", "mcs_accordin"}
+
+
+@dataclass(frozen=True)
+class NodeSpec:
+    node: int
+    cpus: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class CpuTopology:
+    name: str
+    nodes: tuple[NodeSpec, ...]
+    source: str
+
+    def ordered_cpus(self) -> tuple[int, ...]:
+        return tuple(cpu for node in self.nodes for cpu in node.cpus)
+
+    def cpu_to_node(self) -> dict[int, int]:
+        return {cpu: node.node for node in self.nodes for cpu in node.cpus}
+
+    def first_node_count(self) -> int:
+        return len(self.nodes[0].cpus) if self.nodes else 0
+
+    def max_threads(self) -> int:
+        return len(self.ordered_cpus())
+
+
+@dataclass(frozen=True)
+class LockSpec:
+    key: str
+    label: str
+    mode: str
+    lock_kind: str
+    timeslice_extension: str = "off"
+    preload_library: Path | None = None
 
 
 @dataclass(frozen=True)
 class CommandResult:
     log_path: Path
-    output: str
-
-
-@dataclass(frozen=True)
-class BinarySupportCheck:
-    path: Path
-    missing_options: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class PthreadHostSymbolCheck:
-    missing_imports: tuple[str, ...]
-    unexpected_definitions: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class LockExecutionSpec:
-    key: str
-    label: str
-    mode: str
-    direct_binary: Path | None = None
-    pthread_host_binary: Path | None = None
-    wrapper_script: Path | None = None
-    wrapper_library: Path | None = None
-    preload_library: Path | None = None
-
-
-@dataclass(frozen=True)
-class ArtifactIssue:
-    lock_key: str
-    artifact_kind: str
-    path: Path
-    reason: str
 
 
 class CommandError(RuntimeError):
@@ -162,11 +145,21 @@ class CommandError(RuntimeError):
 
 
 class CommandLogger:
-    def __init__(self, result_root: Path) -> None:
+    def __init__(self, result_root: Path, *, resume: bool = False) -> None:
         self.result_root = result_root
         self.log_dir = result_root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.records: list[dict[str, object]] = []
+        self.manifest_path = result_root / "commands.json"
+        self.records = self.load_records() if resume else []
+
+    def load_records(self) -> list[dict[str, object]]:
+        if not self.manifest_path.is_file():
+            return []
+        with self.manifest_path.open("r", encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, list):
+            raise RuntimeError(f"commands.json is not a command-record list: {self.manifest_path}")
+        return records
 
     def run(
         self,
@@ -175,26 +168,36 @@ class CommandLogger:
         log_name: str,
         cwd: Path = REPO_ROOT,
         env: dict[str, str] | None = None,
+        dry_run: bool = False,
     ) -> CommandResult:
         log_path = self.log_dir / log_name
-        started_at = dt.datetime.now(dt.timezone.utc)
         record: dict[str, object] = {
             "command": cmd,
             "command_text": shlex.join(cmd),
             "cwd": str(cwd),
             "log_path": str(log_path),
-            "started_at": started_at.isoformat(),
+            "dry_run": dry_run,
+            "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
+        if env:
+            record["env_overrides"] = dict(sorted(env.items()))
+
+        if dry_run:
+            print(shlex.join(cmd))
+            record["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            record["returncode"] = 0
+            self.records.append(record)
+            self.write_manifest()
+            return CommandResult(log_path=log_path)
+
         run_env = os.environ.copy()
         if env:
             run_env.update(env)
-            record["env_overrides"] = dict(sorted(env.items()))
 
-        output_chunks: list[str] = []
         with log_path.open("w", encoding="utf-8") as log_file:
             log_file.write(f"cwd: {cwd}\n")
             log_file.write(f"command: {shlex.join(cmd)}\n")
-            log_file.write(f"started_at: {started_at.isoformat()}\n\n")
+            log_file.write(f"started_at: {record['started_at']}\n\n")
             if env:
                 log_file.write("env_overrides:\n")
                 for key, value in sorted(env.items()):
@@ -213,31 +216,29 @@ class CommandLogger:
             )
             assert process.stdout is not None
             for line in process.stdout:
-                output_chunks.append(line)
                 log_file.write(line)
                 log_file.flush()
                 print(line, end="", flush=True)
             returncode = process.wait()
 
-            finished_at = dt.datetime.now(dt.timezone.utc)
-            log_file.write(f"\nfinished_at: {finished_at.isoformat()}\n")
+            finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
+            log_file.write(f"\nfinished_at: {finished_at}\n")
             log_file.write(f"returncode: {returncode}\n")
 
-        record["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        record["finished_at"] = finished_at
         record["returncode"] = returncode
         self.records.append(record)
         self.write_manifest()
-
         if returncode != 0:
             raise CommandError(
                 f"Command failed with exit code {returncode}: {shlex.join(cmd)}",
                 returncode,
                 log_path,
             )
-        return CommandResult(log_path=log_path, output="".join(output_chunks))
+        return CommandResult(log_path=log_path)
 
     def write_manifest(self) -> None:
-        with (self.result_root / "commands.json").open("w", encoding="utf-8") as f:
+        with self.manifest_path.open("w", encoding="utf-8") as f:
             json.dump(self.records, f, indent=2)
             f.write("\n")
 
@@ -256,47 +257,21 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
-def positive_float(value: str) -> float:
-    parsed = float(value)
-    if parsed <= 0.0:
-        raise argparse.ArgumentTypeError("value must be positive")
-    return parsed
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run or plot the FlexGuard multi-lock hash-table experiment "
-            "with experiment1-compatible buckets defaults."
-        ),
+        description="Run experiment two: mutexbench with NUMA-first fixed CPU affinity.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""\
 Default benchmark settings:
   locks={','.join(DEFAULT_LOCKS)}
-  machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})
-  threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
-  duration-ms={DEFAULT_DURATION_MS}, repeats={DEFAULT_REPEATS}, buckets={DEFAULT_BUCKETS}
-  max-value={DEFAULT_MAX_VALUE}, offset-changes={DEFAULT_OFFSET_CHANGES}
-  non-critical-cycles={DEFAULT_NON_CRITICAL_CYCLES}, zipf-alpha={DEFAULT_ZIPF_ALPHA}
-
-Lock mapping notes:
-  The default lock order matches experiment1 concepts.
-  mcs uses build/buckets_mcs directly.
-  mcs-tas uses build/buckets_mcstas directly; mcstas remains accepted as an alias.
-  reciprocating uses build/buckets_reciprocating directly.
-  malthusian uses build/buckets_malthusian directly.
-  mcstp and flexguard run the pthread host through build/interpose_<lock>.sh.
-  mcs_extension runs the pthread host with LD_PRELOAD=target/release/libmcs_tse.so.
-  accordin runs the pthread host with LD_PRELOAD=target/release/libmcs_tas_accordin.so.
-  mcs_tas_accordin remains accepted as an alias for accordin.
-  mcs_accordin runs the pthread host with LD_PRELOAD=target/release/libmcs_accordin.so.
-  mutex remains available and uses the pthread host without LD_PRELOAD.
+  critical-ns={DEFAULT_CRITICAL_NS}, outside-ns={DEFAULT_OUTSIDE_NS}
+  duration-ms={DEFAULT_DURATION_MS}, warmup-duration-ms={DEFAULT_WARMUP_DURATION_MS}, repeats={DEFAULT_REPEATS}
+  CPU policy: use all online CPUs from the first NUMA node first, then later NUMA nodes.
 
 Examples:
   python3 experiments/run_experiment_two.py
-  python3 experiments/run_experiment_two.py --output-root experiments/results/experiment2_manual
-  python3 experiments/run_experiment_two.py --threads 1,2,4 --duration-ms 1000 --repeats 1
-  {PROFILE_ENV}=original python3 experiments/run_experiment_two.py
+  python3 experiments/run_experiment_two.py --threads 2,4,8,16,24,32,40,48,56,64,72,80,88,96
+  python3 experiments/run_experiment_two.py --topology-profile current-20c40t
   python3 experiments/run_experiment_two.py --plot-only experiments/results/experiment2_manual
 """,
     )
@@ -319,78 +294,82 @@ Examples:
         help="Allow benchmark output into an existing non-empty output root.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue an existing --output-root by skipping lock/thread points already present in raw.csv.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write settings and commands.json, print benchmark commands, but do not execute them.",
+    )
+    parser.add_argument(
         "--build-missing",
         action="store_true",
-        help=(
-            "Build missing or stale benchmark artifacts, including direct buckets binaries, "
-            "the pthread host, wrapper scripts, and LD_PRELOAD helper libraries."
-        ),
+        help="Build missing mcs_tse preload library before running.",
     )
     parser.add_argument(
         "--locks",
         default=",".join(DEFAULT_LOCKS),
         metavar="CSV",
         help=(
-            "Comma-separated experiment2 lock keys. "
-            f"Default: {','.join(DEFAULT_LOCKS)}. "
-            "Supported mappings: mcs, mcs-tas/mcstas, reciprocating, malthusian, "
-            "mcstp, mcs_extension, flexguard, accordin/mcs_tas_accordin, mcs_accordin, mutex. "
-            "Unknown keys fall back to build/buckets_<lock>."
+            "Comma-separated locks. Default: mcs_tse,mcs_tas. "
+            "Supported: mcs_tse, mcs_tas/mcs-tas/mcstas, mcs_extension."
         ),
     )
     parser.add_argument(
         "--threads",
-        default=",".join(str(thread) for thread in DEFAULT_THREADS),
+        default=None,
         metavar="CSV",
         help=(
-            "Comma-separated thread counts. "
-            f"Default: {','.join(str(thread) for thread in DEFAULT_THREADS)}."
+            "Comma-separated thread counts. Default: experiment-one style powers of two, "
+            "plus the first-NUMA-node CPU count and the machine CPU count."
         ),
+    )
+    parser.add_argument(
+        "--topology-profile",
+        default="auto",
+        choices=sorted(TOPOLOGY_ALIASES),
+        help=(
+            "CPU topology source. Default auto reads lscpu. "
+            "Forced profiles are fallback CPU layouts for the two supported machines."
+        ),
+    )
+    parser.add_argument(
+        "--critical-ns",
+        type=positive_int,
+        default=DEFAULT_CRITICAL_NS,
+        help=f"Mutexbench critical-section burn time in ns. Default: {DEFAULT_CRITICAL_NS}.",
+    )
+    parser.add_argument(
+        "--outside-ns",
+        type=positive_int,
+        default=DEFAULT_OUTSIDE_NS,
+        help=f"Mutexbench outside-section burn time in ns. Default: {DEFAULT_OUTSIDE_NS}.",
     )
     parser.add_argument(
         "--duration-ms",
         type=positive_int,
         default=DEFAULT_DURATION_MS,
-        help=f"Benchmark duration in milliseconds. Default: {DEFAULT_DURATION_MS}.",
+        help=f"Measurement duration per repeat. Default: {DEFAULT_DURATION_MS}.",
+    )
+    parser.add_argument(
+        "--warmup-duration-ms",
+        type=non_negative_int,
+        default=DEFAULT_WARMUP_DURATION_MS,
+        help=f"Warmup duration per repeat. Default: {DEFAULT_WARMUP_DURATION_MS}.",
     )
     parser.add_argument(
         "--repeats",
         type=positive_int,
         default=DEFAULT_REPEATS,
-        help=f"Number of repeats per lock/workload/thread point. Default: {DEFAULT_REPEATS}.",
+        help=f"Repeats per lock/thread point. Default: {DEFAULT_REPEATS}.",
     )
     parser.add_argument(
-        "--buckets",
+        "--timing-sample-stride",
         type=positive_int,
-        default=DEFAULT_BUCKETS,
-        help=f"Number of buckets. Default: {DEFAULT_BUCKETS}.",
-    )
-    parser.add_argument(
-        "--max-value",
-        type=positive_int,
-        default=DEFAULT_MAX_VALUE,
-        help=f"Maximum value. Default: {DEFAULT_MAX_VALUE}.",
-    )
-    parser.add_argument(
-        "--offset-changes",
-        type=positive_int,
-        default=DEFAULT_OFFSET_CHANGES,
-        help=f"Number of offset changes. Default: {DEFAULT_OFFSET_CHANGES}.",
-    )
-    parser.add_argument(
-        "--non-critical-cycles",
-        type=non_negative_int,
-        default=DEFAULT_NON_CRITICAL_CYCLES,
-        help=(
-            "Number of non-critical cycles between critical sections. "
-            f"Default: {DEFAULT_NON_CRITICAL_CYCLES}."
-        ),
-    )
-    parser.add_argument(
-        "--zipf-alpha",
-        type=positive_float,
-        default=DEFAULT_ZIPF_ALPHA,
-        help=f"Zipf alpha for the zipf workload. Default: {DEFAULT_ZIPF_ALPHA}.",
+        default=8,
+        help="Forwarded mutexbench timing sample stride. Default: 8.",
     )
     return parser.parse_args()
 
@@ -408,16 +387,117 @@ def parse_csv_ints(value: str) -> tuple[int, ...]:
         raise ValueError("CSV value must contain at least one integer")
     if any(item <= 0 for item in items):
         raise ValueError("Thread counts must be positive")
-    return items
+    return tuple(dict.fromkeys(items))
 
 
-def resolve_path(path: Path) -> Path:
-    return path.expanduser().resolve()
+def normalize_topology_profile(value: str) -> str:
+    try:
+        return TOPOLOGY_ALIASES[value]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported topology profile: {value}") from exc
 
 
-def normalize_lock_key(lock: str) -> str:
-    normalized = lock.strip().lower()
-    return LOCK_ALIASES.get(normalized, normalized)
+def topology_from_node_cpus(name: str, node_cpus: dict[int, tuple[int, ...]], source: str) -> CpuTopology:
+    nodes = tuple(
+        NodeSpec(node=node, cpus=tuple(sorted(cpus)))
+        for node, cpus in sorted(node_cpus.items())
+        if cpus
+    )
+    if not nodes:
+        raise RuntimeError("CPU topology did not contain any online CPUs.")
+    return CpuTopology(name=name, nodes=nodes, source=source)
+
+
+def detect_lscpu_topology() -> CpuTopology | None:
+    try:
+        completed = subprocess.run(
+            ["lscpu", "-p=CPU,NODE,ONLINE"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+
+    node_cpus: dict[int, list[int]] = defaultdict(list)
+    for line in completed.stdout.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(",")
+        if len(parts) != 3:
+            continue
+        cpu_text, node_text, online = parts
+        if online.strip().upper() not in {"Y", "YES", "1"}:
+            continue
+        try:
+            cpu = int(cpu_text)
+            node = int(node_text)
+        except ValueError:
+            continue
+        node_cpus[node].append(cpu)
+
+    if not node_cpus:
+        return None
+    return topology_from_node_cpus(
+        name="auto",
+        node_cpus={node: tuple(cpus) for node, cpus in node_cpus.items()},
+        source="lscpu -p=CPU,NODE,ONLINE",
+    )
+
+
+def fallback_auto_topology() -> CpuTopology:
+    logical_cpus = os.cpu_count() or 0
+    profile = "current-20c40t" if logical_cpus and logical_cpus <= 40 else "current-48c96t"
+    return topology_from_node_cpus(
+        name=profile,
+        node_cpus=FALLBACK_TOPOLOGIES[profile],
+        source="fallback-profile",
+    )
+
+
+def select_topology(profile_arg: str) -> CpuTopology:
+    profile = normalize_topology_profile(profile_arg)
+    if profile == "auto":
+        detected = detect_lscpu_topology()
+        if detected is not None:
+            return detected
+        return fallback_auto_topology()
+    return topology_from_node_cpus(
+        name=profile,
+        node_cpus=FALLBACK_TOPOLOGIES[profile],
+        source=f"forced-profile:{profile}",
+    )
+
+
+def default_thread_counts(topology: CpuTopology) -> tuple[int, ...]:
+    max_threads = topology.max_threads()
+    first_node_count = topology.first_node_count()
+    candidates = [thread for thread in EXPERIMENT_ONE_STYLE_THREADS if thread <= max_threads]
+    candidates.extend([first_node_count, max_threads])
+    return tuple(sorted({thread for thread in candidates if 1 <= thread <= max_threads}))
+
+
+def cpu_list_for_threads(topology: CpuTopology, threads: int) -> tuple[int, ...]:
+    ordered = topology.ordered_cpus()
+    if threads > len(ordered):
+        raise ValueError(
+            f"threads={threads} exceeds available CPU count {len(ordered)} "
+            f"for topology {topology.name}."
+        )
+    return ordered[:threads]
+
+
+def format_cpu_list(cpus: tuple[int, ...]) -> str:
+    return ",".join(str(cpu) for cpu in cpus)
+
+
+def numa_nodes_for_cpu_list(topology: CpuTopology, cpus: tuple[int, ...]) -> str:
+    cpu_to_node = topology.cpu_to_node()
+    nodes = sorted({cpu_to_node[cpu] for cpu in cpus if cpu in cpu_to_node})
+    return ";".join(str(node) for node in nodes)
 
 
 def default_result_root() -> Path:
@@ -425,947 +505,552 @@ def default_result_root() -> Path:
     return REPO_ROOT / "experiments" / "results" / f"experiment2_{timestamp}"
 
 
-def ensure_output_root(path: Path, force: bool) -> None:
+def ensure_output_root(path: Path, *, force: bool, resume: bool, dry_run: bool) -> None:
     if path.exists() and not path.is_dir():
         raise RuntimeError(f"Output root exists but is not a directory: {path}")
-    if path.exists() and any(path.iterdir()) and not force:
-        raise RuntimeError(f"Output root already exists and is not empty: {path}. Use --force to write there.")
+    if path.exists() and any(path.iterdir()) and not force and not resume:
+        raise RuntimeError(f"Output root already exists and is not empty: {path}. Use --force or --resume.")
     path.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        (path / "per_run").mkdir(parents=True, exist_ok=True)
 
 
-def lock_label(lock: str) -> str:
-    normalized = normalize_lock_key(lock)
-    return LOCK_LABELS.get(normalized, normalized)
+def resolve_path(path: Path) -> Path:
+    return path.expanduser().resolve()
 
 
-def workload_label(workload: str) -> str:
-    return WORKLOAD_LABELS.get(workload, workload)
-
-
-def direct_binary_path(lock: str) -> Path:
-    return FLEXGUARD_BUILD_DIR / f"buckets_{lock}"
-
-
-def wrapper_script_path(lock: str) -> Path:
-    return FLEXGUARD_BUILD_DIR / f"interpose_{lock}.sh"
-
-
-def check_binary_support(path: Path) -> BinarySupportCheck:
+def relative_to_root(path: Path, root: Path) -> str:
     try:
-        completed = subprocess.run(
-            [str(path), "--help"],
-            cwd=str(REPO_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(f"Failed to inspect {path} with --help: {exc}") from exc
-
-    help_output = completed.stdout or ""
-    missing_options = tuple(option for option in REQUIRED_BUCKET_OPTIONS if option not in help_output)
-    if completed.returncode != 0 and not missing_options:
-        raise RuntimeError(f"Failed to inspect {path}: --help exited with code {completed.returncode}.")
-    return BinarySupportCheck(path=path, missing_options=missing_options)
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
 
 
-def normalize_nm_symbol(symbol: str) -> str:
-    return symbol.split("@", 1)[0]
+def resolve_mcs_tse_library() -> Path:
+    env_path = os.environ.get("MCS_TSE_LIB")
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        return candidate if candidate.is_absolute() else (REPO_ROOT / candidate).resolve()
+    if MCS_TSE_RELEASE_LIB.is_file():
+        return MCS_TSE_RELEASE_LIB
+    if MCS_TSE_DEBUG_LIB.is_file():
+        return MCS_TSE_DEBUG_LIB
+    return MCS_TSE_RELEASE_LIB
 
 
-def check_pthread_host_symbols(path: Path) -> PthreadHostSymbolCheck:
-    try:
-        completed = subprocess.run(
-            ["nm", "-g", str(path)],
-            cwd=str(REPO_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(f"Failed to inspect pthread host symbols for {path}: {exc}") from exc
-
-    if completed.returncode != 0:
-        raise RuntimeError(f"Failed to inspect pthread host symbols for {path}: nm exited with code {completed.returncode}.")
-
-    imported_symbols: set[str] = set()
-    defined_symbols: set[str] = set()
-    for line in completed.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        symbol_type = parts[-2]
-        symbol_name = normalize_nm_symbol(parts[-1])
-        if symbol_name not in REQUIRED_PTHREAD_HOST_SYMBOLS:
-            continue
-        if symbol_type in {"U", "u", "w", "v"}:
-            imported_symbols.add(symbol_name)
-            continue
-        defined_symbols.add(symbol_name)
-
-    missing_imports = tuple(
-        symbol for symbol in REQUIRED_PTHREAD_HOST_SYMBOLS if symbol not in imported_symbols
-    )
-    unexpected_definitions = tuple(
-        symbol for symbol in REQUIRED_PTHREAD_HOST_SYMBOLS if symbol in defined_symbols
-    )
-    return PthreadHostSymbolCheck(
-        missing_imports=missing_imports,
-        unexpected_definitions=unexpected_definitions,
-    )
-
-
-def stale_dependencies(target: Path, dependencies: Iterable[Path]) -> tuple[Path, ...]:
-    if not target.is_file():
-        return ()
-
-    target_mtime = target.stat().st_mtime
-    return tuple(
-        dependency
-        for dependency in dependencies
-        if dependency.is_file() and dependency.stat().st_mtime > target_mtime
-    )
-
-
-def lock_sort_key(lock: str) -> tuple[int, str]:
-    normalized = normalize_lock_key(lock)
-    if normalized in DEFAULT_LOCKS:
-        return (DEFAULT_LOCKS.index(normalized), normalized)
-    return (len(DEFAULT_LOCKS), normalized)
-
-
-def workload_sort_key(workload: str) -> tuple[int, str]:
-    if workload in WORKLOAD_ORDER:
-        return (WORKLOAD_ORDER.index(workload), workload)
-    return (len(WORKLOAD_ORDER), workload)
-
-
-def lock_execution_spec(lock: str) -> LockExecutionSpec:
-    normalized = normalize_lock_key(lock)
-    label = lock_label(normalized)
-
-    if normalized == "mcs":
-        return LockExecutionSpec(
-            key=normalized,
-            label=label,
-            mode="direct_binary",
-            direct_binary=direct_binary_path("mcs"),
-        )
-    if normalized == "mcs-tas":
-        return LockExecutionSpec(
-            key=normalized,
-            label=label,
-            mode="direct_binary",
-            direct_binary=direct_binary_path(DIRECT_BINARY_LOCK_KEYS[normalized]),
-        )
-    if normalized == "mcstp":
-        return LockExecutionSpec(
-            key=normalized,
-            label=label,
-            mode="interpose_wrapper",
-            pthread_host_binary=PTHREAD_HOST_BINARY,
-            wrapper_script=wrapper_script_path("mcstp"),
-            wrapper_library=FLEXGUARD_BUILD_DIR / "interpose_mcstp.so",
-        )
-    if normalized == "flexguard":
-        return LockExecutionSpec(
-            key=normalized,
-            label=label,
-            mode="interpose_wrapper",
-            pthread_host_binary=PTHREAD_HOST_BINARY,
-            wrapper_script=wrapper_script_path("flexguard"),
-            wrapper_library=FLEXGUARD_BUILD_DIR / "interpose_flexguard.so",
-        )
-    if normalized == "accordin":
-        return LockExecutionSpec(
-            key=normalized,
-            label=label,
-            mode="ld_preload",
-            pthread_host_binary=PTHREAD_HOST_BINARY,
-            preload_library=ACCORDIN_PRELOAD_LIBRARY,
-        )
-    if normalized == "mcs_accordin":
-        return LockExecutionSpec(
-            key=normalized,
-            label=label,
-            mode="ld_preload",
-            pthread_host_binary=PTHREAD_HOST_BINARY,
-            preload_library=MCS_ACCORDIN_PRELOAD_LIBRARY,
-        )
-    if normalized == "mcs_extension":
-        return LockExecutionSpec(
-            key=normalized,
-            label=label,
-            mode="ld_preload",
-            pthread_host_binary=PTHREAD_HOST_BINARY,
-            preload_library=MCS_EXTENSION_PRELOAD_LIBRARY,
-        )
-    if normalized == "mutex":
-        return LockExecutionSpec(
-            key=normalized,
-            label=label,
-            mode="pthread_host",
-            pthread_host_binary=PTHREAD_HOST_BINARY,
-        )
-    return LockExecutionSpec(
-        key=normalized,
-        label=label,
-        mode="direct_binary",
-        direct_binary=direct_binary_path(normalized),
-    )
-
-
-def resolve_lock_specs(locks: Iterable[str]) -> tuple[LockExecutionSpec, ...]:
-    specs = tuple(lock_execution_spec(lock) for lock in locks)
-    if not specs:
-        raise RuntimeError("At least one lock must be selected.")
-    return specs
-
-
-def executable_missing(path: Path) -> bool:
-    return not path.is_file() or not os.access(path, os.X_OK)
-
-
-def add_issue(
-    issues: list[ArtifactIssue],
-    seen: set[tuple[str, str, str]],
-    *,
-    lock_key: str,
-    artifact_kind: str,
-    path: Path,
-    reason: str,
-) -> None:
-    identity = (artifact_kind, str(path), reason)
-    if identity in seen:
-        return
-    seen.add(identity)
-    issues.append(
-        ArtifactIssue(
-            lock_key=lock_key,
-            artifact_kind=artifact_kind,
-            path=path,
-            reason=reason,
-        )
-    )
-
-
-def collect_artifact_issues(lock_specs: Iterable[LockExecutionSpec]) -> list[ArtifactIssue]:
-    issues: list[ArtifactIssue] = []
-    seen: set[tuple[str, str, str]] = set()
-
-    for spec in lock_specs:
-        if spec.direct_binary is not None:
-            if executable_missing(spec.direct_binary):
-                add_issue(
-                    issues,
-                    seen,
-                    lock_key=spec.key,
-                    artifact_kind="direct binary",
-                    path=spec.direct_binary,
-                    reason="missing executable",
-                )
-            else:
-                try:
-                    support = check_binary_support(spec.direct_binary)
-                except RuntimeError as exc:
-                    add_issue(
-                        issues,
-                        seen,
-                        lock_key=spec.key,
-                        artifact_kind="direct binary",
-                        path=spec.direct_binary,
-                        reason=str(exc),
-                    )
-                else:
-                    if support.missing_options:
-                        add_issue(
-                            issues,
-                            seen,
-                            lock_key=spec.key,
-                            artifact_kind="direct binary",
-                            path=spec.direct_binary,
-                            reason=f"missing {', '.join(support.missing_options)} in --help",
-                        )
-
-        if spec.pthread_host_binary is not None:
-            if executable_missing(spec.pthread_host_binary):
-                add_issue(
-                    issues,
-                    seen,
-                    lock_key=spec.key,
-                    artifact_kind="pthread host",
-                    path=spec.pthread_host_binary,
-                    reason="missing executable",
-                )
-            else:
-                try:
-                    support = check_binary_support(spec.pthread_host_binary)
-                except RuntimeError as exc:
-                    add_issue(
-                        issues,
-                        seen,
-                        lock_key=spec.key,
-                        artifact_kind="pthread host",
-                        path=spec.pthread_host_binary,
-                        reason=str(exc),
-                    )
-                else:
-                    if support.missing_options:
-                        add_issue(
-                            issues,
-                            seen,
-                            lock_key=spec.key,
-                            artifact_kind="pthread host",
-                            path=spec.pthread_host_binary,
-                            reason=f"missing {', '.join(support.missing_options)} in --help",
-                        )
-                    else:
-                        try:
-                            symbol_check = check_pthread_host_symbols(spec.pthread_host_binary)
-                        except RuntimeError as exc:
-                            add_issue(
-                                issues,
-                                seen,
-                                lock_key=spec.key,
-                                artifact_kind="pthread host",
-                                path=spec.pthread_host_binary,
-                                reason=str(exc),
-                            )
-                        else:
-                            if symbol_check.missing_imports:
-                                add_issue(
-                                    issues,
-                                    seen,
-                                    lock_key=spec.key,
-                                    artifact_kind="pthread host",
-                                    path=spec.pthread_host_binary,
-                                    reason=(
-                                        "missing imported pthread symbols: "
-                                        f"{', '.join(symbol_check.missing_imports)}"
-                                    ),
-                                )
-                            if symbol_check.unexpected_definitions:
-                                add_issue(
-                                    issues,
-                                    seen,
-                                    lock_key=spec.key,
-                                    artifact_kind="pthread host",
-                                    path=spec.pthread_host_binary,
-                                    reason=(
-                                        "unexpected defined pthread symbols: "
-                                        f"{', '.join(symbol_check.unexpected_definitions)}"
-                                    ),
-                                )
-                            stale_inputs = stale_dependencies(
-                                spec.pthread_host_binary,
-                                PTHREAD_HOST_STALE_INPUTS,
-                            )
-                            if stale_inputs:
-                                add_issue(
-                                    issues,
-                                    seen,
-                                    lock_key=spec.key,
-                                    artifact_kind="pthread host",
-                                    path=spec.pthread_host_binary,
-                                    reason=(
-                                        "older than dependencies: "
-                                        + ", ".join(str(path) for path in stale_inputs)
-                                    ),
-                                )
-
-        if spec.wrapper_script is not None and executable_missing(spec.wrapper_script):
-            add_issue(
-                issues,
-                seen,
-                lock_key=spec.key,
-                artifact_kind="wrapper script",
-                path=spec.wrapper_script,
-                reason="missing executable",
-            )
-
-        if spec.wrapper_library is not None and not spec.wrapper_library.is_file():
-            add_issue(
-                issues,
-                seen,
-                lock_key=spec.key,
-                artifact_kind="wrapper library",
-                path=spec.wrapper_library,
-                reason="missing file",
-            )
-
-        if spec.preload_library is not None and not spec.preload_library.is_file():
-            add_issue(
-                issues,
-                seen,
-                lock_key=spec.key,
-                artifact_kind="preload library",
-                path=spec.preload_library,
-                reason="missing file",
-            )
-
-    return issues
-
-
-def format_artifact_issues(issues: Iterable[ArtifactIssue]) -> str:
-    return "\n".join(
-        f"  - {issue.lock_key}: {issue.artifact_kind} {issue.path} ({issue.reason})"
-        for issue in issues
-    )
-
-
-def ensure_make_all_script() -> None:
-    if not MAKE_ALL_SCRIPT.is_file() or not os.access(MAKE_ALL_SCRIPT, os.X_OK):
-        raise RuntimeError(f"Build helper is not executable: {MAKE_ALL_SCRIPT}")
-
-
-def build_with_make_all(logger: CommandLogger) -> None:
-    ensure_make_all_script()
-    logger.run([str(MAKE_ALL_SCRIPT)], log_name="build_flexguard_make_all.log", cwd=FLEXGUARD_DIR)
-
-
-def copy_built_artifact(source: Path, destination: Path) -> None:
-    if not source.is_file():
-        raise RuntimeError(f"Expected build artifact was not produced: {source}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
-
-
-def build_pthread_host(logger: CommandLogger) -> None:
-    logger.run(["make", "clean"], log_name="build_buckets_pthread_host_clean.log", cwd=FLEXGUARD_DIR)
-    logger.run(
-        ["make", "LOCK_VERSION=MUTEX", "ADD_PADDING=1", "buckets"],
-        log_name="build_buckets_pthread_host_make.log",
-        cwd=FLEXGUARD_DIR,
-    )
-    copy_built_artifact(FLEXGUARD_DIR / "buckets", PTHREAD_HOST_BINARY)
-    logger.run(["make", "clean"], log_name="build_buckets_pthread_host_post_clean.log", cwd=FLEXGUARD_DIR)
-
-
-def build_accordin_preload(logger: CommandLogger) -> None:
-    logger.run(
-        ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
-        log_name="build_mcs_tas_accordin_release.log",
-        cwd=REPO_ROOT,
-    )
-
-
-def build_mcs_accordin_preload(logger: CommandLogger) -> None:
-    logger.run(
-        ["cargo", "build", "-p", "mcs_accordin", "--release"],
-        log_name="build_mcs_accordin_release.log",
-        cwd=REPO_ROOT,
-    )
-
-
-def build_mcs_extension_preload(logger: CommandLogger) -> None:
-    logger.run(
-        ["cargo", "build", "-p", "mcs_tse", "--release"],
-        log_name="build_mcs_tse_release.log",
-        cwd=REPO_ROOT,
-    )
-
-
-def issue_requires_make_all(issue: ArtifactIssue) -> bool:
-    if issue.artifact_kind == "direct binary":
-        return True
-    return issue.lock_key in {"mcstp", "flexguard"} and issue.artifact_kind in {"wrapper script", "wrapper library"}
-
-
-def ensure_benchmark_artifacts(
-    lock_specs: tuple[LockExecutionSpec, ...],
-    build_missing: bool,
-    logger: CommandLogger,
-) -> None:
-    issues = collect_artifact_issues(lock_specs)
-    if not issues:
-        return
-
+def ensure_mcs_tse_library(logger: CommandLogger, *, build_missing: bool, dry_run: bool) -> Path:
+    library = resolve_mcs_tse_library()
+    if library.is_file() or dry_run:
+        return library
     if not build_missing:
         raise RuntimeError(
-            "Required benchmark artifacts are missing or stale:\n"
-            f"{format_artifact_issues(issues)}\n"
-            "Rerun with --build-missing to rebuild supported artifacts where applicable."
+            f"mcs_tse preload library is missing: {library}. "
+            "Run cargo build -p mcs_tse --release or rerun with --build-missing."
         )
+    logger.run(
+        ["cargo", "build", "-p", "mcs_tse", "--release"],
+        log_name="build_mcs_tse.log",
+        cwd=REPO_ROOT,
+    )
+    library = resolve_mcs_tse_library()
+    if not library.is_file():
+        raise RuntimeError(f"mcs_tse preload library was not built: {library}")
+    return library
 
-    if any(issue_requires_make_all(issue) for issue in issues):
-        build_with_make_all(logger)
-    if any(issue.artifact_kind == "pthread host" for issue in issues):
-        build_pthread_host(logger)
-    if any(issue.lock_key == "accordin" and issue.artifact_kind == "preload library" for issue in issues):
-        build_accordin_preload(logger)
-    if any(issue.lock_key == "mcs_accordin" and issue.artifact_kind == "preload library" for issue in issues):
-        build_mcs_accordin_preload(logger)
-    if any(issue.lock_key == "mcs_extension" and issue.artifact_kind == "preload library" for issue in issues):
-        build_mcs_extension_preload(logger)
 
-    issues_after_build = collect_artifact_issues(lock_specs)
-    if issues_after_build:
-        raise RuntimeError(
-            "Required benchmark artifacts are still invalid after --build-missing:\n"
-            f"{format_artifact_issues(issues_after_build)}"
+def normalize_lock_key(key: str) -> str:
+    normalized = key.strip().lower()
+    aliases = {
+        "mcs-tas": "mcs_tas",
+        "mcstas": "mcs_tas",
+        "mcs_tas": "mcs_tas",
+        "mcs_tse": "mcs_tse",
+        "mcs-extension": "mcs_extension",
+        "mcs_extension": "mcs_extension",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unsupported lock key: {key}. Supported locks: mcs_tse, mcs_tas/mcs-tas/mcstas, mcs_extension."
         )
+    return aliases[normalized]
+
+
+def resolve_lock_specs(
+    lock_keys: tuple[str, ...],
+    *,
+    logger: CommandLogger,
+    build_missing: bool,
+    dry_run: bool,
+) -> tuple[LockSpec, ...]:
+    specs: list[LockSpec] = []
+    seen: set[str] = set()
+    for raw_key in lock_keys:
+        key = normalize_lock_key(raw_key)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if key == "mcs_tse":
+            specs.append(
+                LockSpec(
+                    key="mcs_tse",
+                    label="MCS + TSE",
+                    mode="ld_preload",
+                    lock_kind="mutex",
+                    preload_library=ensure_mcs_tse_library(
+                        logger,
+                        build_missing=build_missing,
+                        dry_run=dry_run,
+                    ),
+                )
+            )
+        elif key == "mcs_tas":
+            specs.append(
+                LockSpec(
+                    key="mcs_tas",
+                    label="MCS-TAS",
+                    mode="native",
+                    lock_kind="mcs-tas",
+                )
+            )
+        elif key == "mcs_extension":
+            specs.append(
+                LockSpec(
+                    key="mcs_extension",
+                    label="MCS + TSE (native)",
+                    mode="native_timeslice_extension",
+                    lock_kind="mcs",
+                    timeslice_extension="require",
+                )
+            )
+    return tuple(specs)
+
+
+def ensure_inputs() -> None:
+    if not SWEEP_SCRIPT.is_file() or not os.access(SWEEP_SCRIPT, os.X_OK):
+        raise RuntimeError(f"Mutexbench sweep script is not executable: {SWEEP_SCRIPT}")
+
+
+def build_sweep_command(
+    spec: LockSpec,
+    *,
+    threads: int,
+    cpu_list: str,
+    args: argparse.Namespace,
+    raw_path: Path,
+    summary_path: Path,
+    output_root: Path,
+) -> list[str]:
+    cmd = [
+        "taskset",
+        "-c",
+        cpu_list,
+        str(SWEEP_SCRIPT),
+        "--threads",
+        str(threads),
+        "--critical-ns",
+        str(args.critical_ns),
+        "--outside-ns",
+        str(args.outside_ns),
+        "--duration-ms",
+        str(args.duration_ms),
+        "--warmup-duration-ms",
+        str(args.warmup_duration_ms),
+        "--timing-sample-stride",
+        str(args.timing_sample_stride),
+        "--repeats",
+        str(args.repeats),
+        "--timeslice-extension",
+        spec.timeslice_extension,
+        "--lock-kind",
+        spec.lock_kind,
+        "--output-root",
+        str(output_root),
+        "--output-raw",
+        str(raw_path),
+        "--output-summary",
+        str(summary_path),
+    ]
+    if spec.preload_library is not None:
+        cmd.extend(["--bench-ld-preload", str(spec.preload_library)])
+    return cmd
 
 
 def write_settings(
     result_root: Path,
     *,
-    lock_specs: tuple[LockExecutionSpec, ...],
+    topology: CpuTopology,
+    locks: tuple[LockSpec, ...],
     threads: tuple[int, ...],
     args: argparse.Namespace,
 ) -> None:
+    cpu_lists = {
+        str(thread): format_cpu_list(cpu_list_for_threads(topology, thread))
+        for thread in threads
+    }
     settings = {
         "locks": [
             {
-                "key": spec.key,
-                "label": spec.label,
-                "mode": spec.mode,
-                "artifacts": {
-                    name: str(path)
-                    for name, path in (
-                        ("direct_binary", spec.direct_binary),
-                        ("pthread_host_binary", spec.pthread_host_binary),
-                        ("wrapper_script", spec.wrapper_script),
-                        ("wrapper_library", spec.wrapper_library),
-                        ("preload_library", spec.preload_library),
-                    )
-                    if path is not None
-                },
+                "key": lock.key,
+                "label": lock.label,
+                "mode": lock.mode,
+                "lock_kind": lock.lock_kind,
+                "timeslice_extension": lock.timeslice_extension,
+                "preload_library": str(lock.preload_library) if lock.preload_library is not None else None,
             }
-            for spec in lock_specs
+            for lock in locks
         ],
         "threads": list(threads),
-        "machine_profile": ACTIVE_MACHINE_CONFIG.name,
-        "machine_profile_env": PROFILE_ENV,
-        "workloads": [{"key": key, "label": label} for key, label in WORKLOAD_LABELS.items()],
+        "cpu_lists_by_thread": cpu_lists,
+        "cpu_policy": "numa-first: first NUMA node CPUs sorted ascending, then later NUMA nodes sorted ascending",
+        "topology": {
+            "name": topology.name,
+            "source": topology.source,
+            "max_threads": topology.max_threads(),
+            "first_node_cpu_count": topology.first_node_count(),
+            "nodes": [
+                {"node": node.node, "cpus": list(node.cpus)}
+                for node in topology.nodes
+            ],
+        },
+        "critical_ns": args.critical_ns,
+        "outside_ns": args.outside_ns,
         "duration_ms": args.duration_ms,
+        "warmup_duration_ms": args.warmup_duration_ms,
         "repeats": args.repeats,
-        "buckets": args.buckets,
-        "max_value": args.max_value,
-        "offset_changes": args.offset_changes,
-        "non_critical_cycles": args.non_critical_cycles,
-        "zipf_alpha": args.zipf_alpha,
+        "timing_sample_stride": args.timing_sample_stride,
         "build_missing": args.build_missing,
-        "flexguard_dir": str(FLEXGUARD_DIR),
-        "machine_core_count": MACHINE_CORE_COUNT,
+        "dry_run": args.dry_run,
     }
     with (result_root / "settings.json").open("w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
 
 
-def parse_run_output(output: str) -> tuple[float, float, int, int]:
-    unsupported_option = UNRECOGNIZED_OPTION_PATTERN.search(output)
-    if unsupported_option is not None:
-        option = unsupported_option.group(1)
-        if option in ("--distribution", "--zipf-alpha"):
-            raise RuntimeError(
-                "The selected benchmark executable does not support "
-                f"{option}. Rebuild bench/flexguard/build/buckets_<lock> from the updated source."
-            )
-        raise RuntimeError(f"Benchmark rejected option {option}.")
-
-    throughput: float | None = None
-    total_bucket_operations = 0
-    hottest_bucket_id = -1
-    hottest_bucket_operations = -1
-
-    for line in output.splitlines():
-        stripped = line.strip()
-        throughput_match = THROUGHPUT_PATTERN.match(stripped)
-        if throughput_match is not None:
-            throughput = float(throughput_match.group(1))
-            continue
-
-        bucket_match = BUCKET_PATTERN.match(stripped)
-        if bucket_match is None:
-            continue
-
-        bucket_id = int(bucket_match.group(1))
-        reads = int(bucket_match.group(3))
-        writes = int(bucket_match.group(4))
-        operations = reads + writes
-        total_bucket_operations += operations
-        if operations > hottest_bucket_operations:
-            hottest_bucket_operations = operations
-            hottest_bucket_id = bucket_id
-
-    if throughput is None:
-        raise RuntimeError("Benchmark output did not contain a #Throughput line.")
-    if hottest_bucket_id < 0:
-        raise RuntimeError("Benchmark output did not contain any #Bucket lines.")
-
-    share = 0.0
-    if total_bucket_operations > 0:
-        share = hottest_bucket_operations / total_bucket_operations
-    return throughput, share, hottest_bucket_id, total_bucket_operations
+def load_raw_rows(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
 
 
-def buckets_args_for_run(args: argparse.Namespace, *, workload: str, threads: int) -> list[str]:
-    return [
-        "--duration",
-        str(args.duration_ms),
-        "--num-threads",
-        str(threads),
-        "--buckets",
-        str(args.buckets),
-        "--max-value",
-        str(args.max_value),
-        "--offset-changes",
-        str(args.offset_changes),
-        "--non-critical-cycles",
-        str(args.non_critical_cycles),
-        "--distribution",
-        workload,
-        "--zipf-alpha",
-        str(args.zipf_alpha),
-    ]
+def write_raw_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=RAW_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in RAW_FIELDS})
 
 
-def combine_ld_preload(preload_library: Path) -> str:
-    existing = os.environ.get("LD_PRELOAD", "").strip()
-    if existing:
-        return f"{preload_library}:{existing}"
-    return str(preload_library)
+def as_float(row: dict[str, str], field: str) -> float:
+    value = row.get(field, "")
+    return float(value) if value not in {"", None} else 0.0
 
 
-def accordin_preload_env(preload_library: Path) -> dict[str, str]:
-    env = {"LD_PRELOAD": combine_ld_preload(preload_library)}
-    if "ACCORDIN_CPU_MASK_K" in os.environ:
-        env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
-    if "K" in os.environ:
-        env["K"] = os.environ["K"]
-    return env
+def summarize_rows(rows: list[dict[str, str]], lock_order: tuple[str, ...]) -> list[dict[str, str]]:
+    groups: dict[tuple[str, str, str, str], list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        groups[(row["lock"], row["threads"], row["critical_ns"], row["outside_ns"])].append(row)
+
+    order_index = {lock: index for index, lock in enumerate(lock_order)}
+    summary: list[dict[str, str]] = []
+    for key, group_rows in sorted(
+        groups.items(),
+        key=lambda item: (
+            order_index.get(item[0][0], len(order_index)),
+            int(item[0][1]),
+            int(item[0][2]),
+            int(item[0][3]),
+        ),
+    ):
+        _lock, _threads, _critical_ns, _outside_ns = key
+        first = group_rows[0]
+        summary.append(
+            {
+                "lock": first["lock"],
+                "lock_label": first["lock_label"],
+                "threads": first["threads"],
+                "cpu_count": first["cpu_count"],
+                "cpu_list": first["cpu_list"],
+                "numa_nodes": first["numa_nodes"],
+                "critical_ns": first["critical_ns"],
+                "outside_ns": first["outside_ns"],
+                "runs": str(len(group_rows)),
+                "mean_throughput_ops_per_sec": f"{mean(as_float(row, 'throughput_ops_per_sec') for row in group_rows):.6f}",
+                "mean_elapsed_seconds": f"{mean(as_float(row, 'elapsed_seconds') for row in group_rows):.6f}",
+                "mean_total_operations": f"{mean(as_float(row, 'total_operations') for row in group_rows):.6f}",
+                "mean_avg_lock_hold_ns": f"{mean(as_float(row, 'avg_lock_hold_ns') for row in group_rows):.6f}",
+                "mean_avg_wait_ns_estimated": f"{mean(as_float(row, 'avg_wait_ns_estimated') for row in group_rows):.6f}",
+                "mean_avg_lock_handoff_ns_estimated": f"{mean(as_float(row, 'avg_lock_handoff_ns_estimated') for row in group_rows):.6f}",
+                "mean_lock_hold_samples": f"{mean(as_float(row, 'lock_hold_samples') for row in group_rows):.6f}",
+                "mean_avg_cpu_pct": f"{mean(as_float(row, 'avg_cpu_pct') for row in group_rows):.6f}",
+            }
+        )
+    return summary
 
 
-def wrap_root_command(cmd: list[str], env: dict[str, str] | None) -> tuple[list[str], dict[str, str] | None]:
-    if os.geteuid() == 0:
-        return cmd, env
-    if shutil.which("sudo") is None:
-        raise RuntimeError("sudo is required to run Accordin preload locks because they load sched_ext eBPF schedulers.")
-
-    env_args = [f"{key}={value}" for key, value in sorted((env or {}).items())]
-    if env_args:
-        return ["sudo", "--", "env", *env_args, *cmd], None
-    return ["sudo", "--", *cmd], None
+def write_summary_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in SUMMARY_FIELDS})
 
 
-def benchmark_command(
-    spec: LockExecutionSpec,
+def append_sweep_rows(
+    rows: list[dict[str, str]],
     *,
-    benchmark_args: list[str],
-) -> tuple[list[str], dict[str, str] | None]:
-    cmd: list[str]
-    env: dict[str, str] | None
-    if spec.mode == "direct_binary":
-        assert spec.direct_binary is not None
-        cmd = [str(spec.direct_binary), *benchmark_args]
-        env = None
-    elif spec.mode == "interpose_wrapper":
-        assert spec.wrapper_script is not None
-        assert spec.pthread_host_binary is not None
-        cmd = [str(spec.wrapper_script), str(spec.pthread_host_binary), *benchmark_args]
-        env = None
-    elif spec.mode == "ld_preload":
-        assert spec.pthread_host_binary is not None
-        assert spec.preload_library is not None
-        cmd = [str(spec.pthread_host_binary), *benchmark_args]
-        if spec.key in {"accordin", "mcs_accordin"}:
-            env = accordin_preload_env(spec.preload_library)
-        else:
-            env = {"LD_PRELOAD": combine_ld_preload(spec.preload_library)}
-    elif spec.mode == "pthread_host":
-        assert spec.pthread_host_binary is not None
-        cmd = [str(spec.pthread_host_binary), *benchmark_args]
-        env = None
-    else:
-        raise RuntimeError(f"Unsupported lock mode {spec.mode} for {spec.key}")
+    spec: LockSpec,
+    topology: CpuTopology,
+    cpu_list: tuple[int, ...],
+    raw_path: Path,
+    result_root: Path,
+    log_path: Path,
+) -> None:
+    with raw_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for source_row in reader:
+            rows.append(
+                {
+                    "lock": spec.key,
+                    "lock_label": spec.label,
+                    "threads": source_row["threads"],
+                    "cpu_count": str(len(cpu_list)),
+                    "cpu_list": format_cpu_list(cpu_list),
+                    "numa_nodes": numa_nodes_for_cpu_list(topology, cpu_list),
+                    "critical_ns": source_row["critical_iters"],
+                    "outside_ns": source_row["outside_iters"],
+                    "repeat": source_row["repeat"],
+                    "throughput_ops_per_sec": source_row["throughput_ops_per_sec"],
+                    "elapsed_seconds": source_row["elapsed_seconds"],
+                    "total_operations": source_row["total_operations"],
+                    "avg_lock_hold_ns": source_row["avg_lock_hold_ns"],
+                    "avg_wait_ns_estimated": source_row["avg_wait_ns_estimated"],
+                    "avg_lock_handoff_ns_estimated": source_row["avg_lock_handoff_ns_estimated"],
+                    "lock_hold_samples": source_row["lock_hold_samples"],
+                    "avg_cpu_pct": source_row["avg_cpu_pct"],
+                    "source_raw": relative_to_root(raw_path, result_root),
+                    "command_log": relative_to_root(log_path, result_root),
+                }
+            )
 
-    if spec.key in ROOT_REQUIRED_LOCKS:
-        return wrap_root_command(cmd, env)
-    return cmd, env
+
+def completed_points(rows: list[dict[str, str]], repeats: int) -> set[tuple[str, int, int, int]]:
+    counts: dict[tuple[str, int, int, int], int] = defaultdict(int)
+    for row in rows:
+        key = (
+            row["lock"],
+            int(row["threads"]),
+            int(row["critical_ns"]),
+            int(row["outside_ns"]),
+        )
+        counts[key] += 1
+    return {key for key, count in counts.items() if count >= repeats}
+
+
+def write_plots(
+    result_root: Path,
+    summary_rows: list[dict[str, str]],
+    *,
+    topology: CpuTopology,
+) -> None:
+    if not summary_rows:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        print(f"Skipping plots because matplotlib is unavailable: {exc}")
+        return
+
+    metrics = (
+        ("mean_throughput_ops_per_sec", "Throughput (ops/s)", "throughput_vs_threads.png"),
+        ("mean_avg_lock_hold_ns", "Avg lock hold (ns)", "lock_hold_ns_vs_threads.png"),
+        ("mean_avg_lock_handoff_ns_estimated", "Avg handoff (ns)", "handoff_ns_vs_threads.png"),
+        ("mean_avg_cpu_pct", "Avg CPU (%)", "cpu_pct_vs_threads.png"),
+    )
+    labels = sorted({row["lock_label"] for row in summary_rows})
+    first_node_count = topology.first_node_count()
+
+    for field, ylabel, filename in metrics:
+        fig, ax = plt.subplots(figsize=(8, 4.8))
+        for label in labels:
+            rows = [row for row in summary_rows if row["lock_label"] == label]
+            rows.sort(key=lambda row: int(row["threads"]))
+            ax.plot(
+                [int(row["threads"]) for row in rows],
+                [float(row[field]) for row in rows],
+                marker="o",
+                linewidth=2,
+                label=label,
+            )
+        if first_node_count > 0:
+            ax.axvline(
+                first_node_count,
+                color="#666666",
+                linestyle="--",
+                linewidth=1,
+                label=f"first NUMA node CPUs ({first_node_count})",
+            )
+        ax.set_xlabel("Threads / bound CPUs")
+        ax.set_ylabel(ylabel)
+        ax.set_xscale("log", base=2)
+        thread_values = sorted({int(row["threads"]) for row in summary_rows})
+        ax.set_xticks(thread_values)
+        ax.set_xticklabels([str(value) for value in thread_values])
+        ax.grid(True, which="both", axis="y", linestyle=":", linewidth=0.8)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(result_root / filename, dpi=180)
+        plt.close(fig)
 
 
 def run_benchmarks(
     result_root: Path,
     *,
-    lock_specs: tuple[LockExecutionSpec, ...],
+    topology: CpuTopology,
+    locks: tuple[LockSpec, ...],
     threads: tuple[int, ...],
     args: argparse.Namespace,
     logger: CommandLogger,
-) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    workloads = WORKLOAD_ORDER
-
-    for workload in workloads:
-        for spec in lock_specs:
-            for thread in threads:
-                for repeat in range(1, args.repeats + 1):
-                    run_args = buckets_args_for_run(args, workload=workload, threads=thread)
-                    cmd, env = benchmark_command(spec, benchmark_args=run_args)
-                    log_name = f"buckets_{spec.key}_{workload}_{thread:03d}_r{repeat}.log"
-                    result = logger.run(cmd, log_name=log_name, env=env)
-                    throughput, share, hottest_bucket_id, total_bucket_operations = parse_run_output(
-                        result.output
-                    )
-                    rows.append(
-                        {
-                            "lock": spec.key,
-                            "workload": workload,
-                            "threads": str(thread),
-                            "buckets": str(args.buckets),
-                            "max_value": str(args.max_value),
-                            "offset_changes": str(args.offset_changes),
-                            "non_critical_cycles": str(args.non_critical_cycles),
-                            "duration_ms": str(args.duration_ms),
-                            "repeat": str(repeat),
-                            "throughput_cs_per_sec": f"{throughput:.6f}",
-                            "hot_bucket_operation_share": f"{share:.6f}",
-                            "hottest_bucket_id": str(hottest_bucket_id),
-                            "total_bucket_operations": str(total_bucket_operations),
-                            "command_log": str(result.log_path.relative_to(result_root)),
-                        }
-                    )
-    return rows
-
-
-def write_raw_csv(result_root: Path, rows: list[dict[str, str]]) -> Path:
-    path = result_root / "raw.csv"
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=RAW_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-    return path
-
-
-def load_raw_rows(result_root: Path) -> list[dict[str, str]]:
-    path = result_root / "raw.csv"
-    if not path.is_file():
-        raise RuntimeError(f"raw.csv was not found under {result_root}")
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise RuntimeError(f"raw.csv is missing a header: {path}")
-        missing = [field for field in RAW_FIELDS if field not in reader.fieldnames]
-        if missing:
-            raise RuntimeError(f"raw.csv is missing required columns: {', '.join(missing)}")
-        rows = [dict(row) for row in reader]
-    for row in rows:
-        row["lock"] = normalize_lock_key(row["lock"])
-    return rows
-
-
-def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    groups: dict[tuple[str, str, int], list[dict[str, str]]] = {}
-    for row in rows:
-        normalized_row = dict(row)
-        normalized_row["lock"] = normalize_lock_key(row["lock"])
-        key = (normalized_row["lock"], normalized_row["workload"], int(normalized_row["threads"]))
-        groups.setdefault(key, []).append(normalized_row)
-
-    summary_rows: list[dict[str, str]] = []
-    for lock, workload, threads in sorted(
-        groups.keys(),
-        key=lambda item: (workload_sort_key(item[1]), lock_sort_key(item[0]), item[2]),
-    ):
-        group_rows = groups[(lock, workload, threads)]
-        summary_rows.append(
-            {
-                "lock": lock,
-                "workload": workload,
-                "threads": str(threads),
-                "mean_throughput_cs_per_sec": f"{mean(float(row['throughput_cs_per_sec']) for row in group_rows):.6f}",
-                "mean_hot_bucket_operation_share": (
-                    f"{mean(float(row['hot_bucket_operation_share']) for row in group_rows):.6f}"
-                ),
-                "runs": str(len(group_rows)),
-            }
-        )
-    return summary_rows
-
-
-def write_summary_csv(result_root: Path, rows: list[dict[str, str]]) -> Path:
-    path = result_root / "summary.csv"
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-    return path
-
-
-def unique_threads(summary_rows: list[dict[str, str]], workload: str) -> list[int]:
-    return sorted({int(row["threads"]) for row in summary_rows if row["workload"] == workload})
-
-
-def add_thread_axis_formatting(ax, threads: list[int]) -> None:
-    if not threads:
-        return
-
-    if len(threads) > 1:
-        ax.set_xscale("log", base=2)
-        ax.set_xlim(threads[0] / 1.08, threads[-1] * 1.25)
-    else:
-        ax.set_xlim(max(0.0, threads[0] - 0.5), threads[0] + 0.5)
-    ax.set_xticks(threads)
-
-    if threads[-1] >= MACHINE_CORE_COUNT:
-        ax.axvspan(MACHINE_CORE_COUNT, threads[-1] * 1.25, color="0.92", alpha=0.55, linewidth=0, zorder=0)
-        ax.axvline(MACHINE_CORE_COUNT, color="0.22", linewidth=1.0, linestyle="--", alpha=0.75, zorder=1)
-        ax.annotate(
-            f"{MACHINE_CORE_COUNT} cores",
-            xy=(MACHINE_CORE_COUNT, 0.96),
-            xycoords=ax.get_xaxis_transform(),
-            xytext=(6, 0),
-            textcoords="offset points",
-            ha="left",
-            va="top",
-            fontsize=8,
-            color="0.2",
-        )
-
-
-def plot_workload_metric(
-    summary_rows: list[dict[str, str]],
-    *,
-    workload: str,
-    metric_field: str,
-    ylabel: str,
-    title_prefix: str,
-    output_path: Path,
+    rows: list[dict[str, str]],
 ) -> None:
-    try:
-        import matplotlib
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("matplotlib is required to generate plots.") from exc
+    done = completed_points(rows, args.repeats) if args.resume else set()
+    for spec in locks:
+        for thread in threads:
+            point = (spec.key, thread, args.critical_ns, args.outside_ns)
+            if point in done:
+                print(f"Skipping completed point: lock={spec.key} threads={thread}")
+                continue
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import ScalarFormatter
-
-    rows = [row for row in summary_rows if row["workload"] == workload]
-    if not rows:
-        raise RuntimeError(f"No summary rows available for workload {workload}.")
-
-    fig, ax = plt.subplots(figsize=(9.5, 5.5))
-    thread_values = unique_threads(summary_rows, workload)
-    lock_keys = sorted({normalize_lock_key(row["lock"]) for row in rows}, key=lock_sort_key)
-
-    for lock in lock_keys:
-        points = [
-            (int(row["threads"]), float(row[metric_field]))
-            for row in rows
-            if normalize_lock_key(row["lock"]) == lock
-        ]
-        if not points:
-            continue
-        points.sort()
-        ax.plot(
-            [thread for thread, _ in points],
-            [value for _, value in points],
-            marker="o",
-            linewidth=1.8,
-            markersize=4,
-            label=lock_label(lock),
-        )
-
-    ax.set_title(f"{title_prefix}: {workload_label(workload)}")
-    ax.set_xlabel("Threads")
-    ax.set_ylabel(ylabel)
-    add_thread_axis_formatting(ax, thread_values)
-    ax.xaxis.set_major_formatter(ScalarFormatter())
-    ax.grid(True, axis="y", alpha=0.28)
-    ax.grid(True, axis="x", which="major", alpha=0.16)
-    if metric_field == "mean_hot_bucket_operation_share":
-        ax.set_ylim(0.0, 1.02)
-    ax.legend(frameon=False)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def write_plots(result_root: Path, summary_rows: list[dict[str, str]]) -> list[Path]:
-    workloads = sorted({row["workload"] for row in summary_rows}, key=workload_sort_key)
-    if not workloads:
-        raise RuntimeError("No summary rows were available for plotting.")
-
-    plot_paths: list[Path] = []
-    for workload in workloads:
-        throughput_path = result_root / f"throughput_vs_threads_{workload}.png"
-        hot_bucket_path = result_root / f"hot_bucket_share_vs_threads_{workload}.png"
-        plot_workload_metric(
-            summary_rows,
-            workload=workload,
-            metric_field="mean_throughput_cs_per_sec",
-            ylabel="Throughput (CS/s)",
-            title_prefix="Hashtable Throughput vs Threads",
-            output_path=throughput_path,
-        )
-        plot_workload_metric(
-            summary_rows,
-            workload=workload,
-            metric_field="mean_hot_bucket_operation_share",
-            ylabel="Hot bucket operation share",
-            title_prefix="Hot Bucket Operation Share vs Threads",
-            output_path=hot_bucket_path,
-        )
-        plot_paths.extend((throughput_path, hot_bucket_path))
-    return plot_paths
-
-
-def print_outputs(result_root: Path, raw_path: Path, summary_path: Path, plot_paths: Iterable[Path]) -> None:
-    print(f"Result root: {result_root}")
-    print(f"Raw CSV: {raw_path}")
-    print(f"Summary CSV: {summary_path}")
-    for plot_path in plot_paths:
-        print(f"Plot: {plot_path}")
+            cpus = cpu_list_for_threads(topology, thread)
+            cpu_list = format_cpu_list(cpus)
+            run_root = result_root / "per_run" / spec.key / f"t{thread:03d}"
+            run_root.mkdir(parents=True, exist_ok=True)
+            raw_path = run_root / "raw.csv"
+            summary_path = run_root / "summary.csv"
+            cmd = build_sweep_command(
+                spec,
+                threads=thread,
+                cpu_list=cpu_list,
+                args=args,
+                raw_path=raw_path,
+                summary_path=summary_path,
+                output_root=run_root,
+            )
+            print(
+                f"Running lock={spec.key} threads={thread} cpus={cpu_list} "
+                f"numa_nodes={numa_nodes_for_cpu_list(topology, cpus)}"
+            )
+            result = logger.run(
+                cmd,
+                log_name=f"sweep_{spec.key}_t{thread:03d}.log",
+                cwd=REPO_ROOT,
+                dry_run=args.dry_run,
+            )
+            if args.dry_run:
+                continue
+            append_sweep_rows(
+                rows,
+                spec=spec,
+                topology=topology,
+                cpu_list=cpus,
+                raw_path=raw_path,
+                result_root=result_root,
+                log_path=result.log_path,
+            )
+            write_raw_csv(result_root / "raw.csv", rows)
+            write_summary_csv(
+                result_root / "summary.csv",
+                summarize_rows(rows, tuple(lock.key for lock in locks)),
+            )
 
 
 def main() -> int:
     args = parse_args()
 
-    try:
-        if args.plot_only is not None:
-            result_root = resolve_path(args.plot_only)
-            if not result_root.is_dir():
-                print(f"Plot-only result root does not exist: {result_root}", file=sys.stderr)
-                return 2
-            raw_rows = load_raw_rows(result_root)
-            summary_rows = summarize_rows(raw_rows)
-            raw_path = result_root / "raw.csv"
-            summary_path = write_summary_csv(result_root, summary_rows)
-            plot_paths = write_plots(result_root, summary_rows)
-            print_outputs(result_root, raw_path, summary_path, plot_paths)
-            return 0
+    if args.plot_only is not None:
+        result_root = resolve_path(args.plot_only)
+        raw_path = result_root / "raw.csv"
+        if not raw_path.is_file():
+            raise RuntimeError(f"raw.csv was not found: {raw_path}")
+        rows = load_raw_rows(raw_path)
+        lock_order = tuple(dict.fromkeys(row["lock"] for row in rows))
+        summary_rows = summarize_rows(rows, lock_order)
+        write_summary_csv(result_root / "summary.csv", summary_rows)
 
-        lock_specs = resolve_lock_specs(parse_csv_strings(args.locks))
-        threads = parse_csv_ints(args.threads)
-        result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
-        ensure_output_root(result_root, args.force)
-        logger = CommandLogger(result_root)
-        ensure_benchmark_artifacts(lock_specs, args.build_missing, logger)
-        write_settings(result_root, lock_specs=lock_specs, threads=threads, args=args)
-        raw_rows = run_benchmarks(
-            result_root,
-            lock_specs=lock_specs,
-            threads=threads,
-            args=args,
-            logger=logger,
-        )
-        raw_path = write_raw_csv(result_root, raw_rows)
-        summary_rows = summarize_rows(raw_rows)
-        summary_path = write_summary_csv(result_root, summary_rows)
-        plot_paths = write_plots(result_root, summary_rows)
-        print_outputs(result_root, raw_path, summary_path, plot_paths)
+        settings_path = result_root / "settings.json"
+        if settings_path.is_file():
+            with settings_path.open("r", encoding="utf-8") as f:
+                settings = json.load(f)
+            topology = topology_from_node_cpus(
+                name=settings.get("topology", {}).get("name", "settings"),
+                node_cpus={
+                    int(node["node"]): tuple(int(cpu) for cpu in node["cpus"])
+                    for node in settings.get("topology", {}).get("nodes", [])
+                },
+                source="settings.json",
+            )
+        else:
+            topology = select_topology(args.topology_profile)
+        write_plots(result_root, summary_rows, topology=topology)
+        print(f"Summary: {result_root / 'summary.csv'}")
         return 0
-    except CommandError as exc:
-        print(str(exc), file=sys.stderr)
-        print(f"Command log: {exc.log_path}", file=sys.stderr)
-        return exc.returncode
-    except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+
+    result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
+    ensure_output_root(result_root, force=args.force, resume=args.resume, dry_run=args.dry_run)
+    ensure_inputs()
+
+    topology = select_topology(args.topology_profile)
+    threads = parse_csv_ints(args.threads) if args.threads is not None else default_thread_counts(topology)
+    invalid_threads = [thread for thread in threads if thread > topology.max_threads()]
+    if invalid_threads:
+        raise RuntimeError(
+            f"Thread counts exceed topology CPU count {topology.max_threads()}: "
+            f"{','.join(str(thread) for thread in invalid_threads)}"
+        )
+
+    logger = CommandLogger(result_root, resume=args.resume)
+    lock_keys = parse_csv_strings(args.locks)
+    locks = resolve_lock_specs(
+        lock_keys,
+        logger=logger,
+        build_missing=args.build_missing,
+        dry_run=args.dry_run,
+    )
+
+    write_settings(result_root, topology=topology, locks=locks, threads=threads, args=args)
+    rows = load_raw_rows(result_root / "raw.csv") if args.resume else []
+    run_benchmarks(
+        result_root,
+        topology=topology,
+        locks=locks,
+        threads=threads,
+        args=args,
+        logger=logger,
+        rows=rows,
+    )
+    if not args.dry_run:
+        summary_rows = summarize_rows(rows, tuple(lock.key for lock in locks))
+        write_raw_csv(result_root / "raw.csv", rows)
+        write_summary_csv(result_root / "summary.csv", summary_rows)
+        write_plots(result_root, summary_rows, topology=topology)
+        print(f"Raw results: {result_root / 'raw.csv'}")
+        print(f"Summary: {result_root / 'summary.csv'}")
+    else:
+        print(f"Dry-run output root: {result_root}")
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except CommandError as exc:
+        print(str(exc), file=sys.stderr)
+        print(f"Command log: {exc.log_path}", file=sys.stderr)
+        raise SystemExit(exc.returncode)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1)

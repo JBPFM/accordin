@@ -1330,7 +1330,7 @@ def add_thread_axis_formatting(ax, threads: list[int]) -> None:
         )
 
 
-def plot_runtime(summary_rows: list[dict[str, str]], *, benchmark: str, output_path: Path) -> None:
+def plot_throughput(summary_rows: list[dict[str, str]], *, benchmark: str, output_path: Path) -> None:
     try:
         import matplotlib
     except ModuleNotFoundError as exc:
@@ -1354,9 +1354,9 @@ def plot_runtime(summary_rows: list[dict[str, str]], *, benchmark: str, output_p
 
     for lock in lock_keys:
         points = [
-            (int(row["threads"]), float(row["mean_run_time_ms"]))
+            (int(row["threads"]), 1000.0 / float(row["mean_run_time_ms"]))
             for row in rows
-            if row["lock"] == lock
+            if row["lock"] == lock and float(row["mean_run_time_ms"]) > 0.0
         ]
         if not points:
             continue
@@ -1370,9 +1370,9 @@ def plot_runtime(summary_rows: list[dict[str, str]], *, benchmark: str, output_p
             label=lock_label(lock),
         )
 
-    ax.set_title(f"Run Time vs Threads: {benchmark_label(benchmark)}")
+    ax.set_title(f"Throughput vs Threads: {benchmark_label(benchmark)}")
     ax.set_xlabel("Threads")
-    ax.set_ylabel("Mean run time (ms)")
+    ax.set_ylabel("Mean throughput (runs/s, higher is better)")
     add_thread_axis_formatting(ax, thread_values)
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.grid(True, axis="y", alpha=0.28)
@@ -1388,8 +1388,8 @@ def write_plots(result_root: Path, summary_rows: list[dict[str, str]]) -> list[P
     for benchmark in DEFAULT_BENCHMARKS:
         if not any(row["benchmark"] == benchmark for row in summary_rows):
             continue
-        output_path = result_root / f"runtime_vs_threads_{benchmark}.png"
-        plot_runtime(summary_rows, benchmark=benchmark, output_path=output_path)
+        output_path = result_root / f"throughput_vs_threads_{benchmark}.png"
+        plot_throughput(summary_rows, benchmark=benchmark, output_path=output_path)
         plot_paths.append(output_path)
     if not plot_paths:
         raise RuntimeError("No summary rows were available for plotting.")

@@ -34,18 +34,7 @@ impl Node {
 
 thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
-    // static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
 }
-
-// #[inline(always)]
-// fn should_sample_wait() -> bool {
-//     WAIT_SAMPLE_COUNTER.with(|counter| {
-//         let next = counter.get().wrapping_add(1);
-//         counter.set(next);
-//         (next & WAIT_TIME_SAMPLE_MASK) == 0
-//     })
-// }
-//
 
 /// MCS-TAS lock with cache-aligned state variables.
 pub struct McsTasLockRaw {

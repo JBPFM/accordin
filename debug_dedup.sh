@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./debug_dedup.sh LOCK [run_experiment_three.py args...]
+Usage: ./debug_dedup.sh LOCK [run_experiment_three_dedup.py args...]
 
 Run experiment three's dedup benchmark at 96 threads for a single lock.
 
@@ -55,8 +55,7 @@ for arg in "$@"; do
   esac
 done
 
-exec "$python" "$script_dir/experiments/run_experiment_three.py" \
-  --benchmarks dedup \
+exec "$python" "$script_dir/experiments/run_experiment_three_dedup.py" \
   --locks "$lock" \
   --threads 96 \
   "${repeat_args[@]}" \

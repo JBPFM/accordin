@@ -121,16 +121,15 @@ fn load_cpu_affinity_state() -> CpuAffinityState {
         Err(error) => return CpuAffinityState::Invalid(error),
     };
 
-    let first_node_cpus = match first_numa_node_cpus() {
+    let numa_cpus = match numa_ordered_cpus() {
         Ok(cpus) => cpus,
         Err(error) => return CpuAffinityState::Invalid(error),
     };
     let current_allowed_cpus = current_affinity_cpus().ok();
-    let available_cpus =
-        select_first_numa_available_cpus(&first_node_cpus, current_allowed_cpus.as_deref());
+    let available_cpus = select_numa_available_cpus(&numa_cpus, current_allowed_cpus.as_deref());
     if available_cpus.len() < requested_cpus {
         return CpuAffinityState::Invalid(format!(
-            "requested {requested_cpus} CPUs from the first NUMA node but only {} are available",
+            "requested {requested_cpus} CPUs from NUMA-ordered available CPUs but only {} are available",
             available_cpus.len()
         ));
     }
@@ -166,19 +165,26 @@ fn parse_requested_cpu_count(value: &str, env_name: &str) -> Result<usize, Strin
     Ok(requested_cpus)
 }
 
-fn first_numa_node_cpus() -> Result<Vec<usize>, String> {
+fn numa_ordered_cpus() -> Result<Vec<usize>, String> {
     let mut node_cpulists = numa_node_cpulist_paths("/sys/devices/system/node");
     node_cpulists.sort_by_key(|(node_id, _)| *node_id);
 
+    let mut cpus = Vec::new();
+    let mut seen = BTreeSet::new();
     for (_node_id, cpulist_path) in node_cpulists {
-        let cpus = read_cpu_list_file(&cpulist_path)?;
-        if !cpus.is_empty() {
-            return Ok(cpus);
+        for cpu in read_cpu_list_file(&cpulist_path)? {
+            if seen.insert(cpu) {
+                cpus.push(cpu);
+            }
         }
     }
 
+    if !cpus.is_empty() {
+        return Ok(cpus);
+    }
+
     read_cpu_list_file(Path::new("/sys/devices/system/cpu/online"))
-        .map_err(|error| format!("failed to find first NUMA node CPUs: {error}"))
+        .map_err(|error| format!("failed to find NUMA node CPUs: {error}"))
 }
 
 fn numa_node_cpulist_paths(root: impl AsRef<Path>) -> Vec<(u32, PathBuf)> {
@@ -258,19 +264,19 @@ fn current_affinity_cpus() -> io::Result<Vec<usize>> {
 }
 
 #[cfg(test)]
-fn select_first_numa_cpus(
+fn select_numa_cpus(
     numa_cpus: &[usize],
     allowed_cpus: Option<&[usize]>,
     requested_cpus: usize,
 ) -> Result<Vec<usize>, String> {
-    let cpus = select_first_numa_available_cpus(numa_cpus, allowed_cpus)
+    let cpus = select_numa_available_cpus(numa_cpus, allowed_cpus)
         .into_iter()
         .take(requested_cpus)
         .collect::<Vec<_>>();
 
     if cpus.len() < requested_cpus {
         return Err(format!(
-            "requested {requested_cpus} CPUs from the first NUMA node but only {} are available",
+            "requested {requested_cpus} CPUs from NUMA-ordered available CPUs but only {} are available",
             cpus.len()
         ));
     }
@@ -278,10 +284,7 @@ fn select_first_numa_cpus(
     Ok(cpus)
 }
 
-fn select_first_numa_available_cpus(
-    numa_cpus: &[usize],
-    allowed_cpus: Option<&[usize]>,
-) -> Vec<usize> {
+fn select_numa_available_cpus(numa_cpus: &[usize], allowed_cpus: Option<&[usize]>) -> Vec<usize> {
     let allowed: Option<BTreeSet<usize>> = allowed_cpus.map(|cpus| cpus.iter().copied().collect());
     numa_cpus
         .iter()
@@ -394,9 +397,7 @@ fn format_cpu_list(cpus: &[usize]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        format_cpu_list, parse_cpu_list, select_first_numa_available_cpus, select_first_numa_cpus,
-    };
+    use super::{format_cpu_list, parse_cpu_list, select_numa_available_cpus, select_numa_cpus};
 
     #[test]
     fn parse_cpu_list_accepts_singletons_and_ranges() {
@@ -417,30 +418,40 @@ mod tests {
     }
 
     #[test]
-    fn select_first_numa_cpus_respects_current_affinity() {
-        let numa_cpus = vec![0, 2, 4, 6, 8, 10];
-        let allowed_cpus = vec![2, 6, 8, 12];
+    fn select_numa_cpus_respects_current_affinity() {
+        let numa_cpus = vec![0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11];
+        let allowed_cpus = vec![2, 6, 8, 1, 3, 12];
 
         assert_eq!(
-            select_first_numa_cpus(&numa_cpus, Some(&allowed_cpus), 3).unwrap(),
-            vec![2, 6, 8]
+            select_numa_cpus(&numa_cpus, Some(&allowed_cpus), 5).unwrap(),
+            vec![2, 6, 8, 1, 3]
         );
     }
 
     #[test]
-    fn select_first_numa_cpus_requires_enough_available_cpus() {
-        let error = select_first_numa_cpus(&[0, 2], Some(&[2]), 2).unwrap_err();
+    fn select_numa_cpus_requires_enough_available_cpus() {
+        let error = select_numa_cpus(&[0, 2], Some(&[2]), 2).unwrap_err();
         assert!(error.contains("requested 2 CPUs"));
     }
 
     #[test]
-    fn select_first_numa_available_cpus_keeps_full_pool() {
-        let numa_cpus = vec![0, 2, 4, 6, 8, 10];
-        let allowed_cpus = vec![2, 6, 8, 12];
+    fn select_numa_available_cpus_keeps_full_pool_across_nodes() {
+        let numa_cpus = vec![0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11];
+        let allowed_cpus = vec![2, 6, 8, 1, 3, 12];
 
         assert_eq!(
-            select_first_numa_available_cpus(&numa_cpus, Some(&allowed_cpus)),
-            vec![2, 6, 8]
+            select_numa_available_cpus(&numa_cpus, Some(&allowed_cpus)),
+            vec![2, 6, 8, 1, 3]
+        );
+    }
+
+    #[test]
+    fn select_numa_cpus_spills_to_later_nodes_after_earlier_nodes() {
+        let numa_cpus = vec![0, 2, 4, 1, 3, 5];
+
+        assert_eq!(
+            select_numa_cpus(&numa_cpus, None, 5).unwrap(),
+            vec![0, 2, 4, 1, 3]
         );
     }
 

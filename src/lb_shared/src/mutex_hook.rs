@@ -487,8 +487,12 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    (*cond_state).seq.fetch_add(1, Ordering::Release);
-                    futex_wake(&(*cond_state).seq, 1);
+                    let target = (*cond_state).target.load(Ordering::Acquire);
+                    let seq = (*cond_state).seq.load(Ordering::Acquire);
+                    if wait_should_continue(target, seq) {
+                        (*cond_state).seq.fetch_add(1, Ordering::Release);
+                        futex_wake(&(*cond_state).seq, 1);
+                    }
                     0
                 }
             }

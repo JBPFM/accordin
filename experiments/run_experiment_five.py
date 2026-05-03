@@ -24,6 +24,7 @@ import run_experiment_three as experiment_three
 
 REPO_ROOT = experiment_three.REPO_ROOT
 FLEXGUARD_DIR = experiment_three.FLEXGUARD_DIR
+DEFAULT_CACHELIB_DIR = REPO_ROOT / "third_party" / "CacheLib"
 
 DEFAULT_WORKLOADS = ("cachebench", "rocksdb", "memcached")
 DEFAULT_ROCKSDB_BENCHMARKS = ("readrandom", "fillrandom")
@@ -39,6 +40,7 @@ DEFAULT_DB_NUM = 500_000
 DEFAULT_CACHEBENCH_NUM_OPS = 100_000
 DEFAULT_CACHEBENCH_NUM_KEYS = 1_000_000
 DEFAULT_CACHEBENCH_CACHE_MB = 512
+DEFAULT_CACHELIB_BUILD_JOBS = os.cpu_count() or 1
 DEFAULT_MEMCACHED_HOST = "127.0.0.1"
 DEFAULT_MEMCACHED_MEMORY_MB = 512
 DEFAULT_MEMTIER_CLIENT_THREADS = 1
@@ -148,7 +150,7 @@ def validate_benchmark_names(benchmarks: tuple[str, ...]) -> tuple[str, ...]:
     return benchmarks
 
 
-def executable_path(value: Path | None, env_name: str, binary_name: str) -> Path:
+def configured_executable_path(value: Path | None, env_name: str, binary_name: str) -> Path | None:
     env_value = os.environ.get(env_name)
     candidate = value or (Path(env_value) if env_value else None)
     if candidate is not None:
@@ -156,7 +158,13 @@ def executable_path(value: Path | None, env_name: str, binary_name: str) -> Path
         if not resolved.is_file() or not os.access(resolved, os.X_OK):
             raise RuntimeError(f"{binary_name} is missing or not executable: {resolved}")
         return resolved
+    return None
 
+
+def executable_path(value: Path | None, env_name: str, binary_name: str) -> Path:
+    configured = configured_executable_path(value, env_name, binary_name)
+    if configured is not None:
+        return configured
     found = shutil.which(binary_name)
     if found is None:
         raise RuntimeError(
@@ -164,6 +172,181 @@ def executable_path(value: Path | None, env_name: str, binary_name: str) -> Path
             f"or set {env_name}."
         )
     return Path(found).resolve()
+
+
+def default_cachelib_dir() -> Path:
+    env_value = os.environ.get("CACHELIB_HOME")
+    if env_value:
+        return resolve_path(Path(env_value))
+    return DEFAULT_CACHELIB_DIR.resolve()
+
+
+def cachelib_source_is_available(cachelib_dir: Path) -> bool:
+    return (
+        (cachelib_dir / "README.md").is_file()
+        and (cachelib_dir / "build" / "fbcode_builder" / "getdeps.py").is_file()
+        and (cachelib_dir / "cachelib" / "cachebench" / "CMakeLists.txt").is_file()
+    )
+
+
+def cachelib_getdeps_install_dir(cachelib_dir: Path) -> Path | None:
+    getdeps = cachelib_dir / "build" / "fbcode_builder" / "getdeps.py"
+    if not getdeps.is_file():
+        return None
+    try:
+        result = subprocess.run(
+            ["python3", "./build/fbcode_builder/getdeps.py", "show-inst-dir", "cachelib"],
+            cwd=str(cachelib_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return Path(lines[-1]).expanduser()
+
+
+def cachebench_candidates(cachelib_dir: Path) -> tuple[Path, ...]:
+    candidates: list[Path] = [
+        cachelib_dir / "opt" / "cachelib" / "bin" / "cachebench",
+    ]
+    getdeps_install_dir = cachelib_getdeps_install_dir(cachelib_dir)
+    if getdeps_install_dir is not None:
+        candidates.append(getdeps_install_dir / "bin" / "cachebench")
+    candidates.extend(
+        (
+            cachelib_dir / "build-cachelib" / "cachebench" / "cachebench",
+            cachelib_dir / "build-cachelib" / "cachelib" / "cachebench" / "cachebench",
+        )
+    )
+    return tuple(candidates)
+
+
+def find_local_cachebench(cachelib_dir: Path) -> Path | None:
+    for candidate in cachebench_candidates(cachelib_dir):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+    return None
+
+
+def cachelib_getdeps_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    virtual_env = os.environ.get("VIRTUAL_ENV")
+    if virtual_env:
+        venv_bin = str(Path(virtual_env).expanduser().resolve() / "bin")
+        path_parts = [
+            part
+            for part in os.environ.get("PATH", "").split(os.pathsep)
+            if part and str(Path(part).expanduser().resolve()) != venv_bin
+        ]
+        env["PATH"] = os.pathsep.join(path_parts)
+        env["VIRTUAL_ENV"] = ""
+    return env
+
+
+def ensure_cachelib_source(
+    cachelib_dir: Path,
+    *,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    if cachelib_source_is_available(cachelib_dir):
+        return
+    if not build_missing:
+        raise RuntimeError(
+            f"CacheLib source directory is missing or incomplete: {cachelib_dir}. "
+            "Rerun with --build-missing or initialize the submodule manually."
+        )
+    if cachelib_dir != DEFAULT_CACHELIB_DIR.resolve():
+        raise RuntimeError(f"Cannot initialize a custom CacheLib source directory: {cachelib_dir}")
+
+    logger.run(
+        [
+            "git",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--depth",
+            "1",
+            str(DEFAULT_CACHELIB_DIR.relative_to(REPO_ROOT)),
+        ],
+        log_name="init_cachelib_submodule.log",
+        cwd=REPO_ROOT,
+    )
+    if not cachelib_source_is_available(cachelib_dir):
+        raise RuntimeError(f"CacheLib source directory is still unavailable after submodule init: {cachelib_dir}")
+
+
+def build_cachebench_from_cachelib(
+    cachelib_dir: Path,
+    *,
+    jobs: int,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    ensure_cachelib_source(cachelib_dir, build_missing=True, logger=logger)
+    getdeps = cachelib_dir / "build" / "fbcode_builder" / "getdeps.py"
+    if not getdeps.is_file():
+        raise RuntimeError(f"CacheLib getdeps.py was not found: {getdeps}")
+
+    logger.run(
+        [
+            "python3",
+            "./build/fbcode_builder/getdeps.py",
+            "--allow-system-packages",
+            "--num-jobs",
+            str(jobs),
+            "build",
+            "--no-tests",
+            "cachelib",
+        ],
+        log_name="build_cachelib_cachebench.log",
+        cwd=cachelib_dir,
+        env=cachelib_getdeps_env(),
+    )
+
+
+def ensure_cachebench_bin(
+    cachebench_bin: Path | None,
+    *,
+    cachelib_dir: Path,
+    cachelib_build_jobs: int,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> Path:
+    configured = configured_executable_path(cachebench_bin, "CACHEBENCH_BIN", "cachebench")
+    if configured is not None:
+        return configured
+
+    local = find_local_cachebench(cachelib_dir)
+    if local is not None:
+        return local
+
+    found = shutil.which("cachebench")
+    if found is not None:
+        return Path(found).resolve()
+
+    if not build_missing:
+        raise RuntimeError(
+            "cachebench was not found. Pass --cachebench-bin, set CACHEBENCH_BIN, "
+            "install cachebench on PATH, or rerun with --build-missing to initialize and build "
+            f"the CacheLib submodule at {DEFAULT_CACHELIB_DIR}."
+        )
+
+    build_cachebench_from_cachelib(cachelib_dir, jobs=cachelib_build_jobs, logger=logger)
+    rebuilt = find_local_cachebench(cachelib_dir)
+    if rebuilt is None:
+        raise RuntimeError(
+            "CacheLib cachebench is still unavailable after build. Expected one of: "
+            + ", ".join(str(path) for path in cachebench_candidates(cachelib_dir))
+        )
+    return rebuilt
 
 
 def default_rocksdb_dir() -> Path:
@@ -225,6 +408,7 @@ Default benchmark settings:
 Examples:
   python3 experiments/run_experiment_five.py --workloads rocksdb --locks stock --threads 1 --repeats 1 --rocksdb-benchmarks fillrandom --total-ops 1000
   python3 experiments/run_experiment_five.py --workloads memcached --locks stock --threads 4 --repeats 1 --memtier-requests 1000
+  python3 experiments/run_experiment_five.py --workloads cachebench --build-missing
   python3 experiments/run_experiment_five.py --workloads cachebench --cachebench-config /path/to/config.json
   python3 experiments/run_experiment_five.py --plot-only experiments/results/experiment5_manual
 """,
@@ -237,7 +421,7 @@ Examples:
         action="store_true",
         help="Continue an existing --output-root by parsing successful command logs and skipping completed points.",
     )
-    parser.add_argument("--build-missing", action="store_true", help="Build missing lock helpers or RocksDB db_bench where possible.")
+    parser.add_argument("--build-missing", action="store_true", help="Build missing lock helpers, CacheBench, or RocksDB db_bench where possible.")
     parser.add_argument("--skip-plots", action="store_true", help="Write CSVs but skip PNG generation.")
     parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS), metavar="CSV", help="cachebench,rocksdb,memcached.")
     parser.add_argument(
@@ -265,7 +449,24 @@ Examples:
     parser.add_argument("--total-ops", type=positive_int, default=DEFAULT_TOTAL_OPS)
     parser.add_argument("--db-num", type=positive_int, default=DEFAULT_DB_NUM, help="RocksDB keyspace/DB size.")
 
-    parser.add_argument("--cachebench-bin", type=Path, default=None, help="Path to CacheLib cachebench. Default: CACHEBENCH_BIN or PATH.")
+    parser.add_argument(
+        "--cachebench-bin",
+        type=Path,
+        default=None,
+        help="Path to CacheLib cachebench. Default: CACHEBENCH_BIN, local CacheLib submodule build, or PATH.",
+    )
+    parser.add_argument(
+        "--cachelib-dir",
+        type=Path,
+        default=None,
+        help=f"CacheLib source directory used with --build-missing. Default: CACHELIB_HOME or {DEFAULT_CACHELIB_DIR}.",
+    )
+    parser.add_argument(
+        "--cachelib-build-jobs",
+        type=positive_int,
+        default=DEFAULT_CACHELIB_BUILD_JOBS,
+        help=f"Parallel jobs passed to CacheLib getdeps --num-jobs. Default: {DEFAULT_CACHELIB_BUILD_JOBS}.",
+    )
     parser.add_argument("--cachebench-config", type=Path, default=None, help="CacheBench JSON config template. A small synthetic config is generated when omitted.")
     parser.add_argument("--cachebench-num-ops", type=positive_int, default=DEFAULT_CACHEBENCH_NUM_OPS)
     parser.add_argument("--cachebench-num-keys", type=positive_int, default=DEFAULT_CACHEBENCH_NUM_KEYS)
@@ -489,7 +690,15 @@ def ensure_required_binaries(
 ) -> dict[str, Path]:
     binaries: dict[str, Path] = {}
     if "cachebench" in workloads:
-        binaries["cachebench"] = executable_path(args.cachebench_bin, "CACHEBENCH_BIN", "cachebench")
+        cachelib_dir = resolve_path(args.cachelib_dir) if args.cachelib_dir is not None else default_cachelib_dir()
+        binaries["cachelib_dir"] = cachelib_dir
+        binaries["cachebench"] = ensure_cachebench_bin(
+            args.cachebench_bin,
+            cachelib_dir=cachelib_dir,
+            cachelib_build_jobs=args.cachelib_build_jobs,
+            build_missing=args.build_missing,
+            logger=logger,
+        )
     if "rocksdb" in workloads:
         rocksdb_dir = resolve_path(args.rocksdb_dir) if args.rocksdb_dir is not None else default_rocksdb_dir()
         db_bench = (
@@ -1452,6 +1661,8 @@ def write_settings(
         "flexguard_dir": str(FLEXGUARD_DIR),
         "machine_core_count": experiment_defaults.MACHINE_CORE_COUNT,
         "cachebench": {
+            "cachelib_dir": str(binaries.get("cachelib_dir", "")),
+            "cachelib_build_jobs": args.cachelib_build_jobs,
             "config": "" if args.cachebench_config is None else str(resolve_path(args.cachebench_config)),
             "num_ops": args.cachebench_num_ops,
             "num_keys": args.cachebench_num_keys,

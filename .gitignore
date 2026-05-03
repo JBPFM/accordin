@@ -11,3 +11,4 @@ results
 .dmux-hooks
 .claude
 experiments/__pycache__
+third_party/rocksdb/

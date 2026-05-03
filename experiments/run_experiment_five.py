@@ -25,6 +25,9 @@ import run_experiment_three as experiment_three
 REPO_ROOT = experiment_three.REPO_ROOT
 FLEXGUARD_DIR = experiment_three.FLEXGUARD_DIR
 DEFAULT_CACHELIB_DIR = REPO_ROOT / "third_party" / "CacheLib"
+DEFAULT_CACHELIB_LIBURING_PREFIX = REPO_ROOT / ".cache" / "experiment5_liburing"
+DEFAULT_ROCKSDB_DIR = REPO_ROOT / "third_party" / "rocksdb"
+ROCKSDB_GIT_URL = "https://github.com/facebook/rocksdb.git"
 
 DEFAULT_WORKLOADS = ("cachebench", "rocksdb", "memcached")
 DEFAULT_ROCKSDB_BENCHMARKS = ("readrandom", "fillrandom")
@@ -49,6 +52,10 @@ DEFAULT_MEMTIER_REQUESTS = 10_000
 DEFAULT_MEMTIER_RATIO = "1:10"
 DEFAULT_MEMTIER_KEY_PATTERN = "R:R"
 DEFAULT_MEMTIER_DATA_SIZE = 128
+MEMCACHED_SYSTEM_PACKAGES = {
+    "memcached": "memcached",
+    "memtier_benchmark": "memtier-benchmark",
+}
 
 SINGLE_OVERSUBSCRIBED_LOCKS = experiment_defaults.SINGLE_OVERSUBSCRIBED_LOCKS
 PER_LOCK_MAX_THREADS = experiment_defaults.per_lock_max_threads_for_settings(
@@ -161,17 +168,46 @@ def configured_executable_path(value: Path | None, env_name: str, binary_name: s
     return None
 
 
-def executable_path(value: Path | None, env_name: str, binary_name: str) -> Path:
-    configured = configured_executable_path(value, env_name, binary_name)
-    if configured is not None:
-        return configured
-    found = shutil.which(binary_name)
-    if found is None:
+def root_command(command: list[str], *, env: dict[str, str] | None = None) -> list[str]:
+    full_command = command
+    if env:
+        full_command = ["env", *(f"{key}={value}" for key, value in env.items()), *command]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return full_command
+    sudo = shutil.which("sudo")
+    if sudo is None:
+        raise RuntimeError(f"Cannot run as root because sudo is unavailable: {' '.join(command)}")
+    return [sudo, "-n", *full_command]
+
+
+def install_system_packages(
+    packages: tuple[str, ...],
+    *,
+    log_prefix: str,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    packages = tuple(dict.fromkeys(package for package in packages if package))
+    if not packages:
+        return
+
+    apt_get = shutil.which("apt-get")
+    if apt_get is None:
         raise RuntimeError(
-            f"{binary_name} was not found on PATH. Pass --{binary_name.replace('_', '-')}-bin "
-            f"or set {env_name}."
+            "Cannot install missing system packages automatically because apt-get was not found: "
+            + ", ".join(packages)
         )
-    return Path(found).resolve()
+
+    env = {"DEBIAN_FRONTEND": "noninteractive"}
+    logger.run(
+        root_command([apt_get, "update"], env=env),
+        log_name=f"{log_prefix}_apt_update.log",
+        cwd=REPO_ROOT,
+    )
+    logger.run(
+        root_command([apt_get, "install", "-y", *packages], env=env),
+        log_name=f"{log_prefix}_apt_install.log",
+        cwd=REPO_ROOT,
+    )
 
 
 def default_cachelib_dir() -> Path:
@@ -219,6 +255,9 @@ def cachebench_candidates(cachelib_dir: Path) -> tuple[Path, ...]:
     getdeps_install_dir = cachelib_getdeps_install_dir(cachelib_dir)
     if getdeps_install_dir is not None:
         candidates.append(getdeps_install_dir / "bin" / "cachebench")
+    getdeps_build_dir = cachelib_getdeps_build_dir(cachelib_dir, "cachelib")
+    if getdeps_build_dir is not None:
+        candidates.append(getdeps_build_dir / "cachebench" / "cachebench")
     candidates.extend(
         (
             cachelib_dir / "build-cachelib" / "cachebench" / "cachebench",
@@ -237,6 +276,10 @@ def find_local_cachebench(cachelib_dir: Path) -> Path | None:
 
 def cachelib_getdeps_env() -> dict[str, str]:
     env: dict[str, str] = {}
+    env.update(cachelib_compiler_env())
+    existing_ldflags = os.environ.get("LDFLAGS", "")
+    if "-latomic" not in existing_ldflags.split():
+        env["LDFLAGS"] = " ".join(part for part in (existing_ldflags, "-latomic") if part)
     virtual_env = os.environ.get("VIRTUAL_ENV")
     if virtual_env:
         venv_bin = str(Path(virtual_env).expanduser().resolve() / "bin")
@@ -247,7 +290,154 @@ def cachelib_getdeps_env() -> dict[str, str]:
         ]
         env["PATH"] = os.pathsep.join(path_parts)
         env["VIRTUAL_ENV"] = ""
+
+    include_paths: list[str] = []
+    liburing_prefix = cachelib_local_liburing_prefix()
+    if liburing_prefix is not None:
+        include_paths.append(str(liburing_prefix / "include"))
+    include_override = cachelib_include_override_dir()
+    if include_override is not None:
+        include_paths.append(str(include_override))
+    if include_paths:
+        for key in ("C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH"):
+            existing = env.get(key, os.environ.get(key, ""))
+            parts = [
+                *include_paths,
+                *(part for part in existing.split(os.pathsep) if part and part not in include_paths),
+            ]
+            env[key] = os.pathsep.join(parts)
+
+    library_paths = []
+    if liburing_prefix is not None:
+        library_paths.append(str(liburing_prefix / "lib"))
+    library_paths.append("/usr/lib/x86_64-linux-gnu")
+    for key in ("LIBRARY_PATH", "LD_LIBRARY_PATH"):
+        existing = env.get(key, os.environ.get(key, ""))
+        parts = [
+            *library_paths,
+            *(part for part in existing.split(os.pathsep) if part and part not in library_paths),
+        ]
+        env[key] = os.pathsep.join(parts)
     return env
+
+
+def cachelib_compiler_env() -> dict[str, str]:
+    clang = shutil.which("clang")
+    clangxx = shutil.which("clang++")
+    if clang is None or clangxx is None:
+        return {}
+
+    env: dict[str, str] = {}
+    if "CC" not in os.environ:
+        env["CC"] = clang
+    if "CXX" not in os.environ:
+        env["CXX"] = clangxx
+    return env
+
+
+def cachelib_local_liburing_prefix() -> Path | None:
+    prefix = DEFAULT_CACHELIB_LIBURING_PREFIX
+    if (
+        (prefix / "include" / "liburing.h").is_file()
+        and (prefix / "include" / "liburing" / "io_uring.h").is_file()
+        and (prefix / "lib" / "liburing.so").is_file()
+    ):
+        return prefix
+    return None
+
+
+def cachelib_extra_cmake_defines() -> dict[str, str]:
+    defines = {
+        "CMAKE_C_COMPILER": os.environ.get("CC", shutil.which("clang") or ""),
+        "CMAKE_CXX_COMPILER": os.environ.get("CXX", shutil.which("clang++") or ""),
+    }
+    defines = {key: value for key, value in defines.items() if value}
+
+    liburing_prefix = cachelib_local_liburing_prefix()
+    if liburing_prefix is not None:
+        defines.update(
+            {
+                "LIBURING_INCLUDE_DIR": str(liburing_prefix / "include"),
+                "LIBURING_LIBRARY": str(liburing_prefix / "lib" / "liburing.so"),
+            }
+        )
+    return defines
+
+
+def cachelib_getdeps_build_dir(cachelib_dir: Path, dependency: str) -> Path | None:
+    getdeps = cachelib_dir / "build" / "fbcode_builder" / "getdeps.py"
+    if not getdeps.is_file():
+        return None
+    try:
+        result = subprocess.run(
+            ["python3", "./build/fbcode_builder/getdeps.py", "show-build-dir", dependency],
+            cwd=str(cachelib_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return Path(lines[-1]).expanduser()
+
+
+def remove_stale_cachelib_cmake_build(
+    cachelib_dir: Path,
+    dependency: str,
+    *,
+    expected_defines: dict[str, str],
+) -> None:
+    build_dir = cachelib_getdeps_build_dir(cachelib_dir, dependency)
+    if build_dir is None:
+        return
+    cmake_cache = build_dir / "CMakeCache.txt"
+    if not cmake_cache.is_file():
+        return
+    try:
+        cache_text = cmake_cache.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+
+    stale = False
+    for key, expected_value in expected_defines.items():
+        define_pattern = re.compile(rf"^{re.escape(key)}:[^=]*={re.escape(expected_value)}$", re.MULTILINE)
+        if not define_pattern.search(cache_text):
+            stale = True
+            break
+
+    if stale:
+        shutil.rmtree(build_dir)
+
+
+def cachelib_include_override_dir() -> Path | None:
+    local_jemalloc = Path("/usr/local/include/jemalloc/jemalloc.h")
+    system_jemalloc = Path("/usr/include/jemalloc/jemalloc.h")
+    try:
+        if (
+            not local_jemalloc.is_file()
+            or "MALLCTL_ARENAS_ALL" in local_jemalloc.read_text(encoding="utf-8", errors="replace")
+            or "MALLCTL_ARENAS_ALL" not in system_jemalloc.read_text(encoding="utf-8", errors="replace")
+        ):
+            return None
+    except OSError:
+        return None
+
+    include_dir = REPO_ROOT / ".cache" / "experiment5_include_overrides"
+    override_header = include_dir / "jemalloc" / "jemalloc.h"
+    override_header.parent.mkdir(parents=True, exist_ok=True)
+    if override_header.exists() or override_header.is_symlink():
+        override_header.unlink()
+    try:
+        override_header.symlink_to(system_jemalloc)
+    except OSError:
+        shutil.copy2(system_jemalloc, override_header)
+    return include_dir
 
 
 def ensure_cachelib_source(
@@ -295,17 +485,22 @@ def build_cachebench_from_cachelib(
     if not getdeps.is_file():
         raise RuntimeError(f"CacheLib getdeps.py was not found: {getdeps}")
 
+    command = [
+        "python3",
+        "./build/fbcode_builder/getdeps.py",
+        "--allow-system-packages",
+        "--num-jobs",
+        str(jobs),
+        "build",
+    ]
+    extra_cmake_defines = cachelib_extra_cmake_defines()
+    remove_stale_cachelib_cmake_build(cachelib_dir, "folly", expected_defines=extra_cmake_defines)
+    remove_stale_cachelib_cmake_build(cachelib_dir, "cachelib", expected_defines=extra_cmake_defines)
+    if extra_cmake_defines:
+        command.extend(["--extra-cmake-defines", json.dumps(extra_cmake_defines, sort_keys=True)])
+    command.extend(["--cmake-target", "cachebench", "--no-tests", "cachelib"])
     logger.run(
-        [
-            "python3",
-            "./build/fbcode_builder/getdeps.py",
-            "--allow-system-packages",
-            "--num-jobs",
-            str(jobs),
-            "build",
-            "--no-tests",
-            "cachelib",
-        ],
+        command,
         log_name="build_cachelib_cachebench.log",
         cwd=cachelib_dir,
         env=cachelib_getdeps_env(),
@@ -355,13 +550,56 @@ def default_rocksdb_dir() -> Path:
         return resolve_path(Path(env_value))
 
     candidates = (
-        REPO_ROOT / "third_party" / "rocksdb",
+        DEFAULT_ROCKSDB_DIR,
         Path("/home/jz/Projects/tests/rocksdb"),
     )
     for candidate in candidates:
         if (candidate / "CMakeLists.txt").is_file() or (candidate / "Makefile").is_file():
             return candidate.resolve()
     return candidates[0].resolve()
+
+
+def rocksdb_source_is_available(rocksdb_dir: Path) -> bool:
+    return (
+        (rocksdb_dir / "CMakeLists.txt").is_file()
+        and (
+            (rocksdb_dir / "tools" / "db_bench_tool.cc").is_file()
+            or (rocksdb_dir / "tools" / "db_bench.cc").is_file()
+        )
+    )
+
+
+def ensure_rocksdb_source(
+    rocksdb_dir: Path,
+    *,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    if rocksdb_source_is_available(rocksdb_dir):
+        return
+    if not build_missing:
+        raise RuntimeError(
+            f"RocksDB source directory is missing or incomplete: {rocksdb_dir}. "
+            "Rerun with --build-missing or set ROCKSDB_HOME/--rocksdb-dir."
+        )
+    if rocksdb_dir != DEFAULT_ROCKSDB_DIR.resolve():
+        raise RuntimeError(f"Cannot initialize a custom RocksDB source directory: {rocksdb_dir}")
+
+    rocksdb_dir.parent.mkdir(parents=True, exist_ok=True)
+    logger.run(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            ROCKSDB_GIT_URL,
+            str(DEFAULT_ROCKSDB_DIR.relative_to(REPO_ROOT)),
+        ],
+        log_name="init_rocksdb_source.log",
+        cwd=REPO_ROOT,
+    )
+    if not rocksdb_source_is_available(rocksdb_dir):
+        raise RuntimeError(f"RocksDB source directory is still unavailable after clone: {rocksdb_dir}")
 
 
 def accordin_rocksdb_build_dir(rocksdb_dir: Path) -> Path:
@@ -408,7 +646,7 @@ Default benchmark settings:
 Examples:
   python3 experiments/run_experiment_five.py --workloads rocksdb --locks stock --threads 1 --repeats 1 --rocksdb-benchmarks fillrandom --total-ops 1000
   python3 experiments/run_experiment_five.py --workloads memcached --locks stock --threads 4 --repeats 1 --memtier-requests 1000
-  python3 experiments/run_experiment_five.py --workloads cachebench --build-missing
+  python3 experiments/run_experiment_five.py --workloads cachebench,rocksdb,memcached --build-missing
   python3 experiments/run_experiment_five.py --workloads cachebench --cachebench-config /path/to/config.json
   python3 experiments/run_experiment_five.py --plot-only experiments/results/experiment5_manual
 """,
@@ -421,7 +659,11 @@ Examples:
         action="store_true",
         help="Continue an existing --output-root by parsing successful command logs and skipping completed points.",
     )
-    parser.add_argument("--build-missing", action="store_true", help="Build missing lock helpers, CacheBench, or RocksDB db_bench where possible.")
+    parser.add_argument(
+        "--build-missing",
+        action="store_true",
+        help="Build/install missing lock helpers, CacheBench, RocksDB db_bench, or memcached/memtier where possible.",
+    )
     parser.add_argument("--skip-plots", action="store_true", help="Write CSVs but skip PNG generation.")
     parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS), metavar="CSV", help="cachebench,rocksdb,memcached.")
     parser.add_argument(
@@ -610,8 +852,7 @@ def ensure_rocksdb_db_bench(
     if not build_missing:
         target = db_bench if db_bench is not None else rocksdb_dir / "db_bench"
         raise RuntimeError(f"RocksDB db_bench is missing or not executable: {target}. Rerun with --build-missing.")
-    if not rocksdb_dir.is_dir():
-        raise RuntimeError(f"RocksDB directory does not exist: {rocksdb_dir}")
+    ensure_rocksdb_source(rocksdb_dir, build_missing=build_missing, logger=logger)
 
     existing_build_dir = rocksdb_dir / "build"
     if cmake_build_dir_matches_source(existing_build_dir, rocksdb_dir):
@@ -682,6 +923,57 @@ def cmake_build_dir_matches_source(build_dir: Path, source_dir: Path) -> bool:
     return False
 
 
+def path_executable(binary_name: str) -> Path | None:
+    found = shutil.which(binary_name)
+    return Path(found).resolve() if found is not None else None
+
+
+def ensure_memcached_binaries(
+    args: argparse.Namespace,
+    *,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> tuple[Path, Path]:
+    configured_memcached = configured_executable_path(args.memcached_bin, "MEMCACHED_BIN", "memcached")
+    configured_memtier = configured_executable_path(args.memtier_bin, "MEMTIER_BIN", "memtier_benchmark")
+
+    memcached_bin = configured_memcached or path_executable("memcached")
+    memtier_bin = configured_memtier or path_executable("memtier_benchmark")
+    missing_packages: list[str] = []
+    if memcached_bin is None and configured_memcached is None:
+        missing_packages.append(MEMCACHED_SYSTEM_PACKAGES["memcached"])
+    if memtier_bin is None and configured_memtier is None:
+        missing_packages.append(MEMCACHED_SYSTEM_PACKAGES["memtier_benchmark"])
+
+    if missing_packages:
+        if not build_missing:
+            missing = []
+            if memcached_bin is None:
+                missing.append("memcached")
+            if memtier_bin is None:
+                missing.append("memtier_benchmark")
+            raise RuntimeError(
+                f"{', '.join(missing)} missing from PATH. Pass explicit paths, install them, "
+                "or rerun with --build-missing."
+            )
+        install_system_packages(
+            tuple(missing_packages),
+            log_prefix="install_memcached_deps",
+            logger=logger,
+        )
+        memcached_bin = configured_memcached or path_executable("memcached")
+        memtier_bin = configured_memtier or path_executable("memtier_benchmark")
+
+    if memcached_bin is None or memtier_bin is None:
+        missing = []
+        if memcached_bin is None:
+            missing.append("memcached")
+        if memtier_bin is None:
+            missing.append("memtier_benchmark")
+        raise RuntimeError(f"Missing memcached workload binaries after install: {', '.join(missing)}")
+    return memcached_bin, memtier_bin
+
+
 def ensure_required_binaries(
     workloads: tuple[str, ...],
     *,
@@ -714,8 +1006,13 @@ def ensure_required_binaries(
             logger=logger,
         )
     if "memcached" in workloads:
-        binaries["memcached"] = executable_path(args.memcached_bin, "MEMCACHED_BIN", "memcached")
-        binaries["memtier"] = executable_path(args.memtier_bin, "MEMTIER_BIN", "memtier_benchmark")
+        memcached_bin, memtier_bin = ensure_memcached_binaries(
+            args,
+            build_missing=args.build_missing,
+            logger=logger,
+        )
+        binaries["memcached"] = memcached_bin
+        binaries["memtier"] = memtier_bin
     return binaries
 
 
@@ -1093,6 +1390,11 @@ def cachebench_runtime_env(cachebench_bin: Path) -> dict[str, str] | None:
             lib_dirs.append(candidate)
     if installed_root.name == "installed" and installed_root.is_dir():
         for child in installed_root.iterdir():
+            lib_dir = child / "lib"
+            if lib_dir.is_dir() and any(lib_dir.glob("*.so*")):
+                lib_dirs.append(lib_dir)
+    if installed_root.name == "build" and (installed_root.parent / "installed").is_dir():
+        for child in (installed_root.parent / "installed").iterdir():
             lib_dir = child / "lib"
             if lib_dir.is_dir() and any(lib_dir.glob("*.so*")):
                 lib_dirs.append(lib_dir)

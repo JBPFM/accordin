@@ -1,6 +1,6 @@
-use std::cell::Cell;
+use std::cell::UnsafeCell;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::admission::{
     mark_critical_section_entered, mark_critical_section_exit, mark_slow_path_pending,
@@ -10,9 +10,6 @@ use crate::lock_backend::LockBackend;
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
-
-const MAX_THREAD_SLOTS: usize = 1600;
-static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C, align(64))]
 pub struct Node {
@@ -29,55 +26,108 @@ impl Node {
     }
 }
 
-thread_local! {
-    static THREAD_ID: Cell<usize> = const { Cell::new(usize::MAX) };
-}
-
 pub struct McsLockRaw {
     tail: CacheAligned<AtomicPtr<Node>>,
-    qnodes: Box<[Node]>,
+}
+
+const MAX_THREAD_NODES: usize = 8;
+
+struct ThreadNodes {
+    nodes: [Node; MAX_THREAD_NODES],
+    lock_owners: [*const McsLockRaw; MAX_THREAD_NODES],
+    in_use: [bool; MAX_THREAD_NODES],
+    depth: usize,
+}
+
+impl ThreadNodes {
+    const fn new() -> Self {
+        Self {
+            nodes: [const { Node::new() }; MAX_THREAD_NODES],
+            lock_owners: [ptr::null(); MAX_THREAD_NODES],
+            in_use: [false; MAX_THREAD_NODES],
+            depth: 0,
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_NODES: UnsafeCell<ThreadNodes> = const { UnsafeCell::new(ThreadNodes::new()) };
 }
 
 impl McsLockRaw {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             tail: CacheAligned(AtomicPtr::new(ptr::null_mut())),
-            qnodes: (0..MAX_THREAD_SLOTS)
-                .map(|_| Node::new())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
         }
     }
 
     #[inline(always)]
-    fn thread_index() -> usize {
-        THREAD_ID.with(|slot| {
-            let id = slot.get();
-            if id != usize::MAX {
-                return id;
+    fn acquire_thread_node(&self, locked: bool) -> *mut Node {
+        THREAD_NODES.with(|nodes| unsafe {
+            let nodes = &mut *nodes.get();
+            if nodes.depth == MAX_THREAD_NODES {
+                panic!("McsLockRaw nested lock depth exceeded {MAX_THREAD_NODES}");
             }
 
-            let next = NEXT_THREAD_ID.fetch_add(1, Ordering::AcqRel);
-            assert!(next < MAX_THREAD_SLOTS, "too many threads for MCS lock");
-            slot.set(next);
-            next
+            let index = nodes
+                .in_use
+                .iter()
+                .position(|in_use| !*in_use)
+                .expect("McsLockRaw node accounting lost a free slot");
+            nodes.in_use[index] = true;
+            nodes.lock_owners[index] = self as *const McsLockRaw;
+            nodes.depth += 1;
+
+            let my_node = &mut nodes.nodes[index] as *mut Node;
+            (*my_node).next.store(ptr::null_mut(), Ordering::Relaxed);
+            (*my_node).locked.store(locked, Ordering::Relaxed);
+            my_node
         })
     }
 
     #[inline(always)]
-    fn thread_node(&self) -> *mut Node {
-        let index = Self::thread_index();
-        self.qnodes.as_ptr().wrapping_add(index).cast_mut()
+    fn locked_thread_node(&self) -> *mut Node {
+        THREAD_NODES.with(|nodes| unsafe {
+            let nodes = &mut *nodes.get();
+            let lock_owner = self as *const McsLockRaw;
+            let index = nodes
+                .lock_owners
+                .iter()
+                .zip(nodes.in_use.iter())
+                .position(|(owner, in_use)| *in_use && *owner == lock_owner)
+                .expect("McsLockRaw unlock without a matching thread-local node");
+            &mut nodes.nodes[index] as *mut Node
+        })
     }
 
     #[inline(always)]
-    fn prepare_node(&self, locked: bool) -> *mut Node {
-        let my_node = self.thread_node();
-        unsafe {
+    fn release_thread_node(&self, my_node: *mut Node) {
+        THREAD_NODES.with(|nodes| unsafe {
+            let nodes = &mut *nodes.get();
+            let lock_owner = self as *const McsLockRaw;
+            let index = nodes
+                .nodes
+                .iter_mut()
+                .enumerate()
+                .find_map(|(index, node)| {
+                    let node_ptr = node as *mut Node;
+                    if nodes.in_use[index]
+                        && nodes.lock_owners[index] == lock_owner
+                        && node_ptr == my_node
+                    {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                })
+                .expect("McsLockRaw node release without a matching active node");
+
             (*my_node).next.store(ptr::null_mut(), Ordering::Relaxed);
-            (*my_node).locked.store(locked, Ordering::Relaxed);
-        }
-        my_node
+            (*my_node).locked.store(false, Ordering::Relaxed);
+            nodes.in_use[index] = false;
+            nodes.lock_owners[index] = ptr::null();
+            nodes.depth -= 1;
+        });
     }
 
     #[inline(always)]
@@ -91,7 +141,7 @@ impl McsLockRaw {
     fn lock_queue(&self) {
         self.ensure_slow_path_admission();
 
-        let my_node = self.prepare_node(true);
+        let my_node = self.acquire_thread_node(true);
         let pred = self.tail.0.swap(my_node, Ordering::AcqRel);
         if !pred.is_null() {
             unsafe {
@@ -108,8 +158,9 @@ impl McsLockRaw {
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn try_lock_fast(&self) -> bool {
-        let my_node = self.prepare_node(false);
-        self.tail
+        let my_node = self.acquire_thread_node(false);
+        let locked = self
+            .tail
             .0
             .compare_exchange(
                 ptr::null_mut(),
@@ -117,13 +168,17 @@ impl McsLockRaw {
                 Ordering::Acquire,
                 Ordering::Relaxed,
             )
-            .is_ok()
+            .is_ok();
+        if !locked {
+            self.release_thread_node(my_node);
+        }
+        locked
     }
 
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock_queue(&self) {
-        let my_node = self.thread_node();
+        let my_node = self.locked_thread_node();
         let mut succ = unsafe { (*my_node).next.load(Ordering::Acquire) };
 
         if succ.is_null() {
@@ -139,6 +194,7 @@ impl McsLockRaw {
                 .is_ok()
             {
                 mark_critical_section_exit();
+                self.release_thread_node(my_node);
                 return;
             }
 
@@ -154,6 +210,7 @@ impl McsLockRaw {
             (*succ).locked.store(false, Ordering::Release);
         }
         mark_critical_section_exit();
+        self.release_thread_node(my_node);
     }
 }
 
@@ -182,7 +239,7 @@ mod tests {
     use std::cell::UnsafeCell;
     use std::sync::Arc;
 
-    use super::{McsLockRaw, Node};
+    use super::{MAX_THREAD_NODES, McsLockRaw, Node};
     use crate::lock_backend::LockBackend;
 
     #[test]
@@ -192,12 +249,32 @@ mod tests {
     }
 
     #[test]
+    fn lock_state_stays_compact() {
+        assert_eq!(std::mem::size_of::<McsLockRaw>(), 64);
+        assert_eq!(std::mem::align_of::<McsLockRaw>(), 64);
+    }
+
+    #[test]
     fn try_lock_requires_unlock_before_reacquire() {
         let lock = McsLockRaw::new();
 
         assert!(lock.try_lock());
         assert!(!lock.try_lock());
         lock.unlock();
+        assert!(lock.try_lock());
+        lock.unlock();
+    }
+
+    #[test]
+    fn failed_try_lock_releases_thread_node() {
+        let lock = McsLockRaw::new();
+
+        assert!(lock.try_lock());
+        for _ in 0..(MAX_THREAD_NODES * 4) {
+            assert!(!lock.try_lock());
+        }
+        lock.unlock();
+
         assert!(lock.try_lock());
         lock.unlock();
     }

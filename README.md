@@ -8,7 +8,7 @@ Accordin 是一个通过 `LD_PRELOAD` 接入 `pthread_mutex` 的用户态锁与 
 
 ## 1. Concurrency Controller
 
-concurrency controller 主要在 `src/lock_stats.rs` 和 `src/lb_shared/src/cpu_affinity.rs` 中实现。
+concurrency controller 主要在 `src/accordin_shared/src/lock_stats.rs` 和 `src/accordin_shared/src/cpu_affinity.rs` 中实现。
 
 它采样锁操作并统计三类时间：
 
@@ -46,7 +46,7 @@ dynamic_cpu_affinity_cpus: ...
 
 admission yield 是用户态锁与 BPF 调度器之间的握手机制。目标是在大量线程即将进入锁慢路径等待时，让 BPF 控制哪些等待者可以继续活跃运行，避免所有等待者同时消耗 CPU。
 
-用户态状态在 `src/lb_shared/src/admission.rs`，BPF 侧调度逻辑在 `src/bpf/main.bpf.c`。
+用户态状态在 `src/accordin_shared/src/admission.rs`，BPF 侧调度逻辑在 `src/bpf/main.bpf.c`。
 
 每个线程有一个 admission word，当前使用两个 bit：
 
@@ -57,7 +57,7 @@ admission yield 是用户态锁与 BPF 调度器之间的握手机制。目标�
 
 基本流程：
 
-1. 锁实现 fast path 失败后，在进入等待前调用 `mark_slow_path_pending()`。
+1. mutex hook 的 fast path 失败后，由 shared adapter 在进入等待前调用 `mark_slow_path_pending()`。
 2. BPF 看到 `SLOW_PATH_PENDING` 后，为该任务选择 admission CPU。
 3. `cpu_admission_owner_map` 对每个 CPU 只记录一个当前 admission owner。
 4. 拿不到 admission 的等待者会被放入该 CPU 的 inactive DSQ。
@@ -75,7 +75,7 @@ admission yield 是用户态锁与 BPF 调度器之间的握手机制。目标�
 
 ## 3. Mutex Hook
 
-mutex hook 在 `src/lb_shared/src/mutex_hook.rs` 中实现。它通过 `export_mutex_hooks!` 宏导出 `pthread_mutex_*` 和 `pthread_cond_*` 符号，使应用无需改源码即可把 `pthread_mutex` 调用接入 Accordin 的锁后端。
+mutex hook 在 `src/accordin_shared/src/mutex_hook.rs` 中实现。它通过 `export_mutex_hooks!` 宏导出 `pthread_mutex_*` 和 `pthread_cond_*` 符号，使应用无需改源码即可把 `pthread_mutex` 调用接入 Accordin 的锁后端。
 
 hook 层负责：
 
@@ -109,13 +109,13 @@ pub trait MutexHookBackend {
 | `libreciprocating_accordin.so` | Reciprocating | yes | `src/reciprocating_accordin` |
 | `libmcs_tse.so` | MCS + timeslice extension | no | `src/mcs_tse` |
 
-新增锁实现时，通常需要：
+新增普通锁实现时，通常需要：
 
 1. 实现原始锁状态，并为其实现 `LockBackend`。
-2. 写一个很薄的 `MutexHookBackend` adapter。
-3. 用 `lb_shared::export_mutex_hooks!(...)` 导出 pthread hook。
+2. 为 raw lock 实现 `Default`，然后用 `accordin_shared::mutex_hook::LockBackendAdapter<RawLock>` 接入 hook。
+3. 用 `accordin_shared::export_mutex_hooks!(...)` 导出 pthread hook。
 4. 如果需要独立 preload，则把新 crate 加入 workspace，并设置 `crate-type = ["cdylib"]`。
-5. 在锁慢路径等待前调用 `mark_slow_path_pending()`；在解锁时清除 CS 状态。hook 会在加锁成功后统一调用 `record_lock_acquired()`，该路径也会设置 `IN_CRITICAL_SECTION`。
+5. raw lock 文件只保留锁算法；slow-path admission、CS 状态、统计和动态并发控制由 `accordin_shared` 的 hook/stats 层处理。需要额外 hook-local 状态的后端仍可直接实现 `MutexHookBackend`。
 
 ## 运行数据流
 
@@ -189,9 +189,9 @@ sudo K=4 LD_PRELOAD=./target/release/libreciprocating_accordin.so ./your_program
 | `src/bpf/main.bpf.c` | `sched_ext` admission scheduler。 |
 | `src/bpf/intf.h` | BPF 常量与 task context 布局。 |
 | `src/bpf/maps.bpf.h` | task state、thread admission pointer、CPU owner 等 BPF maps。 |
-| `src/lb_shared/src/admission.rs` | 用户态 per-thread admission word。 |
-| `src/lock_stats.rs` | CS/NCS/wait 统计与动态并发控制。 |
-| `src/lb_shared/src/cpu_affinity.rs` | CPU mask 解析与动态 affinity 应用。 |
-| `src/lb_shared/src/mutex_hook.rs` | 通用 pthread interposer 与 backend trait。 |
+| `src/accordin_shared/src/admission.rs` | 用户态 per-thread admission word。 |
+| `src/accordin_shared/src/lock_stats.rs` | CS/NCS/wait 统计与动态并发控制。 |
+| `src/accordin_shared/src/cpu_affinity.rs` | CPU mask 解析与动态 affinity 应用。 |
+| `src/accordin_shared/src/mutex_hook.rs` | 通用 pthread interposer 与 backend trait。 |
 | `src/*_accordin/src/*` | 带 BPF admission 的锁后端 crate。 |
 | `src/mcs_tse/src/*` | 使用 timeslice extension 而非 BPF admission 的 MCS 后端。 |

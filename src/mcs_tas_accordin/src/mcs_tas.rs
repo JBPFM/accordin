@@ -2,17 +2,8 @@ use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use crate::admission::{
-    mark_critical_section_entered, mark_critical_section_exit, mark_slow_path_pending,
-};
 use crate::arch::pause;
 use crate::lock_backend::LockBackend;
-
-// we remove sample cause in some high contention env wait can occupy full timeslice
-// or we can reserve a fast path in low contention
-// // Keep in sync with WAIT_TIME_SAMPLE_STRIDE in src/bpf/intf.h.
-// const WAIT_TIME_SAMPLE_STRIDE: u32 = 8;
-// const WAIT_TIME_SAMPLE_MASK: u32 = WAIT_TIME_SAMPLE_STRIDE - 1;
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
@@ -54,17 +45,9 @@ impl McsTasLockRaw {
         THREAD_NODE.with(|node| node.get())
     }
 
-    #[inline(always)]
-    fn ensure_slow_path_admission(&self) {
-        mark_slow_path_pending();
-        std::thread::yield_now();
-    }
-
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn lock_slow(&self) {
-        self.ensure_slow_path_admission();
-
         // prepare node and set pred
         let my_node = Self::thread_node();
         unsafe {
@@ -115,8 +98,6 @@ impl McsTasLockRaw {
                 (*succ).waiting.store(false, Ordering::Release);
             }
         }
-
-        mark_critical_section_entered();
     }
 
     /// Returns true if the lock was acquired, false if it was already held.
@@ -124,23 +105,22 @@ impl McsTasLockRaw {
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn try_lock_fast(&self) -> bool {
         // CAS instead of swap to avoid unnecessary cache-line invalidation
-        if self
-            .locked
+        self.locked
             .0
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
-        {
-            true
-        } else {
-            false
-        }
     }
 
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn unlock_fast(&self) {
         self.locked.0.store(false, Ordering::Release);
-        mark_critical_section_exit();
+    }
+}
+
+impl Default for McsTasLockRaw {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

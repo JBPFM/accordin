@@ -2,7 +2,7 @@
 
 use crate::lock_backend::LockBackend;
 use crate::mcs::McsLockRaw;
-use lb_shared::mutex_hook::MutexHookBackend;
+use accordin_shared::mutex_hook::MutexHookBackend;
 
 struct McsBackend;
 
@@ -26,4 +26,4 @@ impl MutexHookBackend for McsBackend {
     }
 }
 
-lb_shared::export_mutex_hooks!(super::McsBackend);
+accordin_shared::export_mutex_hooks!(super::McsBackend);

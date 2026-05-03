@@ -2,8 +2,10 @@
 
 use crate::lock_backend::LockBackend;
 use crate::mcs::McsLockRaw;
-use lb_shared::mutex_hook::MutexHookBackend;
-use lb_shared::timeslice_extension::{CriticalSectionTimesliceExtension, TimesliceExtensionMode};
+use accordin_shared::mutex_hook::MutexHookBackend;
+use accordin_shared::timeslice_extension::{
+    CriticalSectionTimesliceExtension, TimesliceExtensionMode,
+};
 
 struct McsTseLockState {
     lock: McsLockRaw,
@@ -49,4 +51,4 @@ impl MutexHookBackend for McsTseBackend {
     }
 }
 
-lb_shared::export_mutex_hooks!(super::McsTseBackend);
+accordin_shared::export_mutex_hooks!(super::McsTseBackend);

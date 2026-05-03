@@ -6,14 +6,22 @@ version = 4
 name = "accordin"
 version = "0.1.0"
 dependencies = [
+ "accordin_shared",
  "anyhow",
- "lb_shared",
  "libbpf-rs",
  "libc",
  "log",
  "scx_cargo",
  "scx_utils",
  "simplelog",
+]
+
+[[package]]
+name = "accordin_shared"
+version = "0.1.0"
+dependencies = [
+ "libbpf-rs",
+ "libc",
 ]
 
 [[package]]
@@ -819,14 +827,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
-name = "lb_shared"
-version = "0.1.0"
-dependencies = [
- "libbpf-rs",
- "libc",
-]
-
-[[package]]
 name = "libbpf-cargo"
 version = "0.26.0-beta.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -911,11 +911,11 @@ checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 name = "mcs_accordin"
 version = "0.1.0"
 dependencies = [
+ "accordin_shared",
  "anyhow",
  "clap",
  "crossbeam",
  "ctrlc",
- "lb_shared",
  "libbpf-rs",
  "libc",
  "log",
@@ -931,11 +931,11 @@ dependencies = [
 name = "mcs_tas_accordin"
 version = "0.1.0"
 dependencies = [
+ "accordin_shared",
  "anyhow",
  "clap",
  "crossbeam",
  "ctrlc",
- "lb_shared",
  "libbpf-rs",
  "libc",
  "log",
@@ -951,7 +951,7 @@ dependencies = [
 name = "mcs_tse"
 version = "0.1.0"
 dependencies = [
- "lb_shared",
+ "accordin_shared",
  "libc",
  "log",
  "simplelog",
@@ -1252,11 +1252,11 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 name = "reciprocating_accordin"
 version = "0.1.0"
 dependencies = [
+ "accordin_shared",
  "anyhow",
  "clap",
  "crossbeam",
  "ctrlc",
- "lb_shared",
  "libbpf-rs",
  "libc",
  "log",
@@ -1819,11 +1819,11 @@ dependencies = [
 name = "ttas_accordin"
 version = "0.1.0"
 dependencies = [
+ "accordin_shared",
  "anyhow",
  "clap",
  "crossbeam",
  "ctrlc",
- "lb_shared",
  "libbpf-rs",
  "libc",
  "log",

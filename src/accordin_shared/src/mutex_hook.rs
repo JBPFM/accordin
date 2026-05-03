@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+use std::marker::PhantomData;
 use std::sync::OnceLock;
 
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
+
+use crate::lock_backend::LockBackend;
 
 pub trait MutexHookBackend {
     type LockState;
@@ -11,6 +14,41 @@ pub trait MutexHookBackend {
     fn lock(state: &Self::LockState);
     fn try_lock(state: &Self::LockState) -> bool;
     fn unlock(state: &Self::LockState);
+}
+
+/// Adapts a raw lock implementation to the pthread hook backend interface.
+///
+/// Use this when the lock file should only contain the lock algorithm. The
+/// adapter keeps the shared admission lifecycle outside the raw lock: slow-path
+/// acquisition marks the thread as waiting, and unlock clears the critical
+/// section after the raw lock releases. Stats are still handled by
+/// `export_mutex_hooks!`.
+pub struct LockBackendAdapter<L>(PhantomData<fn() -> L>);
+
+impl<L> MutexHookBackend for LockBackendAdapter<L>
+where
+    L: LockBackend + Default,
+{
+    type LockState = L;
+
+    fn create_state() -> Self::LockState {
+        L::default()
+    }
+
+    fn lock(state: &Self::LockState) {
+        crate::admission::mark_slow_path_pending();
+        std::thread::yield_now();
+        LockBackend::lock(state);
+    }
+
+    fn try_lock(state: &Self::LockState) -> bool {
+        LockBackend::try_lock(state)
+    }
+
+    fn unlock(state: &Self::LockState) {
+        LockBackend::unlock(state);
+        crate::admission::mark_critical_section_exit();
+    }
 }
 
 static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();

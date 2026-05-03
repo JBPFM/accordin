@@ -2,7 +2,7 @@
 
 use crate::lock_backend::LockBackend;
 use crate::ttas::TtasLockRaw;
-use lb_shared::mutex_hook::MutexHookBackend;
+use accordin_shared::mutex_hook::MutexHookBackend;
 
 struct TtasBackend;
 
@@ -26,4 +26,4 @@ impl MutexHookBackend for TtasBackend {
     }
 }
 
-lb_shared::export_mutex_hooks!(super::TtasBackend);
+accordin_shared::export_mutex_hooks!(super::TtasBackend);

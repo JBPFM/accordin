@@ -1,14 +1,13 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 
-pub use lb_shared::arch;
+pub use accordin_shared::arch;
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 pub mod bpf_intf {
     include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"));
 }
-pub use lb_shared::admission;
-pub use lb_shared::lock_backend;
-pub use lb_shared::lock_stats;
+pub use accordin_shared::lock_backend;
+pub use accordin_shared::lock_stats;
 mod mcs_tas;
 mod mutex_hook;
 
@@ -46,7 +45,7 @@ fn init_scheduler(debug: bool, _stats_only: bool, _debug_counters: bool) -> Resu
     let mut skel = scx_ops_load!(skel, accordin_ops, uei)?;
 
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
-    lb_shared::mutex_hook::set_thread_ctx_map(thread_ctx_map);
+    accordin_shared::mutex_hook::set_thread_ctx_map(thread_ctx_map);
 
     let link = scx_ops_attach!(skel, accordin_ops)?;
 
@@ -90,7 +89,7 @@ fn init_ebpf() {
         simplelog::ColorChoice::Auto,
     );
 
-    lb_shared::cpu_affinity::init_from_env("mcs_tas_accordin");
+    accordin_shared::cpu_affinity::init_from_env("mcs_tas_accordin");
 
     if env_flag(DISABLE_BPF_ENV) {
         info!(

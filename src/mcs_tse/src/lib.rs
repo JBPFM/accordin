@@ -1,13 +1,13 @@
-pub use lb_shared::admission;
-pub use lb_shared::arch;
-pub use lb_shared::lock_backend;
-pub use lb_shared::lock_stats;
-pub use lb_shared::timeslice_extension;
+pub use accordin_shared::admission;
+pub use accordin_shared::arch;
+pub use accordin_shared::lock_backend;
+pub use accordin_shared::lock_stats;
+pub use accordin_shared::timeslice_extension;
 
 mod mcs;
 mod mutex_hook;
 
-use lb_shared::timeslice_extension::{
+use accordin_shared::timeslice_extension::{
     TimesliceExtensionMode, current_thread_timeslice_extension_status,
 };
 use log::info;

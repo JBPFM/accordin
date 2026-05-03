@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 [workspace]
 resolver = "3"
 members = [
-    "src/lb_shared",
+    "src/accordin_shared",
     "src/mcs_accordin",
     "src/mcs_tas_accordin",
     "src/mcs_tse",
@@ -21,7 +21,7 @@ members = [
 ]
 default-members = [
     ".",
-    "src/lb_shared",
+    "src/accordin_shared",
     "src/mcs_accordin",
     "src/mcs_tas_accordin",
     "src/mcs_tse",
@@ -32,7 +32,7 @@ exclude = ["bench/mutexbench_rust"]
 
 [dependencies]
 anyhow = "1.0.65"
-lb_shared = { path = "src/lb_shared" }
+accordin_shared = { path = "src/accordin_shared" }
 libbpf-rs = "=0.26.0-beta.1"
 libc = "0.2.177"
 log = "0.4.17"

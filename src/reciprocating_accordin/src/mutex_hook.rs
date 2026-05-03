@@ -2,7 +2,7 @@
 
 use crate::lock_backend::LockBackend;
 use crate::reciprocating::ReciprocatingLockRaw;
-use lb_shared::mutex_hook::MutexHookBackend;
+use accordin_shared::mutex_hook::MutexHookBackend;
 
 struct ReciprocatingBackend;
 
@@ -26,4 +26,4 @@ impl MutexHookBackend for ReciprocatingBackend {
     }
 }
 
-lb_shared::export_mutex_hooks!(super::ReciprocatingBackend);
+accordin_shared::export_mutex_hooks!(super::ReciprocatingBackend);

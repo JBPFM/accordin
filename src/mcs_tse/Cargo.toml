@@ -9,7 +9,7 @@ name = "mcs_tse"
 crate-type = ["cdylib"]
 
 [dependencies]
-lb_shared = { path = "../lb_shared" }
+accordin_shared = { path = "../accordin_shared" }
 libc = "0.2.177"
 log = "0.4.17"
 simplelog = "0.12"

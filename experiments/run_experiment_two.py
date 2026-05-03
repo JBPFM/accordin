@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 
+import experiment_defaults
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MUTEXBENCH_DIR = REPO_ROOT / "bench" / "mutexbench"
@@ -21,13 +22,13 @@ SWEEP_SCRIPT = MUTEXBENCH_DIR / "scripts" / "sweep_mutex_throughput.sh"
 MCS_TSE_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 MCS_TSE_DEBUG_LIB = REPO_ROOT / "target" / "debug" / "libmcs_tse.so"
 
-DEFAULT_LOCKS = ("mcs_tse", "mcs_tas")
-DEFAULT_CRITICAL_NS = 300
-DEFAULT_OUTSIDE_NS = 3000
-DEFAULT_DURATION_MS = 5000
-DEFAULT_WARMUP_DURATION_MS = 1000
-DEFAULT_REPEATS = 4
-EXPERIMENT_ONE_STYLE_THREADS = (1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
+DEFAULT_LOCKS = experiment_defaults.EXPERIMENT_TWO_DEFAULT_LOCKS
+DEFAULT_CRITICAL_NS = experiment_defaults.MUTEXBENCH_DEFAULT_CRITICAL_NS
+DEFAULT_OUTSIDE_NS = experiment_defaults.MUTEXBENCH_DEFAULT_OUTSIDE_NS
+DEFAULT_DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_DURATION_MS
+DEFAULT_WARMUP_DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_WARMUP_DURATION_MS
+DEFAULT_REPEATS = experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS
+EXPERIMENT_TWO_STYLE_THREADS = experiment_defaults.EXPERIMENT_TWO_STYLE_THREADS
 
 RAW_FIELDS = (
     "lock",
@@ -475,7 +476,7 @@ def select_topology(profile_arg: str) -> CpuTopology:
 def default_thread_counts(topology: CpuTopology) -> tuple[int, ...]:
     max_threads = topology.max_threads()
     first_node_count = topology.first_node_count()
-    candidates = [thread for thread in EXPERIMENT_ONE_STYLE_THREADS if thread <= max_threads]
+    candidates = [thread for thread in EXPERIMENT_TWO_STYLE_THREADS if thread <= max_threads]
     candidates.extend([first_node_count, max_threads])
     return tuple(sorted({thread for thread in candidates if 1 <= thread <= max_threads}))
 
@@ -559,20 +560,7 @@ def ensure_mcs_tse_library(logger: CommandLogger, *, build_missing: bool, dry_ru
 
 
 def normalize_lock_key(key: str) -> str:
-    normalized = key.strip().lower()
-    aliases = {
-        "mcs-tas": "mcs_tas",
-        "mcstas": "mcs_tas",
-        "mcs_tas": "mcs_tas",
-        "mcs_tse": "mcs_tse",
-        "mcs-extension": "mcs_extension",
-        "mcs_extension": "mcs_extension",
-    }
-    if normalized not in aliases:
-        raise ValueError(
-            f"Unsupported lock key: {key}. Supported locks: mcs_tse, mcs_tas/mcs-tas/mcstas, mcs_extension."
-        )
-    return aliases[normalized]
+    return experiment_defaults.normalize_experiment_two_lock(key)
 
 
 def resolve_lock_specs(
@@ -594,7 +582,7 @@ def resolve_lock_specs(
             specs.append(
                 LockSpec(
                     key="mcs_tse",
-                    label="MCS + TSE",
+                    label=experiment_defaults.lock_label("mcs_tse"),
                     mode="ld_preload",
                     lock_kind="mutex",
                     preload_library=ensure_mcs_tse_library(
@@ -608,7 +596,7 @@ def resolve_lock_specs(
             specs.append(
                 LockSpec(
                     key="mcs_tas",
-                    label="MCS-TAS",
+                    label=experiment_defaults.lock_label("mcs_tas"),
                     mode="native",
                     lock_kind="mcs-tas",
                 )
@@ -617,7 +605,7 @@ def resolve_lock_specs(
             specs.append(
                 LockSpec(
                     key="mcs_extension",
-                    label="MCS + TSE (native)",
+                    label=f"{experiment_defaults.lock_label('mcs_extension')} (native)",
                     mode="native_timeslice_extension",
                     lock_kind="mcs",
                     timeslice_extension="require",

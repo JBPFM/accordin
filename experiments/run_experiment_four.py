@@ -14,9 +14,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable
 
-import run_experiment_one as experiment_one
+import experiment_defaults
 import run_experiment_three as experiment_three
-import machine_config
 
 
 REPO_ROOT = experiment_three.REPO_ROOT
@@ -26,23 +25,21 @@ DEFAULT_LEVELDB_DIR = REPO_ROOT / "third_party" / f"leveldb-{LEVELDB_VERSION}"
 DEFAULT_DB_BENCH = DEFAULT_LEVELDB_DIR / "build" / "db_bench"
 
 DEFAULT_BENCHMARKS = ("readrandom", "fillrandom")
-DEFAULT_LOCKS = experiment_three.DEFAULT_LOCKS
-DEFAULT_THREADS = experiment_one.THREADS
-DEFAULT_REPEATS = experiment_three.DEFAULT_REPEATS
+DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
+DEFAULT_LOCKS = experiment_defaults.DEFAULT_LOCKS
+FULL_LOCKS = experiment_defaults.FULL_LOCKS
+MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
+DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
+DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
 DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
 DEFAULT_INIT_EXISTING_BENCHMARKS = ("readrandom", "readseq", "overwrite")
-SINGLE_OVERSUBSCRIBED_LOCKS = experiment_three.SINGLE_OVERSUBSCRIBED_LOCKS
-PER_LOCK_MAX_THREADS = {
-    lock: max(
-        machine_config.limit_to_single_oversubscribed_thread_count(
-            DEFAULT_THREADS,
-            experiment_three.MACHINE_CORE_COUNT,
-        )
-    )
-    for lock in SINGLE_OVERSUBSCRIBED_LOCKS
-}
+SINGLE_OVERSUBSCRIBED_LOCKS = experiment_defaults.SINGLE_OVERSUBSCRIBED_LOCKS
+PER_LOCK_MAX_THREADS = experiment_defaults.per_lock_max_threads_for_settings(
+    SINGLE_OVERSUBSCRIBED_LOCKS,
+    DEFAULT_THREADS,
+)
 
 RAW_FIELDS = (
     "benchmark",
@@ -93,8 +90,10 @@ def parse_args() -> argparse.Namespace:
         epilog=f"""\
 Default benchmark settings:
   benchmarks={','.join(DEFAULT_BENCHMARKS)}
-  locks={','.join(DEFAULT_LOCKS)}
-  machine-profile={machine_config.ACTIVE_MACHINE_CONFIG.name} (override with {machine_config.PROFILE_ENV})
+  lock-profile={DEFAULT_LOCK_PROFILE}
+  minimal locks={','.join(MINIMAL_LOCKS)}
+  full locks={','.join(FULL_LOCKS)}
+  machine-profile={experiment_defaults.ACTIVE_MACHINE_CONFIG.name} (override with {experiment_defaults.PROFILE_ENV})
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
   repeats={DEFAULT_REPEATS}, num={DEFAULT_NUM}, total_ops={DEFAULT_TOTAL_OPS}
   leveldb={DEFAULT_LEVELDB_DIR} (tag {LEVELDB_VERSION})
@@ -106,7 +105,7 @@ Default benchmark settings:
 Examples:
   python3 experiments/run_experiment_four.py
   python3 experiments/run_experiment_four.py --locks stock --threads 1 --repeats 1 --benchmarks fillseq --num 1000
-  {machine_config.PROFILE_ENV}=original python3 experiments/run_experiment_four.py
+  {experiment_defaults.PROFILE_ENV}=original python3 experiments/run_experiment_four.py
   python3 experiments/run_experiment_four.py --plot-only experiments/results/experiment4_manual
 """,
     )
@@ -140,12 +139,21 @@ Examples:
         help=f"Comma-separated LevelDB db_bench benchmark names. Default: {','.join(DEFAULT_BENCHMARKS)}.",
     )
     parser.add_argument(
+        "--lock-profile",
+        choices=experiment_defaults.lock_profile_names(),
+        default=DEFAULT_LOCK_PROFILE,
+        help=(
+            "Named lock set used when --locks is omitted. "
+            f"Default: {DEFAULT_LOCK_PROFILE}. "
+            f"minimal={','.join(MINIMAL_LOCKS)}; full={','.join(FULL_LOCKS)}."
+        ),
+    )
+    parser.add_argument(
         "--locks",
-        default=",".join(DEFAULT_LOCKS),
+        default=None,
         metavar="CSV",
         help=(
-            "Comma-separated lock keys. "
-            f"Default: {','.join(DEFAULT_LOCKS)}. "
+            "Comma-separated lock keys. Overrides --lock-profile. "
             "Use stock to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
             "accordin/mcs_accordin == mcs_tas_accordin."
@@ -278,31 +286,22 @@ def default_result_root() -> Path:
 
 
 def lock_label(lock: str) -> str:
-    return experiment_three.lock_label(lock)
+    return experiment_defaults.lock_label(lock)
 
 
 def lock_sort_key(lock: str) -> tuple[int, str]:
-    return experiment_three.lock_sort_key(lock)
+    return experiment_defaults.lock_sort_key(lock)
 
 
 def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:
-    if lock not in SINGLE_OVERSUBSCRIBED_LOCKS:
-        return threads
-    return machine_config.limit_to_single_oversubscribed_thread_count(
-        threads,
-        experiment_three.MACHINE_CORE_COUNT,
-    )
+    return experiment_defaults.runnable_threads_for_lock(lock, threads)
 
 
 def per_lock_max_threads_for_settings(
     locks: tuple[str, ...],
     threads: tuple[int, ...],
 ) -> dict[str, int]:
-    return {
-        lock: max(runnable_threads_for_lock(lock, threads))
-        for lock in locks
-        if lock in SINGLE_OVERSUBSCRIBED_LOCKS
-    }
+    return experiment_defaults.per_lock_max_threads_for_settings(locks, threads)
 
 
 def ceil_div(numerator: int, denominator: int) -> int:
@@ -643,13 +642,17 @@ def write_settings(
     fill_benchmark: str,
     init_existing_benchmarks: tuple[str, ...],
     build_missing: bool,
+    lock_profile: str,
+    lock_profile_source: str,
 ) -> None:
     settings = {
         "benchmarks": [{"key": benchmark, "label": benchmark_label(benchmark)} for benchmark in benchmarks],
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
+        "lock_profile": lock_profile,
+        "lock_profile_source": lock_profile_source,
         "threads": list(threads),
-        "machine_profile": machine_config.ACTIVE_MACHINE_CONFIG.name,
-        "machine_profile_env": machine_config.PROFILE_ENV,
+        "machine_profile": experiment_defaults.ACTIVE_MACHINE_CONFIG.name,
+        "machine_profile_env": experiment_defaults.PROFILE_ENV,
         "single_oversubscribed_locks": list(SINGLE_OVERSUBSCRIBED_LOCKS),
         "per_lock_max_threads": per_lock_max_threads_for_settings(locks, threads),
         "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
@@ -663,7 +666,7 @@ def write_settings(
         "fill_benchmark": fill_benchmark,
         "init_existing_benchmarks": list(init_existing_benchmarks),
         "flexguard_dir": str(FLEXGUARD_DIR),
-        "machine_core_count": experiment_three.MACHINE_CORE_COUNT,
+        "machine_core_count": experiment_defaults.MACHINE_CORE_COUNT,
     }
     with (result_root / "settings.json").open("w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
@@ -854,8 +857,9 @@ def main() -> int:
             return 2
 
         benchmarks = validate_benchmark_names(parse_csv_strings(args.benchmarks))
-        locks = experiment_three.validate_locks(
-            tuple(dict.fromkeys(experiment_three.normalize_lock(lock) for lock in parse_csv_strings(args.locks)))
+        locks = experiment_defaults.resolve_locks(
+            profile=args.lock_profile,
+            locks=None if args.locks is None else parse_csv_strings(args.locks),
         )
         threads = parse_csv_ints(args.threads)
         leveldb_dir = resolve_path(args.leveldb_dir)
@@ -896,6 +900,8 @@ def main() -> int:
             fill_benchmark=fill_benchmark,
             init_existing_benchmarks=init_existing_benchmarks,
             build_missing=args.build_missing,
+            lock_profile=args.lock_profile,
+            lock_profile_source="manual" if args.locks is not None else "profile",
         )
         raw_rows = run_benchmarks(
             result_root,

@@ -18,13 +18,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable, Sequence
 
-from machine_config import (
-    ACTIVE_MACHINE_CONFIG,
-    DEFAULT_THREAD_COUNTS,
-    MACHINE_PHYSICAL_CORES,
-    PROFILE_ENV,
-    limit_to_single_oversubscribed_thread_count,
-)
+import experiment_defaults
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -69,18 +63,12 @@ STREAMCLUSTER_BINARY = (
 )
 
 DEFAULT_BENCHMARKS = ("dedup", "streamcluster")
-DEFAULT_LOCKS = (
-    "mcs",
-    "mcstp",
-    "mcs-tas",
-    "mcs_extension",
-    "flexguard",
-    "malthusian",
-    "reciprocating",
-    "mcs_tas_accordin",
-)
-DEFAULT_THREADS = DEFAULT_THREAD_COUNTS
-DEFAULT_REPEATS = 3
+DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
+DEFAULT_LOCKS = experiment_defaults.DEFAULT_LOCKS
+FULL_LOCKS = experiment_defaults.FULL_LOCKS
+MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
+DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
+DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
 DEFAULT_DEDUP_COMPRESSION = "gzip"
 DEFAULT_STREAMCLUSTER_MIN_CENTERS = 10
 DEFAULT_STREAMCLUSTER_MAX_CENTERS = 30
@@ -89,14 +77,14 @@ DEFAULT_STREAMCLUSTER_NUM_POINTS = 32768
 DEFAULT_STREAMCLUSTER_CHUNKSIZE = 32768
 DEFAULT_STREAMCLUSTER_CLUSTERSIZE = 2000
 DEFAULT_STREAMCLUSTER_INPUT = "none"
-MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
-SINGLE_OVERSUBSCRIBED_LOCKS = ("mcs", "mcstp", "mcs_extension", "malthusian", "reciprocating")
-PER_LOCK_MAX_THREADS = {
-    lock: max(
-        limit_to_single_oversubscribed_thread_count(DEFAULT_THREADS, MACHINE_CORE_COUNT)
-    )
-    for lock in SINGLE_OVERSUBSCRIBED_LOCKS
-}
+MACHINE_CORE_COUNT = experiment_defaults.MACHINE_CORE_COUNT
+ACTIVE_MACHINE_CONFIG = experiment_defaults.ACTIVE_MACHINE_CONFIG
+PROFILE_ENV = experiment_defaults.PROFILE_ENV
+SINGLE_OVERSUBSCRIBED_LOCKS = experiment_defaults.SINGLE_OVERSUBSCRIBED_LOCKS
+PER_LOCK_MAX_THREADS = experiment_defaults.per_lock_max_threads_for_settings(
+    SINGLE_OVERSUBSCRIBED_LOCKS,
+    DEFAULT_THREADS,
+)
 
 RAW_FIELDS = (
     "benchmark",
@@ -124,18 +112,7 @@ SETUP_PATTERN = re.compile(r"Setup time:\s*(\d+)")
 BENCHMARK_PATTERN = re.compile(r"Benchmark time:\s*(\d+)")
 BASE_DIR_PATTERN = re.compile(r"^BASE_DIR=(?P<quote>[\"']?)(?P<value>.*?)(?P=quote)$", re.MULTILINE)
 
-LOCK_LABELS = {
-    "stock": "Stock",
-    "mcs": "MCS",
-    "mcstp": "MCS-TP",
-    "mcstas": "MCS-TAS",
-    "mcs_extension": "MCS + TSE",
-    "flexguard": "FlexGuard",
-    "malthusian": "Malthusian",
-    "reciprocating": "Reciprocating",
-    "accordin": "Accordin",
-    "mcs_tas_accordin": "Accordin",
-}
+LOCK_LABELS = experiment_defaults.LOCK_LABELS
 BENCHMARK_LABELS = {
     "dedup": "PARSEC dedup",
     "streamcluster": "PARSEC streamcluster",
@@ -144,28 +121,8 @@ ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accord
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
 ROOT_REQUIRED_PRELOAD_LOCKS = {"mcs_tas_accordin"}
-LOCK_ALIASES = {
-    "accordin": "mcs_tas_accordin",
-    "mcs_tas_accordin": "mcs_tas_accordin",
-    "mcs-tas": "mcstas",
-    "mcs_extension": "mcs_extension",
-    "mcs-tse": "mcs_extension",
-    "mcs_tse": "mcs_extension",
-    "mcs_accordin": "mcs_tas_accordin",
-    "stock": "stock",
-}
-LOCK_ORDER = (
-    "stock",
-    "mcs",
-    "mcstp",
-    "mcstas",
-    "mcs_extension",
-    "flexguard",
-    "malthusian",
-    "reciprocating",
-    "mcs_tas_accordin",
-    "accordin",
-)
+LOCK_ALIASES = experiment_defaults.LOCK_ALIASES
+LOCK_ORDER = experiment_defaults.LOCK_ORDER
 RESULT_LOG_PATTERN = re.compile(
     rf"^(?P<benchmark>.+)_(?P<lock>{'|'.join(re.escape(lock) for lock in sorted(LOCK_ORDER, key=len, reverse=True))})_"
     r"(?P<threads>\d+)_r(?P<repeat>\d+)\.log$"
@@ -315,7 +272,9 @@ def parse_args(
     settings_lines = [
         "Default benchmark settings:",
         f"  {benchmark_label_text}={','.join(selected_benchmarks)}",
-        f"  locks={','.join(DEFAULT_LOCKS)}",
+        f"  lock-profile={DEFAULT_LOCK_PROFILE}",
+        f"  minimal locks={','.join(MINIMAL_LOCKS)}",
+        f"  full locks={','.join(FULL_LOCKS)}",
         f"  machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})",
         f"  threads={','.join(str(thread) for thread in DEFAULT_THREADS)}",
         f"  repeats={DEFAULT_REPEATS}",
@@ -419,12 +378,21 @@ def parse_args(
             ),
         )
     parser.add_argument(
+        "--lock-profile",
+        choices=experiment_defaults.lock_profile_names(),
+        default=DEFAULT_LOCK_PROFILE,
+        help=(
+            "Named lock set used when --locks is omitted. "
+            f"Default: {DEFAULT_LOCK_PROFILE}. "
+            f"minimal={','.join(MINIMAL_LOCKS)}; full={','.join(FULL_LOCKS)}."
+        ),
+    )
+    parser.add_argument(
         "--locks",
-        default=",".join(DEFAULT_LOCKS),
+        default=None,
         metavar="CSV",
         help=(
-            "Comma-separated lock keys. "
-            f"Default: {','.join(DEFAULT_LOCKS)}. "
+            "Comma-separated lock keys. Overrides --lock-profile. "
             "Use stock to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
             "accordin/mcs_accordin == mcs_tas_accordin."
@@ -516,20 +484,11 @@ def parse_csv_strings(value: str) -> tuple[str, ...]:
 
 
 def normalize_lock(lock: str) -> str:
-    normalized = lock.strip().lower()
-    return LOCK_ALIASES.get(normalized, normalized)
+    return experiment_defaults.normalize_lock(lock)
 
 
 def validate_locks(locks: tuple[str, ...]) -> tuple[str, ...]:
-    supported = set(DEFAULT_LOCKS) | set(LOCK_ALIASES.values())
-    supported.update(LOCK_LABELS.keys())
-    unsupported = [lock for lock in locks if lock not in supported]
-    if unsupported:
-        raise ValueError(
-            f"Unsupported lock keys: {', '.join(unsupported)}. "
-            f"Supported keys: {', '.join(sorted(supported))}"
-        )
-    return locks
+    return experiment_defaults.validate_locks(locks)
 
 
 def combine_ld_preload(preload_library: Path) -> str:
@@ -586,7 +545,7 @@ def ensure_output_root(path: Path, force: bool, resume: bool = False) -> None:
 
 
 def lock_label(lock: str) -> str:
-    return LOCK_LABELS.get(lock, lock)
+    return experiment_defaults.lock_label(lock)
 
 
 def benchmark_label(benchmark: str) -> str:
@@ -594,26 +553,18 @@ def benchmark_label(benchmark: str) -> str:
 
 
 def lock_sort_key(lock: str) -> tuple[int, str]:
-    if lock in LOCK_ORDER:
-        return (LOCK_ORDER.index(lock), lock)
-    return (len(LOCK_ORDER), lock)
+    return experiment_defaults.lock_sort_key(lock)
 
 
 def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:
-    if lock not in SINGLE_OVERSUBSCRIBED_LOCKS:
-        return threads
-    return limit_to_single_oversubscribed_thread_count(threads, MACHINE_CORE_COUNT)
+    return experiment_defaults.runnable_threads_for_lock(lock, threads)
 
 
 def per_lock_max_threads_for_settings(
     locks: tuple[str, ...],
     threads: tuple[int, ...],
 ) -> dict[str, int]:
-    return {
-        lock: max(runnable_threads_for_lock(lock, threads))
-        for lock in locks
-        if lock in SINGLE_OVERSUBSCRIBED_LOCKS
-    }
+    return experiment_defaults.per_lock_max_threads_for_settings(locks, threads)
 
 
 def benchmark_binary_path(benchmark: str) -> Path:
@@ -948,6 +899,8 @@ def write_settings(
             for benchmark in benchmarks
         ],
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
+        "lock_profile": args.lock_profile,
+        "lock_profile_source": "manual" if args.locks is not None else "profile",
         "threads": list(threads),
         "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
         "single_oversubscribed_locks": list(SINGLE_OVERSUBSCRIBED_LOCKS),
@@ -1496,7 +1449,10 @@ def main(
             return 2
 
         benchmarks = validate_benchmarks(fixed_benchmarks or parse_csv_strings(args.benchmarks))
-        locks = validate_locks(tuple(dict.fromkeys(normalize_lock(lock) for lock in parse_csv_strings(args.locks))))
+        locks = experiment_defaults.resolve_locks(
+            profile=args.lock_profile,
+            locks=None if args.locks is None else parse_csv_strings(args.locks),
+        )
         threads = parse_csv_ints(args.threads)
         dedup_input = resolve_path(args.dedup_input)
         streamcluster_input = resolve_optional_input(args.streamcluster_input)

@@ -32,22 +32,23 @@ from bench_csv_schema import (  # noqa: E402
     load_plot_rows,
 )
 
+import experiment_defaults  # noqa: E402
 from machine_config import (  # noqa: E402
-    ACTIVE_MACHINE_CONFIG,
     DECOMPOSITION_THREAD_COUNTS,
     DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
-    DEFAULT_THREAD_COUNTS,
-    MACHINE_PHYSICAL_CORES,
-    PROFILE_ENV,
-    limit_to_single_oversubscribed_thread_count,
 )
 
-MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
-THREADS = DEFAULT_THREAD_COUNTS
+MACHINE_CORE_COUNT = experiment_defaults.MACHINE_CORE_COUNT
+ACTIVE_MACHINE_CONFIG = experiment_defaults.ACTIVE_MACHINE_CONFIG
+PROFILE_ENV = experiment_defaults.PROFILE_ENV
+THREADS = experiment_defaults.DEFAULT_THREADS
+DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
+EXPERIMENT_ONE_MINIMAL_LOCKS = experiment_defaults.EXPERIMENT_ONE_MINIMAL_LOCKS
+EXPERIMENT_ONE_FULL_LOCKS = experiment_defaults.EXPERIMENT_ONE_FULL_LOCKS
 PLOT_THREADS = tuple(thread for thread in THREADS if thread >= 4)
 SINGLE_OVERSUBSCRIBED_THREADS = tuple(
     thread
-    for thread in limit_to_single_oversubscribed_thread_count(THREADS, MACHINE_CORE_COUNT)
+    for thread in experiment_defaults.runnable_threads_for_lock("mcs", THREADS)
     if thread > MACHINE_CORE_COUNT
 )
 DECOMPOSITION_THREADS = tuple(
@@ -55,16 +56,16 @@ DECOMPOSITION_THREADS = tuple(
     for thread in DECOMPOSITION_THREAD_COUNTS
     if thread in SINGLE_OVERSUBSCRIBED_THREADS
 ) or SINGLE_OVERSUBSCRIBED_THREADS
-DECOMPOSITION_LOCK_KEYS = ("mcs", "mcs_extension", "mcs-tas", "malthusian", "flexguard", "accordin")
-CRITICAL_NS = 300
-OUTSIDE_NS = 3000
-DURATION_MS = 5000
-WARMUP_DURATION_MS = 1000
-REPEATS = 4
+DECOMPOSITION_LOCK_KEYS = experiment_defaults.EXPERIMENT_ONE_DECOMPOSITION_LOCKS
+CRITICAL_NS = experiment_defaults.MUTEXBENCH_DEFAULT_CRITICAL_NS
+OUTSIDE_NS = experiment_defaults.MUTEXBENCH_DEFAULT_OUTSIDE_NS
+DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_DURATION_MS
+WARMUP_DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_WARMUP_DURATION_MS
+REPEATS = experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS
 ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin"
 ACCORDIN_TASKSET_PACKAGE = "mcs_tas_accordin"
 ACCORDIN_TASKSET_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
-FOCUS_LOCK_KEYS = ("accordin", "flexguard")
+FOCUS_LOCK_KEYS = experiment_defaults.EXPERIMENT_ONE_FOCUS_LOCKS
 PIECEWISE_Y_THRESHOLD_NS = 1000.0
 PIECEWISE_Y_LINEAR_SCALE = 3.0
 BROKEN_Y_NORMAL = (1e2, 1e4)
@@ -97,19 +98,13 @@ class FlexguardInterposeBuildSpec:
     clean_first: bool = False
 
 
-LOCKS = (
-    LockSpec("MCS", "mcs"),
-    LockSpec("MCS-TP", "mcstp"),
-    LockSpec("MCS-TAS", "mcs-tas"),
-    LockSpec("Reciprocating", "reciprocating", optional=True),
-    LockSpec("Accordin (K=11)", "accordin", optional=True, result_dirs=("mcs_tas_accordin", "accordin", "mcs_accordin")),
-    LockSpec("MCS + TSE", "mcs_extension"),
-    LockSpec("Malthusian", "malthusian", optional=True),
-    LockSpec("FlexGuard", "flexguard"),
+LOCKS = tuple(
+    LockSpec(config.label, config.key, config.optional, config.result_dirs)
+    for config in experiment_defaults.EXPERIMENT_ONE_LOCKS
 )
 
-BASE_LOCK_KEYS = ("mcs", "mcstp", "mcs-tas", "reciprocating", "malthusian", "flexguard")
-SINGLE_OVERSUBSCRIBED_LOCK_KEYS = ("mcs", "mcstp", "mcs_extension", "malthusian", "reciprocating")
+BASE_LOCK_KEYS = experiment_defaults.EXPERIMENT_ONE_BASE_LOCKS
+SINGLE_OVERSUBSCRIBED_LOCK_KEYS = experiment_defaults.SINGLE_OVERSUBSCRIBED_LOCKS
 FLEXGUARD_INTERPOSE_KEYS = ("mcstp", "malthusian", "flexguard")
 FLEXGUARD_INTERPOSE_BUILD_SPECS = {
     "flexguard": FlexguardInterposeBuildSpec(make_target="build/interpose_flexguard.sh"),
@@ -123,7 +118,7 @@ FLEXGUARD_INTERPOSE_BUILD_SPECS = {
     ),
 }
 LOCKS_BY_KEY = {lock.key: lock for lock in LOCKS}
-SUPPLEMENT_DEFAULT_LOCK_KEYS = ("reciprocating", "malthusian")
+SUPPLEMENT_DEFAULT_LOCK_KEYS = experiment_defaults.EXPERIMENT_ONE_SUPPLEMENT_DEFAULT_LOCKS
 
 COMBINED_FIELDS = (
     "lock_label",
@@ -252,11 +247,14 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""\
 Default benchmark settings:
+  lock-profile={DEFAULT_LOCK_PROFILE}
+  minimal locks={','.join(EXPERIMENT_ONE_MINIMAL_LOCKS)}
+  full locks={','.join(EXPERIMENT_ONE_FULL_LOCKS)}
   critical-ns={CRITICAL_NS}, outside-ns={OUTSIDE_NS}, duration=5s, warmup=1s, repeats={REPEATS}
   machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})
   threads={','.join(str(v) for v in THREADS)}
   single-overload locks={','.join(SINGLE_OVERSUBSCRIBED_LOCK_KEYS)} use threads={','.join(str(v) for v in runnable_threads_for_lock("mcs"))}
-  default full run includes accordin ({ACCORDIN_TASKSET_LOCK}) under taskset CPUs={DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
+  full profile includes accordin ({ACCORDIN_TASKSET_LOCK}) under taskset CPUs={DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
 
 Examples:
   python3 experiments/run_experiment_one.py
@@ -279,6 +277,17 @@ Examples:
         default=None,
         metavar="RESULT_ROOT",
         help="Skip benchmark execution and regenerate combined CSV and PNGs from RESULT_ROOT.",
+    )
+    parser.add_argument(
+        "--lock-profile",
+        choices=experiment_defaults.experiment_one_lock_profile_names(),
+        default=DEFAULT_LOCK_PROFILE,
+        help=(
+            "Named experiment-one lock set. "
+            f"Default: {DEFAULT_LOCK_PROFILE}. "
+            f"minimal={','.join(EXPERIMENT_ONE_MINIMAL_LOCKS)}; "
+            f"full={','.join(EXPERIMENT_ONE_FULL_LOCKS)}."
+        ),
     )
     parser.add_argument(
         "--supplement-locks",
@@ -358,10 +367,20 @@ def parse_supplement_lock_keys(value: str) -> tuple[str, ...]:
     return tuple(unique_keys)
 
 
+def selected_lock_keys_for_profile(profile: str) -> tuple[str, ...]:
+    return experiment_defaults.experiment_one_lock_profile_locks(profile)
+
+
+def lock_specs_for_keys(lock_keys: Iterable[str]) -> tuple[LockSpec, ...]:
+    selected = set(lock_keys)
+    unknown = sorted(selected - set(LOCKS_BY_KEY))
+    if unknown:
+        raise ValueError(f"Unsupported experiment-one lock keys: {','.join(unknown)}")
+    return tuple(lock for lock in LOCKS if lock.key in selected)
+
+
 def runnable_threads_for_lock(lock_key: str, threads: tuple[int, ...] = THREADS) -> tuple[int, ...]:
-    if lock_key not in SINGLE_OVERSUBSCRIBED_LOCK_KEYS:
-        return threads
-    return limit_to_single_oversubscribed_thread_count(threads, MACHINE_CORE_COUNT)
+    return experiment_defaults.runnable_threads_for_lock(lock_key, threads)
 
 
 def write_settings(
@@ -370,9 +389,15 @@ def write_settings(
     sudo_mode: str,
     mcs_accordin_taskset_enabled: bool,
     mcs_accordin_taskset_cpus: str,
+    lock_profile: str,
+    selected_lock_keys: tuple[str, ...],
 ) -> None:
+    selected_locks = lock_specs_for_keys(selected_lock_keys)
     settings = {
         "threads": list(THREADS),
+        "lock_profile": lock_profile,
+        "lock_profile_source": "profile",
+        "selected_locks": [{"label": lock.label, "key": lock.key} for lock in selected_locks],
         "machine_profile": ACTIVE_MACHINE_CONFIG.name,
         "machine_profile_env": PROFILE_ENV,
         "critical_ns": CRITICAL_NS,
@@ -383,7 +408,7 @@ def write_settings(
         "single_oversubscribed_locks": list(SINGLE_OVERSUBSCRIBED_LOCK_KEYS),
         "runnable_threads_by_lock": {
             lock.key: list(runnable_threads_for_lock(lock.key))
-            for lock in LOCKS
+            for lock in selected_locks
         },
         "decomposition_threads": list(DECOMPOSITION_THREADS),
         "mcs_extension_mode": mcs_extension_mode,
@@ -391,7 +416,7 @@ def write_settings(
         "accordin_taskset_lock": ACCORDIN_TASKSET_LOCK,
         "mcs_accordin_taskset_enabled": mcs_accordin_taskset_enabled,
         "mcs_accordin_taskset_cpus": mcs_accordin_taskset_cpus,
-        "locks": [{"label": lock.label, "key": lock.key} for lock in LOCKS],
+        "locks": [{"label": lock.label, "key": lock.key} for lock in selected_locks],
         "flexguard_dir": str(FLEXGUARD_DIR),
     }
     with (result_root / "settings.json").open("w", encoding="utf-8") as f:
@@ -405,6 +430,8 @@ def write_settings_if_missing(
     sudo_mode: str,
     mcs_accordin_taskset_enabled: bool,
     mcs_accordin_taskset_cpus: str,
+    lock_profile: str,
+    selected_lock_keys: tuple[str, ...],
 ) -> None:
     settings_path = result_root / "settings.json"
     if settings_path.exists():
@@ -417,6 +444,8 @@ def write_settings_if_missing(
         sudo_mode,
         mcs_accordin_taskset_enabled,
         mcs_accordin_taskset_cpus,
+        lock_profile,
+        selected_lock_keys,
     )
 
 
@@ -600,32 +629,41 @@ def ensure_accordin_taskset_preload(logger: CommandLogger) -> None:
         raise RuntimeError(f"{ACCORDIN_TASKSET_PACKAGE} library was not produced: {ACCORDIN_TASKSET_RELEASE_LIB}")
 
 
-def run_benchmarks(result_root: Path, args: argparse.Namespace, logger: CommandLogger) -> None:
-    run_multi_lock_sweeps(
-        result_root,
-        args,
-        BASE_LOCK_KEYS,
-        logger,
-        log_prefix="sweep_base_locks",
-    )
+def run_benchmarks(
+    result_root: Path,
+    args: argparse.Namespace,
+    logger: CommandLogger,
+    selected_lock_keys: tuple[str, ...],
+) -> None:
+    selected = set(selected_lock_keys)
+    base_lock_keys = tuple(lock_key for lock_key in BASE_LOCK_KEYS if lock_key in selected)
+    if base_lock_keys:
+        run_multi_lock_sweeps(
+            result_root,
+            args,
+            base_lock_keys,
+            logger,
+            log_prefix="sweep_base_locks",
+        )
 
-    extension_dir = result_root / "mcs_extension"
-    extension_dir.mkdir(parents=True, exist_ok=True)
-    extension_cmd = [
-        str(SWEEP_SINGLE),
-        *common_sweep_args(runnable_threads_for_lock("mcs_extension")),
-        "--lock-kind",
-        "mcs",
-        "--timeslice-extension",
-        args.mcs_extension_mode,
-        "--output-raw",
-        str(extension_dir / "raw.csv"),
-        "--output-summary",
-        str(extension_dir / "summary.csv"),
-    ]
-    logger.run(extension_cmd, log_name="sweep_mcs_extension.log")
+    if "mcs_extension" in selected:
+        extension_dir = result_root / "mcs_extension"
+        extension_dir.mkdir(parents=True, exist_ok=True)
+        extension_cmd = [
+            str(SWEEP_SINGLE),
+            *common_sweep_args(runnable_threads_for_lock("mcs_extension")),
+            "--lock-kind",
+            "mcs",
+            "--timeslice-extension",
+            args.mcs_extension_mode,
+            "--output-raw",
+            str(extension_dir / "raw.csv"),
+            "--output-summary",
+            str(extension_dir / "summary.csv"),
+        ]
+        logger.run(extension_cmd, log_name="sweep_mcs_extension.log")
 
-    if args.skip_mcs_accordin_taskset:
+    if "accordin" not in selected or args.skip_mcs_accordin_taskset:
         return
 
     ensure_accordin_taskset_preload(logger)
@@ -663,11 +701,42 @@ def run_supplement_benchmarks(
     )
 
 
-def load_combined_rows(result_root: Path) -> list[dict[str, str]]:
+def selected_lock_keys_from_settings(result_root: Path) -> tuple[str, ...] | None:
+    settings_path = result_root / "settings.json"
+    if not settings_path.is_file():
+        return None
+    try:
+        with settings_path.open("r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    raw_locks = settings.get("selected_locks") or settings.get("locks")
+    if not isinstance(raw_locks, list):
+        return None
+
+    lock_keys: list[str] = []
+    for item in raw_locks:
+        if isinstance(item, dict):
+            key = item.get("key")
+        else:
+            key = item
+        if isinstance(key, str) and key in LOCKS_BY_KEY and key not in lock_keys:
+            lock_keys.append(key)
+    return tuple(lock_keys) if lock_keys else None
+
+
+def load_combined_rows(
+    result_root: Path,
+    selected_lock_keys: tuple[str, ...] | None = None,
+) -> list[dict[str, str]]:
     combined_rows: list[dict[str, str]] = []
     required = set(LATENCY_PLOT_REQUIRED_FIELDS) | {CPU_FIELD}
+    lock_specs = lock_specs_for_keys(
+        selected_lock_keys or selected_lock_keys_from_settings(result_root) or tuple(lock.key for lock in LOCKS)
+    )
 
-    for lock in LOCKS:
+    for lock in lock_specs:
         lock_dir = next(
             (
                 result_root / dir_name
@@ -1296,34 +1365,42 @@ def plot_hold_handoff_decomposition(
 
 
 def write_plots(result_root: Path, rows: list[dict[str, str]]) -> list[Path]:
-    outputs = [
-        result_root / "hold_time_vs_threads.png",
-        result_root / "handoff_time_vs_threads.png",
-        result_root / "hold_plus_handoff_vs_threads.png",
-        result_root / "handoff_time_flexguard_vs_accordin.png",
-    ]
+    outputs: list[Path] = []
+    hold_time_path = result_root / "hold_time_vs_threads.png"
     plot_metric(
         rows,
         metric="avg_lock_hold_ns",
         ylabel="Average lock hold time (ns)",
         title="Lock Hold Time vs Threads",
-        output_path=outputs[0],
+        output_path=hold_time_path,
     )
+    outputs.append(hold_time_path)
+    handoff_path = result_root / "handoff_time_vs_threads.png"
     plot_broken_axis_metric(
         rows,
         metric=HANDOFF_FIELD,
         ylabel="Estimated lock handoff time (ns)",
         title="Lock Handoff Time vs Threads",
-        output_path=outputs[1],
+        output_path=handoff_path,
     )
-    plot_hold_handoff_decomposition(rows, output_path=outputs[2])
+    outputs.append(handoff_path)
+    decomposition_path = result_root / "hold_plus_handoff_vs_threads.png"
+    try:
+        plot_hold_handoff_decomposition(rows, output_path=decomposition_path)
+    except RuntimeError as exc:
+        print(f"Skipping hold/handoff decomposition plot: {exc}", flush=True)
+    else:
+        outputs.append(decomposition_path)
+    focus_path = result_root / "handoff_time_flexguard_vs_accordin.png"
     plot_focused_comparison(
         rows,
         metric=HANDOFF_FIELD,
         ylabel="Estimated lock handoff time (ns)",
         title="Handoff Time: Accordin vs FlexGuard",
-        output_path=outputs[3],
+        output_path=focus_path,
     )
+    if focus_path.is_file():
+        outputs.append(focus_path)
     return outputs
 
 
@@ -1380,6 +1457,7 @@ def main() -> int:
         print("--supplement-locks cannot be used together with --plot-only.", file=sys.stderr)
         return 2
 
+    selected_lock_keys = selected_lock_keys_for_profile(args.lock_profile)
     supplement_lock_keys: tuple[str, ...] | None = None
     if args.supplement_locks is not None:
         if args.output_root is None:
@@ -1411,8 +1489,10 @@ def main() -> int:
                 result_root,
                 args.mcs_extension_mode,
                 args.sudo_mode,
-                not args.skip_mcs_accordin_taskset,
+                "accordin" in selected_lock_keys and not args.skip_mcs_accordin_taskset,
                 args.mcs_accordin_taskset_cpus,
+                args.lock_profile,
+                selected_lock_keys,
             )
             logger = CommandLogger(result_root)
             ensure_inputs(logger, lock_keys=supplement_lock_keys, include_single_sweep=False)
@@ -1423,13 +1503,19 @@ def main() -> int:
                 result_root,
                 args.mcs_extension_mode,
                 args.sudo_mode,
-                not args.skip_mcs_accordin_taskset,
+                "accordin" in selected_lock_keys and not args.skip_mcs_accordin_taskset,
                 args.mcs_accordin_taskset_cpus,
+                args.lock_profile,
+                selected_lock_keys,
             )
             logger = CommandLogger(result_root)
-            ensure_inputs(logger)
-            run_benchmarks(result_root, args, logger)
-        rows = load_combined_rows(result_root)
+            ensure_inputs(
+                logger,
+                lock_keys=selected_lock_keys,
+                include_single_sweep="mcs_extension" in selected_lock_keys,
+            )
+            run_benchmarks(result_root, args, logger, selected_lock_keys)
+        rows = load_combined_rows(result_root, selected_lock_keys if supplement_lock_keys is None else None)
         combined_path = write_combined_csv(result_root, rows)
         plot_paths = write_plots(result_root, rows)
         print_outputs(result_root, combined_path, plot_paths)

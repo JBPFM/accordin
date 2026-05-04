@@ -15,6 +15,7 @@ from pathlib import Path
 from statistics import mean
 
 import experiment_defaults
+import experiment_failures
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MUTEXBENCH_DIR = REPO_ROOT / "bench" / "mutexbench"
@@ -28,6 +29,8 @@ DEFAULT_OUTSIDE_NS = experiment_defaults.MUTEXBENCH_DEFAULT_OUTSIDE_NS
 DEFAULT_DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_DURATION_MS
 DEFAULT_WARMUP_DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_WARMUP_DURATION_MS
 DEFAULT_REPEATS = experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
+COMMAND_TIMEOUT_KILL_AFTER_SECONDS = 60
 EXPERIMENT_TWO_STYLE_THREADS = experiment_defaults.EXPERIMENT_TWO_STYLE_THREADS
 
 RAW_FIELDS = (
@@ -145,13 +148,32 @@ class CommandError(RuntimeError):
         self.log_path = log_path
 
 
+def wrap_command_timeout(command: list[str], timeout_seconds: int) -> list[str]:
+    if timeout_seconds <= 0:
+        return command
+    return [
+        "timeout",
+        "-k",
+        f"{COMMAND_TIMEOUT_KILL_AFTER_SECONDS}s",
+        f"{timeout_seconds}s",
+        *command,
+    ]
+
+
 class CommandLogger:
-    def __init__(self, result_root: Path, *, resume: bool = False) -> None:
+    def __init__(
+        self,
+        result_root: Path,
+        *,
+        resume: bool = False,
+        command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    ) -> None:
         self.result_root = result_root
         self.log_dir = result_root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path = result_root / "commands.json"
         self.records = self.load_records() if resume else []
+        self.command_timeout_seconds = command_timeout_seconds
 
     def load_records(self) -> list[dict[str, object]]:
         if not self.manifest_path.is_file():
@@ -170,21 +192,27 @@ class CommandLogger:
         cwd: Path = REPO_ROOT,
         env: dict[str, str] | None = None,
         dry_run: bool = False,
+        timeout_seconds: int | None = None,
     ) -> CommandResult:
+        effective_timeout = self.command_timeout_seconds if timeout_seconds is None else timeout_seconds
+        run_cmd = wrap_command_timeout(cmd, effective_timeout)
         log_path = self.log_dir / log_name
         record: dict[str, object] = {
-            "command": cmd,
-            "command_text": shlex.join(cmd),
+            "command": run_cmd,
+            "command_text": shlex.join(run_cmd),
             "cwd": str(cwd),
             "log_path": str(log_path),
             "dry_run": dry_run,
             "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
+        if effective_timeout > 0:
+            record["inner_command"] = cmd
+            record["command_timeout_seconds"] = effective_timeout
         if env:
             record["env_overrides"] = dict(sorted(env.items()))
 
         if dry_run:
-            print(shlex.join(cmd))
+            print(shlex.join(run_cmd))
             record["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             record["returncode"] = 0
             self.records.append(record)
@@ -197,7 +225,10 @@ class CommandLogger:
 
         with log_path.open("w", encoding="utf-8") as log_file:
             log_file.write(f"cwd: {cwd}\n")
-            log_file.write(f"command: {shlex.join(cmd)}\n")
+            log_file.write(f"command: {shlex.join(run_cmd)}\n")
+            if effective_timeout > 0:
+                log_file.write(f"inner_command: {shlex.join(cmd)}\n")
+                log_file.write(f"command_timeout_seconds: {effective_timeout}\n")
             log_file.write(f"started_at: {record['started_at']}\n\n")
             if env:
                 log_file.write("env_overrides:\n")
@@ -207,7 +238,7 @@ class CommandLogger:
             log_file.flush()
 
             process = subprocess.Popen(
-                cmd,
+                run_cmd,
                 cwd=str(cwd),
                 env=run_env,
                 stdout=subprocess.PIPE,
@@ -232,7 +263,7 @@ class CommandLogger:
         self.write_manifest()
         if returncode != 0:
             raise CommandError(
-                f"Command failed with exit code {returncode}: {shlex.join(cmd)}",
+                f"Command failed with exit code {returncode}: {shlex.join(run_cmd)}",
                 returncode,
                 log_path,
             )
@@ -308,6 +339,15 @@ Examples:
         "--build-missing",
         action="store_true",
         help="Build missing mcs_tse preload library before running.",
+    )
+    parser.add_argument(
+        "--command-timeout-seconds",
+        type=non_negative_int,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        help=(
+            "Outer timeout for each benchmark command. 0 disables it. "
+            f"Default: {DEFAULT_COMMAND_TIMEOUT_SECONDS}."
+        ),
     )
     parser.add_argument(
         "--locks",
@@ -552,6 +592,7 @@ def ensure_mcs_tse_library(logger: CommandLogger, *, build_missing: bool, dry_ru
         ["cargo", "build", "-p", "mcs_tse", "--release"],
         log_name="build_mcs_tse.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     library = resolve_mcs_tse_library()
     if not library.is_file():
@@ -706,6 +747,7 @@ def write_settings(
         "duration_ms": args.duration_ms,
         "warmup_duration_ms": args.warmup_duration_ms,
         "repeats": args.repeats,
+        "command_timeout_seconds": args.command_timeout_seconds,
         "timing_sample_stride": args.timing_sample_stride,
         "build_missing": args.build_missing,
         "dry_run": args.dry_run,
@@ -904,6 +946,7 @@ def run_benchmarks(
     args: argparse.Namespace,
     logger: CommandLogger,
     rows: list[dict[str, str]],
+    failures: list[dict[str, str]],
 ) -> None:
     done = completed_points(rows, args.repeats) if args.resume else set()
     for spec in locks:
@@ -932,12 +975,28 @@ def run_benchmarks(
                 f"Running lock={spec.key} threads={thread} cpus={cpu_list} "
                 f"numa_nodes={numa_nodes_for_cpu_list(topology, cpus)}"
             )
-            result = logger.run(
-                cmd,
-                log_name=f"sweep_{spec.key}_t{thread:03d}.log",
-                cwd=REPO_ROOT,
-                dry_run=args.dry_run,
-            )
+            try:
+                result = logger.run(
+                    cmd,
+                    log_name=f"sweep_{spec.key}_t{thread:03d}.log",
+                    cwd=REPO_ROOT,
+                    dry_run=args.dry_run,
+                )
+            except CommandError as exc:
+                experiment_failures.append_command_failure(
+                    failures,
+                    result_root=result_root,
+                    experiment="experiment2",
+                    workload="mutexbench",
+                    benchmark="sweep",
+                    lock=spec.key,
+                    threads=thread,
+                    repeat="all",
+                    stage="run",
+                    exc=exc,
+                )
+                experiment_failures.write_failures_csv(result_root, failures)
+                continue
             if args.dry_run:
                 continue
             append_sweep_rows(
@@ -1000,7 +1059,11 @@ def main() -> int:
             f"{','.join(str(thread) for thread in invalid_threads)}"
         )
 
-    logger = CommandLogger(result_root, resume=args.resume)
+    logger = CommandLogger(
+        result_root,
+        resume=args.resume,
+        command_timeout_seconds=args.command_timeout_seconds,
+    )
     lock_keys = parse_csv_strings(args.locks)
     locks = resolve_lock_specs(
         lock_keys,
@@ -1011,6 +1074,7 @@ def main() -> int:
 
     write_settings(result_root, topology=topology, locks=locks, threads=threads, args=args)
     rows = load_raw_rows(result_root / "raw.csv") if args.resume else []
+    failures: list[dict[str, str]] = []
     run_benchmarks(
         result_root,
         topology=topology,
@@ -1019,6 +1083,7 @@ def main() -> int:
         args=args,
         logger=logger,
         rows=rows,
+        failures=failures,
     )
     if not args.dry_run:
         summary_rows = summarize_rows(rows, tuple(lock.key for lock in locks))
@@ -1029,7 +1094,9 @@ def main() -> int:
         print(f"Summary: {result_root / 'summary.csv'}")
     else:
         print(f"Dry-run output root: {result_root}")
-    return 0
+    failures_path = experiment_failures.write_failures_csv(result_root, failures)
+    experiment_failures.print_failure_summary(failures, failures_path)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

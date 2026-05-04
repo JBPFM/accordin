@@ -21,6 +21,7 @@ from statistics import mean, pstdev
 from typing import Iterable
 
 import experiment_defaults
+import experiment_failures
 import run_experiment_three as experiment_three
 
 
@@ -46,7 +47,10 @@ DEFAULT_DB_NUM = 500_000
 DEFAULT_CACHEBENCH_NUM_OPS = 500_000
 DEFAULT_CACHEBENCH_NUM_KEYS = 1_000_000
 DEFAULT_CACHEBENCH_CACHE_MB = 512
+DEFAULT_CACHEBENCH_POOL_REBALANCE_INTERVAL_SEC = 0
 DEFAULT_CACHEBENCH_COMMAND_TIMEOUT_SECONDS = 300
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+COMMAND_TIMEOUT_KILL_AFTER_SECONDS = 60
 DEFAULT_CACHELIB_BUILD_JOBS = os.cpu_count() or 1
 DEFAULT_MEMCACHED_HOST = "127.0.0.1"
 DEFAULT_MEMCACHED_MEMORY_MB = 512
@@ -236,11 +240,13 @@ def install_system_packages(
         root_command([apt_get, "update"], env=env),
         log_name=f"{log_prefix}_apt_update.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     logger.run(
         root_command([apt_get, "install", "-y", *packages], env=env),
         log_name=f"{log_prefix}_apt_install.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
 
 
@@ -503,6 +509,7 @@ def ensure_cachelib_source(
         ],
         log_name="init_cachelib_submodule.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     if not cachelib_source_is_available(cachelib_dir):
         raise RuntimeError(f"CacheLib source directory is still unavailable after submodule init: {cachelib_dir}")
@@ -538,6 +545,7 @@ def build_cachebench_from_cachelib(
         log_name="build_cachelib_cachebench.log",
         cwd=cachelib_dir,
         env=cachelib_getdeps_env(),
+        timeout_seconds=0,
     )
 
 
@@ -631,6 +639,7 @@ def ensure_rocksdb_source(
         ],
         log_name="init_rocksdb_source.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     if not rocksdb_source_is_available(rocksdb_dir):
         raise RuntimeError(f"RocksDB source directory is still unavailable after clone: {rocksdb_dir}")
@@ -674,6 +683,7 @@ Default benchmark settings:
   machine-profile={experiment_defaults.ACTIVE_MACHINE_CONFIG.name} (override with {experiment_defaults.PROFILE_ENV})
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
   repeats={DEFAULT_REPEATS}, total_ops={DEFAULT_TOTAL_OPS}
+  cachebench_pool_rebalance_interval_sec={DEFAULT_CACHEBENCH_POOL_REBALANCE_INTERVAL_SEC}
   rocksdb_benchmarks={','.join(DEFAULT_ROCKSDB_BENCHMARKS)}
   rocksdb_extra_args={' '.join(DEFAULT_ROCKSDB_EXTRA_ARGS)}
   memtier=-t {DEFAULT_MEMTIER_CLIENT_THREADS} -c {DEFAULT_MEMTIER_CLIENTS} --requests {DEFAULT_MEMTIER_REQUESTS}
@@ -702,6 +712,15 @@ Examples:
         help="Build/install missing lock helpers, CacheBench, RocksDB db_bench, or memcached/memtier where possible.",
     )
     parser.add_argument("--skip-plots", action="store_true", help="Write CSVs but skip PNG generation.")
+    parser.add_argument(
+        "--command-timeout-seconds",
+        type=non_negative_int,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        help=(
+            "Outer timeout for each non-CacheBench workload command. 0 disables it. "
+            f"Default: {DEFAULT_COMMAND_TIMEOUT_SECONDS}."
+        ),
+    )
     parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS), metavar="CSV", help="cachebench,rocksdb,memcached.")
     parser.add_argument(
         "--lock-profile",
@@ -750,6 +769,15 @@ Examples:
     parser.add_argument("--cachebench-num-ops", type=positive_int, default=DEFAULT_CACHEBENCH_NUM_OPS)
     parser.add_argument("--cachebench-num-keys", type=positive_int, default=DEFAULT_CACHEBENCH_NUM_KEYS)
     parser.add_argument("--cachebench-cache-mb", type=positive_int, default=DEFAULT_CACHEBENCH_CACHE_MB)
+    parser.add_argument(
+        "--cachebench-pool-rebalance-interval-sec",
+        type=non_negative_int,
+        default=DEFAULT_CACHEBENCH_POOL_REBALANCE_INTERVAL_SEC,
+        help=(
+            "Value written to cache_config.poolRebalanceIntervalSec in generated CacheBench JSON. "
+            f"Default: {DEFAULT_CACHEBENCH_POOL_REBALANCE_INTERVAL_SEC}."
+        ),
+    )
     parser.add_argument("--cachebench-timeout-seconds", type=non_negative_int, default=0, help="Pass --timeout_seconds when non-zero.")
     parser.add_argument(
         "--cachebench-command-timeout-seconds",
@@ -946,6 +974,7 @@ def ensure_rocksdb_db_bench(
             ["cmake", "--build", str(existing_build_dir), "--target", "db_bench", "--parallel"],
             log_name="build_rocksdb_db_bench.log",
             cwd=rocksdb_dir,
+            timeout_seconds=0,
         )
     else:
         build_dir = accordin_rocksdb_build_dir(rocksdb_dir)
@@ -973,6 +1002,7 @@ def ensure_rocksdb_db_bench(
             ],
             log_name="configure_rocksdb_db_bench.log",
             cwd=REPO_ROOT,
+            timeout_seconds=0,
         )
         logger.run(
             [
@@ -985,6 +1015,7 @@ def ensure_rocksdb_db_bench(
             ],
             log_name="build_rocksdb_db_bench.log",
             cwd=REPO_ROOT,
+            timeout_seconds=0,
         )
 
     rebuilt = default_rocksdb_db_bench(rocksdb_dir)
@@ -1185,11 +1216,17 @@ def cachebench_printed_final_results(output: str) -> bool:
 def wrap_command_timeout(command: list[str], timeout_seconds: int) -> list[str]:
     if timeout_seconds <= 0:
         return command
-    return ["timeout", "-k", "5s", f"{timeout_seconds}s", *command]
+    return [
+        "timeout",
+        "-k",
+        f"{COMMAND_TIMEOUT_KILL_AFTER_SECONDS}s",
+        f"{timeout_seconds}s",
+        *command,
+    ]
 
 
 def cachebench_timeout_returncode(returncode: int) -> bool:
-    return returncode in {124, 137}
+    return returncode in {-9, 124, 137}
 
 
 def accepted_timed_out_cachebench_result(
@@ -1485,7 +1522,7 @@ def write_cachebench_config(
         config = {
             "cache_config": {
                 "cacheSizeMB": args.cachebench_cache_mb,
-                "poolRebalanceIntervalSec": 0,
+                "poolRebalanceIntervalSec": args.cachebench_pool_rebalance_interval_sec,
                 "moveOnSlabRelease": False,
                 "numPools": 1,
                 "poolSizes": [1.0],
@@ -1506,6 +1543,11 @@ def write_cachebench_config(
                 "delRatio": 0.05,
             },
         }
+
+    cache_config = config.setdefault("cache_config", {})
+    if not isinstance(cache_config, dict):
+        raise RuntimeError("CacheBench config must contain an object-valued cache_config.")
+    cache_config["poolRebalanceIntervalSec"] = args.cachebench_pool_rebalance_interval_sec
 
     test_config = config.setdefault("test_config", {})
     if not isinstance(test_config, dict):
@@ -1558,6 +1600,7 @@ def run_cachebench(
     cachebench_bin: Path,
     args: argparse.Namespace,
     logger: experiment_three.CommandLogger,
+    failures: list[dict[str, str]],
     existing_rows: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = existing_rows if existing_rows is not None else []
@@ -1590,6 +1633,7 @@ def run_cachebench(
                         log_name=log_name,
                         cwd=REPO_ROOT,
                         env=env,
+                        timeout_seconds=0,
                     )
                 except experiment_three.CommandError as exc:
                     accepted = accepted_timed_out_cachebench_result(
@@ -1597,7 +1641,35 @@ def run_cachebench(
                         timeout_seconds=args.cachebench_command_timeout_seconds,
                     )
                     if accepted is None:
-                        raise
+                        experiment_failures.append_command_failure(
+                            failures,
+                            result_root=result_root,
+                            experiment="experiment5",
+                            workload="cachebench",
+                            benchmark="cachebench",
+                            lock=lock,
+                            threads=thread,
+                            repeat=repeat,
+                            exc=exc,
+                        )
+                        experiment_failures.write_failures_csv(result_root, failures)
+                        continue
+                    experiment_failures.append_failure(
+                        failures,
+                        result_root=result_root,
+                        experiment="experiment5",
+                        workload="cachebench",
+                        benchmark="cachebench",
+                        lock=lock,
+                        threads=thread,
+                        repeat=repeat,
+                        stage="exit_after_results",
+                        status="timeout_after_results",
+                        returncode=exc.returncode,
+                        command_log=exc.log_path,
+                        message=str(exc),
+                    )
+                    experiment_failures.write_failures_csv(result_root, failures)
                     result = accepted
                 ops_per_second = parse_cachebench_ops_per_second(result.output)
                 if ops_per_second is None and result.wall_seconds > 0.0:
@@ -1688,6 +1760,7 @@ def run_rocksdb(
     db_bench: Path,
     args: argparse.Namespace,
     logger: experiment_three.CommandLogger,
+    failures: list[dict[str, str]],
     existing_rows: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = existing_rows if existing_rows is not None else []
@@ -1785,6 +1858,22 @@ def run_rocksdb(
                         )
                         completed_keys.add(key)
                         write_progress_csvs(result_root, rows)
+                    except experiment_three.CommandError as exc:
+                        stage = "setup" if use_existing_db and setup_result is None else "run"
+                        experiment_failures.append_command_failure(
+                            failures,
+                            result_root=result_root,
+                            experiment="experiment5",
+                            workload="rocksdb",
+                            benchmark=benchmark,
+                            lock=lock,
+                            threads=thread,
+                            repeat=repeat,
+                            stage=stage,
+                            exc=exc,
+                        )
+                        experiment_failures.write_failures_csv(result_root, failures)
+                        continue
                     finally:
                         cleanup_path(db_path)
     return rows
@@ -2005,6 +2094,7 @@ def run_memcached(
     memtier_bin: Path,
     args: argparse.Namespace,
     logger: experiment_three.CommandLogger,
+    failures: list[dict[str, str]],
     existing_rows: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = existing_rows if existing_rows is not None else []
@@ -2113,6 +2203,37 @@ def run_memcached(
                         )
                         completed_keys.add(key)
                         write_progress_csvs(result_root, rows)
+                    except experiment_three.CommandError as exc:
+                        experiment_failures.append_command_failure(
+                            failures,
+                            result_root=result_root,
+                            experiment="experiment5",
+                            workload="memcached",
+                            benchmark="memtier",
+                            lock=lock,
+                            threads=thread,
+                            repeat=repeat,
+                            exc=exc,
+                        )
+                        experiment_failures.write_failures_csv(result_root, failures)
+                        continue
+                    except RuntimeError as exc:
+                        experiment_failures.append_failure(
+                            failures,
+                            result_root=result_root,
+                            experiment="experiment5",
+                            workload="memcached",
+                            benchmark="memtier",
+                            lock=lock,
+                            threads=thread,
+                            repeat=repeat,
+                            stage="server_start",
+                            status="failed",
+                            command_log=server_log,
+                            message=str(exc),
+                        )
+                        experiment_failures.write_failures_csv(result_root, failures)
+                        continue
                     finally:
                         terminate_process_group(server_process)
                         server_log_file.write(f"\nserver_returncode: {server_process.returncode}\n")
@@ -2580,6 +2701,7 @@ def write_settings(
         "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
         "repeats": args.repeats,
         "total_ops": args.total_ops,
+        "command_timeout_seconds": args.command_timeout_seconds,
         "db_num": args.db_num,
         "build_missing": args.build_missing,
         "binaries": {key: str(value) for key, value in binaries.items()},
@@ -2592,6 +2714,7 @@ def write_settings(
             "num_ops": args.cachebench_num_ops,
             "num_keys": args.cachebench_num_keys,
             "cache_mb": args.cachebench_cache_mb,
+            "pool_rebalance_interval_sec": args.cachebench_pool_rebalance_interval_sec,
             "timeout_seconds": args.cachebench_timeout_seconds,
             "command_timeout_seconds": args.cachebench_command_timeout_seconds,
             "extra_args": list(args.cachebench_extra_arg),
@@ -2690,7 +2813,11 @@ def main() -> int:
 
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         experiment_three.ensure_output_root(result_root, args.force, args.resume)
-        logger = experiment_three.CommandLogger(result_root, resume=args.resume)
+        logger = experiment_three.CommandLogger(
+            result_root,
+            resume=args.resume,
+            command_timeout_seconds=args.command_timeout_seconds,
+        )
 
         ensure_lock_helpers(locks, build_missing=args.build_missing, logger=logger)
         binaries = ensure_required_binaries(workloads, args=args, logger=logger)
@@ -2718,6 +2845,7 @@ def main() -> int:
             existing_rows.extend(completed_rows_from_records(result_root, logger.records, ordered_targets, args))
             existing_rows = ordered_completed_rows(existing_rows, ordered_targets)
         raw_rows: list[dict[str, str]] = list(existing_rows)
+        failures: list[dict[str, str]] = []
         if raw_rows:
             write_progress_csvs(result_root, raw_rows)
         if "cachebench" in workloads:
@@ -2729,6 +2857,7 @@ def main() -> int:
                 cachebench_bin=binaries["cachebench"],
                 args=args,
                 logger=logger,
+                failures=failures,
                 existing_rows=raw_rows,
             )
         if "rocksdb" in workloads:
@@ -2741,6 +2870,7 @@ def main() -> int:
                 db_bench=binaries["rocksdb_db_bench"],
                 args=args,
                 logger=logger,
+                failures=failures,
                 existing_rows=raw_rows,
             )
         if "memcached" in workloads:
@@ -2753,6 +2883,7 @@ def main() -> int:
                 memtier_bin=binaries["memtier"],
                 args=args,
                 logger=logger,
+                failures=failures,
                 existing_rows=raw_rows,
             )
 
@@ -2762,7 +2893,9 @@ def main() -> int:
         plot_paths = write_plots(result_root, summary_rows, skip_plots=args.skip_plots)
         outlier_paths = write_outlier_artifacts(result_root, raw_rows, summary_rows)
         print_outputs(result_root, raw_path, summary_path, plot_paths, outlier_paths)
-        return 0
+        failures_path = experiment_failures.write_failures_csv(result_root, failures)
+        experiment_failures.print_failure_summary(failures, failures_path)
+        return 1 if failures else 0
     except experiment_three.CommandError as exc:
         print(str(exc), file=sys.stderr)
         print(f"Command log: {exc.log_path}", file=sys.stderr)

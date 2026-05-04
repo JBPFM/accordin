@@ -140,7 +140,7 @@ macro_rules! export_mutex_hooks {
 
             struct CondState {
                 seq: AtomicU32,
-                target: AtomicU32,
+                waiters: AtomicU32,
             }
 
             unsafe impl Send for CondState {}
@@ -305,7 +305,7 @@ macro_rules! export_mutex_hooks {
 
                     let state = Box::new(CondState {
                         seq: AtomicU32::new(0),
-                        target: AtomicU32::new(0),
+                        waiters: AtomicU32::new(0),
                     });
                     let ptr = Box::into_raw(state);
                     atomic.store(ptr as usize, Ordering::Release);
@@ -370,8 +370,45 @@ macro_rules! export_mutex_hooks {
             }
 
             #[inline(always)]
-            fn wait_should_continue(target: u32, seq: u32) -> bool {
-                target.wrapping_sub(seq) < (u32::MAX / 2) && target != seq
+            fn signal_one_waiter(cond_state: *mut CondState) -> bool {
+                unsafe {
+                    let waiters = &(*cond_state).waiters;
+                    let mut current = waiters.load(Ordering::Acquire);
+                    while current != 0 {
+                        match waiters.compare_exchange_weak(
+                            current,
+                            current - 1,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                (*cond_state).seq.fetch_add(1, Ordering::Release);
+                                return true;
+                            }
+                            Err(next) => current = next,
+                        }
+                    }
+                    false
+                }
+            }
+
+            #[inline(always)]
+            fn cancel_one_waiter(cond_state: *mut CondState) {
+                unsafe {
+                    let waiters = &(*cond_state).waiters;
+                    let mut current = waiters.load(Ordering::Acquire);
+                    while current != 0 {
+                        match waiters.compare_exchange_weak(
+                            current,
+                            current - 1,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => return,
+                            Err(next) => current = next,
+                        }
+                    }
+                }
             }
 
             #[unsafe(no_mangle)]
@@ -484,7 +521,7 @@ macro_rules! export_mutex_hooks {
 
                     let state = Box::new(CondState {
                         seq: AtomicU32::new(0),
-                        target: AtomicU32::new(0),
+                        waiters: AtomicU32::new(0),
                     });
                     let ptr = Box::into_raw(state);
                     std::ptr::write_bytes(
@@ -525,10 +562,7 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    let target = (*cond_state).target.load(Ordering::Acquire);
-                    let seq = (*cond_state).seq.load(Ordering::Acquire);
-                    if wait_should_continue(target, seq) {
-                        (*cond_state).seq.fetch_add(1, Ordering::Release);
+                    if signal_one_waiter(cond_state) {
                         futex_wake(&(*cond_state).seq, 1);
                     }
                     0
@@ -544,9 +578,10 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    let target = (*cond_state).target.load(Ordering::Acquire);
-                    (*cond_state).seq.store(target, Ordering::Release);
-                    futex_wake(&(*cond_state).seq, libc::c_int::MAX);
+                    if (*cond_state).waiters.swap(0, Ordering::AcqRel) != 0 {
+                        (*cond_state).seq.fetch_add(1, Ordering::Release);
+                        futex_wake(&(*cond_state).seq, libc::c_int::MAX);
+                    }
                     0
                 }
             }
@@ -565,12 +600,11 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    let target = (*cond_state).target.fetch_add(1, Ordering::Relaxed) + 1;
-                    let mut seq = (*cond_state).seq.load(Ordering::Acquire);
+                    let seq = (*cond_state).seq.load(Ordering::Acquire);
+                    (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
                     unlock_with_stats(&(*state).lock);
-                    while wait_should_continue(target, seq) {
+                    while (*cond_state).seq.load(Ordering::Acquire) == seq {
                         futex_wait(&(*cond_state).seq, seq);
-                        seq = (*cond_state).seq.load(Ordering::Acquire);
                     }
                     lock_with_stats(&(*state).lock);
                     0
@@ -596,19 +630,21 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    let target = (*cond_state).target.fetch_add(1, Ordering::Relaxed) + 1;
-                    let mut seq = (*cond_state).seq.load(Ordering::Acquire);
+                    let seq = (*cond_state).seq.load(Ordering::Acquire);
                     let mut ret = 0;
+                    (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
                     unlock_with_stats(&(*state).lock);
-                    while wait_should_continue(target, seq) {
+                    while (*cond_state).seq.load(Ordering::Acquire) == seq {
                         if futex_wait_until_realtime(&(*cond_state).seq, seq, abstime) != 0 {
                             let errno = *libc::__errno_location();
                             if errno == libc::ETIMEDOUT {
-                                ret = libc::ETIMEDOUT;
+                                if (*cond_state).seq.load(Ordering::Acquire) == seq {
+                                    cancel_one_waiter(cond_state);
+                                    ret = libc::ETIMEDOUT;
+                                }
                                 break;
                             }
                         }
-                        seq = (*cond_state).seq.load(Ordering::Acquire);
                     }
                     lock_with_stats(&(*state).lock);
                     ret

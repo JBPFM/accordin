@@ -18,6 +18,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Iterable, Sequence
 
+import experiment_failures
 import experiment_defaults
 
 
@@ -77,7 +78,8 @@ DEFAULT_STREAMCLUSTER_NUM_POINTS = 32768
 DEFAULT_STREAMCLUSTER_CHUNKSIZE = 32768
 DEFAULT_STREAMCLUSTER_CLUSTERSIZE = 2000
 DEFAULT_STREAMCLUSTER_INPUT = "none"
-DEFAULT_COMMAND_TIMEOUT_SECONDS = 0
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 14400
+COMMAND_TIMEOUT_KILL_AFTER_SECONDS = 60
 MACHINE_CORE_COUNT = experiment_defaults.MACHINE_CORE_COUNT
 ACTIVE_MACHINE_CONFIG = experiment_defaults.ACTIVE_MACHINE_CONFIG
 PROFILE_ENV = experiment_defaults.PROFILE_ENV
@@ -159,7 +161,13 @@ class CommandError(RuntimeError):
 def wrap_command_timeout(command: list[str], timeout_seconds: int) -> list[str]:
     if timeout_seconds <= 0:
         return command
-    return ["timeout", "-k", "5s", f"{timeout_seconds}s", *command]
+    return [
+        "timeout",
+        "-k",
+        f"{COMMAND_TIMEOUT_KILL_AFTER_SECONDS}s",
+        f"{timeout_seconds}s",
+        *command,
+    ]
 
 
 class CommandLogger:
@@ -718,6 +726,7 @@ def ensure_accordin_preload(
         ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
         log_name="build_mcs_tas_accordin.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     if not ACCORDIN_PRELOAD_LIBRARY.is_file():
         raise RuntimeError(f"LD_PRELOAD helper was not built: {ACCORDIN_PRELOAD_LIBRARY}")
@@ -740,6 +749,7 @@ def ensure_mcs_extension_preload(
         ["cargo", "build", "-p", "mcs_tse", "--release"],
         log_name="build_mcs_tse.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     if not MCS_EXTENSION_PRELOAD_LIBRARY.is_file():
         raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_EXTENSION_PRELOAD_LIBRARY}")
@@ -768,6 +778,7 @@ def ensure_interpose_helpers(
         ["bash", str(MAKE_ALL_SCRIPT)],
         log_name="build_interpose_helpers.log",
         cwd=FLEXGUARD_DIR,
+        timeout_seconds=0,
     )
 
     invalid_after_build = invalid_interpose_helpers(locks)
@@ -800,6 +811,7 @@ def ensure_parsec_binaries(
             ["bash", str(build_script)],
             log_name=f"build_{benchmark}.log",
             cwd=FLEXGUARD_DIR,
+            timeout_seconds=0,
         )
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise RuntimeError(f"{benchmark_label(benchmark)} binary is still unavailable after build: {binary}")
@@ -1197,6 +1209,7 @@ def remove_if_exists(path: Path) -> None:
 def run_benchmarks(
     result_root: Path,
     *,
+    experiment_name: str,
     benchmarks: tuple[str, ...],
     locks: tuple[str, ...],
     threads: tuple[int, ...],
@@ -1205,6 +1218,7 @@ def run_benchmarks(
     calibration: TscCalibration,
     args: argparse.Namespace,
     logger: CommandLogger,
+    failures: list[dict[str, str]],
     existing_rows: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = list(existing_rows or [])
@@ -1254,26 +1268,40 @@ def run_benchmarks(
                             raise RuntimeError(f"Unsupported benchmark: {benchmark}")
 
                         log_name = f"{benchmark}_{lock}_{thread:03d}_r{repeat}.log"
-                        result = logger.run(cmd, log_name=log_name, env=env)
-                        parsed = parse_benchmark_output(result.output)
-                        setup_time_ms = cycles_to_ms(parsed.setup_cycles, calibration)
-                        run_time_ms = cycles_to_ms(parsed.benchmark_cycles, calibration)
-                        if run_time_ms is None:
-                            run_time_ms = result.wall_seconds * 1000.0
-                        rows.append(
-                            {
-                                "benchmark": benchmark,
-                                "lock": lock,
-                                "threads": str(thread),
-                                "repeat": str(repeat),
-                                "setup_cycles": str(parsed.setup_cycles),
-                                "benchmark_cycles": str(parsed.benchmark_cycles),
-                                "setup_time_ms": "" if setup_time_ms is None else format_float(setup_time_ms),
-                                "run_time_ms": format_float(run_time_ms),
-                                "wall_seconds": format_float(result.wall_seconds),
-                                "command_log": str(result.log_path.relative_to(result_root)),
-                            }
-                        )
+                        try:
+                            result = logger.run(cmd, log_name=log_name, env=env)
+                            parsed = parse_benchmark_output(result.output)
+                            setup_time_ms = cycles_to_ms(parsed.setup_cycles, calibration)
+                            run_time_ms = cycles_to_ms(parsed.benchmark_cycles, calibration)
+                            if run_time_ms is None:
+                                run_time_ms = result.wall_seconds * 1000.0
+                            rows.append(
+                                {
+                                    "benchmark": benchmark,
+                                    "lock": lock,
+                                    "threads": str(thread),
+                                    "repeat": str(repeat),
+                                    "setup_cycles": str(parsed.setup_cycles),
+                                    "benchmark_cycles": str(parsed.benchmark_cycles),
+                                    "setup_time_ms": "" if setup_time_ms is None else format_float(setup_time_ms),
+                                    "run_time_ms": format_float(run_time_ms),
+                                    "wall_seconds": format_float(result.wall_seconds),
+                                    "command_log": str(result.log_path.relative_to(result_root)),
+                                }
+                            )
+                        except CommandError as exc:
+                            experiment_failures.append_command_failure(
+                                failures,
+                                result_root=result_root,
+                                experiment=experiment_name,
+                                benchmark=benchmark,
+                                lock=lock,
+                                threads=thread,
+                                repeat=repeat,
+                                exc=exc,
+                            )
+                            experiment_failures.write_failures_csv(result_root, failures)
+                            continue
                     finally:
                         remove_if_exists(output_path)
 
@@ -1555,8 +1583,10 @@ def main(
             if args.resume
             else []
         )
+        failures: list[dict[str, str]] = []
         raw_rows = run_benchmarks(
             result_root,
+            experiment_name=result_prefix,
             benchmarks=benchmarks,
             locks=locks,
             threads=threads,
@@ -1565,14 +1595,17 @@ def main(
             calibration=calibration,
             args=args,
             logger=logger,
+            failures=failures,
             existing_rows=existing_rows,
         )
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)
         summary_path = write_summary_csv(result_root, summary_rows)
-        plot_paths = write_plots(result_root, summary_rows)
+        plot_paths = write_plots(result_root, summary_rows) if summary_rows else []
         print_outputs(result_root, raw_path, summary_path, plot_paths)
-        return 0
+        failures_path = experiment_failures.write_failures_csv(result_root, failures)
+        experiment_failures.print_failure_summary(failures, failures_path)
+        return 1 if failures else 0
     except CommandError as exc:
         print(str(exc), file=sys.stderr)
         print(f"Command log: {exc.log_path}", file=sys.stderr)

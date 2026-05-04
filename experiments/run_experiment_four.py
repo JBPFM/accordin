@@ -15,6 +15,7 @@ from statistics import mean
 from typing import Iterable
 
 import experiment_defaults
+import experiment_failures
 import run_experiment_three as experiment_three
 
 
@@ -35,6 +36,7 @@ DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
 DEFAULT_INIT_EXISTING_BENCHMARKS = ("readrandom", "readseq", "overwrite")
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600
 SINGLE_OVERSUBSCRIBED_LOCKS = experiment_defaults.SINGLE_OVERSUBSCRIBED_LOCKS
 PER_LOCK_MAX_THREADS = experiment_defaults.per_lock_max_threads_for_settings(
     SINGLE_OVERSUBSCRIBED_LOCKS,
@@ -131,6 +133,15 @@ Examples:
         "--build-missing",
         action="store_true",
         help="Build missing interpose helpers or db_bench before running.",
+    )
+    parser.add_argument(
+        "--command-timeout-seconds",
+        type=experiment_three.non_negative_int,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        help=(
+            "Outer timeout for each logged benchmark command. 0 disables it. "
+            f"Default: {DEFAULT_COMMAND_TIMEOUT_SECONDS}."
+        ),
     )
     parser.add_argument(
         "--benchmarks",
@@ -355,6 +366,7 @@ def ensure_leveldb_source(
         ],
         log_name="init_leveldb_submodule.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     if not (leveldb_dir / "CMakeLists.txt").is_file():
         raise RuntimeError(f"LevelDB source directory is still unavailable after submodule init: {leveldb_dir}")
@@ -390,6 +402,7 @@ def ensure_db_bench(
         ],
         log_name="configure_leveldb.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     logger.run(
         [
@@ -402,6 +415,7 @@ def ensure_db_bench(
         ],
         log_name="build_leveldb_db_bench.log",
         cwd=REPO_ROOT,
+        timeout_seconds=0,
     )
     if not db_bench.is_file() or not os.access(db_bench, os.X_OK):
         raise RuntimeError(f"LevelDB db_bench is still unavailable after build: {db_bench}")
@@ -541,6 +555,7 @@ def run_benchmarks(
     fill_benchmark: str,
     init_existing_benchmarks: tuple[str, ...],
     logger: experiment_three.CommandLogger,
+    failures: list[dict[str, str]],
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     init_benchmarks = set(init_existing_benchmarks)
@@ -622,6 +637,22 @@ def run_benchmarks(
                                 "command_log": relative_log(result_root, result.log_path),
                             }
                         )
+                    except experiment_three.CommandError as exc:
+                        stage = "init" if use_existing_db and init_result is None else "run"
+                        experiment_failures.append_command_failure(
+                            failures,
+                            result_root=result_root,
+                            experiment="experiment4",
+                            workload="leveldb",
+                            benchmark=benchmark,
+                            lock=lock,
+                            threads=thread,
+                            repeat=repeat,
+                            stage=stage,
+                            exc=exc,
+                        )
+                        experiment_failures.write_failures_csv(result_root, failures)
+                        continue
                     finally:
                         cleanup_db_path(db_path)
 
@@ -644,6 +675,7 @@ def write_settings(
     build_missing: bool,
     lock_profile: str,
     lock_profile_source: str,
+    command_timeout_seconds: int,
 ) -> None:
     settings = {
         "benchmarks": [{"key": benchmark, "label": benchmark_label(benchmark)} for benchmark in benchmarks],
@@ -659,6 +691,7 @@ def write_settings(
         "repeats": repeats,
         "num": num,
         "total_ops": total_ops,
+        "command_timeout_seconds": command_timeout_seconds,
         "build_missing": build_missing,
         "db_bench": str(db_bench),
         "leveldb_dir": str(leveldb_dir),
@@ -882,7 +915,10 @@ def main() -> int:
 
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         experiment_three.ensure_output_root(result_root, args.force)
-        logger = experiment_three.CommandLogger(result_root)
+        logger = experiment_three.CommandLogger(
+            result_root,
+            command_timeout_seconds=args.command_timeout_seconds,
+        )
 
         ensure_lock_helpers(locks, build_missing=args.build_missing, logger=logger)
         ensure_db_bench(db_bench, leveldb_dir=leveldb_dir, build_missing=args.build_missing, logger=logger)
@@ -902,7 +938,9 @@ def main() -> int:
             build_missing=args.build_missing,
             lock_profile=args.lock_profile,
             lock_profile_source="manual" if args.locks is not None else "profile",
+            command_timeout_seconds=args.command_timeout_seconds,
         )
+        failures: list[dict[str, str]] = []
         raw_rows = run_benchmarks(
             result_root,
             benchmarks=benchmarks,
@@ -915,13 +953,16 @@ def main() -> int:
             fill_benchmark=fill_benchmark,
             init_existing_benchmarks=init_existing_benchmarks,
             logger=logger,
+            failures=failures,
         )
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)
         summary_path = write_summary_csv(result_root, summary_rows)
-        plot_paths = write_plots(result_root, summary_rows)
+        plot_paths = write_plots(result_root, summary_rows) if summary_rows else []
         print_outputs(result_root, raw_path, summary_path, plot_paths)
-        return 0
+        failures_path = experiment_failures.write_failures_csv(result_root, failures)
+        experiment_failures.print_failure_summary(failures, failures_path)
+        return 1 if failures else 0
     except experiment_three.CommandError as exc:
         print(str(exc), file=sys.stderr)
         print(f"Command log: {exc.log_path}", file=sys.stderr)

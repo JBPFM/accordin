@@ -33,6 +33,7 @@ from bench_csv_schema import (  # noqa: E402
 )
 
 import experiment_defaults  # noqa: E402
+import experiment_failures  # noqa: E402
 from machine_config import (  # noqa: E402
     DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
 )
@@ -51,6 +52,8 @@ OUTSIDE_NS = experiment_defaults.MUTEXBENCH_DEFAULT_OUTSIDE_NS
 DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_DURATION_MS
 WARMUP_DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_WARMUP_DURATION_MS
 REPEATS = experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 21600
+COMMAND_TIMEOUT_KILL_AFTER_SECONDS = 60
 ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin"
 ACCORDIN_TASKSET_PACKAGE = "mcs_tas_accordin"
 ACCORDIN_TASKSET_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
@@ -137,13 +140,31 @@ class CommandError(RuntimeError):
         self.log_path = log_path
 
 
+def wrap_command_timeout(command: list[str], timeout_seconds: int) -> list[str]:
+    if timeout_seconds <= 0:
+        return command
+    return [
+        "timeout",
+        "-k",
+        f"{COMMAND_TIMEOUT_KILL_AFTER_SECONDS}s",
+        f"{timeout_seconds}s",
+        *command,
+    ]
+
+
 class CommandLogger:
-    def __init__(self, result_root: Path) -> None:
+    def __init__(
+        self,
+        result_root: Path,
+        *,
+        command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    ) -> None:
         self.result_root = result_root
         self.log_dir = result_root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path = result_root / "commands.json"
         self.records: list[dict[str, object]] = self.load_existing_records()
+        self.command_timeout_seconds = command_timeout_seconds
 
     def load_existing_records(self) -> list[dict[str, object]]:
         if not self.manifest_path.is_file():
@@ -175,28 +196,37 @@ class CommandLogger:
         log_name: str,
         cwd: Path = REPO_ROOT,
         env: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
     ) -> None:
+        effective_timeout = self.command_timeout_seconds if timeout_seconds is None else timeout_seconds
+        run_cmd = wrap_command_timeout(cmd, effective_timeout)
         log_path = self.resolve_log_path(log_name)
         started_at = dt.datetime.now(dt.timezone.utc)
         record: dict[str, object] = {
-            "command": cmd,
-            "command_text": shlex.join(cmd),
+            "command": run_cmd,
+            "command_text": shlex.join(run_cmd),
             "cwd": str(cwd),
             "log_path": str(log_path),
             "started_at": started_at.isoformat(),
         }
+        if effective_timeout > 0:
+            record["inner_command"] = cmd
+            record["command_timeout_seconds"] = effective_timeout
         run_env = os.environ.copy()
         if env:
             run_env.update(env)
 
         with log_path.open("w", encoding="utf-8") as log_file:
             log_file.write(f"cwd: {cwd}\n")
-            log_file.write(f"command: {shlex.join(cmd)}\n")
+            log_file.write(f"command: {shlex.join(run_cmd)}\n")
+            if effective_timeout > 0:
+                log_file.write(f"inner_command: {shlex.join(cmd)}\n")
+                log_file.write(f"command_timeout_seconds: {effective_timeout}\n")
             log_file.write(f"started_at: {started_at.isoformat()}\n\n")
             log_file.flush()
 
             process = subprocess.Popen(
-                cmd,
+                run_cmd,
                 cwd=str(cwd),
                 env=run_env,
                 stdout=subprocess.PIPE,
@@ -221,7 +251,7 @@ class CommandLogger:
         self.write_manifest()
         if returncode != 0:
             raise CommandError(
-                f"Command failed with exit code {returncode}: {shlex.join(cmd)}",
+                f"Command failed with exit code {returncode}: {shlex.join(run_cmd)}",
                 returncode,
                 log_path,
             )
@@ -230,6 +260,13 @@ class CommandLogger:
         with self.manifest_path.open("w", encoding="utf-8") as f:
             json.dump(self.records, f, indent=2)
             f.write("\n")
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -325,6 +362,15 @@ Examples:
         action="store_true",
         help="Allow benchmark output into an existing non-empty output root, and in supplement mode allow overwriting target lock results.",
     )
+    parser.add_argument(
+        "--command-timeout-seconds",
+        type=non_negative_int,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        help=(
+            "Outer timeout for each sweep command. 0 disables it. "
+            f"Default: {DEFAULT_COMMAND_TIMEOUT_SECONDS}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -382,6 +428,7 @@ def write_settings(
     mcs_accordin_taskset_cpus: str,
     lock_profile: str,
     selected_lock_keys: tuple[str, ...],
+    command_timeout_seconds: int,
 ) -> None:
     selected_locks = lock_specs_for_keys(selected_lock_keys)
     settings = {
@@ -396,6 +443,7 @@ def write_settings(
         "duration_ms": DURATION_MS,
         "warmup_duration_ms": WARMUP_DURATION_MS,
         "repeats": REPEATS,
+        "command_timeout_seconds": command_timeout_seconds,
         "single_oversubscribed_locks": list(SINGLE_OVERSUBSCRIBED_LOCK_KEYS),
         "runnable_threads_by_lock": {
             lock.key: list(runnable_threads_for_lock(lock.key))
@@ -422,6 +470,7 @@ def write_settings_if_missing(
     mcs_accordin_taskset_cpus: str,
     lock_profile: str,
     selected_lock_keys: tuple[str, ...],
+    command_timeout_seconds: int,
 ) -> None:
     settings_path = result_root / "settings.json"
     if settings_path.exists():
@@ -436,6 +485,7 @@ def write_settings_if_missing(
         mcs_accordin_taskset_cpus,
         lock_profile,
         selected_lock_keys,
+        command_timeout_seconds,
     )
 
 
@@ -447,7 +497,11 @@ def ensure_executable(path: Path, description: str) -> None:
 def ensure_mutex_bench(logger: CommandLogger) -> None:
     binary = MUTEXBENCH_DIR / "mutex_bench"
     if not binary.is_file() or not os.access(binary, os.X_OK):
-        logger.run(["make", "-C", str(MUTEXBENCH_DIR), "mutex_bench"], log_name="build_mutex_bench.log")
+        logger.run(
+            ["make", "-C", str(MUTEXBENCH_DIR), "mutex_bench"],
+            log_name="build_mutex_bench.log",
+            timeout_seconds=0,
+        )
     ensure_executable(binary, "mutexbench binary")
 
 
@@ -474,6 +528,7 @@ def ensure_flexguard_interpose(key: str, logger: CommandLogger) -> None:
             logger.run(
                 ["make", "-C", str(FLEXGUARD_DIR), spec.make_target],
                 log_name=f"build_flexguard_{key}.log",
+                timeout_seconds=0,
             )
         except CommandError as exc:
             raise RuntimeError(
@@ -486,6 +541,7 @@ def ensure_flexguard_interpose(key: str, logger: CommandLogger) -> None:
                 logger.run(
                     ["make", "-C", str(FLEXGUARD_DIR), "clean"],
                     log_name=f"build_flexguard_{key}_clean.log",
+                    timeout_seconds=0,
                 )
             except CommandError as exc:
                 raise RuntimeError(
@@ -495,7 +551,7 @@ def ensure_flexguard_interpose(key: str, logger: CommandLogger) -> None:
 
         build_cmd = ["make", "-C", str(FLEXGUARD_DIR), *spec.make_vars, "interpose.so", "interpose.sh"]
         try:
-            logger.run(build_cmd, log_name=f"build_flexguard_{key}.log")
+            logger.run(build_cmd, log_name=f"build_flexguard_{key}.log", timeout_seconds=0)
         except CommandError as exc:
             raise RuntimeError(
                 f"Required bench/flexguard interpose helper cannot be built: {script}. "
@@ -582,6 +638,7 @@ def run_multi_lock_sweeps(
     args: argparse.Namespace,
     lock_keys: tuple[str, ...],
     logger: CommandLogger,
+    failures: list[dict[str, str]],
     *,
     log_prefix: str,
 ) -> None:
@@ -605,7 +662,22 @@ def run_multi_lock_sweeps(
             log_name = f"{log_prefix}.log"
         else:
             log_name = f"{log_prefix}_{thread_group_log_suffix(threads)}.log"
-        logger.run(sweep_cmd, log_name=log_name, env=env)
+        try:
+            logger.run(sweep_cmd, log_name=log_name, env=env)
+        except CommandError as exc:
+            experiment_failures.append_command_failure(
+                failures,
+                result_root=result_root,
+                experiment="experiment1",
+                workload="mutexbench",
+                benchmark="sweep",
+                lock=",".join(group_lock_keys),
+                threads=",".join(str(thread) for thread in threads),
+                repeat="all",
+                exc=exc,
+            )
+            experiment_failures.write_failures_csv(result_root, failures)
+            continue
 
 
 def ensure_accordin_taskset_preload(logger: CommandLogger) -> None:
@@ -613,6 +685,7 @@ def ensure_accordin_taskset_preload(logger: CommandLogger) -> None:
         logger.run(
             ["cargo", "build", "-p", ACCORDIN_TASKSET_PACKAGE, "--release"],
             log_name=f"build_{ACCORDIN_TASKSET_PACKAGE}.log",
+            timeout_seconds=0,
         )
 
     if not ACCORDIN_TASKSET_RELEASE_LIB.is_file():
@@ -624,6 +697,7 @@ def run_benchmarks(
     args: argparse.Namespace,
     logger: CommandLogger,
     selected_lock_keys: tuple[str, ...],
+    failures: list[dict[str, str]],
 ) -> None:
     selected = set(selected_lock_keys)
     base_lock_keys = tuple(lock_key for lock_key in BASE_LOCK_KEYS if lock_key in selected)
@@ -633,6 +707,7 @@ def run_benchmarks(
             args,
             base_lock_keys,
             logger,
+            failures,
             log_prefix="sweep_base_locks",
         )
 
@@ -651,7 +726,21 @@ def run_benchmarks(
             "--output-summary",
             str(extension_dir / "summary.csv"),
         ]
-        logger.run(extension_cmd, log_name="sweep_mcs_extension.log")
+        try:
+            logger.run(extension_cmd, log_name="sweep_mcs_extension.log")
+        except CommandError as exc:
+            experiment_failures.append_command_failure(
+                failures,
+                result_root=result_root,
+                experiment="experiment1",
+                workload="mutexbench",
+                benchmark="sweep",
+                lock="mcs_extension",
+                threads=",".join(str(thread) for thread in runnable_threads_for_lock("mcs_extension")),
+                repeat="all",
+                exc=exc,
+            )
+            experiment_failures.write_failures_csv(result_root, failures)
 
     if "accordin" not in selected or args.skip_mcs_accordin_taskset:
         return
@@ -673,7 +762,21 @@ def run_benchmarks(
         "--",
         *common_sweep_args(),
     ]
-    logger.run(taskset_cmd, log_name="sweep_accordin_taskset.log")
+    try:
+        logger.run(taskset_cmd, log_name="sweep_accordin_taskset.log")
+    except CommandError as exc:
+        experiment_failures.append_command_failure(
+            failures,
+            result_root=result_root,
+            experiment="experiment1",
+            workload="mutexbench",
+            benchmark="sweep",
+            lock=ACCORDIN_TASKSET_LOCK,
+            threads=",".join(str(thread) for thread in THREADS),
+            repeat="all",
+            exc=exc,
+        )
+        experiment_failures.write_failures_csv(result_root, failures)
 
 
 def run_supplement_benchmarks(
@@ -681,12 +784,14 @@ def run_supplement_benchmarks(
     args: argparse.Namespace,
     lock_keys: tuple[str, ...],
     logger: CommandLogger,
+    failures: list[dict[str, str]],
 ) -> None:
     run_multi_lock_sweeps(
         result_root,
         args,
         lock_keys,
         logger,
+        failures,
         log_prefix=f"sweep_supplement_{'_'.join(lock_keys)}",
     )
 
@@ -719,6 +824,8 @@ def selected_lock_keys_from_settings(result_root: Path) -> tuple[str, ...] | Non
 def load_combined_rows(
     result_root: Path,
     selected_lock_keys: tuple[str, ...] | None = None,
+    *,
+    allow_missing: bool = False,
 ) -> list[dict[str, str]]:
     combined_rows: list[dict[str, str]] = []
     required = set(LATENCY_PLOT_REQUIRED_FIELDS) | {CPU_FIELD}
@@ -737,7 +844,7 @@ def load_combined_rows(
             result_root / lock.result_dir_names()[0],
         )
         if (
-            lock.optional
+            (lock.optional or allow_missing)
             and not (lock_dir / "summary.csv").is_file()
             and not (lock_dir / "raw.csv").is_file()
         ):
@@ -1362,10 +1469,12 @@ def main() -> int:
                 args.mcs_accordin_taskset_cpus,
                 args.lock_profile,
                 selected_lock_keys,
+                args.command_timeout_seconds,
             )
-            logger = CommandLogger(result_root)
+            logger = CommandLogger(result_root, command_timeout_seconds=args.command_timeout_seconds)
             ensure_inputs(logger, lock_keys=supplement_lock_keys, include_single_sweep=False)
-            run_supplement_benchmarks(result_root, args, supplement_lock_keys, logger)
+            failures: list[dict[str, str]] = []
+            run_supplement_benchmarks(result_root, args, supplement_lock_keys, logger, failures)
         else:
             ensure_output_root(result_root, args.force)
             write_settings(
@@ -1376,19 +1485,27 @@ def main() -> int:
                 args.mcs_accordin_taskset_cpus,
                 args.lock_profile,
                 selected_lock_keys,
+                args.command_timeout_seconds,
             )
-            logger = CommandLogger(result_root)
+            logger = CommandLogger(result_root, command_timeout_seconds=args.command_timeout_seconds)
             ensure_inputs(
                 logger,
                 lock_keys=selected_lock_keys,
                 include_single_sweep="mcs_extension" in selected_lock_keys,
             )
-            run_benchmarks(result_root, args, logger, selected_lock_keys)
-        rows = load_combined_rows(result_root, selected_lock_keys if supplement_lock_keys is None else None)
+            failures = []
+            run_benchmarks(result_root, args, logger, selected_lock_keys, failures)
+        rows = load_combined_rows(
+            result_root,
+            selected_lock_keys if supplement_lock_keys is None else None,
+            allow_missing=bool(failures),
+        )
         combined_path = write_combined_csv(result_root, rows)
-        plot_paths = write_plots(result_root, rows)
+        plot_paths = write_plots(result_root, rows) if rows else []
         print_outputs(result_root, combined_path, plot_paths)
-        return 0
+        failures_path = experiment_failures.write_failures_csv(result_root, failures)
+        experiment_failures.print_failure_summary(failures, failures_path)
+        return 1 if failures else 0
     except CommandError as exc:
         print(str(exc), file=sys.stderr)
         print(f"Command log: {exc.log_path}", file=sys.stderr)

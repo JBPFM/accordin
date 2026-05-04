@@ -16,6 +16,7 @@ from statistics import mean
 from typing import Iterable
 
 import experiment_defaults
+import experiment_failures
 import run_experiment_three_common as parsec_common
 
 
@@ -51,6 +52,7 @@ FULL_LOCKS = experiment_defaults.FULL_LOCKS
 MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
 DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
 DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 900
 SINGLE_OVERSUBSCRIBED_LOCKS = experiment_defaults.SINGLE_OVERSUBSCRIBED_LOCKS
 PER_LOCK_MAX_THREADS = experiment_defaults.per_lock_max_threads_for_settings(
     SINGLE_OVERSUBSCRIBED_LOCKS,
@@ -284,6 +286,15 @@ Examples:
     )
     parser.add_argument("--threads", default=",".join(str(thread) for thread in DEFAULT_THREADS), metavar="CSV")
     parser.add_argument("--repeats", type=positive_int, default=DEFAULT_REPEATS)
+    parser.add_argument(
+        "--command-timeout-seconds",
+        type=parsec_common.non_negative_int,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        help=(
+            "Outer timeout for each logged benchmark command. 0 disables it. "
+            f"Default: {DEFAULT_COMMAND_TIMEOUT_SECONDS}."
+        ),
+    )
     parser.add_argument("--tsc-khz", type=positive_int, default=None, help="Override TSC frequency in kHz. Default: auto-detect.")
     return parser.parse_args()
 
@@ -323,6 +334,7 @@ def ensure_parsec_binaries(
             ],
             log_name=f"build_{benchmark}_{build_config}.log",
             cwd=PARSEC_DIR,
+            timeout_seconds=0,
         )
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise RuntimeError(f"{benchmark_label(benchmark)} binary is still unavailable after build: {binary}")
@@ -350,6 +362,7 @@ def ensure_flexguard_inputs(
             ["tar", "-xf", str(FLEXGUARD_DEDUP_INPUT_ARCHIVE), "-C", str(FLEXGUARD_DEDUP_RUN_DIR)],
             log_name="extract_dedup_native_input.log",
             cwd=PARSEC_DIR,
+            timeout_seconds=0,
         )
         if FLEXGUARD_DEDUP_INPUT.is_file():
             return
@@ -357,6 +370,7 @@ def ensure_flexguard_inputs(
         ["./get-inputs", "-n"],
         log_name="fetch_parsec_native_inputs.log",
         cwd=PARSEC_DIR,
+        timeout_seconds=0,
     )
     if not FLEXGUARD_DEDUP_INPUT.is_file():
         raise RuntimeError(f"FlexGuard dedup input is still missing after get-inputs: {FLEXGUARD_DEDUP_INPUT}")
@@ -717,6 +731,7 @@ def run_benchmarks(
     calibration: parsec_common.TscCalibration,
     args: argparse.Namespace,
     logger: parsec_common.CommandLogger,
+    failures: list[dict[str, str]],
     existing_rows: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = list(existing_rows or [])
@@ -743,27 +758,42 @@ def run_benchmarks(
                     )
                     try:
                         log_name = f"{benchmark}_{lock}_{thread:03d}_r{repeat}.log"
-                        result = logger.run(
-                            run_command.cmd,
-                            log_name=log_name,
-                            cwd=run_command.cwd,
-                            env=run_command.env,
-                        )
-                        rows.append(
-                            row_from_output(
+                        try:
+                            result = logger.run(
+                                run_command.cmd,
+                                log_name=log_name,
+                                cwd=run_command.cwd,
+                                env=run_command.env,
+                            )
+                            rows.append(
+                                row_from_output(
+                                    result_root=result_root,
+                                    benchmark=benchmark,
+                                    lock=lock,
+                                    threads=thread,
+                                    repeat=repeat,
+                                    input_size=input_size,
+                                    build_config=build_config,
+                                    output=result.output,
+                                    wall_seconds=result.wall_seconds,
+                                    log_path=result.log_path,
+                                    calibration=calibration,
+                                )
+                            )
+                        except parsec_common.CommandError as exc:
+                            experiment_failures.append_command_failure(
+                                failures,
                                 result_root=result_root,
+                                experiment="experiment6",
+                                workload="parsec",
                                 benchmark=benchmark,
                                 lock=lock,
                                 threads=thread,
                                 repeat=repeat,
-                                input_size=input_size,
-                                build_config=build_config,
-                                output=result.output,
-                                wall_seconds=result.wall_seconds,
-                                log_path=result.log_path,
-                                calibration=calibration,
+                                exc=exc,
                             )
-                        )
+                            experiment_failures.write_failures_csv(result_root, failures)
+                            continue
                     finally:
                         for cleanup_path in run_command.cleanup_paths:
                             remove_if_exists(cleanup_path)
@@ -819,6 +849,7 @@ def write_settings(
         "parsec_platform": parsec_platform(args.build_config),
         "parsec_dir": str(PARSEC_DIR),
         "repeats": args.repeats,
+        "command_timeout_seconds": args.command_timeout_seconds,
         "build_missing": args.build_missing,
         "source": calibration.source,
         "tsc_khz": calibration.tsc_khz,
@@ -1023,7 +1054,11 @@ def main() -> int:
 
         result_root = parsec_common.resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         parsec_common.ensure_output_root(result_root, args.force, args.resume)
-        logger = parsec_common.CommandLogger(result_root, resume=args.resume)
+        logger = parsec_common.CommandLogger(
+            result_root,
+            resume=args.resume,
+            command_timeout_seconds=args.command_timeout_seconds,
+        )
         parsec_common.ensure_interpose_helpers(locks, build_missing=args.build_missing, logger=logger)
         if "mcs_tas_accordin" in locks:
             parsec_common.ensure_accordin_preload(build_missing=args.build_missing, logger=logger)
@@ -1069,6 +1104,7 @@ def main() -> int:
             if args.resume
             else []
         )
+        failures: list[dict[str, str]] = []
         raw_rows = run_benchmarks(
             result_root,
             benchmarks=benchmarks,
@@ -1079,6 +1115,7 @@ def main() -> int:
             calibration=calibration,
             args=args,
             logger=logger,
+            failures=failures,
             existing_rows=existing_rows,
         )
         raw_path = write_raw_csv(result_root, raw_rows)
@@ -1086,7 +1123,9 @@ def main() -> int:
         summary_path = write_summary_csv(result_root, summary_rows)
         plot_paths = maybe_write_plots(result_root, summary_rows, skip_plots=args.skip_plots)
         print_outputs(result_root, raw_path, summary_path, plot_paths)
-        return 0
+        failures_path = experiment_failures.write_failures_csv(result_root, failures)
+        experiment_failures.print_failure_summary(failures, failures_path)
+        return 1 if failures else 0
     except parsec_common.CommandError as exc:
         print(str(exc), file=sys.stderr)
         print(f"Command log: {exc.log_path}", file=sys.stderr)

@@ -34,7 +34,6 @@ from bench_csv_schema import (  # noqa: E402
 
 import experiment_defaults  # noqa: E402
 from machine_config import (  # noqa: E402
-    DECOMPOSITION_THREAD_COUNTS,
     DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
 )
 
@@ -46,17 +45,7 @@ DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 EXPERIMENT_ONE_MINIMAL_LOCKS = experiment_defaults.EXPERIMENT_ONE_MINIMAL_LOCKS
 EXPERIMENT_ONE_FULL_LOCKS = experiment_defaults.EXPERIMENT_ONE_FULL_LOCKS
 PLOT_THREADS = tuple(thread for thread in THREADS if thread >= 4)
-SINGLE_OVERSUBSCRIBED_THREADS = tuple(
-    thread
-    for thread in experiment_defaults.runnable_threads_for_lock("mcs", THREADS)
-    if thread > MACHINE_CORE_COUNT
-)
-DECOMPOSITION_THREADS = tuple(
-    thread
-    for thread in DECOMPOSITION_THREAD_COUNTS
-    if thread in SINGLE_OVERSUBSCRIBED_THREADS
-) or SINGLE_OVERSUBSCRIBED_THREADS
-DECOMPOSITION_LOCK_KEYS = experiment_defaults.EXPERIMENT_ONE_DECOMPOSITION_LOCKS
+HOLD_TIME_MAX_THREADS = 96
 CRITICAL_NS = experiment_defaults.MUTEXBENCH_DEFAULT_CRITICAL_NS
 OUTSIDE_NS = experiment_defaults.MUTEXBENCH_DEFAULT_OUTSIDE_NS
 DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_DURATION_MS
@@ -71,11 +60,13 @@ PIECEWISE_Y_LINEAR_SCALE = 3.0
 BROKEN_Y_NORMAL = (1e2, 1e4)
 BROKEN_Y_UPPER_MIN = 1e5
 BROKEN_LOWER_AXIS_PADDING = 1.2
-DECOMPOSITION_HOLD_COLOR = "#74a9cf"
-DECOMPOSITION_HANDOFF_COLOR = "#ef8a62"
 THREAD_AXIS_MIN = PLOT_THREADS[0] / 1.08
 THREAD_AXIS_MAX = PLOT_THREADS[-1] * 1.25
-OVERSUBSCRIBED_LABEL_X = (MACHINE_CORE_COUNT * THREAD_AXIS_MAX) ** 0.5
+PLOT_TITLE_FONTSIZE = 16
+PLOT_LABEL_FONTSIZE = 14
+PLOT_TICK_FONTSIZE = 12
+PLOT_LEGEND_FONTSIZE = 11
+PLOT_ANNOTATION_FONTSIZE = 11
 
 
 @dataclass(frozen=True)
@@ -410,7 +401,6 @@ def write_settings(
             lock.key: list(runnable_threads_for_lock(lock.key))
             for lock in selected_locks
         },
-        "decomposition_threads": list(DECOMPOSITION_THREADS),
         "mcs_extension_mode": mcs_extension_mode,
         "sudo_mode": sudo_mode,
         "accordin_taskset_lock": ACCORDIN_TASKSET_LOCK,
@@ -799,8 +789,11 @@ def is_experiment_row(row: dict[str, str]) -> bool:
     return int(row["critical_ns"]) == CRITICAL_NS and int(row["outside_ns"]) == OUTSIDE_NS
 
 
-def is_plot_row(row: dict[str, str]) -> bool:
-    return is_experiment_row(row) and int(row["threads"]) in PLOT_THREADS
+def is_plot_row(row: dict[str, str], *, max_threads: int | None = None) -> bool:
+    thread = int(row["threads"])
+    if max_threads is not None and thread > max_threads:
+        return False
+    return is_experiment_row(row) and thread in PLOT_THREADS
 
 
 def metric_values(rows: list[dict[str, str]], metric: str) -> list[float]:
@@ -853,48 +846,46 @@ def apply_piecewise_y_scale(ax, rows: list[dict[str, str]], metric: str) -> None
     ax.axhline(linear_limit, color="0.55", linewidth=0.8, linestyle=":", alpha=0.65)
 
 
-def draw_machine_core_line(ax) -> None:
-    ax.axvspan(
-        MACHINE_CORE_COUNT,
-        THREAD_AXIS_MAX,
-        color="0.92",
-        alpha=0.55,
-        linewidth=0,
-        zorder=0,
-    )
-    ax.axvline(
-        MACHINE_CORE_COUNT,
-        color="0.22",
-        linewidth=1.0,
-        linestyle="--",
-        alpha=0.75,
-        zorder=1,
-    )
+def draw_machine_core_line(
+    ax,
+    *,
+    axis_max: float = THREAD_AXIS_MAX,
+    shade_oversubscribed: bool = True,
+) -> None:
+    if shade_oversubscribed and MACHINE_CORE_COUNT < axis_max:
+        ax.axvspan(
+            MACHINE_CORE_COUNT,
+            axis_max,
+            color="0.92",
+            alpha=0.55,
+            linewidth=0,
+            zorder=0,
+        )
+    if MACHINE_CORE_COUNT <= axis_max:
+        ax.axvline(
+            MACHINE_CORE_COUNT,
+            color="0.22",
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.75,
+            zorder=1,
+        )
 
 
-def annotate_oversubscribed_region(ax, *, y_fraction: float = 0.94) -> None:
+def annotate_oversubscribed_region(
+    ax,
+    *,
+    y_fraction: float = 0.94,
+    axis_max: float = THREAD_AXIS_MAX,
+) -> None:
     ax.annotate(
         "Oversubscribed",
-        xy=(OVERSUBSCRIBED_LABEL_X, y_fraction),
+        xy=((MACHINE_CORE_COUNT * axis_max) ** 0.5, y_fraction),
         xycoords=ax.get_xaxis_transform(),
         ha="center",
         va="top",
-        fontsize=8,
+        fontsize=PLOT_ANNOTATION_FONTSIZE,
         color="0.35",
-    )
-
-
-def annotate_machine_core_count(ax, *, y_fraction: float = 0.96, va: str = "top") -> None:
-    ax.annotate(
-        f"{MACHINE_CORE_COUNT} cores",
-        xy=(MACHINE_CORE_COUNT, y_fraction),
-        xycoords=ax.get_xaxis_transform(),
-        xytext=(6, 0),
-        textcoords="offset points",
-        ha="left",
-        va=va,
-        fontsize=8,
-        color="0.2",
     )
 
 
@@ -905,6 +896,9 @@ def plot_metric(
     ylabel: str,
     title: str,
     output_path: Path,
+    max_threads: int | None = None,
+    value_scale: float = 1.0,
+    piecewise_y_scale: bool = True,
 ) -> None:
     import matplotlib
 
@@ -912,7 +906,15 @@ def plot_metric(
     import matplotlib.pyplot as plt
     from matplotlib.ticker import ScalarFormatter
 
-    plot_rows = [row for row in rows if is_plot_row(row)]
+    plot_threads = tuple(
+        thread
+        for thread in PLOT_THREADS
+        if max_threads is None or thread <= max_threads
+    )
+    if not plot_threads:
+        raise RuntimeError(f"No plot threads matched max_threads={max_threads}.")
+
+    plot_rows = [row for row in rows if is_plot_row(row, max_threads=max_threads)]
     if not plot_rows:
         raise RuntimeError(
             f"No rows matched critical_ns={CRITICAL_NS} and outside_ns={OUTSIDE_NS} for plotting."
@@ -921,7 +923,7 @@ def plot_metric(
     fig, ax = plt.subplots(figsize=(9.5, 5.5))
     for lock in LOCKS:
         points = [
-            (int(row["threads"]), float(row[metric]))
+            (int(row["threads"]), float(row[metric]) * value_scale)
             for row in plot_rows
             if row["lock_key"] == lock.key
         ]
@@ -937,20 +939,29 @@ def plot_metric(
             label=lock.label,
         )
 
-    ax.set_title(title)
-    ax.set_xlabel("Threads")
-    ax.set_ylabel(ylabel)
-    apply_piecewise_y_scale(ax, plot_rows, metric)
+    ax.set_title(title, fontsize=PLOT_TITLE_FONTSIZE)
+    ax.set_xlabel("Threads", fontsize=PLOT_LABEL_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=PLOT_LABEL_FONTSIZE)
+    if piecewise_y_scale:
+        apply_piecewise_y_scale(ax, plot_rows, metric)
     ax.set_xscale("log", base=2)
-    ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
-    ax.set_xticks(list(PLOT_THREADS))
+    thread_axis_min = plot_threads[0] / 1.08
+    thread_axis_max = plot_threads[-1] * 1.25
+    ax.set_xlim(thread_axis_min, thread_axis_max)
+    ax.set_xticks(list(plot_threads))
     ax.xaxis.set_major_formatter(ScalarFormatter())
-    draw_machine_core_line(ax)
-    annotate_machine_core_count(ax)
-    annotate_oversubscribed_region(ax)
+    show_oversubscribed_region = plot_threads[-1] > MACHINE_CORE_COUNT
+    draw_machine_core_line(
+        ax,
+        axis_max=thread_axis_max,
+        shade_oversubscribed=show_oversubscribed_region,
+    )
+    if show_oversubscribed_region:
+        annotate_oversubscribed_region(ax, axis_max=thread_axis_max)
     ax.grid(True, axis="y", alpha=0.28)
     ax.grid(True, axis="x", which="major", alpha=0.16)
-    ax.legend(frameon=False, ncol=2)
+    ax.tick_params(axis="both", labelsize=PLOT_TICK_FONTSIZE)
+    ax.legend(frameon=False, ncol=2, fontsize=PLOT_LEGEND_FONTSIZE)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -1017,7 +1028,7 @@ def plot_focused_comparison(
             textcoords="offset points",
             ha="center",
             va="bottom",
-            fontsize=8,
+            fontsize=PLOT_ANNOTATION_FONTSIZE,
             color="0.25",
         )
 
@@ -1027,19 +1038,19 @@ def plot_focused_comparison(
         upper = max(values)
         pad = max((upper - lower) * 0.16, upper * 0.05)
         ax.set_ylim(max(0.0, lower - pad), upper + pad)
-    ax.set_title(title)
-    ax.set_xlabel("Threads")
-    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=PLOT_TITLE_FONTSIZE)
+    ax.set_xlabel("Threads", fontsize=PLOT_LABEL_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=PLOT_LABEL_FONTSIZE)
     ax.set_xscale("log", base=2)
     ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
     ax.set_xticks(list(PLOT_THREADS))
     ax.xaxis.set_major_formatter(ScalarFormatter())
     draw_machine_core_line(ax)
-    annotate_machine_core_count(ax)
     annotate_oversubscribed_region(ax)
     ax.grid(True, axis="y", alpha=0.28)
     ax.grid(True, axis="x", which="major", alpha=0.16)
-    ax.legend(frameon=False)
+    ax.tick_params(axis="both", labelsize=PLOT_TICK_FONTSIZE)
+    ax.legend(frameon=False, fontsize=PLOT_LEGEND_FONTSIZE)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -1134,14 +1145,15 @@ def plot_broken_axis_metric(
         ax.grid(True, axis="y", which="major", alpha=0.28)
         ax.grid(True, axis="x", which="major", alpha=0.16)
         ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10))
+        ax.tick_params(axis="both", labelsize=PLOT_TICK_FONTSIZE)
         draw_machine_core_line(ax)
 
     upper_ax.set_ylim(*upper_ylim)
     lower_ax.set_ylim(*lower_ylim)
     upper_ax.spines["bottom"].set_visible(False)
     lower_ax.spines["top"].set_visible(False)
-    upper_ax.tick_params(labelbottom=False, bottom=False)
-    lower_ax.tick_params(top=False)
+    upper_ax.tick_params(labelbottom=False, bottom=False, labelsize=PLOT_TICK_FONTSIZE)
+    lower_ax.tick_params(top=False, labelsize=PLOT_TICK_FONTSIZE)
 
     break_mark = 0.012
     break_kwargs = dict(transform=upper_ax.transAxes, color="0.25", clip_on=False, linewidth=1.0)
@@ -1151,14 +1163,13 @@ def plot_broken_axis_metric(
     lower_ax.plot((-break_mark, +break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
     lower_ax.plot((1 - break_mark, 1 + break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
 
-    upper_ax.set_title(title)
-    fig.supylabel(ylabel)
-    lower_ax.set_xlabel("Threads")
+    upper_ax.set_title(title, fontsize=PLOT_TITLE_FONTSIZE)
+    fig.supylabel(ylabel, fontsize=PLOT_LABEL_FONTSIZE)
+    lower_ax.set_xlabel("Threads", fontsize=PLOT_LABEL_FONTSIZE)
     lower_ax.set_xscale("log", base=2)
     lower_ax.set_xlim(THREAD_AXIS_MIN, THREAD_AXIS_MAX)
     lower_ax.set_xticks(list(PLOT_THREADS))
     lower_ax.xaxis.set_major_formatter(ScalarFormatter())
-    annotate_machine_core_count(lower_ax)
     annotate_oversubscribed_region(upper_ax, y_fraction=0.88)
     lock_handles = [
         Line2D(
@@ -1173,7 +1184,13 @@ def plot_broken_axis_metric(
         for lock in LOCKS
         if any(row["lock_key"] == lock.key for row in plot_rows)
     ]
-    lock_legend = upper_ax.legend(handles=lock_handles, frameon=False, ncol=2, loc="upper left")
+    lock_legend = upper_ax.legend(
+        handles=lock_handles,
+        frameon=False,
+        ncol=2,
+        loc="upper left",
+        fontsize=PLOT_LEGEND_FONTSIZE,
+    )
     upper_ax.add_artist(lock_legend)
     if secondary_metric is not None:
         style_handles = [
@@ -1200,166 +1217,13 @@ def plot_broken_axis_metric(
                 label=secondary_metric_label or secondary_metric,
             ),
         ]
-        upper_ax.legend(handles=style_handles, frameon=False, loc="upper right")
+        upper_ax.legend(
+            handles=style_handles,
+            frameon=False,
+            loc="upper right",
+            fontsize=PLOT_LEGEND_FONTSIZE,
+        )
     fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.11, hspace=0.06)
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def format_ns_tick(value: float, _position: int) -> str:
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:g}M"
-    if value >= 1_000:
-        return f"{value / 1_000:g}K"
-    return f"{value:g}"
-
-
-def plot_hold_handoff_decomposition(
-    rows: list[dict[str, str]],
-    *,
-    output_path: Path,
-) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    from matplotlib.ticker import FuncFormatter
-
-    selected_rows = [
-        row
-        for row in rows
-        if is_experiment_row(row)
-        and int(row["threads"]) in DECOMPOSITION_THREADS
-        and row["lock_key"] in DECOMPOSITION_LOCK_KEYS
-    ]
-    if not selected_rows:
-        raise RuntimeError("No rows matched the hold/handoff decomposition plot inputs.")
-
-    row_by_key = {
-        (int(row["threads"]), row["lock_key"]): row
-        for row in selected_rows
-    }
-    lock_by_key = {lock.key: lock for lock in LOCKS}
-    optional_lock_keys = {lock.key for lock in LOCKS if lock.optional}
-    active_lock_keys: list[str] = []
-    skipped_optional_lock_keys: list[str] = []
-    missing: list[tuple[int, str]] = []
-    for lock_key in DECOMPOSITION_LOCK_KEYS:
-        missing_threads = [
-            thread for thread in DECOMPOSITION_THREADS if (thread, lock_key) not in row_by_key
-        ]
-        if not missing_threads:
-            active_lock_keys.append(lock_key)
-            continue
-        if lock_key in optional_lock_keys:
-            skipped_optional_lock_keys.append(lock_key)
-            continue
-        missing.extend((thread, lock_key) for thread in missing_threads)
-    if missing:
-        missing_text = ", ".join(f"{thread}:{lock_key}" for thread, lock_key in missing)
-        raise RuntimeError(f"Missing decomposition rows: {missing_text}")
-    if not active_lock_keys:
-        raise RuntimeError("No complete lock series matched the hold/handoff decomposition plot inputs.")
-    if skipped_optional_lock_keys:
-        skipped_labels = ", ".join(lock_by_key[lock_key].label for lock_key in skipped_optional_lock_keys)
-        print(f"Skipping decomposition locks without complete data: {skipped_labels}", flush=True)
-
-    group_stride = len(active_lock_keys) + 1.7
-    bar_width = 0.72
-    x_values: list[float] = []
-    x_labels: list[str] = []
-    hold_values: list[float] = []
-    handoff_values: list[float] = []
-    group_centers: list[tuple[float, int]] = []
-
-    for group_index, thread in enumerate(DECOMPOSITION_THREADS):
-        group_start = group_index * group_stride
-        positions = [group_start + method_index for method_index in range(len(active_lock_keys))]
-        group_centers.append((sum(positions) / len(positions), thread))
-        for position, lock_key in zip(positions, active_lock_keys, strict=True):
-            row = row_by_key[(thread, lock_key)]
-            x_values.append(position)
-            x_labels.append(lock_by_key[lock_key].label)
-            hold_values.append(float(row["avg_lock_hold_ns"]))
-            handoff_values.append(float(row[HANDOFF_FIELD]))
-
-    totals = [hold + handoff for hold, handoff in zip(hold_values, handoff_values, strict=True)]
-    normal_totals = [value for value in totals if value < BROKEN_Y_UPPER_MIN]
-    lower_ylim = (0.0, max(normal_totals or totals) * 1.15)
-    upper_values = [value for value in totals if value >= BROKEN_Y_UPPER_MIN]
-    upper_ylim = (
-        BROKEN_Y_UPPER_MIN,
-        max(upper_values) * 1.08 if upper_values else BROKEN_Y_UPPER_MIN * 1.08,
-    )
-
-    fig, (upper_ax, lower_ax) = plt.subplots(
-        2,
-        1,
-        sharex=True,
-        figsize=(11.5, 6.8),
-        gridspec_kw={"height_ratios": [1.0, 2.8], "hspace": 0.06},
-    )
-
-    for ax in (upper_ax, lower_ax):
-        ax.bar(
-            x_values,
-            hold_values,
-            width=bar_width,
-            color=DECOMPOSITION_HOLD_COLOR,
-            edgecolor="0.25",
-            linewidth=0.5,
-        )
-        ax.bar(
-            x_values,
-            handoff_values,
-            bottom=hold_values,
-            width=bar_width,
-            color=DECOMPOSITION_HANDOFF_COLOR,
-            edgecolor="0.25",
-            linewidth=0.5,
-        )
-        ax.grid(True, axis="y", alpha=0.28)
-        ax.yaxis.set_major_formatter(FuncFormatter(format_ns_tick))
-
-    upper_ax.set_ylim(*upper_ylim)
-    lower_ax.set_ylim(*lower_ylim)
-    upper_ax.spines["bottom"].set_visible(False)
-    lower_ax.spines["top"].set_visible(False)
-    upper_ax.tick_params(labelbottom=False, bottom=False)
-    lower_ax.tick_params(top=False)
-
-    break_mark = 0.012
-    break_kwargs = dict(transform=upper_ax.transAxes, color="0.25", clip_on=False, linewidth=1.0)
-    upper_ax.plot((-break_mark, +break_mark), (-break_mark, +break_mark), **break_kwargs)
-    upper_ax.plot((1 - break_mark, 1 + break_mark), (-break_mark, +break_mark), **break_kwargs)
-    break_kwargs.update(transform=lower_ax.transAxes)
-    lower_ax.plot((-break_mark, +break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
-    lower_ax.plot((1 - break_mark, 1 + break_mark), (1 - break_mark, 1 + break_mark), **break_kwargs)
-
-    lower_ax.set_xlim(min(x_values) - 0.8, max(x_values) + 0.8)
-    lower_ax.set_xticks(x_values)
-    lower_ax.set_xticklabels(x_labels, rotation=32, ha="right", fontsize=8)
-    for center, thread in group_centers:
-        lower_ax.text(
-            center,
-            -0.24,
-            f"{thread} threads",
-            transform=lower_ax.get_xaxis_transform(),
-            ha="center",
-            va="top",
-            fontsize=9,
-            fontweight="bold",
-        )
-
-    upper_ax.set_title("Hold/Handoff Decomposition Under Oversubscription")
-    fig.supylabel("Time (ns)")
-    handles = [
-        Patch(facecolor=DECOMPOSITION_HOLD_COLOR, edgecolor="0.25", label="hold"),
-        Patch(facecolor=DECOMPOSITION_HANDOFF_COLOR, edgecolor="0.25", label="handoff"),
-    ]
-    upper_ax.legend(handles=handles, frameon=False, loc="upper left")
-    fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.27, hspace=0.06)
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
@@ -1373,6 +1237,7 @@ def write_plots(result_root: Path, rows: list[dict[str, str]]) -> list[Path]:
         ylabel="Average lock hold time (ns)",
         title="Lock Hold Time vs Threads",
         output_path=hold_time_path,
+        max_threads=HOLD_TIME_MAX_THREADS,
     )
     outputs.append(hold_time_path)
     handoff_path = result_root / "handoff_time_vs_threads.png"
@@ -1384,13 +1249,17 @@ def write_plots(result_root: Path, rows: list[dict[str, str]]) -> list[Path]:
         output_path=handoff_path,
     )
     outputs.append(handoff_path)
-    decomposition_path = result_root / "hold_plus_handoff_vs_threads.png"
-    try:
-        plot_hold_handoff_decomposition(rows, output_path=decomposition_path)
-    except RuntimeError as exc:
-        print(f"Skipping hold/handoff decomposition plot: {exc}", flush=True)
-    else:
-        outputs.append(decomposition_path)
+    ops_path = result_root / "ops_vs_threads.png"
+    plot_metric(
+        rows,
+        metric=THROUGHPUT_FIELD,
+        ylabel="Throughput (Mops/s)",
+        title="Throughput vs Threads",
+        output_path=ops_path,
+        value_scale=1e-6,
+        piecewise_y_scale=False,
+    )
+    outputs.append(ops_path)
     focus_path = result_root / "handoff_time_flexguard_vs_accordin.png"
     plot_focused_comparison(
         rows,

@@ -6,8 +6,10 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -15,7 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from statistics import mean
+from statistics import mean, pstdev
 from typing import Iterable
 
 import experiment_defaults
@@ -32,6 +34,7 @@ ROCKSDB_GIT_URL = "https://github.com/facebook/rocksdb.git"
 DEFAULT_WORKLOADS = ("cachebench", "rocksdb", "memcached")
 DEFAULT_ROCKSDB_BENCHMARKS = ("readrandom", "fillrandom")
 DEFAULT_ROCKSDB_COMPRESSION_TYPE = "none"
+DEFAULT_ROCKSDB_EXTRA_ARGS = ("--disable_auto_compactions=true",)
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 DEFAULT_LOCKS = experiment_defaults.DEFAULT_LOCKS
 FULL_LOCKS = experiment_defaults.FULL_LOCKS
@@ -40,17 +43,22 @@ DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
 DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_DB_NUM = 500_000
-DEFAULT_CACHEBENCH_NUM_OPS = 100_000
+DEFAULT_CACHEBENCH_NUM_OPS = 500_000
 DEFAULT_CACHEBENCH_NUM_KEYS = 1_000_000
 DEFAULT_CACHEBENCH_CACHE_MB = 512
 DEFAULT_CACHELIB_BUILD_JOBS = os.cpu_count() or 1
 DEFAULT_MEMCACHED_HOST = "127.0.0.1"
 DEFAULT_MEMCACHED_MEMORY_MB = 512
-DEFAULT_MEMTIER_CLIENT_THREADS = 1
-DEFAULT_MEMTIER_CLIENTS = 4
+DEFAULT_MEMCACHED_CONN_LIMIT = 0
+DEFAULT_MEMTIER_CLIENT_THREADS = 48
+DEFAULT_MEMTIER_CLIENTS = 32
 DEFAULT_MEMTIER_REQUESTS = 10_000
 DEFAULT_MEMTIER_RATIO = "1:10"
 DEFAULT_MEMTIER_KEY_PATTERN = "R:R"
+DEFAULT_MEMTIER_FILL_KEY_PATTERN = "P:P"
+DEFAULT_MEMTIER_KEY_MINIMUM = 1
+DEFAULT_MEMTIER_KEY_MAXIMUM = 10_000
+DEFAULT_MEMTIER_WARMUP_REQUESTS = 1_000
 DEFAULT_MEMTIER_DATA_SIZE = 128
 MEMCACHED_SYSTEM_PACKAGES = {
     "memcached": "memcached",
@@ -89,6 +97,31 @@ SUMMARY_FIELDS = (
     "mean_setup_wall_seconds",
     "runs",
 )
+OUTLIER_FIELDS = (
+    "kind",
+    "workload",
+    "benchmark",
+    "lock",
+    "threads",
+    "score",
+    "direction",
+    "mean_ops_per_second",
+    "cv_percent",
+    "runs",
+    "sample_ops_per_second",
+    "sample_wall_seconds",
+    "command_logs",
+    "setup_logs",
+    "server_logs",
+    "neighbor_threads",
+    "neighbor_ops_per_second",
+    "note",
+)
+
+REPEAT_OUTLIER_MIN_RUNS = 3
+REPEAT_OUTLIER_CV_THRESHOLD_PERCENT = 15.0
+REPEAT_OUTLIER_MAX_MIN_RATIO_THRESHOLD = 2.0
+LOCAL_SHAPE_RATIO_THRESHOLD = 2.0
 
 DB_BENCH_LATENCY_PATTERN = re.compile(
     r"^(?P<name>[A-Za-z0-9_]+)\s+:\s+(?P<micros>\d+(?:\.\d+)?)\s+micros/op"
@@ -641,6 +674,9 @@ Default benchmark settings:
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
   repeats={DEFAULT_REPEATS}, total_ops={DEFAULT_TOTAL_OPS}
   rocksdb_benchmarks={','.join(DEFAULT_ROCKSDB_BENCHMARKS)}
+  rocksdb_extra_args={' '.join(DEFAULT_ROCKSDB_EXTRA_ARGS)}
+  memtier=-t {DEFAULT_MEMTIER_CLIENT_THREADS} -c {DEFAULT_MEMTIER_CLIENTS} --requests {DEFAULT_MEMTIER_REQUESTS}
+  memtier_key_range={DEFAULT_MEMTIER_KEY_MINIMUM}..{DEFAULT_MEMTIER_KEY_MAXIMUM}, warmup_requests={DEFAULT_MEMTIER_WARMUP_REQUESTS}
   per_lock_max_threads={','.join(f"{lock}:{max_threads}" for lock, max_threads in PER_LOCK_MAX_THREADS.items())}
 
 Examples:
@@ -731,13 +767,27 @@ Examples:
         help="Allow db_bench progress output. Default: disabled to keep long experiment logs manageable.",
     )
     parser.add_argument("--rocksdb-init-existing-benchmarks", default="readrandom,readseq,seekrandom,overwrite", metavar="CSV")
-    parser.add_argument("--rocksdb-extra-arg", action="append", default=[], help="Extra argument passed through to db_bench; repeatable.")
+    parser.add_argument(
+        "--rocksdb-extra-arg",
+        action="append",
+        default=list(DEFAULT_ROCKSDB_EXTRA_ARGS),
+        help=(
+            "Extra argument passed through to db_bench; repeatable. "
+            f"Default: {' '.join(DEFAULT_ROCKSDB_EXTRA_ARGS)}."
+        ),
+    )
 
     parser.add_argument("--memcached-bin", type=Path, default=None, help="Path to memcached. Default: MEMCACHED_BIN or PATH.")
     parser.add_argument("--memtier-bin", type=Path, default=None, help="Path to memtier_benchmark. Default: MEMTIER_BIN or PATH.")
     parser.add_argument("--memcached-host", default=DEFAULT_MEMCACHED_HOST)
     parser.add_argument("--memcached-port", type=non_negative_int, default=0, help="0 chooses a free localhost port per run.")
     parser.add_argument("--memcached-memory-mb", type=positive_int, default=DEFAULT_MEMCACHED_MEMORY_MB)
+    parser.add_argument(
+        "--memcached-conn-limit",
+        type=non_negative_int,
+        default=DEFAULT_MEMCACHED_CONN_LIMIT,
+        help="Passed to memcached as -c. Default 0 auto-sizes from server threads.",
+    )
     parser.add_argument("--memcached-user", default=os.environ.get("USER", "nobody"), help="User passed with -u when memcached is launched through sudo.")
     parser.add_argument("--memcached-start-timeout", type=positive_int, default=10)
     parser.add_argument("--memtier-client-threads", type=positive_int, default=DEFAULT_MEMTIER_CLIENT_THREADS)
@@ -745,6 +795,22 @@ Examples:
     parser.add_argument("--memtier-requests", type=positive_int, default=DEFAULT_MEMTIER_REQUESTS)
     parser.add_argument("--memtier-ratio", default=DEFAULT_MEMTIER_RATIO)
     parser.add_argument("--memtier-key-pattern", default=DEFAULT_MEMTIER_KEY_PATTERN)
+    parser.add_argument("--memtier-key-minimum", type=non_negative_int, default=DEFAULT_MEMTIER_KEY_MINIMUM)
+    parser.add_argument("--memtier-key-maximum", type=non_negative_int, default=DEFAULT_MEMTIER_KEY_MAXIMUM)
+    parser.add_argument("--memtier-no-fill", action="store_true", help="Skip the SET-only key fill before measured memtier runs.")
+    parser.add_argument(
+        "--memtier-fill-requests",
+        type=non_negative_int,
+        default=0,
+        help="SET-only fill requests per memtier client. Default 0 covers the configured key range once.",
+    )
+    parser.add_argument("--memtier-fill-key-pattern", default=DEFAULT_MEMTIER_FILL_KEY_PATTERN)
+    parser.add_argument(
+        "--memtier-warmup-requests",
+        type=non_negative_int,
+        default=DEFAULT_MEMTIER_WARMUP_REQUESTS,
+        help="Unmeasured warmup requests per memtier client after fill. 0 disables warmup.",
+    )
     parser.add_argument("--memtier-data-size", type=positive_int, default=DEFAULT_MEMTIER_DATA_SIZE)
     parser.add_argument("--memtier-extra-arg", action="append", default=[], help="Extra argument passed through to memtier_benchmark; repeatable.")
     return parser.parse_args()
@@ -821,10 +887,20 @@ def build_lock_command(
     *,
     extra_env: dict[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str] | None]:
-    prefix, env = lock_command_prefix(lock)
-    full_command = [*prefix, *command]
-    env = merge_envs(extra_env, env)
-    return experiment_three.benchmark_command(lock, full_command, env)
+    if lock == "stock":
+        return command, extra_env
+    if lock == "mcs_tas_accordin":
+        env = merge_envs(extra_env, experiment_three.accordin_preload_env(experiment_three.ACCORDIN_PRELOAD_LIBRARY))
+        return experiment_three.benchmark_command(lock, command, env)
+    if lock == "mcs_extension":
+        env = merge_envs(
+            extra_env,
+            {"LD_PRELOAD": experiment_three.combine_ld_preload(experiment_three.MCS_EXTENSION_PRELOAD_LIBRARY)},
+        )
+        return experiment_three.benchmark_command(lock, command, env)
+
+    prefix, env = experiment_three.interpose_command(lock, extra_env)
+    return [*prefix, *command], env
 
 
 def ensure_lock_helpers(
@@ -1301,10 +1377,24 @@ def completed_rows_from_records(
             record, output, log_path = completed
             wall_seconds = record_wall_seconds(record, output)
             ops_per_second = parse_memtier_ops_per_second(output)
-            total_ops = args.memtier_client_threads * args.memtier_clients * args.memtier_requests
+            total_ops = memtier_total_requests(args)
             if ops_per_second is None and wall_seconds > 0.0:
                 ops_per_second = total_ops / wall_seconds
             server_log = result_root / "server_logs" / log_name
+            setup_log_names: list[str] = []
+            if not args.memtier_no_fill:
+                setup_log_names.append(f"fill_memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log")
+            if args.memtier_warmup_requests > 0:
+                setup_log_names.append(f"warmup_memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log")
+            setup_wall_seconds = 0.0
+            setup_logs: list[str] = []
+            for setup_log_name in setup_log_names:
+                setup_completed = records_by_log.get(setup_log_name)
+                if setup_completed is None:
+                    continue
+                setup_record, setup_output, setup_path = setup_completed
+                setup_wall_seconds += record_wall_seconds(setup_record, setup_output)
+                setup_logs.append(relative_log(result_root, setup_path))
             rows.append(
                 {
                     "workload": workload,
@@ -1315,10 +1405,10 @@ def completed_rows_from_records(
                     "ops_per_second": "" if ops_per_second is None else format_float(ops_per_second),
                     "latency_micros_per_op": "",
                     "wall_seconds": format_float(wall_seconds),
-                    "setup_wall_seconds": "",
+                    "setup_wall_seconds": format_float(setup_wall_seconds) if setup_wall_seconds > 0.0 else "",
                     "total_ops": str(total_ops),
                     "command_log": relative_log(result_root, log_path),
-                    "setup_log": "",
+                    "setup_log": ";".join(setup_logs),
                     "server_log": relative_log(result_root, server_log) if server_log.is_file() else "",
                 }
             )
@@ -1344,7 +1434,7 @@ def write_cachebench_config(
         config = {
             "cache_config": {
                 "cacheSizeMB": args.cachebench_cache_mb,
-                "poolRebalanceIntervalSec": 1,
+                "poolRebalanceIntervalSec": 0,
                 "moveOnSlabRelease": False,
                 "numPools": 1,
                 "poolSizes": [1.0],
@@ -1482,6 +1572,7 @@ def build_db_bench_args(
     num: int,
     use_existing_db: bool,
     reads: int | None,
+    writes: int | None,
     compression_type: str,
     progress_reports: bool,
     extra_args: list[str],
@@ -1496,6 +1587,8 @@ def build_db_bench_args(
     ]
     if reads is not None:
         command.append(f"--reads={reads}")
+    if writes is not None:
+        command.append(f"--writes={writes}")
     if compression_type:
         command.append(f"--compression_type={compression_type}")
     if not progress_reports:
@@ -1548,11 +1641,13 @@ def run_rocksdb(
                 if uses_reads:
                     db_bench_num = args.db_num
                     reads_per_thread = ceil_div(args.total_ops, thread)
+                    writes_per_thread = None
                     effective_total_ops = reads_per_thread * thread
                 else:
-                    db_bench_num = ceil_div(args.total_ops, thread)
+                    db_bench_num = args.db_num
                     reads_per_thread = None
-                    effective_total_ops = db_bench_num * thread
+                    writes_per_thread = ceil_div(args.total_ops, thread)
+                    effective_total_ops = writes_per_thread * thread
                 for repeat in range(1, repeats + 1):
                     key = ("rocksdb", benchmark, lock, thread, repeat)
                     if key in completed_keys:
@@ -1570,6 +1665,7 @@ def run_rocksdb(
                                 num=args.db_num,
                                 use_existing_db=False,
                                 reads=None,
+                                writes=None,
                                 compression_type=args.rocksdb_compression_type,
                                 progress_reports=args.rocksdb_progress_reports,
                                 extra_args=args.rocksdb_extra_arg,
@@ -1591,6 +1687,7 @@ def run_rocksdb(
                             num=db_bench_num,
                             use_existing_db=use_existing_db,
                             reads=reads_per_thread,
+                            writes=writes_per_thread,
                             compression_type=args.rocksdb_compression_type,
                             progress_reports=args.rocksdb_progress_reports,
                             extra_args=args.rocksdb_extra_arg,
@@ -1638,10 +1735,35 @@ def choose_free_port(host: str) -> int:
         return int(sock.getsockname()[1])
 
 
-def wait_for_tcp(host: str, port: int, timeout_seconds: int) -> None:
+def tail_file(path: Path, max_lines: int = 20) -> str:
+    try:
+        return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:])
+    except OSError:
+        return ""
+
+
+def wait_for_tcp(
+    host: str,
+    port: int,
+    timeout_seconds: int,
+    *,
+    process: subprocess.Popen[str] | None = None,
+    log_path: Path | None = None,
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     last_error: OSError | None = None
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            detail = (
+                f"memcached exited before accepting connections on {host}:{port} "
+                f"(returncode {process.returncode})"
+            )
+            if log_path is not None:
+                detail += f"; server log: {log_path}"
+                log_tail = tail_file(log_path)
+                if log_tail:
+                    detail += f"\nserver log tail:\n{log_tail}"
+            raise RuntimeError(detail)
         try:
             with socket.create_connection((host, port), timeout=0.2):
                 return
@@ -1662,8 +1784,154 @@ def terminate_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
+def terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process_group_id = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    process.wait(timeout=5)
+
+
 def command_uses_sudo(command: list[str]) -> bool:
     return bool(command) and Path(command[0]).name == "sudo"
+
+
+def memcached_conn_limit_for_thread(thread: int, args: argparse.Namespace) -> int:
+    if args.memcached_conn_limit > 0:
+        return args.memcached_conn_limit
+    client_connections = args.memtier_client_threads * args.memtier_clients
+    return max(1024, thread * 16, client_connections * 4)
+
+
+def memtier_client_count(args: argparse.Namespace) -> int:
+    return args.memtier_client_threads * args.memtier_clients
+
+
+def memtier_total_requests(args: argparse.Namespace) -> int:
+    return memtier_client_count(args) * args.memtier_requests
+
+
+def memtier_key_count(args: argparse.Namespace) -> int:
+    return args.memtier_key_maximum - args.memtier_key_minimum + 1
+
+
+def memtier_fill_requests(args: argparse.Namespace) -> int:
+    if args.memtier_fill_requests > 0:
+        return args.memtier_fill_requests
+    return ceil_div(memtier_key_count(args), memtier_client_count(args))
+
+
+def memtier_command(
+    memtier_bin: Path,
+    *,
+    host: str,
+    port: int,
+    client_threads: int,
+    clients: int,
+    requests: int,
+    ratio: str,
+    key_pattern: str,
+    args: argparse.Namespace,
+) -> list[str]:
+    command = [
+        str(memtier_bin),
+        "-s",
+        host,
+        "-p",
+        str(port),
+        "--protocol=memcache_text",
+        "-t",
+        str(client_threads),
+        "-c",
+        str(clients),
+        "--requests",
+        str(requests),
+        "--ratio",
+        ratio,
+        "--key-pattern",
+        key_pattern,
+        "--key-minimum",
+        str(args.memtier_key_minimum),
+        "--key-maximum",
+        str(args.memtier_key_maximum),
+        "--data-size",
+        str(args.memtier_data_size),
+        "--hide-histogram",
+    ]
+    command.extend(args.memtier_extra_arg)
+    return command
+
+
+def run_memtier_setup(
+    result_root: Path,
+    *,
+    lock: str,
+    thread: int,
+    repeat: int,
+    port: int,
+    memtier_bin: Path,
+    args: argparse.Namespace,
+    logger: experiment_three.CommandLogger,
+) -> tuple[float, str]:
+    setup_wall_seconds = 0.0
+    setup_logs: list[str] = []
+
+    if not args.memtier_no_fill:
+        result = logger.run(
+            memtier_command(
+                memtier_bin,
+                host=args.memcached_host,
+                port=port,
+                client_threads=args.memtier_client_threads,
+                clients=args.memtier_clients,
+                requests=memtier_fill_requests(args),
+                ratio="1:0",
+                key_pattern=args.memtier_fill_key_pattern,
+                args=args,
+            ),
+            log_name=f"fill_memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
+            cwd=REPO_ROOT,
+        )
+        setup_wall_seconds += result.wall_seconds
+        setup_logs.append(relative_log(result_root, result.log_path))
+
+    if args.memtier_warmup_requests > 0:
+        result = logger.run(
+            memtier_command(
+                memtier_bin,
+                host=args.memcached_host,
+                port=port,
+                client_threads=args.memtier_client_threads,
+                clients=args.memtier_clients,
+                requests=args.memtier_warmup_requests,
+                ratio=args.memtier_ratio,
+                key_pattern=args.memtier_key_pattern,
+                args=args,
+            ),
+            log_name=f"warmup_memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
+            cwd=REPO_ROOT,
+        )
+        setup_wall_seconds += result.wall_seconds
+        setup_logs.append(relative_log(result_root, result.log_path))
+
+    return setup_wall_seconds, ";".join(setup_logs)
 
 
 def run_memcached(
@@ -1703,6 +1971,8 @@ def run_memcached(
                     str(thread),
                     "-m",
                     str(args.memcached_memory_mb),
+                    "-c",
+                    str(memcached_conn_limit_for_thread(thread, args)),
                 ]
                 locked_server_command, server_env = build_lock_command(lock, server_command)
                 if command_uses_sudo(locked_server_command):
@@ -1723,38 +1993,44 @@ def run_memcached(
                         stdout=server_log_file,
                         stderr=subprocess.STDOUT,
                         text=True,
+                        start_new_session=True,
                     )
                     try:
-                        wait_for_tcp(args.memcached_host, port, args.memcached_start_timeout)
-                        client_command = [
-                            str(memtier_bin),
-                            "-s",
+                        wait_for_tcp(
                             args.memcached_host,
-                            "-p",
-                            str(port),
-                            "--protocol=memcache_text",
-                            "-t",
-                            str(args.memtier_client_threads),
-                            "-c",
-                            str(args.memtier_clients),
-                            "--requests",
-                            str(args.memtier_requests),
-                            "--ratio",
-                            args.memtier_ratio,
-                            "--key-pattern",
-                            args.memtier_key_pattern,
-                            "--data-size",
-                            str(args.memtier_data_size),
-                            "--hide-histogram",
-                        ]
-                        client_command.extend(args.memtier_extra_arg)
+                            port,
+                            args.memcached_start_timeout,
+                            process=server_process,
+                            log_path=server_log,
+                        )
+                        setup_wall_seconds, setup_log = run_memtier_setup(
+                            result_root,
+                            lock=lock,
+                            thread=thread,
+                            repeat=repeat,
+                            port=port,
+                            memtier_bin=memtier_bin,
+                            args=args,
+                            logger=logger,
+                        )
+                        client_command = memtier_command(
+                            memtier_bin,
+                            host=args.memcached_host,
+                            port=port,
+                            client_threads=args.memtier_client_threads,
+                            clients=args.memtier_clients,
+                            requests=args.memtier_requests,
+                            ratio=args.memtier_ratio,
+                            key_pattern=args.memtier_key_pattern,
+                            args=args,
+                        )
                         result = logger.run(
                             client_command,
                             log_name=f"memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
                             cwd=REPO_ROOT,
                         )
                         ops_per_second = parse_memtier_ops_per_second(result.output)
-                        total_ops = args.memtier_client_threads * args.memtier_clients * args.memtier_requests
+                        total_ops = memtier_total_requests(args)
                         if ops_per_second is None and result.wall_seconds > 0.0:
                             ops_per_second = total_ops / result.wall_seconds
                         rows.append(
@@ -1767,17 +2043,17 @@ def run_memcached(
                                 "ops_per_second": "" if ops_per_second is None else format_float(ops_per_second),
                                 "latency_micros_per_op": "",
                                 "wall_seconds": format_float(result.wall_seconds),
-                                "setup_wall_seconds": "",
+                                "setup_wall_seconds": format_float(setup_wall_seconds) if setup_wall_seconds > 0.0 else "",
                                 "total_ops": str(total_ops),
                                 "command_log": relative_log(result_root, result.log_path),
-                                "setup_log": "",
+                                "setup_log": setup_log,
                                 "server_log": relative_log(result_root, server_log),
                             }
                         )
                         completed_keys.add(key)
                         write_progress_csvs(result_root, rows)
                     finally:
-                        terminate_process(server_process)
+                        terminate_process_group(server_process)
                         server_log_file.write(f"\nserver_returncode: {server_process.returncode}\n")
 
     return rows
@@ -1848,6 +2124,292 @@ def write_summary_csv(result_root: Path, rows: list[dict[str, str]]) -> Path:
         writer.writeheader()
         writer.writerows(rows)
     return path
+
+
+def optional_float(value: str) -> float | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        return float(stripped)
+    except ValueError:
+        return None
+
+
+def optional_int(value: str) -> int | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        return None
+
+
+def outlier_sort_key(row: dict[str, str]) -> tuple[tuple[int, str], tuple[int, str], tuple[int, str], int, str]:
+    thread = optional_int(row["threads"])
+    return (
+        workload_sort_key(row["workload"]),
+        benchmark_sort_key(row["workload"], row["benchmark"]),
+        lock_sort_key(row["lock"]),
+        -1 if thread is None else thread,
+        row["kind"],
+    )
+
+
+def raw_group_key(row: dict[str, str]) -> tuple[str, str, str, int] | None:
+    thread = optional_int(row["threads"])
+    if thread is None:
+        return None
+    return (row["workload"], row["benchmark"], row["lock"], thread)
+
+
+def sample_field(rows: list[dict[str, str]], field: str) -> str:
+    samples: list[str] = []
+    for row in sorted(rows, key=lambda item: optional_int(item["repeat"]) or 0):
+        value = row[field].strip()
+        if not value:
+            continue
+        repeat = optional_int(row["repeat"])
+        prefix = f"r{repeat}" if repeat is not None else "r?"
+        samples.append(f"{prefix}:{value}")
+    return "; ".join(samples)
+
+
+def log_field(rows: list[dict[str, str]], field: str) -> str:
+    values = []
+    seen = set()
+    for row in sorted(rows, key=lambda item: optional_int(item["repeat"]) or 0):
+        value = row[field].strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return "; ".join(values)
+
+
+def raw_groups_by_point(raw_rows: list[dict[str, str]]) -> dict[tuple[str, str, str, int], list[dict[str, str]]]:
+    groups: dict[tuple[str, str, str, int], list[dict[str, str]]] = {}
+    for row in raw_rows:
+        key = raw_group_key(row)
+        if key is not None:
+            groups.setdefault(key, []).append(row)
+    return groups
+
+
+def detect_repeat_outliers(
+    raw_groups: dict[tuple[str, str, str, int], list[dict[str, str]]],
+) -> list[dict[str, str]]:
+    outliers: list[dict[str, str]] = []
+    for workload, benchmark, lock, thread in sorted(
+        raw_groups.keys(),
+        key=lambda item: (workload_sort_key(item[0]), benchmark_sort_key(item[0], item[1]), lock_sort_key(item[2]), item[3]),
+    ):
+        group_rows = raw_groups[(workload, benchmark, lock, thread)]
+        samples = [
+            (row, value)
+            for row in group_rows
+            if (value := optional_float(row["ops_per_second"])) is not None
+        ]
+        if len(samples) < REPEAT_OUTLIER_MIN_RUNS:
+            continue
+
+        values = [value for _, value in samples]
+        mean_value = mean(values)
+        if mean_value <= 0.0:
+            continue
+        cv_percent = pstdev(values) / mean_value * 100.0 if len(values) > 1 else 0.0
+        positive_values = [value for value in values if value > 0.0]
+        max_min_ratio = (
+            max(positive_values) / min(positive_values)
+            if len(positive_values) >= 2 and min(positive_values) > 0.0
+            else 1.0
+        )
+        if (
+            cv_percent < REPEAT_OUTLIER_CV_THRESHOLD_PERCENT
+            and max_min_ratio < REPEAT_OUTLIER_MAX_MIN_RATIO_THRESHOLD
+        ):
+            continue
+
+        score = max(
+            cv_percent / REPEAT_OUTLIER_CV_THRESHOLD_PERCENT,
+            max_min_ratio / REPEAT_OUTLIER_MAX_MIN_RATIO_THRESHOLD,
+        )
+        outliers.append(
+            {
+                "kind": "repeat_variation",
+                "workload": workload,
+                "benchmark": benchmark,
+                "lock": lock,
+                "threads": str(thread),
+                "score": format_float(score),
+                "direction": "variable",
+                "mean_ops_per_second": format_float(mean_value),
+                "cv_percent": format_float(cv_percent),
+                "runs": str(len(samples)),
+                "sample_ops_per_second": sample_field(group_rows, "ops_per_second"),
+                "sample_wall_seconds": sample_field(group_rows, "wall_seconds"),
+                "command_logs": log_field(group_rows, "command_log"),
+                "setup_logs": log_field(group_rows, "setup_log"),
+                "server_logs": log_field(group_rows, "server_log"),
+                "neighbor_threads": "",
+                "neighbor_ops_per_second": "",
+                "note": f"repeat CV >= {REPEAT_OUTLIER_CV_THRESHOLD_PERCENT:g}% or max/min >= {REPEAT_OUTLIER_MAX_MIN_RATIO_THRESHOLD:g}x; max/min={max_min_ratio:.2f}x",
+            }
+        )
+    return outliers
+
+
+def detect_local_shape_outliers(
+    summary_rows: list[dict[str, str]],
+    raw_groups: dict[tuple[str, str, str, int], list[dict[str, str]]],
+) -> list[dict[str, str]]:
+    curves: dict[tuple[str, str, str], dict[int, float]] = {}
+    for row in summary_rows:
+        value = optional_float(row["mean_ops_per_second"])
+        thread = optional_int(row["threads"])
+        if value is None or thread is None or value <= 0.0:
+            continue
+        curves.setdefault((row["workload"], row["benchmark"], row["lock"]), {})[thread] = value
+
+    outliers: list[dict[str, str]] = []
+    for workload, benchmark, lock in sorted(
+        curves.keys(),
+        key=lambda item: (workload_sort_key(item[0]), benchmark_sort_key(item[0], item[1]), lock_sort_key(item[2])),
+    ):
+        points = curves[(workload, benchmark, lock)]
+        thread_values = sorted(points)
+        if len(thread_values) < 3:
+            continue
+        for index in range(1, len(thread_values) - 1):
+            prev_thread = thread_values[index - 1]
+            thread = thread_values[index]
+            next_thread = thread_values[index + 1]
+            prev_value = points[prev_thread]
+            value = points[thread]
+            next_value = points[next_thread]
+            if prev_value <= 0.0 or next_value <= 0.0:
+                continue
+            expected = math.sqrt(prev_value * next_value)
+            if expected <= 0.0:
+                continue
+            ratio = value / expected
+            if ratio < LOCAL_SHAPE_RATIO_THRESHOLD and ratio > 1.0 / LOCAL_SHAPE_RATIO_THRESHOLD:
+                continue
+
+            group_rows = raw_groups.get((workload, benchmark, lock, thread), [])
+            direction = "peak" if ratio >= LOCAL_SHAPE_RATIO_THRESHOLD else "dip"
+            score = ratio if ratio >= 1.0 else 1.0 / ratio
+            neighbor_ops = (
+                f"{prev_thread}:{format_float(prev_value)}; "
+                f"{thread}:{format_float(value)}; "
+                f"{next_thread}:{format_float(next_value)}"
+            )
+            outliers.append(
+                {
+                    "kind": "local_shape",
+                    "workload": workload,
+                    "benchmark": benchmark,
+                    "lock": lock,
+                    "threads": str(thread),
+                    "score": format_float(score),
+                    "direction": direction,
+                    "mean_ops_per_second": format_float(value),
+                    "cv_percent": "",
+                    "runs": str(len(group_rows)),
+                    "sample_ops_per_second": sample_field(group_rows, "ops_per_second"),
+                    "sample_wall_seconds": sample_field(group_rows, "wall_seconds"),
+                    "command_logs": log_field(group_rows, "command_log"),
+                    "setup_logs": log_field(group_rows, "setup_log"),
+                    "server_logs": log_field(group_rows, "server_log"),
+                    "neighbor_threads": f"{prev_thread}; {thread}; {next_thread}",
+                    "neighbor_ops_per_second": neighbor_ops,
+                    "note": f"{direction} is {score:.2f}x away from geometric interpolation of adjacent thread points",
+                }
+            )
+    return outliers
+
+
+def detect_outliers(raw_rows: list[dict[str, str]], summary_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    raw_groups = raw_groups_by_point(raw_rows)
+    outliers = [
+        *detect_repeat_outliers(raw_groups),
+        *detect_local_shape_outliers(summary_rows, raw_groups),
+    ]
+    return sorted(outliers, key=outlier_sort_key)
+
+
+def write_outlier_csv(result_root: Path, outlier_rows: list[dict[str, str]]) -> Path:
+    path = result_root / "outliers.csv"
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTLIER_FIELDS)
+        writer.writeheader()
+        writer.writerows(outlier_rows)
+    return path
+
+
+def markdown_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", "<br>")
+
+
+def write_outlier_markdown(result_root: Path, outlier_rows: list[dict[str, str]]) -> Path:
+    path = result_root / "outliers.md"
+    lines = [
+        "# Experiment 5 Outlier Tracking",
+        "",
+        "Generated from raw.csv and summary.csv during plot generation.",
+        "",
+        "Rules:",
+        f"- repeat_variation: at least {REPEAT_OUTLIER_MIN_RUNS} repeats and CV >= {REPEAT_OUTLIER_CV_THRESHOLD_PERCENT:g}% or max/min >= {REPEAT_OUTLIER_MAX_MIN_RATIO_THRESHOLD:g}x.",
+        f"- local_shape: point is >= {LOCAL_SHAPE_RATIO_THRESHOLD:g}x above or below the geometric interpolation of adjacent thread points on the same workload/benchmark/lock curve.",
+        "",
+    ]
+    if not outlier_rows:
+        lines.append("No outliers detected.")
+    else:
+        lines.extend(
+            [
+                f"Detected {len(outlier_rows)} outlier records.",
+                "",
+                "| kind | workload | benchmark | lock | threads | direction | score | mean_ops_per_second | cv_percent | sample_ops_per_second | command_logs | note |",
+                "| --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | --- | --- | --- |",
+            ]
+        )
+        for row in outlier_rows:
+            lines.append(
+                "| "
+                + " | ".join(
+                    markdown_cell(value)
+                    for value in (
+                        row["kind"],
+                        row["workload"],
+                        row["benchmark"],
+                        lock_label(row["lock"]),
+                        row["threads"],
+                        row["direction"],
+                        row["score"],
+                        row["mean_ops_per_second"],
+                        row["cv_percent"],
+                        row["sample_ops_per_second"],
+                        row["command_logs"],
+                        row["note"],
+                    )
+                )
+                + " |"
+            )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def write_outlier_artifacts(
+    result_root: Path,
+    raw_rows: list[dict[str, str]],
+    summary_rows: list[dict[str, str]],
+) -> list[Path]:
+    outlier_rows = detect_outliers(raw_rows, summary_rows)
+    csv_path = write_outlier_csv(result_root, outlier_rows)
+    markdown_path = write_outlier_markdown(result_root, outlier_rows)
+    return [csv_path, markdown_path]
 
 
 def unique_threads(summary_rows: list[dict[str, str]], workload: str, benchmark: str) -> list[int]:
@@ -1983,11 +2545,22 @@ def write_settings(
             "host": args.memcached_host,
             "port": args.memcached_port,
             "memory_mb": args.memcached_memory_mb,
+            "conn_limit": args.memcached_conn_limit,
+            "effective_conn_limits_by_thread": {
+                str(thread): memcached_conn_limit_for_thread(thread, args)
+                for thread in threads
+            },
             "memtier_client_threads": args.memtier_client_threads,
             "memtier_clients": args.memtier_clients,
             "memtier_requests": args.memtier_requests,
             "memtier_ratio": args.memtier_ratio,
             "memtier_key_pattern": args.memtier_key_pattern,
+            "memtier_key_minimum": args.memtier_key_minimum,
+            "memtier_key_maximum": args.memtier_key_maximum,
+            "memtier_fill_enabled": not args.memtier_no_fill,
+            "memtier_fill_requests": None if args.memtier_no_fill else memtier_fill_requests(args),
+            "memtier_fill_key_pattern": args.memtier_fill_key_pattern,
+            "memtier_warmup_requests": args.memtier_warmup_requests,
             "memtier_data_size": args.memtier_data_size,
             "memtier_extra_args": list(args.memtier_extra_arg),
         },
@@ -1997,12 +2570,20 @@ def write_settings(
         f.write("\n")
 
 
-def print_outputs(result_root: Path, raw_path: Path, summary_path: Path, plot_paths: Iterable[Path]) -> None:
+def print_outputs(
+    result_root: Path,
+    raw_path: Path,
+    summary_path: Path,
+    plot_paths: Iterable[Path],
+    outlier_paths: Iterable[Path],
+) -> None:
     print(f"Result root: {result_root}")
     print(f"Raw CSV: {raw_path}")
     print(f"Summary CSV: {summary_path}")
     for plot_path in plot_paths:
         print(f"Plot: {plot_path}")
+    for outlier_path in outlier_paths:
+        print(f"Outliers: {outlier_path}")
 
 
 def main() -> int:
@@ -2027,6 +2608,9 @@ def main() -> int:
         threads = parse_csv_ints(args.threads)
         validate_benchmark_names((args.rocksdb_fill_benchmark,))
         init_existing_benchmarks(args.rocksdb_init_existing_benchmarks)
+        if args.memtier_key_maximum < args.memtier_key_minimum:
+            print("--memtier-key-maximum must be greater than or equal to --memtier-key-minimum.", file=sys.stderr)
+            return 2
 
         if args.plot_only is not None:
             result_root = resolve_path(args.plot_only)
@@ -2038,7 +2622,8 @@ def main() -> int:
             summary_rows = summarize_rows(raw_rows)
             summary_path = write_summary_csv(result_root, summary_rows)
             plot_paths = write_plots(result_root, summary_rows, skip_plots=args.skip_plots)
-            print_outputs(result_root, raw_path, summary_path, plot_paths)
+            outlier_paths = write_outlier_artifacts(result_root, raw_rows, summary_rows)
+            print_outputs(result_root, raw_path, summary_path, plot_paths, outlier_paths)
             return 0
 
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
@@ -2113,7 +2698,8 @@ def main() -> int:
         summary_rows = summarize_rows(raw_rows)
         summary_path = write_summary_csv(result_root, summary_rows)
         plot_paths = write_plots(result_root, summary_rows, skip_plots=args.skip_plots)
-        print_outputs(result_root, raw_path, summary_path, plot_paths)
+        outlier_paths = write_outlier_artifacts(result_root, raw_rows, summary_rows)
+        print_outputs(result_root, raw_path, summary_path, plot_paths, outlier_paths)
         return 0
     except experiment_three.CommandError as exc:
         print(str(exc), file=sys.stderr)

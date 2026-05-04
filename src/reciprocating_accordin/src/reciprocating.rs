@@ -6,11 +6,8 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use crate::admission::{
     mark_critical_section_entered, mark_critical_section_exit, mark_slow_path_pending,
 };
-use crate::arch::pause;
+use crate::arch::{CacheAligned, pause};
 use crate::lock_backend::LockBackend;
-
-#[repr(align(64))]
-struct CacheAligned<T>(T);
 
 #[repr(C, align(128))]
 pub struct WaitElement {

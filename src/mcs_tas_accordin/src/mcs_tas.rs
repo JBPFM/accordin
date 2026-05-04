@@ -2,11 +2,8 @@ use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use crate::arch::pause;
+use crate::arch::{CacheAligned, pause};
 use crate::lock_backend::LockBackend;
-
-#[repr(align(64))]
-struct CacheAligned<T>(T);
 
 #[repr(C, align(64))]
 pub struct Node {

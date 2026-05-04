@@ -14,7 +14,9 @@ const DYNAMIC_CPU_WINDOW_NS_ENV: &str = "ACCORDIN_DYNAMIC_CPU_WINDOW_NS";
 
 const DEFAULT_SAMPLE_STRIDE: u64 = 8;
 const DEFAULT_DYNAMIC_CPU_WINDOW_NS: u64 = 1_000_000;
-const DYNAMIC_CPU_EWMA_ALPHA: f64 = 0.2;
+const DYNAMIC_CPU_CRITICAL_EWMA_ALPHA: f64 = 0.5;
+const DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA: f64 = 0.1;
+const DYNAMIC_CPU_MAX_TARGET_MULTIPLIER: usize = 8;
 
 /// Per-thread lock statistics storage used by print_process_stats.
 #[repr(C)]
@@ -98,7 +100,9 @@ impl ThreadStatsAux {
 #[derive(Default)]
 struct WindowControlState {
     last_dynamic_cpu_count: Option<usize>,
-    ewma_target: Option<f64>,
+    target_cpu_limit: Option<usize>,
+    critical_ewma_ns: Option<f64>,
+    outside_ewma_ns: Option<f64>,
     frozen: bool,
 }
 
@@ -369,7 +373,8 @@ pub fn print_process_stats(label: &str) {
     if let Some(cpu_count) = cpu_affinity::current_dynamic_cpu_count() {
         println!("dynamic_cpu_affinity_cpus: {cpu_count}");
         println!("dynamic_cpu_window_ns: {}", dynamic_cpu_window_ns());
-        println!("dynamic_cpu_ewma_alpha: {DYNAMIC_CPU_EWMA_ALPHA:.2}");
+        println!("dynamic_cpu_critical_ewma_alpha: {DYNAMIC_CPU_CRITICAL_EWMA_ALPHA:.2}");
+        println!("dynamic_cpu_outside_ewma_alpha: {DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA:.2}");
     }
 }
 
@@ -594,10 +599,6 @@ fn run_dynamic_cpu_control_tick() {
     let Some((critical_avg_ns, outside_avg_ns)) = take_dynamic_sample_averages() else {
         return;
     };
-    let Some(target) = dynamic_cpu_target_from_sample_averages(critical_avg_ns, outside_avg_ns)
-    else {
-        return;
-    };
 
     let mut control = dynamic_cpu_control_state()
         .lock()
@@ -606,12 +607,19 @@ fn run_dynamic_cpu_control_tick() {
         return;
     }
 
-    let ewma_target = next_ewma_target(control.ewma_target, target);
-    control.ewma_target = Some(ewma_target);
-    let rounded_target = dynamic_cpu_count_from_target(ewma_target);
     let current_cpu_count = control
         .last_dynamic_cpu_count
         .or_else(cpu_affinity::current_dynamic_cpu_count);
+    let target_cpu_limit = dynamic_cpu_target_limit(&mut control, current_cpu_count);
+    let Some(smoothed_target) = dynamic_cpu_target_from_smoothed_components(
+        &mut control,
+        critical_avg_ns,
+        outside_avg_ns,
+        target_cpu_limit,
+    ) else {
+        return;
+    };
+    let rounded_target = dynamic_cpu_count_from_target(smoothed_target);
 
     if dynamic_cpu_count_within_dead_zone(current_cpu_count, rounded_target) {
         control.last_dynamic_cpu_count = current_cpu_count;
@@ -673,11 +681,64 @@ fn dynamic_cpu_target_from_sample_averages(critical_ns: f64, outside_ns: f64) ->
     Some(target)
 }
 
-fn next_ewma_target(previous: Option<f64>, value: f64) -> f64 {
+fn dynamic_cpu_target_from_smoothed_components(
+    control: &mut WindowControlState,
+    critical_ns: f64,
+    outside_ns: f64,
+    target_cpu_limit: Option<usize>,
+) -> Option<f64> {
+    let valid_sample =
+        critical_ns.is_finite() && outside_ns.is_finite() && critical_ns > 0.0 && outside_ns >= 0.0;
+    if !valid_sample {
+        return None;
+    }
+
+    let target_cpu_limit = target_cpu_limit.map(|limit| limit.max(1) as f64);
+    let max_outside_to_critical_ratio = target_cpu_limit.map(|limit| (limit - 1.0).max(0.0));
+    let outside_ns = max_outside_to_critical_ratio
+        .map(|ratio| outside_ns.min(critical_ns * ratio))
+        .unwrap_or(outside_ns);
+
+    let critical_ewma_ns = next_ewma(
+        control.critical_ewma_ns,
+        critical_ns,
+        DYNAMIC_CPU_CRITICAL_EWMA_ALPHA,
+    );
+    let outside_ewma_ns = next_ewma(
+        control.outside_ewma_ns,
+        outside_ns,
+        DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA,
+    );
+    let outside_ewma_ns = max_outside_to_critical_ratio
+        .map(|ratio| outside_ewma_ns.min(critical_ewma_ns * ratio))
+        .unwrap_or(outside_ewma_ns);
+    let target = dynamic_cpu_target_from_sample_averages(critical_ewma_ns, outside_ewma_ns)?;
+    let target = target_cpu_limit
+        .map(|limit| target.min(limit))
+        .unwrap_or(target);
+
+    control.critical_ewma_ns = Some(critical_ewma_ns);
+    control.outside_ewma_ns = Some(outside_ewma_ns);
+    Some(target)
+}
+
+fn dynamic_cpu_target_limit(
+    control: &mut WindowControlState,
+    current_cpu_count: Option<usize>,
+) -> Option<usize> {
+    if control.target_cpu_limit.is_none() {
+        control.target_cpu_limit = current_cpu_count.map(|count| {
+            count
+                .max(1)
+                .saturating_mul(DYNAMIC_CPU_MAX_TARGET_MULTIPLIER)
+        });
+    }
+    control.target_cpu_limit
+}
+
+fn next_ewma(previous: Option<f64>, value: f64, alpha: f64) -> f64 {
     match previous {
-        Some(previous) => {
-            DYNAMIC_CPU_EWMA_ALPHA * value + (1.0 - DYNAMIC_CPU_EWMA_ALPHA) * previous
-        }
+        Some(previous) => alpha * value + (1.0 - alpha) * previous,
         None => value,
     }
 }
@@ -744,12 +805,13 @@ pub fn dynamic_cpu_affinity_begin_measurement_for_thread() {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SAMPLE_STRIDE, DYNAMIC_CPU_EWMA_ALPHA, ThreadStatsAux, advance_periodic_sample,
+        DEFAULT_SAMPLE_STRIDE, DYNAMIC_CPU_CRITICAL_EWMA_ALPHA, DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA,
+        ThreadStatsAux, WindowControlState, advance_periodic_sample,
         begin_outside_gap_sample_with_enabled, decide_operation_sampling_with_enabled,
         dynamic_cpu_count_from_target, dynamic_cpu_count_within_dead_zone,
-        dynamic_cpu_target_from_sample_averages, dynamic_sample_averages,
-        finish_outside_gap_sample, next_ewma_target, parse_dynamic_cpu_window_ns,
-        parse_sample_stride, record_lock_acquired, record_post_unlock,
+        dynamic_cpu_target_from_sample_averages, dynamic_cpu_target_from_smoothed_components,
+        dynamic_cpu_target_limit, dynamic_sample_averages, finish_outside_gap_sample, next_ewma,
+        parse_dynamic_cpu_window_ns, parse_sample_stride, record_lock_acquired, record_post_unlock,
         refresh_thread_elapsed_for_aux,
     };
 
@@ -961,12 +1023,64 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_cpu_ewma_uses_alpha_point_two() {
-        assert_eq!(next_ewma_target(None, 5.0), 5.0);
+    fn ewma_uses_supplied_alpha() {
+        assert_eq!(next_ewma(None, 5.0, 0.2), 5.0);
+        assert_eq!(next_ewma(Some(5.0), 15.0, 0.2), 0.2 * 15.0 + 0.8 * 5.0);
+        assert_eq!(next_ewma(Some(5.0), 15.0, 0.5), 0.5 * 15.0 + 0.5 * 5.0);
+    }
+
+    #[test]
+    fn dynamic_cpu_target_uses_component_ewmas() {
+        let mut control = WindowControlState::default();
+
         assert_eq!(
-            next_ewma_target(Some(5.0), 15.0),
-            DYNAMIC_CPU_EWMA_ALPHA * 15.0 + (1.0 - DYNAMIC_CPU_EWMA_ALPHA) * 5.0
+            dynamic_cpu_target_from_smoothed_components(&mut control, 100.0, 100.0, None),
+            Some(2.0)
         );
+        assert_eq!(control.critical_ewma_ns, Some(100.0));
+        assert_eq!(control.outside_ewma_ns, Some(100.0));
+
+        let target = dynamic_cpu_target_from_smoothed_components(&mut control, 300.0, 900.0, None)
+            .expect("valid component samples should produce a target");
+        let expected_critical = DYNAMIC_CPU_CRITICAL_EWMA_ALPHA * 300.0
+            + (1.0 - DYNAMIC_CPU_CRITICAL_EWMA_ALPHA) * 100.0;
+        let expected_outside =
+            DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA * 900.0 + (1.0 - DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA) * 100.0;
+
+        assert_eq!(control.critical_ewma_ns, Some(expected_critical));
+        assert_eq!(control.outside_ewma_ns, Some(expected_outside));
+        assert!(
+            (target - (1.0 + expected_outside / expected_critical)).abs() < f64::EPSILON,
+            "target should be derived from smoothed components"
+        );
+    }
+
+    #[test]
+    fn dynamic_cpu_component_ewma_clamps_outlier_targets() {
+        let mut control = WindowControlState::default();
+
+        assert_eq!(
+            dynamic_cpu_target_from_smoothed_components(&mut control, 300.0, 3_000.0, Some(16)),
+            Some(11.0)
+        );
+
+        let target =
+            dynamic_cpu_target_from_smoothed_components(&mut control, 1.0, 10_000_000.0, Some(16))
+                .expect("clamped component samples should produce a target");
+
+        assert!(target <= 16.0);
+        assert!(
+            control.outside_ewma_ns.unwrap() <= control.critical_ewma_ns.unwrap() * 15.0,
+            "stored outside EWMA should not keep an unbounded outlier"
+        );
+    }
+
+    #[test]
+    fn dynamic_cpu_target_limit_is_based_on_initial_cpu_count() {
+        let mut control = WindowControlState::default();
+
+        assert_eq!(dynamic_cpu_target_limit(&mut control, Some(2)), Some(16));
+        assert_eq!(dynamic_cpu_target_limit(&mut control, Some(32)), Some(16));
     }
 
     #[test]

@@ -1522,7 +1522,7 @@ def write_cachebench_config(
         config = {
             "cache_config": {
                 "cacheSizeMB": args.cachebench_cache_mb,
-                "poolRebalanceIntervalSec": args.cachebench_pool_rebalance_interval_sec,
+                "poolRebalanceIntervalSec": 0,
                 "moveOnSlabRelease": False,
                 "numPools": 1,
                 "poolSizes": [1.0],

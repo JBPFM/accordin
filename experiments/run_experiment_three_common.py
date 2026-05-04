@@ -77,6 +77,7 @@ DEFAULT_STREAMCLUSTER_NUM_POINTS = 32768
 DEFAULT_STREAMCLUSTER_CHUNKSIZE = 32768
 DEFAULT_STREAMCLUSTER_CLUSTERSIZE = 2000
 DEFAULT_STREAMCLUSTER_INPUT = "none"
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 0
 MACHINE_CORE_COUNT = experiment_defaults.MACHINE_CORE_COUNT
 ACTIVE_MACHINE_CONFIG = experiment_defaults.ACTIVE_MACHINE_CONFIG
 PROFILE_ENV = experiment_defaults.PROFILE_ENV
@@ -155,12 +156,25 @@ class CommandError(RuntimeError):
         self.log_path = log_path
 
 
+def wrap_command_timeout(command: list[str], timeout_seconds: int) -> list[str]:
+    if timeout_seconds <= 0:
+        return command
+    return ["timeout", "-k", "5s", f"{timeout_seconds}s", *command]
+
+
 class CommandLogger:
-    def __init__(self, result_root: Path, *, resume: bool = False) -> None:
+    def __init__(
+        self,
+        result_root: Path,
+        *,
+        resume: bool = False,
+        command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    ) -> None:
         self.result_root = result_root
         self.log_dir = result_root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.records = self.load_records() if resume else []
+        self.command_timeout_seconds = command_timeout_seconds
 
     def load_records(self) -> list[dict[str, object]]:
         path = self.result_root / "commands.json"
@@ -179,17 +193,23 @@ class CommandLogger:
         log_name: str,
         cwd: Path = REPO_ROOT,
         env: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
     ) -> CommandResult:
+        effective_timeout = self.command_timeout_seconds if timeout_seconds is None else timeout_seconds
+        run_cmd = wrap_command_timeout(cmd, effective_timeout)
         log_path = self.log_dir / log_name
         started_at = dt.datetime.now(dt.timezone.utc)
         started_perf = time.perf_counter()
         record: dict[str, object] = {
-            "command": cmd,
-            "command_text": shlex.join(cmd),
+            "command": run_cmd,
+            "command_text": shlex.join(run_cmd),
             "cwd": str(cwd),
             "log_path": str(log_path),
             "started_at": started_at.isoformat(),
         }
+        if effective_timeout > 0:
+            record["inner_command"] = cmd
+            record["command_timeout_seconds"] = effective_timeout
         run_env = os.environ.copy()
         if env:
             run_env.update(env)
@@ -197,12 +217,15 @@ class CommandLogger:
         output_chunks: list[str] = []
         with log_path.open("w", encoding="utf-8") as log_file:
             log_file.write(f"cwd: {cwd}\n")
-            log_file.write(f"command: {shlex.join(cmd)}\n")
+            log_file.write(f"command: {shlex.join(run_cmd)}\n")
+            if effective_timeout > 0:
+                log_file.write(f"inner_command: {shlex.join(cmd)}\n")
+                log_file.write(f"command_timeout_seconds: {effective_timeout}\n")
             log_file.write(f"started_at: {started_at.isoformat()}\n\n")
             log_file.flush()
 
             process = subprocess.Popen(
-                cmd,
+                run_cmd,
                 cwd=str(cwd),
                 env=run_env,
                 stdout=subprocess.PIPE,
@@ -232,7 +255,7 @@ class CommandLogger:
 
         if returncode != 0:
             raise CommandError(
-                f"Command failed with exit code {returncode}: {shlex.join(cmd)}",
+                f"Command failed with exit code {returncode}: {shlex.join(run_cmd)}",
                 returncode,
                 log_path,
             )
@@ -252,6 +275,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
     return parsed
 
 
@@ -366,6 +396,15 @@ def parse_args(
         "--build-missing",
         action="store_true",
         help="Build missing interpose helpers or PARSEC binaries before running.",
+    )
+    parser.add_argument(
+        "--command-timeout-seconds",
+        type=non_negative_int,
+        default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        help=(
+            "Outer timeout for each logged command. 0 disables it. "
+            f"Default: {DEFAULT_COMMAND_TIMEOUT_SECONDS}."
+        ),
     )
     if fixed_benchmarks is None:
         parser.add_argument(
@@ -909,6 +948,7 @@ def write_settings(
         "machine_profile_env": PROFILE_ENV,
         "repeats": args.repeats,
         "build_missing": args.build_missing,
+        "command_timeout_seconds": args.command_timeout_seconds,
         "source": calibration.source,
         "tsc_khz": calibration.tsc_khz,
         "flexguard_dir": str(FLEXGUARD_DIR),
@@ -1479,7 +1519,11 @@ def main(
 
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root(result_prefix)
         ensure_output_root(result_root, args.force, args.resume)
-        logger = CommandLogger(result_root, resume=args.resume)
+        logger = CommandLogger(
+            result_root,
+            resume=args.resume,
+            command_timeout_seconds=args.command_timeout_seconds,
+        )
         ensure_interpose_helpers(locks, build_missing=args.build_missing, logger=logger)
         if "mcs_tas_accordin" in locks:
             ensure_accordin_preload(build_missing=args.build_missing, logger=logger)

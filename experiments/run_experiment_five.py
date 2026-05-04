@@ -46,6 +46,7 @@ DEFAULT_DB_NUM = 500_000
 DEFAULT_CACHEBENCH_NUM_OPS = 500_000
 DEFAULT_CACHEBENCH_NUM_KEYS = 1_000_000
 DEFAULT_CACHEBENCH_CACHE_MB = 512
+DEFAULT_CACHEBENCH_COMMAND_TIMEOUT_SECONDS = 300
 DEFAULT_CACHELIB_BUILD_JOBS = os.cpu_count() or 1
 DEFAULT_MEMCACHED_HOST = "127.0.0.1"
 DEFAULT_MEMCACHED_MEMORY_MB = 512
@@ -750,6 +751,15 @@ Examples:
     parser.add_argument("--cachebench-num-keys", type=positive_int, default=DEFAULT_CACHEBENCH_NUM_KEYS)
     parser.add_argument("--cachebench-cache-mb", type=positive_int, default=DEFAULT_CACHEBENCH_CACHE_MB)
     parser.add_argument("--cachebench-timeout-seconds", type=non_negative_int, default=0, help="Pass --timeout_seconds when non-zero.")
+    parser.add_argument(
+        "--cachebench-command-timeout-seconds",
+        type=non_negative_int,
+        default=DEFAULT_CACHEBENCH_COMMAND_TIMEOUT_SECONDS,
+        help=(
+            "Outer timeout for each cachebench command. 0 disables it. "
+            "Timed-out commands are accepted only when final CacheBench throughput results were already printed."
+        ),
+    )
     parser.add_argument("--cachebench-extra-arg", action="append", default=[], help="Extra argument passed through to cachebench; repeatable.")
 
     parser.add_argument("--rocksdb-dir", type=Path, default=None, help="RocksDB source/build directory. Default: ROCKSDB_HOME or local probe.")
@@ -1168,6 +1178,47 @@ def parse_cachebench_ops_per_second(output: str) -> float | None:
     return parse_generic_ops_per_second(output)
 
 
+def cachebench_printed_final_results(output: str) -> bool:
+    return "== Throughput Stats ==" in output and parse_cachebench_ops_per_second(output) is not None
+
+
+def wrap_command_timeout(command: list[str], timeout_seconds: int) -> list[str]:
+    if timeout_seconds <= 0:
+        return command
+    return ["timeout", "-k", "5s", f"{timeout_seconds}s", *command]
+
+
+def cachebench_timeout_returncode(returncode: int) -> bool:
+    return returncode in {124, 137}
+
+
+def accepted_timed_out_cachebench_result(
+    exc: experiment_three.CommandError,
+    *,
+    timeout_seconds: int,
+) -> experiment_three.CommandResult | None:
+    if not cachebench_timeout_returncode(exc.returncode):
+        return None
+    try:
+        output = exc.log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not cachebench_printed_final_results(output):
+        return None
+    wall_seconds = parse_log_wall_seconds(output)
+    if wall_seconds is None:
+        wall_seconds = float(timeout_seconds)
+    print(
+        f"Accepted timed-out CacheBench command because final throughput results were printed: {exc.log_path}",
+        flush=True,
+    )
+    return experiment_three.CommandResult(
+        log_path=exc.log_path,
+        output=output,
+        wall_seconds=wall_seconds,
+    )
+
+
 def parse_log_wall_seconds(output: str) -> float | None:
     for line in reversed(output.splitlines()):
         if not line.startswith("wall_seconds:"):
@@ -1532,12 +1583,22 @@ def run_cachebench(
                     command.append(f"--timeout_seconds={args.cachebench_timeout_seconds}")
                 command.extend(args.cachebench_extra_arg)
                 command, env = build_lock_command(lock, command, extra_env=runtime_env)
-                result = logger.run(
-                    command,
-                    log_name=f"cachebench_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
-                    cwd=REPO_ROOT,
-                    env=env,
-                )
+                log_name = f"cachebench_{safe_name(lock)}_{thread:03d}_r{repeat}.log"
+                try:
+                    result = logger.run(
+                        wrap_command_timeout(command, args.cachebench_command_timeout_seconds),
+                        log_name=log_name,
+                        cwd=REPO_ROOT,
+                        env=env,
+                    )
+                except experiment_three.CommandError as exc:
+                    accepted = accepted_timed_out_cachebench_result(
+                        exc,
+                        timeout_seconds=args.cachebench_command_timeout_seconds,
+                    )
+                    if accepted is None:
+                        raise
+                    result = accepted
                 ops_per_second = parse_cachebench_ops_per_second(result.output)
                 if ops_per_second is None and result.wall_seconds > 0.0:
                     ops_per_second = args.cachebench_num_ops / result.wall_seconds
@@ -2532,6 +2593,7 @@ def write_settings(
             "num_keys": args.cachebench_num_keys,
             "cache_mb": args.cachebench_cache_mb,
             "timeout_seconds": args.cachebench_timeout_seconds,
+            "command_timeout_seconds": args.cachebench_command_timeout_seconds,
             "extra_args": list(args.cachebench_extra_arg),
         },
         "rocksdb": {

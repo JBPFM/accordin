@@ -75,6 +75,7 @@ LATENCY_PATTERN = re.compile(
     r"^(?P<name>\w+)\s+:\s+(?P<micros>\d+(?:\.\d+)?)\s+micros/op;",
     re.MULTILINE,
 )
+LEVELDB_PROGRESS_PATTERN = re.compile(r"^\.\.\. (?:finished \d+ ops|crc=0x[0-9a-fA-F]+)\s*$")
 BENCHMARK_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 
@@ -523,6 +524,12 @@ def parse_latency(output: str, benchmark: str) -> float:
     raise RuntimeError(f"db_bench output did not contain a latency line for {benchmark}.")
 
 
+def drop_leveldb_progress_line(line: str) -> str | None:
+    if LEVELDB_PROGRESS_PATTERN.fullmatch(line.strip()):
+        return None
+    return line
+
+
 def format_float(value: float) -> str:
     return experiment_three.format_float(value)
 
@@ -918,6 +925,8 @@ def main() -> int:
         logger = experiment_three.CommandLogger(
             result_root,
             command_timeout_seconds=args.command_timeout_seconds,
+            echo_output=False,
+            output_filter=drop_leveldb_progress_line,
         )
 
         ensure_lock_helpers(locks, build_missing=args.build_missing, logger=logger)

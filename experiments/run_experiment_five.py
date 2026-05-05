@@ -1617,7 +1617,6 @@ def run_cachebench(
             for repeat in range(1, repeats + 1):
                 key = ("cachebench", "cachebench", lock, thread, repeat)
                 if key in completed_keys:
-                    print(f"Skipping completed cachebench/{lock}/{thread}/r{repeat}", flush=True)
                     continue
                 config_path = config_dir / f"cachebench_{safe_name(lock)}_{thread:03d}_r{repeat}.json"
                 write_cachebench_config(config_path, template=config_template, threads=thread, args=args)
@@ -1785,7 +1784,6 @@ def run_rocksdb(
                 for repeat in range(1, repeats + 1):
                     key = ("rocksdb", benchmark, lock, thread, repeat)
                     if key in completed_keys:
-                        print(f"Skipping completed rocksdb/{benchmark}/{lock}/{thread}/r{repeat}", flush=True)
                         continue
                     db_path = Path(tempfile.mkdtemp(prefix="experiment5_rocksdb_"))
                     setup_result: experiment_three.CommandResult | None = None
@@ -2107,7 +2105,6 @@ def run_memcached(
             for repeat in range(1, repeats + 1):
                 key = ("memcached", "memtier", lock, thread, repeat)
                 if key in completed_keys:
-                    print(f"Skipping completed memcached/{lock}/{thread}/r{repeat}", flush=True)
                     continue
                 port = args.memcached_port or choose_free_port(args.memcached_host)
                 server_command = [
@@ -2817,6 +2814,7 @@ def main() -> int:
             result_root,
             resume=args.resume,
             command_timeout_seconds=args.command_timeout_seconds,
+            echo_output=False,
         )
 
         ensure_lock_helpers(locks, build_missing=args.build_missing, logger=logger)

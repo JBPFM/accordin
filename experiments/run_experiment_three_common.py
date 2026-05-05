@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import experiment_failures
 import experiment_defaults
@@ -177,12 +177,16 @@ class CommandLogger:
         *,
         resume: bool = False,
         command_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        echo_output: bool = True,
+        output_filter: Callable[[str], str | None] | None = None,
     ) -> None:
         self.result_root = result_root
         self.log_dir = result_root / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.records = self.load_records() if resume else []
         self.command_timeout_seconds = command_timeout_seconds
+        self.echo_output = echo_output
+        self.output_filter = output_filter
 
     def load_records(self) -> list[dict[str, object]]:
         path = self.result_root / "commands.json"
@@ -243,10 +247,15 @@ class CommandLogger:
             )
             assert process.stdout is not None
             for line in process.stdout:
+                if self.output_filter is not None:
+                    line = self.output_filter(line)
+                    if line is None:
+                        continue
                 output_chunks.append(line)
                 log_file.write(line)
                 log_file.flush()
-                print(line, end="", flush=True)
+                if self.echo_output:
+                    print(line, end="", flush=True)
             returncode = process.wait()
             wall_seconds = time.perf_counter() - started_perf
 

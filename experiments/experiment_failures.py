@@ -114,8 +114,6 @@ def append_command_failure(
 
 def write_failures_csv(result_root: Path, failures: list[dict[str, str]]) -> Path | None:
     path = result_root / "failed_runs.csv"
-    if not failures:
-        return None
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FAILURE_FIELDS)
         writer.writeheader()

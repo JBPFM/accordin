@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const CPU_MASK_K_ENV: &str = "ACCORDIN_CPU_MASK_K";
 pub const CPU_MASK_K_SHORT_ENV: &str = "K";
@@ -26,6 +26,7 @@ enum CpuAffinityState {
 }
 
 static CPU_AFFINITY_STATE: OnceLock<CpuAffinityState> = OnceLock::new();
+static PROCESS_AFFINITY_CONTROL_DISABLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static CURRENT_THREAD_AFFINITY_GENERATION: Cell<u64> = const { Cell::new(0) };
@@ -39,6 +40,10 @@ pub struct DynamicCpuAffinityUpdate {
 }
 
 pub fn init_from_env(label: &str) {
+    if process_affinity_control_disabled() {
+        return;
+    }
+
     match cpu_affinity_state() {
         CpuAffinityState::Disabled => {}
         CpuAffinityState::Invalid(error) => {
@@ -64,18 +69,46 @@ pub fn init_from_env(label: &str) {
 }
 
 pub fn ensure_current_thread_affinity() {
+    if process_affinity_control_disabled() {
+        return;
+    }
+
     if let CpuAffinityState::Configured(config) = cpu_affinity_state() {
         let _ = apply_current_thread_affinity_if_needed(config);
     }
 }
 
 pub fn configured_cpu_count_env_present() -> bool {
+    if process_affinity_control_disabled() {
+        return false;
+    }
+
     configured_cpu_count_env().is_some()
+}
+
+pub fn disable_process_affinity_control() {
+    PROCESS_AFFINITY_CONTROL_DISABLED.store(true, Ordering::Release);
+}
+
+fn process_affinity_control_disabled() -> bool {
+    PROCESS_AFFINITY_CONTROL_DISABLED.load(Ordering::Acquire)
+}
+
+pub fn requested_cpu_count_from_env() -> Result<Option<usize>, String> {
+    let Some((env_name, value)) = configured_cpu_count_env() else {
+        return Ok(None);
+    };
+
+    parse_requested_cpu_count(&value, env_name).map(Some)
 }
 
 pub fn update_dynamic_cpu_count(
     requested_cpus: usize,
 ) -> Result<Option<DynamicCpuAffinityUpdate>, String> {
+    if process_affinity_control_disabled() {
+        return Ok(None);
+    }
+
     let requested_cpus = requested_cpus.max(1);
     let config = match cpu_affinity_state() {
         CpuAffinityState::Disabled => return Ok(None),
@@ -99,6 +132,10 @@ pub fn update_dynamic_cpu_count(
 }
 
 pub fn current_dynamic_cpu_count() -> Option<usize> {
+    if process_affinity_control_disabled() {
+        return None;
+    }
+
     match cpu_affinity_state() {
         CpuAffinityState::Configured(config) => {
             Some(config.active_cpu_count.load(Ordering::Acquire))

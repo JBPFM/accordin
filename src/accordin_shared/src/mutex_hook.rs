@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+use std::hint::spin_loop;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
@@ -36,8 +38,6 @@ where
     }
 
     fn lock(state: &Self::LockState) {
-        crate::admission::mark_slow_path_pending();
-        std::thread::yield_now();
         LockBackend::lock(state);
     }
 
@@ -52,6 +52,60 @@ where
 }
 
 static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
+
+#[doc(hidden)]
+pub const MAX_DISTRIBUTED_LOCK_DOMAINS: u32 = 8;
+#[doc(hidden)]
+pub const LOCK_DOMAIN_OVERFLOW: u32 = u32::MAX;
+#[doc(hidden)]
+pub const LOCK_DOMAIN_ALLOCATING: u32 = u32::MAX - 1;
+
+#[doc(hidden)]
+pub static NEXT_LOCK_DOMAIN: AtomicU32 = AtomicU32::new(1);
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn lock_domain_for_atomic(domain: &AtomicU32) -> u32 {
+    loop {
+        match domain.load(Ordering::Acquire) {
+            0 => {
+                if domain
+                    .compare_exchange(
+                        0,
+                        LOCK_DOMAIN_ALLOCATING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return allocate_lock_domain(domain);
+                }
+            }
+            LOCK_DOMAIN_ALLOCATING => spin_loop(),
+            LOCK_DOMAIN_OVERFLOW => return 0,
+            current => return current,
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn allocate_lock_domain(domain: &AtomicU32) -> u32 {
+    let next = NEXT_LOCK_DOMAIN.fetch_add(1, Ordering::AcqRel);
+    let assigned = if next <= MAX_DISTRIBUTED_LOCK_DOMAINS {
+        next
+    } else {
+        LOCK_DOMAIN_OVERFLOW
+    };
+
+    domain.store(assigned, Ordering::Release);
+
+    if assigned == LOCK_DOMAIN_OVERFLOW {
+        0
+    } else {
+        assigned
+    }
+}
 
 #[inline(always)]
 pub fn current_tid() -> u32 {
@@ -102,7 +156,7 @@ pub fn register_current_thread() -> bool {
     };
 
     let tid = current_tid();
-    let admission_word_ptr = crate::admission::user_word_addr() as u64;
+    let admission_word_ptr = crate::admission::user_ctx_addr() as u64;
     register_thread_ctx_with_map(map, tid, admission_word_ptr)
 }
 
@@ -133,6 +187,7 @@ macro_rules! export_mutex_hooks {
 
             struct HookState {
                 lock: <Backend as MutexHookBackend>::LockState,
+                domain: AtomicU32,
             }
 
             unsafe impl Send for HookState {}
@@ -175,13 +230,33 @@ macro_rules! export_mutex_hooks {
             }
 
             #[inline(always)]
-            fn lock_with_stats(lock: &<Backend as MutexHookBackend>::LockState) {
-                if Backend::try_lock(lock) {
+            fn publish_slow_path(state: &HookState) {
+                if $crate::admission::tracked_lock_depth() != 0 {
+                    return;
+                }
+
+                let domain = lock_domain_for_state(state);
+                $crate::admission::mark_slow_path_pending_for_lock(
+                    domain,
+                    state as *const HookState as u64,
+                );
+                std::thread::yield_now();
+            }
+
+            #[inline(always)]
+            fn lock_domain_for_state(state: &HookState) -> u32 {
+                $crate::mutex_hook::lock_domain_for_atomic(&state.domain)
+            }
+
+            #[inline(always)]
+            fn lock_with_stats(state: &HookState) {
+                if Backend::try_lock(&state.lock) {
                     record_lock_acquired();
                     return;
                 }
                 let wait_start = record_wait_start();
-                Backend::lock(lock);
+                publish_slow_path(state);
+                Backend::lock(&state.lock);
                 record_wait_end(wait_start);
                 record_lock_acquired();
             }
@@ -253,6 +328,7 @@ macro_rules! export_mutex_hooks {
 
                     let state = Box::new(HookState {
                         lock: Backend::create_state(),
+                        domain: AtomicU32::new(0),
                     });
                     let ptr = Box::into_raw(state);
 
@@ -423,6 +499,7 @@ macro_rules! export_mutex_hooks {
 
                     let state = Box::new(HookState {
                         lock: Backend::create_state(),
+                        domain: AtomicU32::new(0),
                     });
                     let ptr = Box::into_raw(state);
 
@@ -466,7 +543,7 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    lock_with_stats(&(*state).lock);
+                    lock_with_stats(&*state);
                     0
                 }
             }
@@ -606,7 +683,7 @@ macro_rules! export_mutex_hooks {
                     while (*cond_state).seq.load(Ordering::Acquire) == seq {
                         futex_wait(&(*cond_state).seq, seq);
                     }
-                    lock_with_stats(&(*state).lock);
+                    lock_with_stats(&*state);
                     0
                 }
             }
@@ -646,7 +723,7 @@ macro_rules! export_mutex_hooks {
                             }
                         }
                     }
-                    lock_with_stats(&(*state).lock);
+                    lock_with_stats(&*state);
                     ret
                 }
             }
@@ -657,10 +734,17 @@ macro_rules! export_mutex_hooks {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use libbpf_rs::MapFlags;
 
-    use super::{ThreadCtxMapOps, register_thread_ctx_with_map, unregister_thread_ctx_with_map};
+    use super::{
+        NEXT_LOCK_DOMAIN, ThreadCtxMapOps, lock_domain_for_atomic, register_thread_ctx_with_map,
+        unregister_thread_ctx_with_map,
+    };
+
+    static DOMAIN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum MapCall {
@@ -731,5 +815,29 @@ mod tests {
                 key: 11u32.to_ne_bytes().to_vec(),
             }]
         );
+    }
+
+    #[test]
+    fn concurrent_lock_domain_allocation_consumes_one_id() {
+        let _guard = DOMAIN_TEST_LOCK.lock().unwrap();
+        NEXT_LOCK_DOMAIN.store(1, Ordering::SeqCst);
+
+        let domain = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(Barrier::new(16));
+        let mut threads = Vec::new();
+
+        for _ in 0..16 {
+            let domain = Arc::clone(&domain);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                lock_domain_for_atomic(&domain)
+            }));
+        }
+
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), 1);
+        }
+        assert_eq!(NEXT_LOCK_DOMAIN.load(Ordering::SeqCst), 2);
     }
 }

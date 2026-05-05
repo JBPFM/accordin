@@ -41,6 +41,27 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, MAX_LOCK_DOMAINS);
+  __type(key, __u32);
+  __type(value, struct lock_domain_state);
+} lock_domain_state_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, DOMAIN_CPU_SLOTS);
+  __type(key, __u32);
+  __type(value, __u32);
+} domain_cpu_owner_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, MAX_CPUS);
+  __type(key, __u32);
+  __type(value, __u32);
+} cpu_lock_rr_cursor_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, STAT_NR);
   __type(key, __u32);
   __type(value, __u64);
@@ -49,5 +70,8 @@ struct {
 volatile __u32 stats_only_mode = 0;
 volatile __u64 dbg_acct_calls = 0;
 volatile __u64 dbg_acct_read_ok = 0;
+
+const volatile __u32 distributed_inactive_pool = 0;
+const volatile __u32 initial_lock_budget = 0;
 
 #endif /* __MAPS_BPF_H */

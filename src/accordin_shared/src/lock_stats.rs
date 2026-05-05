@@ -415,7 +415,7 @@ pub fn record_wait_end(wait_start: u64) {
 
 #[inline(always)]
 pub fn record_lock_acquired() {
-    admission::mark_critical_section_entered();
+    admission::mark_critical_section_entered_from_hook();
 
     unsafe {
         let aux = &mut *thread_aux();

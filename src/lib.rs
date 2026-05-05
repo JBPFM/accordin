@@ -27,6 +27,7 @@ const SCHEDULER_NAME: &str = "accordin";
 const DISABLE_BPF_ENV: &str = "ACCORDIN_DISABLE_BPF";
 const STATS_ONLY_ENV: &str = "ACCORDIN_STATS_ONLY";
 const DEBUG_COUNTERS_ENV: &str = "ACCORDIN_DEBUG_COUNTERS";
+const INACTIVE_POOL_ENV: &str = "ACCORDIN_INACTIVE_POOL";
 
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
 
@@ -38,7 +39,13 @@ struct SchedulerState {
 unsafe impl Send for SchedulerState {}
 unsafe impl Sync for SchedulerState {}
 
-fn init_scheduler(debug: bool, _stats_only: bool, _debug_counters: bool) -> Result<SchedulerState> {
+fn init_scheduler(
+    debug: bool,
+    _stats_only: bool,
+    _debug_counters: bool,
+    distributed_inactive_pool: bool,
+    initial_lock_budget: u32,
+) -> Result<SchedulerState> {
     let mut skel_builder = BpfSkelBuilder::default();
     skel_builder.obj_builder.debug(debug);
 
@@ -46,6 +53,7 @@ fn init_scheduler(debug: bool, _stats_only: bool, _debug_counters: bool) -> Resu
         Box::leak(Box::new(MaybeUninit::uninit()));
 
     let mut skel = scx_ops_open!(skel_builder, open_object, accordin_ops, None)?;
+    configure_bpf_rodata(&mut skel, distributed_inactive_pool, initial_lock_budget);
     let mut skel = scx_ops_load!(skel, accordin_ops, uei)?;
 
     let thread_ctx_map = MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
@@ -81,6 +89,44 @@ fn env_flag(name: &str) -> bool {
     }
 }
 
+fn inactive_pool_distributed() -> bool {
+    match std::env::var(INACTIVE_POOL_ENV) {
+        Ok(value) => {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("distributed")
+                || value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
+fn initial_lock_budget_from_env() -> u32 {
+    match accordin_shared::cpu_affinity::requested_cpu_count_from_env() {
+        Ok(Some(value)) => value.min(u32::MAX as usize) as u32,
+        Ok(None) => 0,
+        Err(error) => {
+            eprintln!("[accordin] distributed inactive pool K ignored: {error}");
+            0
+        }
+    }
+}
+
+fn configure_bpf_rodata(
+    skel: &mut OpenBpfSkel<'_>,
+    distributed_inactive_pool: bool,
+    initial_lock_budget: u32,
+) {
+    let Some(rodata) = skel.maps.rodata_data.as_deref_mut() else {
+        return;
+    };
+
+    rodata.distributed_inactive_pool = u32::from(distributed_inactive_pool);
+    rodata.initial_lock_budget = initial_lock_budget;
+}
+
 fn init_ebpf() {
     if cfg!(test) {
         return;
@@ -93,7 +139,26 @@ fn init_ebpf() {
         simplelog::ColorChoice::Auto,
     );
 
-    accordin_shared::cpu_affinity::init_from_env("accordin");
+    let distributed_inactive_pool = inactive_pool_distributed();
+    let initial_lock_budget = if distributed_inactive_pool {
+        accordin_shared::cpu_affinity::disable_process_affinity_control();
+        initial_lock_budget_from_env()
+    } else {
+        0
+    };
+
+    if distributed_inactive_pool {
+        eprintln!(
+            "[accordin] distributed inactive pool enabled with initial K={}",
+            if initial_lock_budget == 0 {
+                "all".to_string()
+            } else {
+                initial_lock_budget.to_string()
+            }
+        );
+    } else {
+        accordin_shared::cpu_affinity::init_from_env("accordin");
+    }
 
     if env_flag(DISABLE_BPF_ENV) {
         info!(
@@ -107,7 +172,13 @@ fn init_ebpf() {
     let stats_only = env_flag(STATS_ONLY_ENV);
     let debug_counters = env_flag(DEBUG_COUNTERS_ENV);
 
-    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false, stats_only, debug_counters) {
+    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(
+        false,
+        stats_only,
+        debug_counters,
+        distributed_inactive_pool,
+        initial_lock_budget,
+    ) {
         Ok(state) => {
             if stats_only {
                 info!(

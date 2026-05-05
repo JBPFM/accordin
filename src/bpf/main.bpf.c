@@ -164,42 +164,6 @@ static __always_inline void release_domain_budget(
   __sync_fetch_and_sub(&domain->active_count, 1);
 }
 
-static __always_inline __u64 *domain_nonempty_word(
-    struct lock_domain_state *domain, __u32 word) {
-  if (!domain)
-    return NULL;
-
-  switch (word) {
-  case 0:
-    return &domain->nonempty_shards[0];
-  case 1:
-    return &domain->nonempty_shards[1];
-  case 2:
-    return &domain->nonempty_shards[2];
-  case 3:
-    return &domain->nonempty_shards[3];
-  default:
-    return NULL;
-  }
-}
-
-static __always_inline void domain_set_nonempty(
-    struct lock_domain_state *domain, __u32 shard) {
-  __u32 word = shard >> 6;
-  __u32 bit = shard & 63U;
-  __u64 *bits;
-
-  if (!domain || shard >= MAX_INACTIVE_SHARDS || word >= 4)
-    return;
-
-  bits = domain_nonempty_word(domain, word);
-  if (!bits)
-    return;
-
-  *bits |= (1ULL << bit);
-  domain->pending_count++;
-}
-
 static __always_inline bool should_drain_inactive(__u32 cpu, __u32 *owner) {
   __u32 *seq;
   __u32 next;
@@ -315,21 +279,14 @@ static __always_inline bool try_move_domain_shard(__u32 lock_domain,
                                                   __u32 source_shard,
                                                   __u32 target_cpu,
                                                   bool steal) {
-  struct lock_domain_state *domain;
-  bool moved;
-
   if (source_shard >= MAX_INACTIVE_SHARDS)
     return false;
 
   if (!reserve_domain_cpu(lock_domain, target_cpu))
     return false;
 
-  moved = scx_bpf_dsq_move_to_local(
-      distributed_inactive_dsq_id(lock_domain, source_shard));
-  if (moved) {
-    domain = lookup_domain_state(lock_domain);
-    if (domain && domain->pending_count)
-      domain->pending_count--;
+  if (scx_bpf_dsq_move_to_local(
+          distributed_inactive_dsq_id(lock_domain, source_shard))) {
     inc_stat(steal ? STAT_DISTRIBUTED_STEAL_MOVE
                    : STAT_DISTRIBUTED_LOCAL_MOVE);
     return true;
@@ -364,9 +321,7 @@ static __always_inline bool try_move_domain_remote(__u32 lock_domain,
       continue;
 
     if (try_move_domain_shard(lock_domain, shard, target_cpu, true)) {
-      domain->rr_cursor = shard + 1;
-      if (domain->rr_cursor >= MAX_INACTIVE_SHARDS)
-        domain->rr_cursor = 0;
+      domain->rr_cursor = (shard + 1) & (MAX_INACTIVE_SHARDS - 1);
       return true;
     }
   }
@@ -376,8 +331,6 @@ static __always_inline bool try_move_domain_remote(__u32 lock_domain,
 
 static __always_inline bool rescue_domain_shard(__u32 lock_domain,
                                                 __u32 source_shard) {
-  struct lock_domain_state *domain;
-
   if (source_shard >= MAX_INACTIVE_SHARDS)
     return false;
 
@@ -385,9 +338,6 @@ static __always_inline bool rescue_domain_shard(__u32 lock_domain,
           distributed_inactive_dsq_id(lock_domain, source_shard)))
     return false;
 
-  domain = lookup_domain_state(lock_domain);
-  if (domain && domain->pending_count)
-    domain->pending_count--;
   inc_stat(STAT_DISTRIBUTED_RESCUE_MOVE);
   return true;
 }
@@ -416,9 +366,7 @@ static __always_inline bool rescue_domain_remote(__u32 lock_domain,
       continue;
 
     if (rescue_domain_shard(lock_domain, shard)) {
-      domain->rr_cursor = shard + 1;
-      if (domain->rr_cursor >= MAX_INACTIVE_SHARDS)
-        domain->rr_cursor = 0;
+      domain->rr_cursor = (shard + 1) & (MAX_INACTIVE_SHARDS - 1);
       return true;
     }
   }
@@ -428,13 +376,18 @@ static __always_inline bool rescue_domain_remote(__u32 lock_domain,
 
 static __always_inline void update_cpu_rr_cursor(__u32 cpu, __u32 lock_domain) {
   __u32 *cursor;
+  __u32 next;
 
   if (cpu >= MAX_CPUS || !valid_lock_domain(lock_domain))
     return;
 
   cursor = bpf_map_lookup_elem(&cpu_lock_rr_cursor_map, &cpu);
-  if (cursor)
-    *cursor = lock_domain_slot(lock_domain) + 1;
+  if (!cursor)
+    return;
+
+  next = lock_domain_slot(lock_domain) + 1;
+  if (*cursor != next)
+    *cursor = next;
 }
 
 static __always_inline bool dispatch_distributed_inactive(__u32 cpu) {
@@ -783,35 +736,38 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   struct user_admission_ctx user_ctx = {};
   bool is_idle = false;
   bool have_user = false;
+  bool slow_path = false;
+  __u32 lock_domain = 0;
   s32 cpu;
 
   task_ctx = get_task_ctx(p);
-  if (task_ctx)
+  if (task_ctx) {
     have_user = read_user_ctx(p, task_ctx, &user_ctx);
-
-  if (task_ctx)
     clear_invalid_admission_cpu(p, task_ctx);
+    slow_path = slow_path_requested(task_ctx, have_user, &user_ctx);
+    if (slow_path)
+      lock_domain = user_lock_domain(&user_ctx);
+  }
 
   if (task_ctx && task_ctx->admission_cpu < MAX_CPUS &&
       (task_ctx->holds_admission || task_ctx->must_run_on_admission_cpu))
     return (s32)task_ctx->admission_cpu;
 
-  if (task_ctx && slow_path_requested(task_ctx, have_user, &user_ctx) &&
-      valid_cpu(prev_cpu) && task_cpu_allowed(p, (__u32)prev_cpu)) {
-    task_ctx->lock_domain = user_lock_domain(&user_ctx);
+  if (slow_path && valid_cpu(prev_cpu) &&
+      task_cpu_allowed(p, (__u32)prev_cpu)) {
+    task_ctx->lock_domain = lock_domain;
     task_ctx->admission_cpu = (__u32)prev_cpu;
     return prev_cpu;
   }
 
   cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-  if (task_ctx && slow_path_requested(task_ctx, have_user, &user_ctx) &&
-      valid_cpu(cpu)) {
-    task_ctx->lock_domain = user_lock_domain(&user_ctx);
+  if (slow_path && valid_cpu(cpu)) {
+    task_ctx->lock_domain = lock_domain;
     task_ctx->admission_cpu = (__u32)cpu;
   }
 
-  if (is_idle && !(task_ctx && slow_path_requested(task_ctx, have_user, &user_ctx)))
+  if (is_idle && !slow_path)
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
   return cpu;
@@ -861,9 +817,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
     task_ctx->inactive_wait = 1;
     if (distributed_inactive_pool && valid_lock_domain(lock_domain)) {
-      struct lock_domain_state *domain = lookup_domain_state(lock_domain);
       __u32 shard = inactive_shard_for_cpu(cpu);
-      domain_set_nonempty(domain, shard);
       inc_stat(STAT_DISTRIBUTED_ENQUEUE);
       scx_bpf_dsq_insert(p, distributed_inactive_dsq_id(lock_domain, shard),
                          SCX_SLICE_DFL, enq_flags);

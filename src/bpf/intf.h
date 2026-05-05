@@ -42,10 +42,7 @@ struct task_scx_ctx {
 
 struct lock_domain_state {
   unsigned int active_count;
-  unsigned int pending_count;
   unsigned int rr_cursor;
-  unsigned int epoch;
-  unsigned long long nonempty_shards[4];
 };
 
 enum stat_key {

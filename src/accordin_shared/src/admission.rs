@@ -43,14 +43,7 @@ pub fn tracked_lock_depth() -> u32 {
 
 #[inline(always)]
 pub fn mark_slow_path_pending() {
-    USER_ADMISSION_CTX.with(|ctx| {
-        if ctx.tracked_lock_depth.load(Ordering::Relaxed) != 0 {
-            return;
-        }
-        let value = ctx.flags.load(Ordering::Relaxed);
-        ctx.flags
-            .store(value | SLOW_PATH_PENDING, Ordering::Release);
-    });
+    mark_slow_path_pending_for_lock(0, 0);
 }
 
 #[inline(always)]
@@ -61,9 +54,7 @@ pub fn mark_slow_path_pending_for_lock(lock_domain: u32, lock_id: u64) {
         }
         ctx.lock_id.store(lock_id, Ordering::Relaxed);
         ctx.lock_domain.store(lock_domain, Ordering::Relaxed);
-        let value = ctx.flags.load(Ordering::Relaxed);
-        ctx.flags
-            .store(value | SLOW_PATH_PENDING, Ordering::Release);
+        ctx.flags.fetch_or(SLOW_PATH_PENDING, Ordering::Release);
     });
 }
 

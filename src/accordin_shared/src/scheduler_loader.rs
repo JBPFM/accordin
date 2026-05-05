@@ -72,13 +72,26 @@ macro_rules! define_scheduler_loader {
             match ::std::env::var(INACTIVE_POOL_ENV) {
                 Ok(value) => {
                     let value = value.trim();
-                    value.eq_ignore_ascii_case("distributed")
-                        || value == "1"
-                        || value.eq_ignore_ascii_case("true")
-                        || value.eq_ignore_ascii_case("yes")
-                        || value.eq_ignore_ascii_case("on")
+                    if value.eq_ignore_ascii_case("local")
+                        || value.eq_ignore_ascii_case("per_cpu")
+                        || value.eq_ignore_ascii_case("per-cpu")
+                        || value == "0"
+                        || value.eq_ignore_ascii_case("false")
+                        || value.eq_ignore_ascii_case("no")
+                        || value.eq_ignore_ascii_case("off")
+                    {
+                        false
+                    } else {
+                        value.is_empty()
+                            || value.eq_ignore_ascii_case("distributed")
+                            || value == "1"
+                            || value.eq_ignore_ascii_case("true")
+                            || value.eq_ignore_ascii_case("yes")
+                            || value.eq_ignore_ascii_case("on")
+                    }
                 }
-                Err(_) => false,
+                Err(::std::env::VarError::NotPresent) => true,
+                Err(::std::env::VarError::NotUnicode(_)) => false,
             }
         }
 

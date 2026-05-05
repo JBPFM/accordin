@@ -11,7 +11,6 @@ UEI_DEFINE(uei);
 
 #define INACTIVE_DRAIN_INTERVAL 64U
 #define INACTIVE_STEAL_SCAN 8U
-#define DOMAIN_ACTIVE_CAS_RETRIES 8U
 
 static __always_inline bool valid_cpu(s32 cpu) {
   return cpu >= 0 && cpu < MAX_CPUS;
@@ -122,7 +121,7 @@ static __always_inline __u32 *lookup_domain_cpu_owner(__u32 lock_domain,
   return bpf_map_lookup_elem(&domain_cpu_owner_map, &slot);
 }
 
-static __always_inline __u32 effective_lock_budget(void) {
+static __always_inline __u32 enabled_token_count(void) {
   __u32 nr_cpus = scx_bpf_nr_cpu_ids();
   __u32 budget = initial_lock_budget;
 
@@ -135,33 +134,16 @@ static __always_inline __u32 effective_lock_budget(void) {
   return budget;
 }
 
+static __always_inline bool domain_cpu_token_enabled(__u32 cpu) {
+  if (cpu >= MAX_CPUS)
+    return false;
+
+  return cpu < enabled_token_count();
+}
+
 static __always_inline bool domain_owner_cas(__u32 *owner, __u32 old_owner,
                                              __u32 new_owner) {
   return __sync_val_compare_and_swap(owner, old_owner, new_owner) == old_owner;
-}
-
-static __always_inline bool try_take_domain_budget(
-    struct lock_domain_state *domain, __u32 budget) {
-  __u32 i;
-
-#pragma clang loop unroll(full)
-  for (i = 0; i < DOMAIN_ACTIVE_CAS_RETRIES; i++) {
-    __u32 active_count = domain->active_count;
-
-    if (active_count >= budget)
-      return false;
-
-    if (__sync_val_compare_and_swap(&domain->active_count, active_count,
-                                    active_count + 1) == active_count)
-      return true;
-  }
-
-  return false;
-}
-
-static __always_inline void release_domain_budget(
-    struct lock_domain_state *domain) {
-  __sync_fetch_and_sub(&domain->active_count, 1);
 }
 
 static __always_inline bool should_drain_inactive(__u32 cpu, __u32 *owner) {
@@ -194,25 +176,16 @@ static __always_inline void set_task_admission(struct task_struct *p,
 }
 
 static __always_inline bool reserve_domain_cpu(__u32 lock_domain, __u32 cpu) {
-  struct lock_domain_state *domain;
   __u32 *owner;
-  __u32 budget;
 
-  domain = lookup_domain_state(lock_domain);
   owner = lookup_domain_cpu_owner(lock_domain, cpu);
-  if (!domain || !owner)
-    return false;
-
-  budget = effective_lock_budget();
-  if (!try_take_domain_budget(domain, budget)) {
+  if (!owner || !domain_cpu_token_enabled(cpu)) {
     inc_stat(STAT_DISTRIBUTED_RESERVE_FAIL);
     return false;
   }
 
-  if (!domain_owner_cas(owner, 0, ADMISSION_OWNER_RESERVED)) {
-    release_domain_budget(domain);
+  if (!domain_owner_cas(owner, 0, ADMISSION_OWNER_RESERVED))
     return false;
-  }
 
   return true;
 }
@@ -220,33 +193,27 @@ static __always_inline bool reserve_domain_cpu(__u32 lock_domain, __u32 cpu) {
 static __always_inline void release_domain_cpu(__u32 lock_domain, __u32 cpu,
                                                __u32 pid,
                                                bool allow_reserved) {
-  struct lock_domain_state *domain;
   __u32 *owner;
 
-  domain = lookup_domain_state(lock_domain);
   owner = lookup_domain_cpu_owner(lock_domain, cpu);
-  if (!domain || !owner)
+  if (!owner)
     return;
 
   if (domain_owner_cas(owner, pid, 0))
-    release_domain_budget(domain);
-  else if (allow_reserved &&
-           domain_owner_cas(owner, ADMISSION_OWNER_RESERVED, 0))
-    release_domain_budget(domain);
+    return;
+  if (allow_reserved)
+    domain_owner_cas(owner, ADMISSION_OWNER_RESERVED, 0);
 }
 
 static __always_inline bool grant_domain_admission(struct task_struct *p,
                                                    struct task_scx_ctx *task_ctx,
                                                    __u32 cpu,
                                                    __u32 lock_domain) {
-  struct lock_domain_state *domain;
   __u32 pid = p->pid;
   __u32 *owner;
-  __u32 budget;
 
-  domain = lookup_domain_state(lock_domain);
   owner = lookup_domain_cpu_owner(lock_domain, cpu);
-  if (!domain || !owner)
+  if (!owner || !domain_cpu_token_enabled(cpu))
     return false;
 
   if (*owner == pid) {
@@ -262,14 +229,8 @@ static __always_inline bool grant_domain_admission(struct task_struct *p,
   if (*owner)
     return false;
 
-  budget = effective_lock_budget();
-  if (!try_take_domain_budget(domain, budget))
+  if (!domain_owner_cas(owner, 0, pid))
     return false;
-
-  if (!domain_owner_cas(owner, 0, pid)) {
-    release_domain_budget(domain);
-    return false;
-  }
 
   set_task_admission(p, task_ctx, cpu, lock_domain);
   return true;
@@ -404,6 +365,8 @@ static __always_inline bool dispatch_distributed_inactive(__u32 cpu) {
     nr_cpus = MAX_CPUS;
   if (cpu >= nr_cpus)
     return false;
+  if (!domain_cpu_token_enabled(cpu))
+    return false;
 
   cursor = bpf_map_lookup_elem(&cpu_lock_rr_cursor_map, &cpu);
   if (cursor && *cursor < MAX_LOCK_DOMAINS)
@@ -448,6 +411,8 @@ static __always_inline bool rescue_distributed_inactive(__u32 cpu) {
   if (nr_cpus > MAX_CPUS)
     nr_cpus = MAX_CPUS;
   if (cpu >= nr_cpus)
+    return false;
+  if (!domain_cpu_token_enabled(cpu))
     return false;
 
   cursor = bpf_map_lookup_elem(&cpu_lock_rr_cursor_map, &cpu);
@@ -634,6 +599,27 @@ static __always_inline __u32 pick_allowed_cpu(struct task_struct *p,
   return ADMISSION_CPU_NONE;
 }
 
+static __always_inline __u32 pick_enabled_token_cpu(struct task_struct *p,
+                                                    __u32 fallback_cpu) {
+  __u32 token_count;
+  __u32 cpu;
+
+  if (domain_cpu_token_enabled(fallback_cpu) &&
+      task_cpu_allowed(p, fallback_cpu))
+    return fallback_cpu;
+
+  token_count = enabled_token_count();
+#pragma clang loop unroll(disable)
+  for (cpu = 0; cpu < MAX_CPUS; cpu++) {
+    if (cpu >= token_count)
+      break;
+    if (task_cpu_allowed(p, cpu))
+      return cpu;
+  }
+
+  return ADMISSION_CPU_NONE;
+}
+
 static __always_inline __u32 requested_cpu(struct task_struct *p,
                                            struct task_scx_ctx *task_ctx,
                                            s32 fallback_cpu) {
@@ -802,12 +788,14 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
   if (slow_path_requested(task_ctx, have_user, &user_ctx)) {
     cpu = requested_cpu(p, task_ctx, -1);
+    lock_domain = user_lock_domain(&user_ctx);
+    if (distributed_inactive_pool && valid_lock_domain(lock_domain))
+      cpu = pick_enabled_token_cpu(p, cpu);
     if (cpu >= MAX_CPUS) {
       scx_bpf_dsq_insert(p, READY_DSQ_ID, SCX_SLICE_DFL, enq_flags);
       return;
     }
     task_ctx->admission_cpu = cpu;
-    lock_domain = user_lock_domain(&user_ctx);
     task_ctx->lock_domain = lock_domain;
 
     if (grant_admission(p, task_ctx, cpu)) {

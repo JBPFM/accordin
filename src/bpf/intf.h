@@ -41,7 +41,6 @@ struct task_scx_ctx {
 };
 
 struct lock_domain_state {
-  unsigned int active_count;
   unsigned int rr_cursor;
 };
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
@@ -52,6 +53,7 @@ where
 }
 
 static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
+const HOOK_SCOPE_ENV: &str = "ACCORDIN_HOOK_SCOPE";
 
 #[inline(always)]
 pub fn current_tid() -> u32 {
@@ -60,6 +62,73 @@ pub fn current_tid() -> u32 {
 
 pub fn set_thread_ctx_map(map: MapHandle) {
     let _ = THREAD_CTX_MAP.set(map);
+}
+
+fn hook_scope_value_is_registered(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("registered"))
+}
+
+pub fn registered_hook_scope_enabled() -> bool {
+    static REGISTERED_SCOPE: OnceLock<bool> = OnceLock::new();
+    *REGISTERED_SCOPE.get_or_init(|| {
+        hook_scope_value_is_registered(std::env::var(HOOK_SCOPE_ENV).ok().as_deref())
+    })
+}
+
+fn hooked_mutexes() -> &'static Mutex<HashSet<usize>> {
+    static HOOKED_MUTEXES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    HOOKED_MUTEXES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn hooked_conds() -> &'static Mutex<HashSet<usize>> {
+    static HOOKED_CONDS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    HOOKED_CONDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_addr(registry: &Mutex<HashSet<usize>>, addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    registry
+        .lock()
+        .is_ok_and(|mut entries| entries.insert(addr))
+}
+
+fn unregister_addr(registry: &Mutex<HashSet<usize>>, addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    registry
+        .lock()
+        .is_ok_and(|mut entries| entries.remove(&addr))
+}
+
+fn contains_addr(registry: &Mutex<HashSet<usize>>, addr: usize) -> bool {
+    addr != 0 && registry.lock().is_ok_and(|entries| entries.contains(&addr))
+}
+
+pub fn register_hooked_mutex_addr(mutex: *mut libc::pthread_mutex_t) -> bool {
+    register_addr(hooked_mutexes(), mutex as usize)
+}
+
+pub fn unregister_hooked_mutex_addr(mutex: *mut libc::pthread_mutex_t) -> bool {
+    unregister_addr(hooked_mutexes(), mutex as usize)
+}
+
+pub fn hooked_mutex_registered(mutex: *mut libc::pthread_mutex_t) -> bool {
+    contains_addr(hooked_mutexes(), mutex as usize)
+}
+
+pub fn register_hooked_cond_addr(cond: *mut libc::pthread_cond_t) -> bool {
+    register_addr(hooked_conds(), cond as usize)
+}
+
+pub fn unregister_hooked_cond_addr(cond: *mut libc::pthread_cond_t) -> bool {
+    unregister_addr(hooked_conds(), cond as usize)
+}
+
+pub fn hooked_cond_registered(cond: *mut libc::pthread_cond_t) -> bool {
+    contains_addr(hooked_conds(), cond as usize)
 }
 
 trait ThreadCtxMapOps {
@@ -121,6 +190,7 @@ macro_rules! export_mutex_hooks {
         mod exported_mutex_hooks {
             use std::cell::{Cell, UnsafeCell};
             use std::hint::spin_loop;
+            use std::sync::OnceLock;
             use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
             use $crate::lock_stats::{
@@ -199,6 +269,211 @@ macro_rules! export_mutex_hooks {
             const FUTEX_WAIT_BITSET_PRIVATE_REALTIME: libc::c_int = 9 | 128 | 256;
             const FUTEX_BITSET_MATCH_ANY: libc::c_uint = libc::c_uint::MAX;
 
+            type PthreadMutexInitFn = unsafe extern "C" fn(
+                *mut libc::pthread_mutex_t,
+                *const libc::pthread_mutexattr_t,
+            ) -> libc::c_int;
+            type PthreadMutexDestroyFn =
+                unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int;
+            type PthreadMutexLockFn =
+                unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int;
+            type PthreadMutexTrylockFn =
+                unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int;
+            type PthreadMutexUnlockFn =
+                unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> libc::c_int;
+            type PthreadCondInitFn = unsafe extern "C" fn(
+                *mut libc::pthread_cond_t,
+                *const libc::pthread_condattr_t,
+            ) -> libc::c_int;
+            type PthreadCondDestroyFn =
+                unsafe extern "C" fn(*mut libc::pthread_cond_t) -> libc::c_int;
+            type PthreadCondSignalFn =
+                unsafe extern "C" fn(*mut libc::pthread_cond_t) -> libc::c_int;
+            type PthreadCondBroadcastFn =
+                unsafe extern "C" fn(*mut libc::pthread_cond_t) -> libc::c_int;
+            type PthreadCondWaitFn = unsafe extern "C" fn(
+                *mut libc::pthread_cond_t,
+                *mut libc::pthread_mutex_t,
+            ) -> libc::c_int;
+            type PthreadCondTimedwaitFn = unsafe extern "C" fn(
+                *mut libc::pthread_cond_t,
+                *mut libc::pthread_mutex_t,
+                *const libc::timespec,
+            ) -> libc::c_int;
+
+            unsafe fn resolve_next_symbol(name: &'static [u8]) -> usize {
+                unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr().cast()) as usize }
+            }
+
+            unsafe fn transmute_symbol<T: Copy>(ptr: usize) -> Option<T> {
+                if ptr == 0 {
+                    None
+                } else {
+                    Some(unsafe { std::mem::transmute_copy(&ptr) })
+                }
+            }
+
+            unsafe fn real_pthread_mutex_init(
+                mutex: *mut libc::pthread_mutex_t,
+                attr: *const libc::pthread_mutexattr_t,
+            ) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) =
+                    (unsafe {
+                        transmute_symbol::<PthreadMutexInitFn>(*REAL.get_or_init(|| unsafe {
+                            resolve_next_symbol(b"pthread_mutex_init\0")
+                        }))
+                    })
+                else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(mutex, attr) }
+            }
+
+            unsafe fn real_pthread_mutex_destroy(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) =
+                    (unsafe {
+                        transmute_symbol::<PthreadMutexDestroyFn>(*REAL.get_or_init(|| unsafe {
+                            resolve_next_symbol(b"pthread_mutex_destroy\0")
+                        }))
+                    })
+                else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(mutex) }
+            }
+
+            unsafe fn real_pthread_mutex_lock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) =
+                    (unsafe {
+                        transmute_symbol::<PthreadMutexLockFn>(*REAL.get_or_init(|| unsafe {
+                            resolve_next_symbol(b"pthread_mutex_lock\0")
+                        }))
+                    })
+                else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(mutex) }
+            }
+
+            unsafe fn real_pthread_mutex_trylock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) =
+                    (unsafe {
+                        transmute_symbol::<PthreadMutexTrylockFn>(*REAL.get_or_init(|| unsafe {
+                            resolve_next_symbol(b"pthread_mutex_trylock\0")
+                        }))
+                    })
+                else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(mutex) }
+            }
+
+            unsafe fn real_pthread_mutex_unlock(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) =
+                    (unsafe {
+                        transmute_symbol::<PthreadMutexUnlockFn>(*REAL.get_or_init(|| unsafe {
+                            resolve_next_symbol(b"pthread_mutex_unlock\0")
+                        }))
+                    })
+                else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(mutex) }
+            }
+
+            unsafe fn real_pthread_cond_init(
+                cond: *mut libc::pthread_cond_t,
+                attr: *const libc::pthread_condattr_t,
+            ) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) = (unsafe {
+                    transmute_symbol::<PthreadCondInitFn>(
+                        *REAL
+                            .get_or_init(|| unsafe { resolve_next_symbol(b"pthread_cond_init\0") }),
+                    )
+                }) else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(cond, attr) }
+            }
+
+            unsafe fn real_pthread_cond_destroy(cond: *mut libc::pthread_cond_t) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) =
+                    (unsafe {
+                        transmute_symbol::<PthreadCondDestroyFn>(*REAL.get_or_init(|| unsafe {
+                            resolve_next_symbol(b"pthread_cond_destroy\0")
+                        }))
+                    })
+                else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(cond) }
+            }
+
+            unsafe fn real_pthread_cond_signal(cond: *mut libc::pthread_cond_t) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) =
+                    (unsafe {
+                        transmute_symbol::<PthreadCondSignalFn>(*REAL.get_or_init(|| unsafe {
+                            resolve_next_symbol(b"pthread_cond_signal\0")
+                        }))
+                    })
+                else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(cond) }
+            }
+
+            unsafe fn real_pthread_cond_broadcast(cond: *mut libc::pthread_cond_t) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) = (unsafe {
+                    transmute_symbol::<PthreadCondBroadcastFn>(*REAL.get_or_init(|| unsafe {
+                        resolve_next_symbol(b"pthread_cond_broadcast\0")
+                    }))
+                }) else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(cond) }
+            }
+
+            unsafe fn real_pthread_cond_wait(
+                cond: *mut libc::pthread_cond_t,
+                mutex: *mut libc::pthread_mutex_t,
+            ) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) = (unsafe {
+                    transmute_symbol::<PthreadCondWaitFn>(
+                        *REAL
+                            .get_or_init(|| unsafe { resolve_next_symbol(b"pthread_cond_wait\0") }),
+                    )
+                }) else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(cond, mutex) }
+            }
+
+            unsafe fn real_pthread_cond_timedwait(
+                cond: *mut libc::pthread_cond_t,
+                mutex: *mut libc::pthread_mutex_t,
+                abstime: *const libc::timespec,
+            ) -> libc::c_int {
+                static REAL: OnceLock<usize> = OnceLock::new();
+                let Some(func) = (unsafe {
+                    transmute_symbol::<PthreadCondTimedwaitFn>(*REAL.get_or_init(|| unsafe {
+                        resolve_next_symbol(b"pthread_cond_timedwait\0")
+                    }))
+                }) else {
+                    return libc::ENOSYS;
+                };
+                unsafe { func(cond, mutex, abstime) }
+            }
+
             #[inline(always)]
             unsafe fn state_atomic(mutex: *mut libc::pthread_mutex_t) -> &'static AtomicUsize {
                 unsafe { &*(mutex as *const AtomicUsize) }
@@ -207,6 +482,55 @@ macro_rules! export_mutex_hooks {
             #[inline(always)]
             unsafe fn cond_atomic(cond: *mut libc::pthread_cond_t) -> &'static AtomicUsize {
                 unsafe { &*(cond as *const AtomicUsize) }
+            }
+
+            #[inline(always)]
+            fn should_hook_mutex(mutex: *mut libc::pthread_mutex_t) -> bool {
+                !$crate::mutex_hook::registered_hook_scope_enabled()
+                    || $crate::mutex_hook::hooked_mutex_registered(mutex)
+            }
+
+            unsafe fn initialize_hook_state(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
+                unsafe {
+                    if mutex.is_null() {
+                        return libc::EINVAL;
+                    }
+
+                    let state = Box::new(HookState {
+                        lock: Backend::create_state(),
+                    });
+                    let ptr = Box::into_raw(state);
+
+                    std::ptr::write_bytes(
+                        mutex as *mut u8,
+                        0,
+                        std::mem::size_of::<libc::pthread_mutex_t>(),
+                    );
+                    (*(mutex as *mut usize)) = ptr as usize;
+                    0
+                }
+            }
+
+            unsafe fn initialize_cond_state(cond: *mut libc::pthread_cond_t) -> libc::c_int {
+                unsafe {
+                    if cond.is_null() {
+                        return libc::EINVAL;
+                    }
+
+                    let state = Box::new(CondState {
+                        seq: AtomicU32::new(0),
+                        waiters: AtomicU32::new(0),
+                    });
+                    let ptr = Box::into_raw(state);
+                    std::ptr::write_bytes(
+                        cond as *mut u8,
+                        0,
+                        std::mem::size_of::<libc::pthread_cond_t>(),
+                    );
+                    (*(cond as *mut usize)) = ptr as usize;
+                    $crate::mutex_hook::register_hooked_cond_addr(cond);
+                    0
+                }
             }
 
             #[inline(always)]
@@ -309,6 +633,7 @@ macro_rules! export_mutex_hooks {
                     });
                     let ptr = Box::into_raw(state);
                     atomic.store(ptr as usize, Ordering::Release);
+                    $crate::mutex_hook::register_hooked_cond_addr(cond);
                     return Ok(ptr);
                 }
             }
@@ -417,21 +742,66 @@ macro_rules! export_mutex_hooks {
                 attr: *const libc::pthread_mutexattr_t,
             ) -> libc::c_int {
                 unsafe {
+                    if $crate::mutex_hook::registered_hook_scope_enabled() {
+                        return real_pthread_mutex_init(mutex, attr);
+                    }
+                    initialize_hook_state(mutex)
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_register_hooked_mutex(
+                mutex: *mut libc::c_void,
+            ) -> libc::c_int {
+                unsafe {
                     if mutex.is_null() {
                         return libc::EINVAL;
                     }
 
-                    let state = Box::new(HookState {
-                        lock: Backend::create_state(),
-                    });
-                    let ptr = Box::into_raw(state);
+                    let mutex = mutex.cast::<libc::pthread_mutex_t>();
+                    let val = state_atomic(mutex).load(Ordering::Acquire);
+                    if val > SENTINEL {
+                        $crate::mutex_hook::register_hooked_mutex_addr(mutex);
+                        return 0;
+                    }
 
-                    std::ptr::write_bytes(
-                        mutex as *mut u8,
-                        0,
-                        std::mem::size_of::<libc::pthread_mutex_t>(),
-                    );
-                    (*(mutex as *mut usize)) = ptr as usize;
+                    if val == SENTINEL {
+                        return libc::EBUSY;
+                    }
+
+                    if $crate::mutex_hook::registered_hook_scope_enabled() {
+                        let ret = real_pthread_mutex_destroy(mutex);
+                        if ret != 0 {
+                            return ret;
+                        }
+                    }
+
+                    let ret = initialize_hook_state(mutex);
+                    if ret == 0 {
+                        $crate::mutex_hook::register_hooked_mutex_addr(mutex);
+                    }
+                    ret
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_unregister_hooked_mutex(
+                mutex: *mut libc::c_void,
+            ) -> libc::c_int {
+                unsafe {
+                    if mutex.is_null() {
+                        return libc::EINVAL;
+                    }
+
+                    let mutex = mutex.cast::<libc::pthread_mutex_t>();
+                    $crate::mutex_hook::unregister_hooked_mutex_addr(mutex);
+
+                    let atomic = state_atomic(mutex);
+                    let val = atomic.load(Ordering::Acquire);
+                    if val > SENTINEL {
+                        drop(Box::from_raw(val as *mut HookState));
+                        atomic.store(0, Ordering::Release);
+                    }
                     0
                 }
             }
@@ -444,6 +814,12 @@ macro_rules! export_mutex_hooks {
                     if mutex.is_null() {
                         return libc::EINVAL;
                     }
+
+                    if !should_hook_mutex(mutex) {
+                        return real_pthread_mutex_destroy(mutex);
+                    }
+
+                    $crate::mutex_hook::unregister_hooked_mutex_addr(mutex);
 
                     let atomic = state_atomic(mutex);
                     let val = atomic.load(Ordering::Acquire);
@@ -460,8 +836,11 @@ macro_rules! export_mutex_hooks {
             pub unsafe extern "C" fn pthread_mutex_lock(
                 mutex: *mut libc::pthread_mutex_t,
             ) -> libc::c_int {
-                ensure_registered();
                 unsafe {
+                    if !should_hook_mutex(mutex) {
+                        return real_pthread_mutex_lock(mutex);
+                    }
+                    ensure_registered();
                     let state = match ensure_state(mutex) {
                         Ok(state) => state,
                         Err(ret) => return ret,
@@ -475,8 +854,11 @@ macro_rules! export_mutex_hooks {
             pub unsafe extern "C" fn pthread_mutex_trylock(
                 mutex: *mut libc::pthread_mutex_t,
             ) -> libc::c_int {
-                ensure_registered();
                 unsafe {
+                    if !should_hook_mutex(mutex) {
+                        return real_pthread_mutex_trylock(mutex);
+                    }
+                    ensure_registered();
                     let state = match ensure_state(mutex) {
                         Ok(state) => state,
                         Err(ret) => return ret,
@@ -499,6 +881,10 @@ macro_rules! export_mutex_hooks {
                         return libc::EINVAL;
                     }
 
+                    if !should_hook_mutex(mutex) {
+                        return real_pthread_mutex_unlock(mutex);
+                    }
+
                     let atomic = state_atomic(mutex);
                     let val = atomic.load(Ordering::Acquire);
                     if val > SENTINEL {
@@ -512,25 +898,13 @@ macro_rules! export_mutex_hooks {
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn pthread_cond_init(
                 cond: *mut libc::pthread_cond_t,
-                _attr: *const libc::pthread_condattr_t,
+                attr: *const libc::pthread_condattr_t,
             ) -> libc::c_int {
                 unsafe {
-                    if cond.is_null() {
-                        return libc::EINVAL;
+                    if $crate::mutex_hook::registered_hook_scope_enabled() {
+                        return real_pthread_cond_init(cond, attr);
                     }
-
-                    let state = Box::new(CondState {
-                        seq: AtomicU32::new(0),
-                        waiters: AtomicU32::new(0),
-                    });
-                    let ptr = Box::into_raw(state);
-                    std::ptr::write_bytes(
-                        cond as *mut u8,
-                        0,
-                        std::mem::size_of::<libc::pthread_cond_t>(),
-                    );
-                    (*(cond as *mut usize)) = ptr as usize;
-                    0
+                    initialize_cond_state(cond)
                 }
             }
 
@@ -542,6 +916,14 @@ macro_rules! export_mutex_hooks {
                     if cond.is_null() {
                         return libc::EINVAL;
                     }
+
+                    if $crate::mutex_hook::registered_hook_scope_enabled()
+                        && !$crate::mutex_hook::hooked_cond_registered(cond)
+                    {
+                        return real_pthread_cond_destroy(cond);
+                    }
+
+                    $crate::mutex_hook::unregister_hooked_cond_addr(cond);
 
                     let atomic = cond_atomic(cond);
                     let val = atomic.load(Ordering::Acquire);
@@ -558,6 +940,12 @@ macro_rules! export_mutex_hooks {
                 cond: *mut libc::pthread_cond_t,
             ) -> libc::c_int {
                 unsafe {
+                    if $crate::mutex_hook::registered_hook_scope_enabled()
+                        && !$crate::mutex_hook::hooked_cond_registered(cond)
+                    {
+                        return real_pthread_cond_signal(cond);
+                    }
+
                     let cond_state = match ensure_cond_state(cond) {
                         Ok(state) => state,
                         Err(ret) => return ret,
@@ -574,6 +962,12 @@ macro_rules! export_mutex_hooks {
                 cond: *mut libc::pthread_cond_t,
             ) -> libc::c_int {
                 unsafe {
+                    if $crate::mutex_hook::registered_hook_scope_enabled()
+                        && !$crate::mutex_hook::hooked_cond_registered(cond)
+                    {
+                        return real_pthread_cond_broadcast(cond);
+                    }
+
                     let cond_state = match ensure_cond_state(cond) {
                         Ok(state) => state,
                         Err(ret) => return ret,
@@ -592,6 +986,10 @@ macro_rules! export_mutex_hooks {
                 user_mutex: *mut libc::pthread_mutex_t,
             ) -> libc::c_int {
                 unsafe {
+                    if !should_hook_mutex(user_mutex) {
+                        return real_pthread_cond_wait(cond, user_mutex);
+                    }
+
                     let state = match ensure_state(user_mutex) {
                         Ok(state) => state,
                         Err(ret) => return ret,
@@ -620,6 +1018,10 @@ macro_rules! export_mutex_hooks {
                 unsafe {
                     if abstime.is_null() {
                         return libc::EINVAL;
+                    }
+
+                    if !should_hook_mutex(user_mutex) {
+                        return real_pthread_cond_timedwait(cond, user_mutex, abstime);
                     }
 
                     let state = match ensure_state(user_mutex) {
@@ -660,7 +1062,12 @@ mod tests {
 
     use libbpf_rs::MapFlags;
 
-    use super::{ThreadCtxMapOps, register_thread_ctx_with_map, unregister_thread_ctx_with_map};
+    use super::{
+        ThreadCtxMapOps, hook_scope_value_is_registered, hooked_cond_registered,
+        hooked_mutex_registered, register_hooked_cond_addr, register_hooked_mutex_addr,
+        register_thread_ctx_with_map, unregister_hooked_cond_addr, unregister_hooked_mutex_addr,
+        unregister_thread_ctx_with_map,
+    };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum MapCall {
@@ -731,5 +1138,44 @@ mod tests {
                 key: 11u32.to_ne_bytes().to_vec(),
             }]
         );
+    }
+
+    #[test]
+    fn hook_scope_registered_value_is_explicit() {
+        assert!(hook_scope_value_is_registered(Some("registered")));
+        assert!(hook_scope_value_is_registered(Some("REGISTERED")));
+        assert!(!hook_scope_value_is_registered(None));
+        assert!(!hook_scope_value_is_registered(Some("all")));
+        assert!(!hook_scope_value_is_registered(Some("")));
+    }
+
+    #[test]
+    fn hooked_mutex_registry_tracks_registered_addresses() {
+        let mut mutex = std::mem::MaybeUninit::<libc::pthread_mutex_t>::uninit();
+        let ptr = mutex.as_mut_ptr();
+
+        unregister_hooked_mutex_addr(ptr);
+        assert!(!hooked_mutex_registered(ptr));
+
+        assert!(register_hooked_mutex_addr(ptr));
+        assert!(hooked_mutex_registered(ptr));
+
+        assert!(unregister_hooked_mutex_addr(ptr));
+        assert!(!hooked_mutex_registered(ptr));
+    }
+
+    #[test]
+    fn hooked_cond_registry_tracks_registered_addresses() {
+        let mut cond = std::mem::MaybeUninit::<libc::pthread_cond_t>::uninit();
+        let ptr = cond.as_mut_ptr();
+
+        unregister_hooked_cond_addr(ptr);
+        assert!(!hooked_cond_registered(ptr));
+
+        assert!(register_hooked_cond_addr(ptr));
+        assert!(hooked_cond_registered(ptr));
+
+        assert!(unregister_hooked_cond_addr(ptr));
+        assert!(!hooked_cond_registered(ptr));
     }
 }

@@ -4,10 +4,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const CPU_MASK_K_ENV: &str = "ACCORDIN_CPU_MASK_K";
 pub const CPU_MASK_K_SHORT_ENV: &str = "K";
+pub const MAX_CPUS: usize = 256;
+pub const ACTIVE_CPU_WORDS: usize = MAX_CPUS / 64;
 
 #[derive(Debug)]
 struct CpuAffinityConfig {
@@ -15,7 +17,6 @@ struct CpuAffinityConfig {
     requested_cpus: usize,
     available_cpus: Vec<usize>,
     active_cpu_count: AtomicUsize,
-    generation: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -26,9 +27,14 @@ enum CpuAffinityState {
 }
 
 static CPU_AFFINITY_STATE: OnceLock<CpuAffinityState> = OnceLock::new();
+static BPF_SINK: OnceLock<Box<dyn BpfActiveCpusSink>> = OnceLock::new();
 
 thread_local! {
-    static CURRENT_THREAD_AFFINITY_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static CURRENT_THREAD_AFFINITY_APPLIED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub trait BpfActiveCpusSink: Send + Sync {
+    fn push(&self, wanted: &[u8; MAX_CPUS]) -> Result<(), String>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,29 +50,63 @@ pub fn init_from_env(label: &str) {
         CpuAffinityState::Invalid(error) => {
             eprintln!("[{label}] CPU affinity env ignored: {error}");
         }
-        CpuAffinityState::Configured(config) => match apply_current_configured_affinity(config) {
-            Ok(()) => {
+        CpuAffinityState::Configured(config) => {
+            if !should_apply_userspace_affinity(bpf_sink_registered()) {
                 eprintln!(
-                    "[{label}] CPU affinity initially limited by {}={} to CPUs: {}",
+                    "[{label}] BPF active CPU mask initially limited by {}={} to CPUs: {}",
                     config.env_name,
                     config.requested_cpus,
                     format_cpu_list(&active_cpus(config))
                 );
+                return;
             }
-            Err(error) => {
-                eprintln!(
-                    "[{label}] failed to apply CPU affinity from {}={}: {error}",
-                    config.env_name, config.requested_cpus
-                );
+
+            match apply_current_configured_affinity(config) {
+                Ok(()) => {
+                    eprintln!(
+                        "[{label}] CPU affinity initially limited by {}={} to CPUs: {}",
+                        config.env_name,
+                        config.requested_cpus,
+                        format_cpu_list(&active_cpus(config))
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[{label}] failed to apply CPU affinity from {}={}: {error}",
+                        config.env_name, config.requested_cpus
+                    );
+                }
             }
-        },
+        }
     }
 }
 
 pub fn ensure_current_thread_affinity() {
+    if !should_apply_userspace_affinity(bpf_sink_registered()) {
+        return;
+    }
+
     if let CpuAffinityState::Configured(config) = cpu_affinity_state() {
         let _ = apply_current_thread_affinity_if_needed(config);
     }
+}
+
+pub fn set_bpf_sink(sink: Box<dyn BpfActiveCpusSink>) -> Result<(), String> {
+    BPF_SINK
+        .set(sink)
+        .map_err(|_| "BPF active CPU sink already registered".to_string())
+}
+
+pub fn push_initial_mask_to_bpf() -> Result<(), String> {
+    let CpuAffinityState::Configured(config) = cpu_affinity_state() else {
+        return Ok(());
+    };
+
+    let wanted = build_active_cpu_bitmap(
+        &config.available_cpus,
+        config.active_cpu_count.load(Ordering::Acquire),
+    )?;
+    push_active_mask(&wanted)
 }
 
 pub fn configured_cpu_count_env_present() -> bool {
@@ -87,8 +127,13 @@ pub fn update_dynamic_cpu_count(
     let previous_cpus = config.active_cpu_count.swap(applied_cpus, Ordering::AcqRel);
     let changed = previous_cpus != applied_cpus;
     if changed {
-        config.generation.fetch_add(1, Ordering::AcqRel);
-        apply_process_configured_affinity(config)?;
+        let wanted = build_active_cpu_bitmap(&config.available_cpus, applied_cpus)?;
+        if let Err(error) = push_active_mask(&wanted) {
+            config
+                .active_cpu_count
+                .store(previous_cpus, Ordering::Release);
+            return Err(error);
+        }
     }
 
     Ok(Some(DynamicCpuAffinityUpdate {
@@ -139,7 +184,6 @@ fn load_cpu_affinity_state() -> CpuAffinityState {
         requested_cpus,
         available_cpus,
         active_cpu_count: AtomicUsize::new(requested_cpus),
-        generation: AtomicU64::new(1),
     })
 }
 
@@ -303,62 +347,62 @@ fn active_cpus(config: &CpuAffinityConfig) -> Vec<usize> {
         .collect()
 }
 
-fn apply_current_configured_affinity(config: &CpuAffinityConfig) -> Result<(), String> {
-    apply_cpu_affinity(&active_cpus(config))
+fn initial_cpus(config: &CpuAffinityConfig) -> Vec<usize> {
+    config
+        .available_cpus
+        .iter()
+        .copied()
+        .take(config.requested_cpus)
+        .collect()
 }
 
-fn apply_process_configured_affinity(config: &CpuAffinityConfig) -> Result<(), String> {
-    apply_process_affinity(&active_cpus(config))
+fn build_active_cpu_bitmap(
+    available_cpus: &[usize],
+    active_cpu_count: usize,
+) -> Result<[u8; MAX_CPUS], String> {
+    let mut wanted = [0; MAX_CPUS];
+    for &cpu in available_cpus.iter().take(active_cpu_count) {
+        if cpu >= MAX_CPUS {
+            return Err(format!("CPU {cpu} is outside BPF MAX_CPUS {}", MAX_CPUS));
+        }
+        wanted[cpu] = 1;
+    }
+    Ok(wanted)
+}
+
+fn push_active_mask(wanted: &[u8; MAX_CPUS]) -> Result<(), String> {
+    let Some(sink) = BPF_SINK.get() else {
+        return Err("BPF active CPU sink is not registered".to_string());
+    };
+    sink.push(wanted)
+}
+
+fn bpf_sink_registered() -> bool {
+    BPF_SINK.get().is_some()
+}
+
+fn should_apply_userspace_affinity(bpf_sink_registered: bool) -> bool {
+    !bpf_sink_registered
+}
+
+fn apply_current_configured_affinity(config: &CpuAffinityConfig) -> Result<(), String> {
+    apply_cpu_affinity(&initial_cpus(config))
 }
 
 fn apply_current_thread_affinity_if_needed(config: &CpuAffinityConfig) -> Result<bool, String> {
-    let generation = config.generation.load(Ordering::Acquire);
-    if generation == 0 {
-        return Ok(false);
-    }
-
-    CURRENT_THREAD_AFFINITY_GENERATION.with(|applied_generation| {
-        if applied_generation.get() == generation {
+    CURRENT_THREAD_AFFINITY_APPLIED.with(|applied| {
+        if applied.get() {
             return Ok(false);
         }
 
         let result = apply_current_configured_affinity(config);
-        applied_generation.set(generation);
+        applied.set(true);
         result.map(|()| true)
     })
 }
 
 fn apply_cpu_affinity(cpus: &[usize]) -> Result<(), String> {
     apply_cpu_affinity_to_tid(0, cpus).map_err(|error| error.to_string())
-}
-
-fn apply_process_affinity(cpus: &[usize]) -> Result<(), String> {
-    for tid in current_process_tids()? {
-        match apply_cpu_affinity_to_tid(tid, cpus) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(())
-}
-
-fn current_process_tids() -> Result<Vec<libc::pid_t>, String> {
-    let entries = fs::read_dir("/proc/self/task")
-        .map_err(|error| format!("failed to read /proc/self/task: {error}"))?;
-    let mut tids = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("failed to read task entry: {error}"))?;
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        let Ok(tid) = file_name.parse::<libc::pid_t>() else {
-            continue;
-        };
-        tids.push(tid);
-    }
-    Ok(tids)
 }
 
 fn apply_cpu_affinity_to_tid(tid: libc::pid_t, cpus: &[usize]) -> io::Result<()> {
@@ -397,7 +441,10 @@ fn format_cpu_list(cpus: &[usize]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_cpu_list, parse_cpu_list, select_numa_available_cpus, select_numa_cpus};
+    use super::{
+        build_active_cpu_bitmap, format_cpu_list, parse_cpu_list, select_numa_available_cpus,
+        select_numa_cpus, should_apply_userspace_affinity,
+    };
 
     #[test]
     fn parse_cpu_list_accepts_singletons_and_ranges() {
@@ -458,5 +505,22 @@ mod tests {
     #[test]
     fn format_cpu_list_joins_selected_cpus() {
         assert_eq!(format_cpu_list(&[0, 2, 4]), "0,2,4");
+    }
+
+    #[test]
+    fn build_active_cpu_bitmap_marks_first_available_cpus() {
+        let bitmap = build_active_cpu_bitmap(&[2, 6, 8, 1], 3).unwrap();
+
+        assert_eq!(bitmap[0], 0);
+        assert_eq!(bitmap[1], 0);
+        assert_eq!(bitmap[2], 1);
+        assert_eq!(bitmap[6], 1);
+        assert_eq!(bitmap[8], 1);
+    }
+
+    #[test]
+    fn userspace_affinity_is_disabled_when_bpf_sink_is_registered() {
+        assert!(should_apply_userspace_affinity(false));
+        assert!(!should_apply_userspace_affinity(true));
     }
 }

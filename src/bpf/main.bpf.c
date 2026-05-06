@@ -16,15 +16,70 @@ static __always_inline bool valid_cpu(s32 cpu) {
   return cpu >= 0 && cpu < MAX_CPUS;
 }
 
-static __always_inline bool task_cpu_allowed(struct task_struct *p, __u32 cpu) {
+static __always_inline struct active_cpumask_slot *lookup_active_cpumask_slot(void) {
+  __u32 key = 0;
+
+  return bpf_map_lookup_elem(&active_cpumask_map, &key);
+}
+
+static __always_inline bool cpu_is_active(__u32 cpu) {
+  struct active_cpumask_slot *slot;
+  struct bpf_cpumask *mask;
+  bool active = true;
+
+  if (cpu >= MAX_CPUS)
+    return false;
+
+  bpf_rcu_read_lock();
+  slot = lookup_active_cpumask_slot();
+  mask = slot ? slot->mask : NULL;
+  if (mask)
+    active = bpf_cpumask_test_cpu(cpu, (const struct cpumask *)mask);
+  bpf_rcu_read_unlock();
+
+  return active;
+}
+
+static __always_inline bool task_cpumask_allows(struct task_struct *p,
+                                                __u32 cpu) {
   if (cpu >= MAX_CPUS)
     return false;
 
   return bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
 }
 
+static __always_inline bool task_cpu_allowed(struct task_struct *p, __u32 cpu) {
+  if (cpu >= MAX_CPUS)
+    return false;
+
+  if (!task_cpumask_allows(p, cpu))
+    return false;
+
+  return cpu_is_active(cpu);
+}
+
 static __always_inline __u64 inactive_dsq_id(__u32 cpu) {
   return INACTIVE_DSQ_BASE + cpu;
+}
+
+static __always_inline bool active_words_want_cpu(__u64 wanted0, __u64 wanted1,
+                                                  __u64 wanted2, __u64 wanted3,
+                                                  __u32 cpu, __u32 nr_cpus) {
+  __u64 word;
+
+  if (cpu >= nr_cpus || cpu >= MAX_CPUS)
+    return false;
+
+  if (cpu < 64)
+    word = wanted0;
+  else if (cpu < 128)
+    word = wanted1;
+  else if (cpu < 192)
+    word = wanted2;
+  else
+    word = wanted3;
+
+  return word & (1ULL << (cpu & 63));
 }
 
 static __always_inline void init_task_ctx_if_needed(struct task_scx_ctx *task_ctx) {
@@ -208,14 +263,36 @@ static __always_inline __u32 pick_allowed_cpu(struct task_struct *p,
     return cpu;
 
   cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-  if (valid_cpu(cpu))
+  if (valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
     return cpu;
 
   cpu = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
-  if (valid_cpu(cpu))
+  if (valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
     return cpu;
 
   return ADMISSION_CPU_NONE;
+}
+
+static __always_inline __u32 pick_task_cpu(struct task_struct *p,
+                                           s32 fallback_cpu) {
+  s32 cpu;
+
+  if (valid_cpu(fallback_cpu) && task_cpumask_allows(p, (__u32)fallback_cpu))
+    return fallback_cpu;
+
+  cpu = scx_bpf_task_cpu(p);
+  if (valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu))
+    return cpu;
+
+  cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+  if (valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu))
+    return cpu;
+
+  cpu = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
+  if (valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu))
+    return cpu;
+
+  return 0;
 }
 
 static __always_inline __u32 requested_cpu(struct task_struct *p,
@@ -326,11 +403,19 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
 
   cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
+  if (!valid_cpu(cpu) || !task_cpu_allowed(p, (__u32)cpu)) {
+    is_idle = false;
+    cpu = pick_allowed_cpu(p, prev_cpu);
+  }
+  if (!valid_cpu(cpu))
+    cpu = pick_task_cpu(p, prev_cpu);
+
   if (task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word) &&
-      valid_cpu(cpu))
+      valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
     task_ctx->admission_cpu = (__u32)cpu;
 
-  if (is_idle && !(task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word)))
+  if (is_idle && valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu) &&
+      !(task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word)))
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
   return cpu;
@@ -388,23 +473,90 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   __u32 *owner;
   (void)prev;
 
-  if (valid_cpu(cpu)) {
-    owner = lookup_cpu_owner((__u32)cpu);
-    if (should_drain_inactive((__u32)cpu, owner) &&
-        scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
-      return;
-  }
-
-  if (scx_bpf_dsq_move_to_local(READY_DSQ_ID))
+  if (!valid_cpu(cpu) || !cpu_is_active((__u32)cpu))
     return;
 
-  if (!valid_cpu(cpu))
+  owner = lookup_cpu_owner((__u32)cpu);
+  if (should_drain_inactive((__u32)cpu, owner) &&
+      scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
+    return;
+
+  if (scx_bpf_dsq_move_to_local(READY_DSQ_ID))
     return;
 
   if (scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
     return;
 
   steal_inactive((__u32)cpu);
+}
+
+static __always_inline void drain_inactive_to_ready(__u32 cpu) {
+  struct task_struct *p;
+
+  bpf_rcu_read_lock();
+  bpf_for_each(scx_dsq, p, inactive_dsq_id(cpu), 0) {
+    if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, READY_DSQ_ID, 0))
+      break;
+  }
+  bpf_rcu_read_unlock();
+}
+
+SEC("syscall")
+int accordin_set_active_cpus(struct accordin_active_cpus_args *args) {
+  struct active_cpumask_slot *slot;
+  struct bpf_cpumask *new_mask, *old_mask;
+  __u64 wanted0, wanted1, wanted2, wanted3;
+  __u32 i, n;
+
+  if (!args)
+    return -EINVAL;
+
+  wanted0 = args->wanted0;
+  wanted1 = args->wanted1;
+  wanted2 = args->wanted2;
+  wanted3 = args->wanted3;
+  n = args->nr_cpus;
+  if (n > MAX_CPUS)
+    n = MAX_CPUS;
+
+  new_mask = bpf_cpumask_create();
+  if (!new_mask)
+    return -ENOMEM;
+
+  slot = lookup_active_cpumask_slot();
+  if (!slot) {
+    bpf_cpumask_release(new_mask);
+    return -EINVAL;
+  }
+
+  for (i = 0; i < MAX_CPUS; i++) {
+    if (active_words_want_cpu(wanted0, wanted1, wanted2, wanted3, i, n))
+      bpf_cpumask_set_cpu(i, new_mask);
+  }
+
+  old_mask = bpf_kptr_xchg(&slot->mask, new_mask);
+  if (old_mask)
+    bpf_cpumask_release(old_mask);
+
+  return 0;
+}
+
+SEC("syscall")
+int accordin_nudge_cpu(struct accordin_cpu_nudge_args *args) {
+  __u32 cpu;
+
+  if (!args)
+    return -EINVAL;
+
+  cpu = args->cpu;
+  if (cpu >= MAX_CPUS)
+    return -EINVAL;
+
+  if (args->drain_inactive)
+    drain_inactive_to_ready(cpu);
+
+  scx_bpf_kick_cpu(cpu, 0);
+  return 0;
 }
 
 void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
@@ -458,6 +610,8 @@ void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
+  struct active_cpumask_slot *slot;
+  struct bpf_cpumask *mask, *old_mask;
   __u32 cpu;
   __u32 nr_cpus = scx_bpf_nr_cpu_ids();
   s32 ret;
@@ -475,10 +629,37 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
       return ret;
   }
 
+  slot = lookup_active_cpumask_slot();
+  if (!slot)
+    return -EINVAL;
+
+  bpf_rcu_read_lock();
+  old_mask = slot->mask;
+  bpf_rcu_read_unlock();
+  if (!old_mask) {
+    mask = bpf_cpumask_create();
+    if (!mask)
+      return -ENOMEM;
+    bpf_cpumask_setall(mask);
+    old_mask = bpf_kptr_xchg(&slot->mask, mask);
+    if (old_mask)
+      bpf_cpumask_release(old_mask);
+  }
+
   return 0;
 }
 
 void BPF_STRUCT_OPS(accordin_exit, struct scx_exit_info *ei) {
+  struct active_cpumask_slot *slot;
+  struct bpf_cpumask *mask;
+
+  slot = lookup_active_cpumask_slot();
+  if (slot) {
+    mask = bpf_kptr_xchg(&slot->mask, NULL);
+    if (mask)
+      bpf_cpumask_release(mask);
+  }
+
   UEI_RECORD(uei, ei);
 }
 

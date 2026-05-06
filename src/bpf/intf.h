@@ -15,6 +15,19 @@
 #define USER_ADMISSION_IN_CRITICAL_SECTION (1U << 0)
 #define USER_ADMISSION_SLOW_PATH_PENDING (1U << 1)
 
+struct accordin_active_cpus_args {
+  unsigned long long wanted0;
+  unsigned long long wanted1;
+  unsigned long long wanted2;
+  unsigned long long wanted3;
+  unsigned int nr_cpus;
+};
+
+struct accordin_cpu_nudge_args {
+  unsigned int cpu;
+  unsigned int drain_inactive;
+};
+
 struct task_scx_ctx {
   unsigned int admitted;
   unsigned int initialized;

@@ -16,7 +16,4 @@ mod mutex_hook;
 
 type AccordinRawLock = mcs_tas::McsTasLockRaw;
 
-accordin_shared::define_scheduler_loader!(
-    scheduler_name = "accordin",
-    env_prefix = "ACCORDIN",
-);
+accordin_shared::define_scheduler_loader!(scheduler_name = "accordin", env_prefix = "ACCORDIN",);

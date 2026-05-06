@@ -46,6 +46,17 @@ struct {
   __type(value, __u64);
 } stats_map SEC(".maps");
 
+struct active_cpumask_slot {
+  struct bpf_cpumask __kptr *mask;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct active_cpumask_slot);
+} active_cpumask_map SEC(".maps");
+
 volatile __u32 stats_only_mode = 0;
 volatile __u64 dbg_acct_calls = 0;
 volatile __u64 dbg_acct_read_ok = 0;

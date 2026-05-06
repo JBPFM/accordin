@@ -21,6 +21,167 @@ macro_rules! define_scheduler_loader {
 
         static SCHEDULER_STATE: ::std::sync::OnceLock<SchedulerState> = ::std::sync::OnceLock::new();
 
+        struct ActiveCpusProgSink {
+            set_prog_fd: ::std::os::fd::RawFd,
+            nudge_prog_fd: ::std::os::fd::RawFd,
+            previous: ::std::sync::Mutex<Option<[u8; $crate::cpu_affinity::MAX_CPUS]>>,
+        }
+
+        impl ActiveCpusProgSink {
+            fn set_active_cpus(
+                &self,
+                wanted: &[u8; $crate::cpu_affinity::MAX_CPUS],
+            ) -> ::std::result::Result<(), ::std::string::String> {
+                let mut wanted_words = [0u64; $crate::cpu_affinity::ACTIVE_CPU_WORDS];
+                for (cpu, active) in wanted.iter().enumerate() {
+                    if *active != 0 {
+                        wanted_words[cpu / 64] |= 1u64 << (cpu % 64);
+                    }
+                }
+
+                let args = crate::bpf_intf::accordin_active_cpus_args {
+                    wanted0: wanted_words[0],
+                    wanted1: wanted_words[1],
+                    wanted2: wanted_words[2],
+                    wanted3: wanted_words[3],
+                    nr_cpus: crate::bpf_intf::MAX_CPUS,
+                };
+                let mut opts = ::libbpf_rs::libbpf_sys::bpf_test_run_opts {
+                    sz: ::std::mem::size_of::<::libbpf_rs::libbpf_sys::bpf_test_run_opts>() as _,
+                    ctx_in: (&args as *const crate::bpf_intf::accordin_active_cpus_args).cast(),
+                    ctx_size_in: ::std::mem::size_of::<crate::bpf_intf::accordin_active_cpus_args>()
+                        as u32,
+                    ..::std::default::Default::default()
+                };
+
+                let ret = unsafe {
+                    ::libbpf_rs::libbpf_sys::bpf_prog_test_run_opts(
+                        self.set_prog_fd,
+                        &mut opts,
+                    )
+                };
+                if ret != 0 {
+                    return Err(::std::format!(
+                        "bpf_prog_test_run_opts(accordin_set_active_cpus) failed: {}",
+                        ::std::io::Error::last_os_error()
+                    ));
+                }
+
+                let retval = opts.retval as i32;
+                if retval != 0 {
+                    return Err(::std::format!(
+                        "accordin_set_active_cpus returned {retval}"
+                    ));
+                }
+
+                Ok(())
+            }
+
+            fn nudge_cpu(
+                &self,
+                cpu: usize,
+                drain_inactive: bool,
+            ) -> ::std::result::Result<(), ::std::string::String> {
+                let args = crate::bpf_intf::accordin_cpu_nudge_args {
+                    cpu: cpu as u32,
+                    drain_inactive: u32::from(drain_inactive),
+                };
+                let mut opts = ::libbpf_rs::libbpf_sys::bpf_test_run_opts {
+                    sz: ::std::mem::size_of::<::libbpf_rs::libbpf_sys::bpf_test_run_opts>() as _,
+                    ctx_in: (&args as *const crate::bpf_intf::accordin_cpu_nudge_args).cast(),
+                    ctx_size_in: ::std::mem::size_of::<crate::bpf_intf::accordin_cpu_nudge_args>()
+                        as u32,
+                    ..::std::default::Default::default()
+                };
+
+                let ret = unsafe {
+                    ::libbpf_rs::libbpf_sys::bpf_prog_test_run_opts(
+                        self.nudge_prog_fd,
+                        &mut opts,
+                    )
+                };
+                if ret != 0 {
+                    return Err(::std::format!(
+                        "bpf_prog_test_run_opts(accordin_nudge_cpu) failed: {}",
+                        ::std::io::Error::last_os_error()
+                    ));
+                }
+
+                let retval = opts.retval as i32;
+                if retval != 0 {
+                    return Err(::std::format!("accordin_nudge_cpu returned {retval}"));
+                }
+
+                Ok(())
+            }
+
+            fn nudge_changed_cpus(
+                &self,
+                previous: Option<[u8; $crate::cpu_affinity::MAX_CPUS]>,
+                wanted: &[u8; $crate::cpu_affinity::MAX_CPUS],
+            ) {
+                let Some(previous) = previous else {
+                    return;
+                };
+
+                let mut removed_any = false;
+                for cpu in 0..$crate::cpu_affinity::MAX_CPUS {
+                    if previous[cpu] != 0 && wanted[cpu] == 0 {
+                        removed_any = true;
+                        if let Err(error) = self.nudge_cpu(cpu, true) {
+                            eprintln!(
+                                "[{}] failed to drain inactive CPU {}: {}",
+                                SCHEDULER_NAME, cpu, error
+                            );
+                        }
+                    }
+                }
+
+                for cpu in 0..$crate::cpu_affinity::MAX_CPUS {
+                    if previous[cpu] == 0 && wanted[cpu] != 0 {
+                        if let Err(error) = self.nudge_cpu(cpu, false) {
+                            eprintln!(
+                                "[{}] failed to kick newly active CPU {}: {}",
+                                SCHEDULER_NAME, cpu, error
+                            );
+                        }
+                    }
+                }
+
+                if removed_any {
+                    if let Some(cpu) = wanted.iter().position(|active| *active != 0) {
+                        if let Err(error) = self.nudge_cpu(cpu, false) {
+                            eprintln!(
+                                "[{}] failed to kick active CPU {} after drain: {}",
+                                SCHEDULER_NAME, cpu, error
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        impl $crate::cpu_affinity::BpfActiveCpusSink for ActiveCpusProgSink {
+            fn push(
+                &self,
+                wanted: &[u8; $crate::cpu_affinity::MAX_CPUS],
+            ) -> ::std::result::Result<(), ::std::string::String> {
+                self.set_active_cpus(wanted)?;
+
+                let previous = {
+                    let mut previous = self
+                        .previous
+                        .lock()
+                        .map_err(|_| "BPF active CPU previous-mask lock is poisoned".to_string())?;
+                    let old = *previous;
+                    *previous = Some(*wanted);
+                    old
+                };
+                self.nudge_changed_cpus(previous, wanted);
+                Ok(())
+            }
+        }
+
         struct SchedulerState {
             _link: Option<::libbpf_rs::Link>,
             _skel: Option<BpfSkel<'static>>,
@@ -45,6 +206,23 @@ macro_rules! define_scheduler_loader {
 
             let thread_ctx_map = ::libbpf_rs::MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
             $crate::mutex_hook::set_thread_ctx_map(thread_ctx_map);
+
+            let active_cpus_prog_fd = {
+                use ::std::os::fd::{AsFd, AsRawFd};
+                skel.progs.accordin_set_active_cpus.as_fd().as_raw_fd()
+            };
+            let nudge_cpu_prog_fd = {
+                use ::std::os::fd::{AsFd, AsRawFd};
+                skel.progs.accordin_nudge_cpu.as_fd().as_raw_fd()
+            };
+            $crate::cpu_affinity::set_bpf_sink(Box::new(ActiveCpusProgSink {
+                set_prog_fd: active_cpus_prog_fd,
+                nudge_prog_fd: nudge_cpu_prog_fd,
+                previous: ::std::sync::Mutex::new(None),
+            }))
+            .map_err(::anyhow::Error::msg)?;
+            $crate::cpu_affinity::init_from_env(SCHEDULER_NAME);
+            $crate::cpu_affinity::push_initial_mask_to_bpf().map_err(::anyhow::Error::msg)?;
 
             let link = ::scx_utils::scx_ops_attach!(skel, accordin_ops)?;
 
@@ -75,9 +253,8 @@ macro_rules! define_scheduler_loader {
                 ::simplelog::ColorChoice::Auto,
             );
 
-            $crate::cpu_affinity::init_from_env(SCHEDULER_NAME);
-
             if $crate::env::env_flag(DISABLE_BPF_ENV) {
+                $crate::cpu_affinity::init_from_env(SCHEDULER_NAME);
                 ::log::info!(
                     "{SCHEDULER_NAME} scheduler disabled by env {}",
                     DISABLE_BPF_ENV

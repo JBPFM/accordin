@@ -37,6 +37,13 @@ DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
 DEFAULT_INIT_EXISTING_BENCHMARKS = ("readrandom", "readseq", "overwrite")
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600
+ACCORDIN_HOOK_SCOPE_ENV = "ACCORDIN_HOOK_SCOPE"
+ACCORDIN_LEVELDB_HOOK_SCOPE = "registered"
+LEVELDB_REBUILD_INPUTS = (
+    Path("db/db_impl.cc"),
+    Path("db/db_impl.h"),
+    Path("port/port_stdcxx.h"),
+)
 SINGLE_OVERSUBSCRIBED_LOCKS = experiment_defaults.SINGLE_OVERSUBSCRIBED_LOCKS
 PER_LOCK_MAX_THREADS = experiment_defaults.per_lock_max_threads_for_settings(
     SINGLE_OVERSUBSCRIBED_LOCKS,
@@ -77,6 +84,7 @@ LATENCY_PATTERN = re.compile(
 )
 LEVELDB_PROGRESS_PATTERN = re.compile(r"^\.\.\. (?:finished \d+ ops|crc=0x[0-9a-fA-F]+)\s*$")
 BENCHMARK_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+RunKey = tuple[str, str, int, int]
 
 
 def positive_int(value: str) -> int:
@@ -129,6 +137,18 @@ Examples:
         "--force",
         action="store_true",
         help="Allow benchmark output into an existing non-empty output root.",
+    )
+    parser.add_argument(
+        "--keep-db",
+        action="store_true",
+        help="Preserve each temporary LevelDB DB directory instead of removing it after the run.",
+    )
+    parser.add_argument(
+        "--rerun-failures",
+        type=Path,
+        default=None,
+        metavar="FAILED_RUNS_CSV",
+        help="Run only benchmark/lock/thread/repeat points listed in an experiment failed_runs.csv.",
     )
     parser.add_argument(
         "--build-missing",
@@ -257,6 +277,30 @@ def parse_init_existing_benchmarks(value: str) -> tuple[str, ...]:
     return validate_benchmark_names(parse_csv_strings(value))
 
 
+def load_failure_selection(path: Path) -> set[RunKey]:
+    path = resolve_path(path)
+    if not path.is_file():
+        raise RuntimeError(f"Failure CSV was not found: {path}")
+    selected: set[RunKey] = set()
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise RuntimeError(f"Failure CSV is missing a header: {path}")
+        required = {"benchmark", "lock", "threads", "repeat"}
+        missing = sorted(required - set(reader.fieldnames))
+        if missing:
+            raise RuntimeError(f"Failure CSV is missing required columns: {', '.join(missing)}")
+        for row in reader:
+            benchmark = row["benchmark"].strip()
+            lock = row["lock"].strip()
+            if not benchmark or not lock:
+                continue
+            selected.add((benchmark, lock, int(row["threads"]), int(row["repeat"])))
+    if not selected:
+        raise RuntimeError(f"Failure CSV did not contain any runnable experiment-four failures: {path}")
+    return selected
+
+
 def resolve_path(path: Path) -> Path:
     return experiment_three.resolve_path(path)
 
@@ -285,6 +329,7 @@ def accordin_preload_env(preload_library: Path) -> dict[str, str]:
     env = preload_env(preload_library)
     if env is None:
         env = {}
+    env[ACCORDIN_HOOK_SCOPE_ENV] = ACCORDIN_LEVELDB_HOOK_SCOPE
     if "ACCORDIN_CPU_MASK_K" in os.environ:
         env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
     if "K" in os.environ:
@@ -338,6 +383,22 @@ def default_db_bench_for_leveldb(leveldb_dir: Path) -> Path:
     return leveldb_dir / "build" / "db_bench"
 
 
+def db_bench_needs_rebuild(db_bench: Path, leveldb_dir: Path) -> bool:
+    try:
+        db_bench_mtime = db_bench.stat().st_mtime
+    except OSError:
+        return True
+
+    for relative_source in LEVELDB_REBUILD_INPUTS:
+        source = leveldb_dir / relative_source
+        try:
+            if source.stat().st_mtime > db_bench_mtime:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def ensure_leveldb_source(
     leveldb_dir: Path,
     *,
@@ -381,6 +442,9 @@ def ensure_db_bench(
     logger: experiment_three.CommandLogger,
 ) -> None:
     if db_bench.is_file() and os.access(db_bench, os.X_OK):
+        if not (build_missing and db_bench_needs_rebuild(db_bench, leveldb_dir)):
+            return
+    if db_bench.is_file() and os.access(db_bench, os.X_OK) and not build_missing:
         return
     if not build_missing:
         raise RuntimeError(f"LevelDB db_bench is missing or not executable: {db_bench}. Rerun with --build-missing.")
@@ -563,6 +627,8 @@ def run_benchmarks(
     init_existing_benchmarks: tuple[str, ...],
     logger: experiment_three.CommandLogger,
     failures: list[dict[str, str]],
+    selected_runs: set[RunKey] | None,
+    keep_db: bool,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     init_benchmarks = set(init_existing_benchmarks)
@@ -581,6 +647,9 @@ def run_benchmarks(
                     reads_per_thread = None
                     effective_total_ops = db_bench_num * thread
                 for repeat in range(1, repeats + 1):
+                    run_key = (benchmark, lock, thread, repeat)
+                    if selected_runs is not None and run_key not in selected_runs:
+                        continue
                     db_path = Path(tempfile.mkdtemp(prefix="experiment4_leveldb_"))
                     init_result: experiment_three.CommandResult | None = None
                     try:
@@ -661,7 +730,10 @@ def run_benchmarks(
                         experiment_failures.write_failures_csv(result_root, failures)
                         continue
                     finally:
-                        cleanup_db_path(db_path)
+                        if keep_db:
+                            print(f"Preserved temporary DB path: {db_path}", file=sys.stderr)
+                        else:
+                            cleanup_db_path(db_path)
 
     return rows
 
@@ -705,6 +777,8 @@ def write_settings(
         "leveldb_version": LEVELDB_VERSION if leveldb_dir == DEFAULT_LEVELDB_DIR else "custom",
         "fill_benchmark": fill_benchmark,
         "init_existing_benchmarks": list(init_existing_benchmarks),
+        "accordin_hook_scope_env": ACCORDIN_HOOK_SCOPE_ENV,
+        "accordin_hook_scope": ACCORDIN_LEVELDB_HOOK_SCOPE,
         "flexguard_dir": str(FLEXGUARD_DIR),
         "machine_core_count": experiment_defaults.MACHINE_CORE_COUNT,
     }
@@ -906,6 +980,7 @@ def main() -> int:
         db_bench = resolve_path(args.db_bench) if args.db_bench is not None else default_db_bench_for_leveldb(leveldb_dir)
         fill_benchmark = validate_benchmark_names((args.fill_benchmark,))[0]
         init_existing_benchmarks = parse_init_existing_benchmarks(args.init_existing_benchmarks)
+        selected_runs = load_failure_selection(args.rerun_failures) if args.rerun_failures is not None else None
 
         if args.plot_only is not None:
             result_root = resolve_path(args.plot_only)
@@ -963,6 +1038,8 @@ def main() -> int:
             init_existing_benchmarks=init_existing_benchmarks,
             logger=logger,
             failures=failures,
+            selected_runs=selected_runs,
+            keep_db=args.keep_db,
         )
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)

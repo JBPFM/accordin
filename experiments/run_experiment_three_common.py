@@ -123,7 +123,10 @@ BENCHMARK_LABELS = {
 ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
-ROOT_REQUIRED_PRELOAD_LOCKS = {"mcs_tas_accordin"}
+ROOT_REQUIRED_PRELOAD_LOCKS = {
+    lock
+    for lock in experiment_defaults.ACCORDIN_VARIANT_LOCKS
+}
 LOCK_ALIASES = experiment_defaults.LOCK_ALIASES
 LOCK_ORDER = experiment_defaults.LOCK_ORDER
 RESULT_LOG_PATTERN = re.compile(
@@ -204,7 +207,7 @@ class CommandLogger:
         *,
         log_name: str,
         cwd: Path = REPO_ROOT,
-        env: dict[str, str] | None = None,
+        env: dict[str, str | None] | None = None,
         timeout_seconds: int | None = None,
     ) -> CommandResult:
         effective_timeout = self.command_timeout_seconds if timeout_seconds is None else timeout_seconds
@@ -224,7 +227,11 @@ class CommandLogger:
             record["command_timeout_seconds"] = effective_timeout
         run_env = os.environ.copy()
         if env:
-            run_env.update(env)
+            for key, value in env.items():
+                if value is None:
+                    run_env.pop(key, None)
+                else:
+                    run_env[key] = value
 
         output_chunks: list[str] = []
         with log_path.open("w", encoding="utf-8") as log_file:
@@ -451,7 +458,8 @@ def parse_args(
             "Comma-separated lock keys. Overrides --lock-profile. "
             "Use stock to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "accordin/mcs_accordin == mcs_tas_accordin."
+            "accordin == mcs_tas_accordin_admission_only, accordin_sampled, "
+            "accordin_no_admission, accordin_taskset."
         ),
     )
     parser.add_argument(
@@ -552,13 +560,55 @@ def combine_ld_preload(preload_library: Path) -> str:
     return f"{preload_library}:{existing}" if existing else str(preload_library)
 
 
-def accordin_preload_env(preload_library: Path) -> dict[str, str]:
-    env = {"LD_PRELOAD": combine_ld_preload(preload_library)}
-    if "ACCORDIN_CPU_MASK_K" in os.environ:
-        env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
-    if "K" in os.environ:
-        env["K"] = os.environ["K"]
+def accordin_preload_env(
+    preload_library: Path,
+    *,
+    lock: str = experiment_defaults.ACCORDIN_BASE_LOCK,
+) -> dict[str, str | None]:
+    env: dict[str, str | None] = {
+        "LD_PRELOAD": combine_ld_preload(preload_library),
+        "ACCORDIN_DISABLE_ADMISSION": None,
+        "ACCORDIN_CPU_MASK_K": None,
+        "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
+        "MCS_TAS_ACCORDIN_STATS_ONLY": None,
+    }
+    if experiment_defaults.accordin_uses_sampling(lock):
+        env["K"] = str(experiment_defaults.DEFAULT_ACCORDIN_CONCURRENCY)
+    else:
+        env["K"] = None
+    if experiment_defaults.accordin_disables_admission(lock):
+        env["ACCORDIN_DISABLE_ADMISSION"] = "1"
+        env["MCS_TAS_ACCORDIN_STATS_ONLY"] = "1"
     return env
+
+
+def taskset_wrapper_env(env: dict[str, str | None]) -> dict[str, str | None]:
+    return {key: None for key in env}
+
+
+def accordin_command_prefix_from_env(
+    lock: str,
+    env: dict[str, str | None],
+) -> tuple[list[str], dict[str, str | None]]:
+    if experiment_defaults.accordin_uses_taskset(lock):
+        return (
+            [
+                "taskset",
+                "-c",
+                experiment_defaults.DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
+                "env",
+                *env_command_tokens(env),
+            ],
+            taskset_wrapper_env(env),
+        )
+    return [], env
+
+
+def accordin_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None]]:
+    return accordin_command_prefix_from_env(
+        lock,
+        accordin_preload_env(ACCORDIN_PRELOAD_LIBRARY, lock=lock),
+    )
 
 
 def parse_csv_ints(value: str) -> tuple[int, ...]:
@@ -651,22 +701,33 @@ def interpose_needs_sudo(lock: str) -> bool:
     return lock.startswith(BPF_INTERPOSE_LOCK_PREFIXES)
 
 
-def with_sudo_env(cmd: list[str], env: dict[str, str] | None) -> tuple[list[str], None]:
+def env_command_tokens(env: dict[str, str | None]) -> list[str]:
+    tokens: list[str] = []
+    for key, value in sorted(env.items()):
+        if value is None:
+            tokens.extend(["-u", key])
+    for key, value in sorted(env.items()):
+        if value is not None:
+            tokens.append(f"{key}={value}")
+    return tokens
+
+
+def with_sudo_env(cmd: list[str], env: dict[str, str | None] | None) -> tuple[list[str], None]:
     sudo_cmd = ["sudo", "-n", "env"]
     if env is not None:
-        sudo_cmd.extend(f"{key}={value}" for key, value in sorted(env.items()))
+        sudo_cmd.extend(env_command_tokens(env))
     sudo_cmd.extend(cmd)
     return sudo_cmd, None
 
 
-def interpose_command(lock: str, env: dict[str, str] | None = None) -> tuple[list[str], dict[str, str] | None]:
+def interpose_command(lock: str, env: dict[str, str | None] | None = None) -> tuple[list[str], dict[str, str | None] | None]:
     cmd = [str(interpose_script_path(lock))]
     if interpose_needs_sudo(lock):
         return with_sudo_env(cmd, env)
     return cmd, env
 
 
-def benchmark_command(lock: str, cmd: list[str], env: dict[str, str] | None) -> tuple[list[str], dict[str, str] | None]:
+def benchmark_command(lock: str, cmd: list[str], env: dict[str, str | None] | None) -> tuple[list[str], dict[str, str | None] | None]:
     if env is not None and lock in ROOT_REQUIRED_PRELOAD_LOCKS:
         return with_sudo_env(cmd, env)
     return cmd, env
@@ -710,7 +771,7 @@ def interpose_helper_error(lock: str) -> str | None:
 def invalid_interpose_helpers(locks: Iterable[str]) -> list[str]:
     invalid: list[str] = []
     for lock in locks:
-        if lock in {"stock", "mcs_tas_accordin", "mcs_extension"}:
+        if lock in {"stock", "mcs_extension"} or experiment_defaults.is_accordin_lock(lock):
             continue
         error = interpose_helper_error(lock)
         if error is not None:
@@ -1039,11 +1100,11 @@ def build_dedup_command(
     input_path: Path,
     compression: str,
     output_path: Path,
-) -> tuple[list[str], dict[str, str] | None]:
+) -> tuple[list[str], dict[str, str | None] | None]:
     cmd: list[str] = []
     if lock != "stock":
-        if lock == "mcs_tas_accordin":
-            env = accordin_preload_env(ACCORDIN_PRELOAD_LIBRARY)
+        if experiment_defaults.is_accordin_lock(lock):
+            cmd, env = accordin_command_prefix(lock)
         elif lock == "mcs_extension":
             env = {"LD_PRELOAD": combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)}
         else:
@@ -1071,11 +1132,11 @@ def build_streamcluster_command(
     input_value: str,
     output_path: Path,
     args: argparse.Namespace,
-) -> tuple[list[str], dict[str, str] | None]:
+) -> tuple[list[str], dict[str, str | None] | None]:
     cmd: list[str] = []
     if lock != "stock":
-        if lock == "mcs_tas_accordin":
-            env = accordin_preload_env(ACCORDIN_PRELOAD_LIBRARY)
+        if experiment_defaults.is_accordin_lock(lock):
+            cmd, env = accordin_command_prefix(lock)
         elif lock == "mcs_extension":
             env = {"LD_PRELOAD": combine_ld_preload(MCS_EXTENSION_PRELOAD_LIBRARY)}
         else:
@@ -1256,7 +1317,7 @@ def run_benchmarks(
                     )
                     remove_if_exists(output_path)
                     try:
-                        env: dict[str, str] | None
+                        env: dict[str, str | None] | None
                         if benchmark == "dedup":
                             cmd, env = build_dedup_command(
                                 lock=lock,
@@ -1562,7 +1623,7 @@ def main(
             command_timeout_seconds=args.command_timeout_seconds,
         )
         ensure_interpose_helpers(locks, build_missing=args.build_missing, logger=logger)
-        if "mcs_tas_accordin" in locks:
+        if any(experiment_defaults.is_accordin_lock(lock) for lock in locks):
             ensure_accordin_preload(build_missing=args.build_missing, logger=logger)
         if "mcs_extension" in locks:
             ensure_mcs_extension_preload(build_missing=args.build_missing, logger=logger)

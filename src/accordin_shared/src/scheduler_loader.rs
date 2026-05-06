@@ -169,7 +169,7 @@ macro_rules! define_scheduler_loader {
 
         fn init_scheduler(
             debug: bool,
-            _stats_only: bool,
+            stats_only: bool,
             _debug_counters: bool,
         ) -> ::anyhow::Result<SchedulerState> {
             let mut skel_builder = BpfSkelBuilder::default();
@@ -179,6 +179,9 @@ macro_rules! define_scheduler_loader {
                 Box::leak(Box::new(::std::mem::MaybeUninit::uninit()));
 
             let mut skel = ::scx_utils::scx_ops_open!(skel_builder, open_object, accordin_ops, None)?;
+            if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
+                bss.stats_only_mode = u32::from(stats_only);
+            }
             let mut skel = ::scx_utils::scx_ops_load!(skel, accordin_ops, uei)?;
 
             let thread_ctx_map = ::libbpf_rs::MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
@@ -250,11 +253,11 @@ macro_rules! define_scheduler_loader {
                 Ok(state) => {
                     if stats_only {
                         ::log::info!(
-                            "{SCHEDULER_NAME} stats-only env {} requested but ignored by minimal BPF controller",
+                            "{SCHEDULER_NAME} stats-only env {} requested; lock-aware scheduling disabled",
                             STATS_ONLY_ENV
                         );
                         eprintln!(
-                            "[{}] stats-only env {} requested but ignored by minimal BPF controller",
+                            "[{}] stats-only env {} requested; lock-aware scheduling disabled",
                             SCHEDULER_NAME, STATS_ONLY_ENV
                         );
                     }

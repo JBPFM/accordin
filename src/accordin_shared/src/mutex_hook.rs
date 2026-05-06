@@ -37,8 +37,9 @@ where
     }
 
     fn lock(state: &Self::LockState) {
-        crate::admission::mark_slow_path_pending();
-        std::thread::yield_now();
+        if crate::admission::mark_slow_path_pending() {
+            std::thread::yield_now();
+        }
         LockBackend::lock(state);
     }
 

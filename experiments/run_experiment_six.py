@@ -133,7 +133,7 @@ class ParsedHookOutput:
 @dataclass(frozen=True)
 class RunCommand:
     cmd: list[str]
-    env: dict[str, str] | None
+    env: dict[str, str | None] | None
     cwd: Path
     cleanup_paths: tuple[Path, ...] = ()
 
@@ -281,7 +281,8 @@ Examples:
             "Comma-separated lock keys. Overrides --lock-profile. "
             "Use stock to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "accordin/mcs_accordin == mcs_tas_accordin."
+            "accordin == mcs_tas_accordin_admission_only, accordin_sampled, "
+            "accordin_no_admission, accordin_taskset."
         ),
     )
     parser.add_argument("--threads", default=",".join(str(thread) for thread in DEFAULT_THREADS), metavar="CSV")
@@ -410,9 +411,12 @@ def parse_log_wall_seconds(output: str) -> float | None:
 def submit_command_for_lock(lock: str) -> str:
     if lock == "stock":
         return "time"
-    if lock == "mcs_tas_accordin":
-        env = parsec_common.accordin_preload_env(parsec_common.ACCORDIN_PRELOAD_LIBRARY)
-        return shlex.join(["sudo", "-n", "env", *(f"{key}={value}" for key, value in sorted(env.items()))])
+    if experiment_defaults.is_accordin_lock(lock):
+        prefix, env = parsec_common.accordin_command_prefix(lock)
+        command = ["env", *parsec_common.env_command_tokens(env), *prefix]
+        if lock in parsec_common.ROOT_REQUIRED_PRELOAD_LOCKS:
+            command = ["sudo", "-n", *command]
+        return shlex.join(command)
     if lock == "mcs_extension":
         preload = parsec_common.combine_ld_preload(parsec_common.MCS_EXTENSION_PRELOAD_LIBRARY)
         return shlex.join(["env", f"LD_PRELOAD={preload}"])
@@ -426,11 +430,11 @@ def submit_command_for_lock(lock: str) -> str:
 def command_with_lock(
     lock: str,
     payload: list[str],
-) -> tuple[list[str], dict[str, str] | None]:
+) -> tuple[list[str], dict[str, str | None] | None]:
     cmd: list[str] = []
     if lock != "stock":
-        if lock == "mcs_tas_accordin":
-            env = parsec_common.accordin_preload_env(parsec_common.ACCORDIN_PRELOAD_LIBRARY)
+        if experiment_defaults.is_accordin_lock(lock):
+            cmd, env = parsec_common.accordin_command_prefix(lock)
         elif lock == "mcs_extension":
             env = {"LD_PRELOAD": parsec_common.combine_ld_preload(parsec_common.MCS_EXTENSION_PRELOAD_LIBRARY)}
         else:
@@ -1060,7 +1064,7 @@ def main() -> int:
             command_timeout_seconds=args.command_timeout_seconds,
         )
         parsec_common.ensure_interpose_helpers(locks, build_missing=args.build_missing, logger=logger)
-        if "mcs_tas_accordin" in locks:
+        if any(experiment_defaults.is_accordin_lock(lock) for lock in locks):
             parsec_common.ensure_accordin_preload(build_missing=args.build_missing, logger=logger)
         if "mcs_extension" in locks:
             parsec_common.ensure_mcs_extension_preload(build_missing=args.build_missing, logger=logger)

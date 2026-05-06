@@ -34,6 +34,7 @@ from bench_csv_schema import (  # noqa: E402
 
 import experiment_defaults  # noqa: E402
 import experiment_failures  # noqa: E402
+import run_experiment_three_common as experiment_three  # noqa: E402
 from machine_config import (  # noqa: E402
     DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
 )
@@ -54,9 +55,15 @@ WARMUP_DURATION_MS = experiment_defaults.MUTEXBENCH_DEFAULT_WARMUP_DURATION_MS
 REPEATS = experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 21600
 COMMAND_TIMEOUT_KILL_AFTER_SECONDS = 60
-ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin"
-ACCORDIN_TASKSET_PACKAGE = "mcs_tas_accordin"
-ACCORDIN_TASKSET_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
+ACCORDIN_TASKSET_LOCK = experiment_defaults.ACCORDIN_TASKSET_LOCK
+ACCORDIN_DIRECT_PACKAGE = "mcs_tas_accordin_direct"
+ACCORDIN_DIRECT_LOCK_KIND = "mcs_tas_accordin_direct"
+ACCORDIN_DIRECT_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
+ACCORDIN_DIRECT_LIB_ENV = "MCS_TAS_ACCORDIN_DIRECT_LIB"
+ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
+ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
+ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
+ACCORDIN_PRELOAD_LOCKS = experiment_defaults.EXPERIMENT_ONE_ACCORDIN_LOCKS
 FOCUS_LOCK_KEYS = experiment_defaults.EXPERIMENT_ONE_FOCUS_LOCKS
 PIECEWISE_Y_THRESHOLD_NS = 1000.0
 PIECEWISE_Y_LINEAR_SCALE = 3.0
@@ -269,6 +276,22 @@ def non_negative_int(value: str) -> int:
     return parsed
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def parse_csv_ints(value: str) -> tuple[int, ...]:
+    items = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    if not items:
+        raise argparse.ArgumentTypeError("CSV value must contain at least one integer")
+    if any(item <= 0 for item in items):
+        raise argparse.ArgumentTypeError("thread counts must be positive")
+    return items
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run or plot the mutexbench experiment-one sweep.",
@@ -287,7 +310,7 @@ Default benchmark settings:
 Examples:
   python3 experiments/run_experiment_one.py
   python3 experiments/run_experiment_one.py --output-root experiments/results/experiment1_manual
-  python3 experiments/run_experiment_one.py --mcs-accordin-taskset-cpus {DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
+  python3 experiments/run_experiment_one.py --threads 128 --repeats 1
   {PROFILE_ENV}=original python3 experiments/run_experiment_one.py
   python3 experiments/run_experiment_one.py --plot-only experiments/results/experiment1_manual
   python3 experiments/run_experiment_one.py --output-root experiments/results/experiment1_20260423_194548 --supplement-locks
@@ -344,18 +367,34 @@ Examples:
         help="Sudo policy forwarded to the multi-lock sweep. Default: auto.",
     )
     parser.add_argument(
+        "--threads",
+        type=parse_csv_ints,
+        default=THREADS,
+        metavar="CSV",
+        help=f"Comma-separated thread counts. Default: {','.join(str(v) for v in THREADS)}.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=positive_int,
+        default=REPEATS,
+        help=f"Number of repeats per point. Default: {REPEATS}.",
+    )
+    parser.add_argument(
         "--mcs-accordin-taskset-cpus",
         default=DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
         metavar="CPU_LIST",
         help=(
-            f"CPU list passed to taskset for the accordin ({ACCORDIN_TASKSET_LOCK}) series. "
+            f"CPU list passed to taskset for the {experiment_defaults.ACCORDIN_TASKSET_LOCK} series. "
             f"Default: {DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}."
         ),
     )
     parser.add_argument(
         "--skip-mcs-accordin-taskset",
         action="store_true",
-        help=f"Skip only the taskset accordin ({ACCORDIN_TASKSET_LOCK}) series. Default full run includes it.",
+        help=(
+            f"Skip only the taskset accordin ({experiment_defaults.ACCORDIN_TASKSET_LOCK}) "
+            "series. Default minimal/full run includes it."
+        ),
     )
     parser.add_argument(
         "--force",
@@ -429,10 +468,12 @@ def write_settings(
     lock_profile: str,
     selected_lock_keys: tuple[str, ...],
     command_timeout_seconds: int,
+    threads: tuple[int, ...],
+    repeats: int,
 ) -> None:
     selected_locks = lock_specs_for_keys(selected_lock_keys)
     settings = {
-        "threads": list(THREADS),
+        "threads": list(threads),
         "lock_profile": lock_profile,
         "lock_profile_source": "profile",
         "selected_locks": [{"label": lock.label, "key": lock.key} for lock in selected_locks],
@@ -442,11 +483,11 @@ def write_settings(
         "outside_ns": OUTSIDE_NS,
         "duration_ms": DURATION_MS,
         "warmup_duration_ms": WARMUP_DURATION_MS,
-        "repeats": REPEATS,
+        "repeats": repeats,
         "command_timeout_seconds": command_timeout_seconds,
         "single_oversubscribed_locks": list(SINGLE_OVERSUBSCRIBED_LOCK_KEYS),
         "runnable_threads_by_lock": {
-            lock.key: list(runnable_threads_for_lock(lock.key))
+            lock.key: list(runnable_threads_for_lock(lock.key, threads))
             for lock in selected_locks
         },
         "mcs_extension_mode": mcs_extension_mode,
@@ -454,6 +495,8 @@ def write_settings(
         "accordin_taskset_lock": ACCORDIN_TASKSET_LOCK,
         "mcs_accordin_taskset_enabled": mcs_accordin_taskset_enabled,
         "mcs_accordin_taskset_cpus": mcs_accordin_taskset_cpus,
+        "accordin_direct_lock_kind": ACCORDIN_DIRECT_LOCK_KIND,
+        "accordin_direct_library": str(ACCORDIN_DIRECT_RELEASE_LIB),
         "locks": [{"label": lock.label, "key": lock.key} for lock in selected_locks],
         "flexguard_dir": str(FLEXGUARD_DIR),
     }
@@ -471,6 +514,8 @@ def write_settings_if_missing(
     lock_profile: str,
     selected_lock_keys: tuple[str, ...],
     command_timeout_seconds: int,
+    threads: tuple[int, ...],
+    repeats: int,
 ) -> None:
     settings_path = result_root / "settings.json"
     if settings_path.exists():
@@ -486,6 +531,8 @@ def write_settings_if_missing(
         lock_profile,
         selected_lock_keys,
         command_timeout_seconds,
+        threads,
+        repeats,
     )
 
 
@@ -496,12 +543,11 @@ def ensure_executable(path: Path, description: str) -> None:
 
 def ensure_mutex_bench(logger: CommandLogger) -> None:
     binary = MUTEXBENCH_DIR / "mutex_bench"
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        logger.run(
-            ["make", "-C", str(MUTEXBENCH_DIR), "mutex_bench"],
-            log_name="build_mutex_bench.log",
-            timeout_seconds=0,
-        )
+    logger.run(
+        ["make", "-C", str(MUTEXBENCH_DIR), "mutex_bench"],
+        log_name="build_mutex_bench.log",
+        timeout_seconds=0,
+    )
     ensure_executable(binary, "mutexbench binary")
 
 
@@ -597,7 +643,7 @@ def ensure_inputs(
         ensure_flexguard_interpose(key, logger)
 
 
-def common_sweep_args(threads: tuple[int, ...] = THREADS) -> list[str]:
+def common_sweep_args(args: argparse.Namespace, threads: tuple[int, ...]) -> list[str]:
     return [
         "--threads",
         ",".join(str(v) for v in threads),
@@ -610,14 +656,17 @@ def common_sweep_args(threads: tuple[int, ...] = THREADS) -> list[str]:
         "--warmup-duration-ms",
         str(WARMUP_DURATION_MS),
         "--repeats",
-        str(REPEATS),
+        str(args.repeats),
     ]
 
 
-def lock_thread_groups(lock_keys: tuple[str, ...]) -> list[tuple[tuple[str, ...], tuple[int, ...]]]:
+def lock_thread_groups(
+    lock_keys: tuple[str, ...],
+    requested_threads: tuple[int, ...],
+) -> list[tuple[tuple[str, ...], tuple[int, ...]]]:
     groups: list[tuple[list[str], tuple[int, ...]]] = []
     for lock_key in lock_keys:
-        threads = runnable_threads_for_lock(lock_key)
+        threads = runnable_threads_for_lock(lock_key, requested_threads)
         for group_lock_keys, group_threads in groups:
             if group_threads == threads:
                 group_lock_keys.append(lock_key)
@@ -630,6 +679,8 @@ def lock_thread_groups(lock_keys: tuple[str, ...]) -> list[tuple[tuple[str, ...]
 def thread_group_log_suffix(threads: tuple[int, ...]) -> str:
     if threads == THREADS:
         return "full"
+    if threads == (128,):
+        return "128"
     return "single_oversubscribed"
 
 
@@ -643,7 +694,7 @@ def run_multi_lock_sweeps(
     log_prefix: str,
 ) -> None:
     env = {"FLEXGUARD_DIR": str(FLEXGUARD_DIR)}
-    groups = lock_thread_groups(lock_keys)
+    groups = lock_thread_groups(lock_keys, args.threads)
     for group_lock_keys, threads in groups:
         sweep_cmd = [
             str(SWEEP_MULTI),
@@ -656,7 +707,7 @@ def run_multi_lock_sweeps(
             "--timeslice-extension",
             "off",
             "--",
-            *common_sweep_args(threads),
+            *common_sweep_args(args, threads),
         ]
         if len(groups) == 1:
             log_name = f"{log_prefix}.log"
@@ -680,16 +731,96 @@ def run_multi_lock_sweeps(
             continue
 
 
-def ensure_accordin_taskset_preload(logger: CommandLogger) -> None:
-    if not ACCORDIN_TASKSET_RELEASE_LIB.is_file():
+def ensure_accordin_direct_library(logger: CommandLogger) -> None:
+    if not ACCORDIN_DIRECT_RELEASE_LIB.is_file():
         logger.run(
-            ["cargo", "build", "-p", ACCORDIN_TASKSET_PACKAGE, "--release"],
-            log_name=f"build_{ACCORDIN_TASKSET_PACKAGE}.log",
+            ["cargo", "build", "-p", ACCORDIN_DIRECT_PACKAGE, "--release"],
+            log_name=f"build_{ACCORDIN_DIRECT_PACKAGE}.log",
             timeout_seconds=0,
         )
 
-    if not ACCORDIN_TASKSET_RELEASE_LIB.is_file():
-        raise RuntimeError(f"{ACCORDIN_TASKSET_PACKAGE} library was not produced: {ACCORDIN_TASKSET_RELEASE_LIB}")
+    if not ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+        raise RuntimeError(f"{ACCORDIN_DIRECT_PACKAGE} library was not produced: {ACCORDIN_DIRECT_RELEASE_LIB}")
+
+
+def accordin_direct_sweep_env(lock: str) -> dict[str, str | None]:
+    env: dict[str, str | None] = {
+        "ACCORDIN_CPU_MASK_K": None,
+        "ACCORDIN_DISABLE_ADMISSION": None,
+        "K": None,
+        "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
+        ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
+        ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
+    }
+    for key, value in os.environ.items():
+        if key.startswith(ACCORDIN_DIRECT_ENV_PREFIX):
+            env[key] = value
+    env[ACCORDIN_DIRECT_LIB_ENV] = str(ACCORDIN_DIRECT_RELEASE_LIB)
+    env[ACCORDIN_DIRECT_DISABLE_BPF_ENV] = None
+    if experiment_defaults.accordin_uses_sampling(lock):
+        env["K"] = str(experiment_defaults.DEFAULT_ACCORDIN_CONCURRENCY)
+    if experiment_defaults.accordin_disables_admission(lock):
+        env["ACCORDIN_DISABLE_ADMISSION"] = "1"
+        env[ACCORDIN_DIRECT_STATS_ONLY_ENV] = "1"
+    return env
+
+
+def accordin_sweep_command(
+    *,
+    lock: str,
+    result_root: Path,
+    args: argparse.Namespace,
+) -> tuple[list[str], dict[str, str | None]]:
+    lock_dir = result_root / lock
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(SWEEP_SINGLE),
+        *common_sweep_args(args, runnable_threads_for_lock(lock, args.threads)),
+        "--lock-kind",
+        ACCORDIN_DIRECT_LOCK_KIND,
+        "--timeslice-extension",
+        "off",
+        "--output-raw",
+        str(lock_dir / "raw.csv"),
+        "--output-summary",
+        str(lock_dir / "summary.csv"),
+    ]
+    if experiment_defaults.accordin_uses_taskset(lock):
+        cmd = ["taskset", "-c", args.mcs_accordin_taskset_cpus, *cmd]
+    return cmd, accordin_direct_sweep_env(lock)
+
+
+def run_accordin_sweeps(
+    result_root: Path,
+    args: argparse.Namespace,
+    lock_keys: tuple[str, ...],
+    logger: CommandLogger,
+    failures: list[dict[str, str]],
+) -> None:
+    if not lock_keys:
+        return
+
+    ensure_accordin_direct_library(logger)
+    for lock in lock_keys:
+        if lock == ACCORDIN_TASKSET_LOCK and args.skip_mcs_accordin_taskset:
+            continue
+        cmd, env = accordin_sweep_command(lock=lock, result_root=result_root, args=args)
+        sudo_cmd, _ = experiment_three.with_sudo_env(cmd, env)
+        try:
+            logger.run(sudo_cmd, log_name=f"sweep_{lock}.log")
+        except CommandError as exc:
+            experiment_failures.append_command_failure(
+                failures,
+                result_root=result_root,
+                experiment="experiment1",
+                workload="mutexbench",
+                benchmark="sweep",
+                lock=lock,
+                threads=",".join(str(thread) for thread in runnable_threads_for_lock(lock, args.threads)),
+                repeat="all",
+                exc=exc,
+            )
+            experiment_failures.write_failures_csv(result_root, failures)
 
 
 def run_benchmarks(
@@ -701,6 +832,7 @@ def run_benchmarks(
 ) -> None:
     selected = set(selected_lock_keys)
     base_lock_keys = tuple(lock_key for lock_key in BASE_LOCK_KEYS if lock_key in selected)
+    accordin_lock_keys = tuple(lock_key for lock_key in ACCORDIN_PRELOAD_LOCKS if lock_key in selected)
     if base_lock_keys:
         run_multi_lock_sweeps(
             result_root,
@@ -711,12 +843,14 @@ def run_benchmarks(
             log_prefix="sweep_base_locks",
         )
 
+    run_accordin_sweeps(result_root, args, accordin_lock_keys, logger, failures)
+
     if "mcs_extension" in selected:
         extension_dir = result_root / "mcs_extension"
         extension_dir.mkdir(parents=True, exist_ok=True)
         extension_cmd = [
             str(SWEEP_SINGLE),
-            *common_sweep_args(runnable_threads_for_lock("mcs_extension")),
+            *common_sweep_args(args, runnable_threads_for_lock("mcs_extension", args.threads)),
             "--lock-kind",
             "mcs",
             "--timeslice-extension",
@@ -736,47 +870,11 @@ def run_benchmarks(
                 workload="mutexbench",
                 benchmark="sweep",
                 lock="mcs_extension",
-                threads=",".join(str(thread) for thread in runnable_threads_for_lock("mcs_extension")),
+                threads=",".join(str(thread) for thread in runnable_threads_for_lock("mcs_extension", args.threads)),
                 repeat="all",
                 exc=exc,
             )
             experiment_failures.write_failures_csv(result_root, failures)
-
-    if "accordin" not in selected or args.skip_mcs_accordin_taskset:
-        return
-
-    ensure_accordin_taskset_preload(logger)
-    taskset_cmd = [
-        "taskset",
-        "-c",
-        args.mcs_accordin_taskset_cpus,
-        str(SWEEP_MULTI),
-        "--locks",
-        ACCORDIN_TASKSET_LOCK,
-        "--output-root",
-        str(result_root),
-        "--sudo-mode",
-        "auto",
-        "--timeslice-extension",
-        "off",
-        "--",
-        *common_sweep_args(),
-    ]
-    try:
-        logger.run(taskset_cmd, log_name="sweep_accordin_taskset.log")
-    except CommandError as exc:
-        experiment_failures.append_command_failure(
-            failures,
-            result_root=result_root,
-            experiment="experiment1",
-            workload="mutexbench",
-            benchmark="sweep",
-            lock=ACCORDIN_TASKSET_LOCK,
-            threads=",".join(str(thread) for thread in THREADS),
-            repeat="all",
-            exc=exc,
-        )
-        experiment_failures.write_failures_csv(result_root, failures)
 
 
 def run_supplement_benchmarks(
@@ -901,6 +999,10 @@ def is_plot_row(row: dict[str, str], *, max_threads: int | None = None) -> bool:
     if max_threads is not None and thread > max_threads:
         return False
     return is_experiment_row(row) and thread in PLOT_THREADS
+
+
+def has_plot_rows(rows: list[dict[str, str]], *, max_threads: int | None = None) -> bool:
+    return any(is_plot_row(row, max_threads=max_threads) for row in rows)
 
 
 def metric_values(rows: list[dict[str, str]], metric: str) -> list[float]:
@@ -1122,7 +1224,7 @@ def plot_focused_comparison(
     for thread, values in sorted(ratio_rows.items()):
         if not all(key in values for key in FOCUS_LOCK_KEYS):
             continue
-        lower = values["accordin"]
+        lower = values[FOCUS_LOCK_KEYS[0]]
         upper = values["flexguard"]
         if lower <= 0.0 or upper <= lower:
             continue
@@ -1337,16 +1439,17 @@ def plot_broken_axis_metric(
 
 def write_plots(result_root: Path, rows: list[dict[str, str]]) -> list[Path]:
     outputs: list[Path] = []
-    hold_time_path = result_root / "hold_time_vs_threads.png"
-    plot_metric(
-        rows,
-        metric="avg_lock_hold_ns",
-        ylabel="Average lock hold time (ns)",
-        title="Lock Hold Time vs Threads",
-        output_path=hold_time_path,
-        max_threads=HOLD_TIME_MAX_THREADS,
-    )
-    outputs.append(hold_time_path)
+    if has_plot_rows(rows, max_threads=HOLD_TIME_MAX_THREADS):
+        hold_time_path = result_root / "hold_time_vs_threads.png"
+        plot_metric(
+            rows,
+            metric="avg_lock_hold_ns",
+            ylabel="Average lock hold time (ns)",
+            title="Lock Hold Time vs Threads",
+            output_path=hold_time_path,
+            max_threads=HOLD_TIME_MAX_THREADS,
+        )
+        outputs.append(hold_time_path)
     handoff_path = result_root / "handoff_time_vs_threads.png"
     plot_broken_axis_metric(
         rows,
@@ -1465,11 +1568,13 @@ def main() -> int:
                 result_root,
                 args.mcs_extension_mode,
                 args.sudo_mode,
-                "accordin" in selected_lock_keys and not args.skip_mcs_accordin_taskset,
+                ACCORDIN_TASKSET_LOCK in selected_lock_keys and not args.skip_mcs_accordin_taskset,
                 args.mcs_accordin_taskset_cpus,
                 args.lock_profile,
                 selected_lock_keys,
                 args.command_timeout_seconds,
+                args.threads,
+                args.repeats,
             )
             logger = CommandLogger(result_root, command_timeout_seconds=args.command_timeout_seconds)
             ensure_inputs(logger, lock_keys=supplement_lock_keys, include_single_sweep=False)
@@ -1481,17 +1586,22 @@ def main() -> int:
                 result_root,
                 args.mcs_extension_mode,
                 args.sudo_mode,
-                "accordin" in selected_lock_keys and not args.skip_mcs_accordin_taskset,
+                ACCORDIN_TASKSET_LOCK in selected_lock_keys and not args.skip_mcs_accordin_taskset,
                 args.mcs_accordin_taskset_cpus,
                 args.lock_profile,
                 selected_lock_keys,
                 args.command_timeout_seconds,
+                args.threads,
+                args.repeats,
             )
             logger = CommandLogger(result_root, command_timeout_seconds=args.command_timeout_seconds)
             ensure_inputs(
                 logger,
                 lock_keys=selected_lock_keys,
-                include_single_sweep="mcs_extension" in selected_lock_keys,
+                include_single_sweep=(
+                    "mcs_extension" in selected_lock_keys
+                    or any(lock in selected_lock_keys for lock in ACCORDIN_PRELOAD_LOCKS)
+                ),
             )
             failures = []
             run_benchmarks(result_root, args, logger, selected_lock_keys, failures)

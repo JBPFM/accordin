@@ -16,6 +16,10 @@ static __always_inline bool valid_cpu(s32 cpu) {
   return cpu >= 0 && cpu < MAX_CPUS;
 }
 
+static __always_inline bool stats_only_enabled(void) {
+  return stats_only_mode != 0;
+}
+
 static __always_inline struct active_cpumask_slot *lookup_active_cpumask_slot(void) {
   __u32 key = 0;
 
@@ -374,6 +378,9 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
   bool have_user = false;
   __u32 cpu = bpf_get_smp_processor_id();
 
+  if (stats_only_enabled())
+    return;
+
   task_ctx = get_task_ctx(p);
   if (!task_ctx)
     return;
@@ -398,6 +405,21 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   bool wants_slow_path = false;
   bool slow_path_seen = false;
   s32 cpu;
+
+  if (stats_only_enabled()) {
+    cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+    if (!valid_cpu(cpu) || !task_cpu_allowed(p, (__u32)cpu)) {
+      is_idle = false;
+      cpu = pick_allowed_cpu(p, prev_cpu);
+      if (cpu >= MAX_CPUS)
+        cpu = pick_task_cpu(p, prev_cpu);
+    }
+
+    if (is_idle && valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
+      scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+
+    return cpu;
+  }
 
   task_ctx = get_task_ctx(p);
   if (task_ctx) {
@@ -456,6 +478,20 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   bool have_user = false;
   bool slow_path_seen = false;
   __u32 cpu;
+
+  if (stats_only_enabled()) {
+    if (p->nr_cpus_allowed == 1) {
+      cpu = pick_allowed_cpu(p, -1);
+      if (valid_cpu(cpu) && task_cpu_allowed(p, cpu)) {
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL,
+                           enq_flags);
+        return;
+      }
+    }
+
+    scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+    return;
+  }
 
   task_ctx = get_task_ctx(p);
   if (!task_ctx) {
@@ -531,6 +567,9 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
 
   active = cpu_is_active((__u32)cpu);
   if (!active)
+    return;
+
+  if (stats_only_enabled())
     return;
 
   owner = lookup_cpu_owner((__u32)cpu);
@@ -609,7 +648,7 @@ int accordin_nudge_cpu(struct accordin_cpu_nudge_args *args) {
   if (cpu >= MAX_CPUS)
     return -EINVAL;
 
-  if (args->drain_inactive)
+  if (!stats_only_enabled() && args->drain_inactive)
     drain_inactive_to_controlled(cpu);
 
   scx_bpf_kick_cpu(cpu, 0);
@@ -631,6 +670,9 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
 
   task_ctx = lookup_task_ctx(p);
   if (!task_ctx)
+    return;
+
+  if (stats_only_enabled())
     return;
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);

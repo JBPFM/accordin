@@ -739,7 +739,8 @@ Examples:
         help=(
             "Comma-separated lock keys. Overrides --lock-profile. Use stock for no interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "accordin/mcs_accordin == mcs_tas_accordin."
+            "accordin == mcs_tas_accordin_admission_only, accordin_sampled, "
+            "accordin_no_admission, accordin_taskset."
         ),
     )
     parser.add_argument("--threads", default=",".join(str(thread) for thread in DEFAULT_THREADS), metavar="CSV")
@@ -901,18 +902,18 @@ def per_lock_max_threads_for_settings(
     return experiment_defaults.per_lock_max_threads_for_settings(locks, threads)
 
 
-def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str] | None]:
+def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None] | None]:
     if lock == "stock":
         return [], None
-    if lock == "mcs_tas_accordin":
-        return [], experiment_three.accordin_preload_env(experiment_three.ACCORDIN_PRELOAD_LIBRARY)
+    if experiment_defaults.is_accordin_lock(lock):
+        return experiment_three.accordin_command_prefix(lock)
     if lock == "mcs_extension":
         return [], {"LD_PRELOAD": experiment_three.combine_ld_preload(experiment_three.MCS_EXTENSION_PRELOAD_LIBRARY)}
     return experiment_three.interpose_command(lock)
 
 
-def merge_envs(*envs: dict[str, str] | None) -> dict[str, str] | None:
-    merged: dict[str, str] = {}
+def merge_envs(*envs: dict[str, str | None] | None) -> dict[str, str | None] | None:
+    merged: dict[str, str | None] = {}
     for env in envs:
         if env:
             merged.update(env)
@@ -923,13 +924,14 @@ def build_lock_command(
     lock: str,
     command: list[str],
     *,
-    extra_env: dict[str, str] | None = None,
-) -> tuple[list[str], dict[str, str] | None]:
+    extra_env: dict[str, str | None] | None = None,
+) -> tuple[list[str], dict[str, str | None] | None]:
     if lock == "stock":
         return command, extra_env
-    if lock == "mcs_tas_accordin":
-        env = merge_envs(extra_env, experiment_three.accordin_preload_env(experiment_three.ACCORDIN_PRELOAD_LIBRARY))
-        return experiment_three.benchmark_command(lock, command, env)
+    if experiment_defaults.is_accordin_lock(lock):
+        prefix, accordin_env = experiment_three.accordin_command_prefix(lock)
+        env = merge_envs(extra_env, accordin_env)
+        return experiment_three.benchmark_command(lock, [*prefix, *command], env)
     if lock == "mcs_extension":
         env = merge_envs(
             extra_env,
@@ -948,7 +950,7 @@ def ensure_lock_helpers(
     logger: experiment_three.CommandLogger,
 ) -> None:
     experiment_three.ensure_interpose_helpers(locks, build_missing=build_missing, logger=logger)
-    if "mcs_tas_accordin" in locks:
+    if any(experiment_defaults.is_accordin_lock(lock) for lock in locks):
         experiment_three.ensure_accordin_preload(build_missing=build_missing, logger=logger)
     if "mcs_extension" in locks:
         experiment_three.ensure_mcs_extension_preload(build_missing=build_missing, logger=logger)

@@ -6,6 +6,7 @@ from typing import Iterable
 try:
     from machine_config import (
         ACTIVE_MACHINE_CONFIG,
+        DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
         DEFAULT_THREAD_COUNTS,
         MACHINE_PHYSICAL_CORES,
         PROFILE_ENV,
@@ -14,6 +15,7 @@ try:
 except ModuleNotFoundError:
     from .machine_config import (
         ACTIVE_MACHINE_CONFIG,
+        DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
         DEFAULT_THREAD_COUNTS,
         MACHINE_PHYSICAL_CORES,
         PROFILE_ENV,
@@ -23,6 +25,42 @@ except ModuleNotFoundError:
 
 MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
 DEFAULT_THREADS = DEFAULT_THREAD_COUNTS
+ACCORDIN_ADMISSION_ONLY_LOCK = "mcs_tas_accordin_admission_only"
+ACCORDIN_BASE_LOCK = ACCORDIN_ADMISSION_ONLY_LOCK
+ACCORDIN_SAMPLED_LOCK = "mcs_tas_accordin_sampled"
+ACCORDIN_NO_ADMISSION_LOCK = "mcs_tas_accordin_no_admission"
+ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin_taskset"
+ACCORDIN_VARIANT_LOCKS = (
+    ACCORDIN_BASE_LOCK,
+    ACCORDIN_SAMPLED_LOCK,
+    ACCORDIN_NO_ADMISSION_LOCK,
+    ACCORDIN_TASKSET_LOCK,
+)
+ACCORDIN_SAMPLED_LOCKS = (
+    ACCORDIN_SAMPLED_LOCK,
+    ACCORDIN_NO_ADMISSION_LOCK,
+)
+ACCORDIN_ADMISSION_DISABLED_LOCKS = (ACCORDIN_NO_ADMISSION_LOCK,)
+ACCORDIN_TASKSET_LOCKS = (ACCORDIN_TASKSET_LOCK,)
+
+
+def _cpu_list_count(cpu_list: str) -> int:
+    cpus: set[int] = set()
+    for part in cpu_list.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            cpus.update(range(start, end + 1))
+        else:
+            cpus.add(int(part))
+    return len(cpus)
+
+
+DEFAULT_ACCORDIN_CONCURRENCY = _cpu_list_count(DEFAULT_MCS_ACCORDIN_TASKSET_CPUS)
 
 FULL_LOCKS = (
     "mcs",
@@ -32,9 +70,9 @@ FULL_LOCKS = (
     "flexguard",
     "malthusian",
     "reciprocating",
-    "mcs_tas_accordin",
+    *ACCORDIN_VARIANT_LOCKS,
 )
-MINIMAL_LOCKS = ("accordin", "flexguard")
+MINIMAL_LOCKS = (*ACCORDIN_VARIANT_LOCKS, "flexguard")
 LOCK_PROFILES = {
     "minimal": MINIMAL_LOCKS,
     "full": FULL_LOCKS,
@@ -57,7 +95,7 @@ EXPERIMENT_ONE_DECOMPOSITION_LOCKS = (
     "mcs-tas",
     "malthusian",
     "flexguard",
-    "accordin",
+    ACCORDIN_BASE_LOCK,
 )
 EXPERIMENT_ONE_BASE_LOCKS = (
     "mcs",
@@ -67,7 +105,8 @@ EXPERIMENT_ONE_BASE_LOCKS = (
     "malthusian",
     "flexguard",
 )
-EXPERIMENT_ONE_FOCUS_LOCKS = ("accordin", "flexguard")
+EXPERIMENT_ONE_ACCORDIN_LOCKS = ACCORDIN_VARIANT_LOCKS
+EXPERIMENT_ONE_FOCUS_LOCKS = (ACCORDIN_BASE_LOCK, "flexguard")
 EXPERIMENT_ONE_SUPPLEMENT_DEFAULT_LOCKS = ("reciprocating", "malthusian")
 
 SINGLE_OVERSUBSCRIBED_LOCKS = (
@@ -90,15 +129,29 @@ LOCK_LABELS = {
     "flexguard": "FlexGuard",
     "malthusian": "Malthusian",
     "reciprocating": "Reciprocating",
-    "accordin": "Accordin",
-    "mcs_accordin": "Accordin",
-    "mcs_tas_accordin": "Accordin",
+    "accordin": "Accordin (admission only)",
+    "mcs_accordin": "Accordin (admission only)",
+    "mcs_tas_accordin": "Accordin (admission only)",
+    "mcs_tas_accordin_admission_only": "Accordin (admission only)",
+    "mcs_tas_accordin_sampled": "Accordin (sampled)",
+    "mcs_tas_accordin_no_admission": "Accordin (controller only)",
+    "mcs_tas_accordin_taskset": "Accordin (taskset)",
 }
 
 LOCK_ALIASES = {
-    "accordin": "mcs_tas_accordin",
-    "mcs_tas_accordin": "mcs_tas_accordin",
-    "mcs_accordin": "mcs_tas_accordin",
+    "accordin": ACCORDIN_ADMISSION_ONLY_LOCK,
+    "accordin_admission_only": ACCORDIN_ADMISSION_ONLY_LOCK,
+    "mcs_tas_accordin": ACCORDIN_ADMISSION_ONLY_LOCK,
+    "mcs_tas_accordin_admission_only": ACCORDIN_ADMISSION_ONLY_LOCK,
+    "mcs_accordin": ACCORDIN_ADMISSION_ONLY_LOCK,
+    "accordin_sampled": "mcs_tas_accordin_sampled",
+    "accordin_sampling": "mcs_tas_accordin_sampled",
+    "mcs_tas_accordin_sampled": "mcs_tas_accordin_sampled",
+    "accordin_no_admission": "mcs_tas_accordin_no_admission",
+    "accordin_controller_only": "mcs_tas_accordin_no_admission",
+    "mcs_tas_accordin_no_admission": "mcs_tas_accordin_no_admission",
+    "accordin_taskset": "mcs_tas_accordin_taskset",
+    "mcs_tas_accordin_taskset": "mcs_tas_accordin_taskset",
     "mcs-tas": "mcstas",
     "mcs_tas": "mcstas",
     "mcstas": "mcstas",
@@ -131,7 +184,11 @@ LOCK_ORDER = (
     "flexguard",
     "malthusian",
     "reciprocating",
+    "mcs_tas_accordin_admission_only",
     "mcs_tas_accordin",
+    "mcs_tas_accordin_sampled",
+    "mcs_tas_accordin_no_admission",
+    "mcs_tas_accordin_taskset",
     "mcs_accordin",
     "accordin",
 )
@@ -150,19 +207,17 @@ EXPERIMENT_ONE_LOCKS = (
     ExperimentOneLockConfig("MCS-TP", "mcstp"),
     ExperimentOneLockConfig("MCS-TAS", "mcs-tas"),
     ExperimentOneLockConfig("Reciprocating", "reciprocating", optional=True),
-    ExperimentOneLockConfig(
-        "Accordin (K=11)",
-        "accordin",
-        optional=True,
-        result_dirs=("mcs_tas_accordin", "accordin", "mcs_accordin"),
-    ),
+    ExperimentOneLockConfig("Accordin (admission only)", ACCORDIN_BASE_LOCK, optional=True),
+    ExperimentOneLockConfig("Accordin (sampled)", ACCORDIN_SAMPLED_LOCK, optional=True),
+    ExperimentOneLockConfig("Accordin (controller only)", ACCORDIN_NO_ADMISSION_LOCK, optional=True),
+    ExperimentOneLockConfig("Accordin (taskset)", ACCORDIN_TASKSET_LOCK, optional=True),
     ExperimentOneLockConfig("MCS + TSE", "mcs_extension"),
     ExperimentOneLockConfig("Malthusian", "malthusian", optional=True),
     ExperimentOneLockConfig("FlexGuard", "flexguard"),
 )
 
 EXPERIMENT_ONE_FULL_LOCKS = tuple(config.key for config in EXPERIMENT_ONE_LOCKS)
-EXPERIMENT_ONE_MINIMAL_LOCKS = ("accordin", "flexguard")
+EXPERIMENT_ONE_MINIMAL_LOCKS = (*ACCORDIN_VARIANT_LOCKS, "flexguard")
 EXPERIMENT_ONE_LOCK_PROFILES = {
     "minimal": EXPERIMENT_ONE_MINIMAL_LOCKS,
     "full": EXPERIMENT_ONE_FULL_LOCKS,
@@ -240,6 +295,22 @@ def lock_sort_key(lock: str) -> tuple[int, str]:
     if lock in LOCK_ORDER:
         return (LOCK_ORDER.index(lock), lock)
     return (len(LOCK_ORDER), lock)
+
+
+def is_accordin_lock(lock: str) -> bool:
+    return lock in ACCORDIN_VARIANT_LOCKS
+
+
+def accordin_uses_sampling(lock: str) -> bool:
+    return lock in ACCORDIN_SAMPLED_LOCKS
+
+
+def accordin_disables_admission(lock: str) -> bool:
+    return lock in ACCORDIN_ADMISSION_DISABLED_LOCKS
+
+
+def accordin_uses_taskset(lock: str) -> bool:
+    return lock in ACCORDIN_TASKSET_LOCKS
 
 
 def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:

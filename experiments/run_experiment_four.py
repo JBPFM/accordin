@@ -25,12 +25,10 @@ FLEXGUARD_DIR = experiment_three.FLEXGUARD_DIR
 LEVELDB_VERSION = "1.23"
 DEFAULT_LEVELDB_DIR = REPO_ROOT / "third_party" / f"leveldb-{LEVELDB_VERSION}"
 DEFAULT_DB_BENCH = DEFAULT_LEVELDB_DIR / "build" / "db_bench"
+LEVELDB_ACCORDIN_PATCH = REPO_ROOT / "patches" / "leveldb-accordin-direct.patch"
 
 DEFAULT_BENCHMARKS = ("readrandom", "fillrandom")
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
-DEFAULT_LOCKS = experiment_defaults.DEFAULT_LOCKS
-FULL_LOCKS = experiment_defaults.FULL_LOCKS
-MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
 DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
 DEFAULT_REPEATS = 5
 SUMMARY_DISCARD_INITIAL_REPEATS = 1
@@ -43,6 +41,7 @@ DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600
 ACCORDIN_HOOK_SCOPE_ENV = "ACCORDIN_HOOK_SCOPE"
 ACCORDIN_LEVELDB_HOOK_SCOPE = "registered"
 MCS_TAS_ACCORDIN_DIRECT_LOCK = "mcs_tas_accordin_direct"
+MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK = "mcs_tas_accordin_direct_admission_only"
 MCS_TAS_ACCORDIN_DIRECT_ALIASES = {
     "mcs_tas_accordin_direct",
     "mcs-tas-accordin-direct",
@@ -53,6 +52,63 @@ MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY = (
     REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
 )
 MCS_TAS_ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
+MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
+MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
+MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK = "mcs_tas_accordin_direct_sampled"
+MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK = "mcs_tas_accordin_direct_no_admission"
+MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK = "mcs_tas_accordin_direct_taskset"
+LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS = (
+    MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
+    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
+    MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
+)
+LEVELDB_ACCORDIN_DIRECT_SAMPLED_LOCKS = (
+    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
+    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
+)
+LEVELDB_ACCORDIN_DIRECT_ADMISSION_DISABLED_LOCKS = (
+    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
+)
+LEVELDB_ACCORDIN_DIRECT_TASKSET_LOCKS = (MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,)
+LEVELDB_ACCORDIN_DIRECT_ALIAS_TARGETS = {
+    experiment_defaults.ACCORDIN_BASE_LOCK: MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "accordin": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "accordin_admission_only": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "mcs_accordin": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "mcs_tas_accordin": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "mcs_tas_accordin_direct": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "mcs_tas_accordin_direct_admission_only": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "mcs-tas-accordin-direct": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "accordin_direct": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "accordin_direct_admission_only": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    "accordin-direct": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+    experiment_defaults.ACCORDIN_SAMPLED_LOCK: MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
+    "accordin_sampled": MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
+    "accordin_sampling": MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
+    "accordin_direct_sampled": MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
+    "mcs_tas_accordin_direct_sampled": MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
+    experiment_defaults.ACCORDIN_NO_ADMISSION_LOCK: MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
+    "accordin_no_admission": MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
+    "accordin_controller_only": MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
+    "accordin_direct_no_admission": MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
+    "mcs_tas_accordin_direct_no_admission": MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
+    experiment_defaults.ACCORDIN_TASKSET_LOCK: MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
+    "accordin_taskset": MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
+    "accordin_direct_taskset": MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
+    "mcs_tas_accordin_direct_taskset": MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
+}
+MINIMAL_LOCKS = (*LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS, "flexguard")
+FULL_LOCKS = tuple(
+    lock
+    for lock in experiment_defaults.FULL_LOCKS
+    if lock not in experiment_defaults.ACCORDIN_VARIANT_LOCKS
+) + LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS
+LOCK_PROFILES = {
+    "minimal": MINIMAL_LOCKS,
+    "full": FULL_LOCKS,
+}
+DEFAULT_LOCKS = LOCK_PROFILES[DEFAULT_LOCK_PROFILE]
 LEVELDB_REBUILD_INPUTS = (
     Path("db/db_impl.cc"),
     Path("db/db_impl.h"),
@@ -186,7 +242,7 @@ Examples:
     )
     parser.add_argument(
         "--lock-profile",
-        choices=experiment_defaults.lock_profile_names(),
+        choices=tuple(LOCK_PROFILES),
         default=DEFAULT_LOCK_PROFILE,
         help=(
             "Named lock set used when --locks is omitted. "
@@ -202,8 +258,8 @@ Examples:
             "Comma-separated lock keys. Overrides --lock-profile. "
             "Use stock to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "accordin/mcs_accordin == mcs_tas_accordin, "
-            "accordin_direct == mcs_tas_accordin_direct."
+            "accordin == mcs_tas_accordin_direct_admission_only, accordin_sampled, "
+            "accordin_no_admission, accordin_taskset."
         ),
     )
     parser.add_argument(
@@ -281,18 +337,17 @@ def parse_csv_ints(value: str) -> tuple[int, ...]:
 
 def normalize_leveldb_lock(lock: str) -> str:
     normalized = lock.strip().lower()
-    if normalized in MCS_TAS_ACCORDIN_DIRECT_ALIASES:
-        return MCS_TAS_ACCORDIN_DIRECT_LOCK
-    return experiment_defaults.normalize_lock(lock)
+    normalized = experiment_defaults.normalize_lock(normalized)
+    return LEVELDB_ACCORDIN_DIRECT_ALIAS_TARGETS.get(normalized, normalized)
 
 
 def validate_leveldb_locks(locks: tuple[str, ...]) -> tuple[str, ...]:
     supported = (
-        set(experiment_defaults.FULL_LOCKS)
-        | set(experiment_defaults.MINIMAL_LOCKS)
+        set(FULL_LOCKS)
+        | set(MINIMAL_LOCKS)
         | set(experiment_defaults.LOCK_ALIASES.values())
         | set(experiment_defaults.LOCK_LABELS)
-        | {MCS_TAS_ACCORDIN_DIRECT_LOCK}
+        | set(LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS)
     )
     unsupported = [lock for lock in locks if lock not in supported]
     if unsupported:
@@ -304,7 +359,13 @@ def validate_leveldb_locks(locks: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def resolve_leveldb_locks(*, profile: str, locks: Iterable[str] | None) -> tuple[str, ...]:
-    raw_locks = experiment_defaults.lock_profile_locks(profile) if locks is None else tuple(locks)
+    try:
+        raw_locks = LOCK_PROFILES[profile] if locks is None else tuple(locks)
+    except KeyError as exc:
+        supported_profiles = ", ".join(LOCK_PROFILES)
+        raise ValueError(
+            f"Unsupported lock profile: {profile}. Supported profiles: {supported_profiles}."
+        ) from exc
     normalized = tuple(dict.fromkeys(normalize_leveldb_lock(lock) for lock in raw_locks))
     return validate_leveldb_locks(normalized)
 
@@ -370,29 +431,59 @@ def preload_env(*libraries: Path | None) -> dict[str, str] | None:
     return {"LD_PRELOAD": ld_preload}
 
 
-def accordin_preload_env(preload_library: Path) -> dict[str, str]:
-    env = preload_env(preload_library)
-    if env is None:
-        env = {}
+def accordin_preload_env(
+    preload_library: Path,
+    *,
+    lock: str = experiment_defaults.ACCORDIN_BASE_LOCK,
+) -> dict[str, str | None]:
+    env = experiment_three.accordin_preload_env(preload_library, lock=lock)
     env[ACCORDIN_HOOK_SCOPE_ENV] = ACCORDIN_LEVELDB_HOOK_SCOPE
-    if "ACCORDIN_CPU_MASK_K" in os.environ:
-        env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
-    if "K" in os.environ:
-        env["K"] = os.environ["K"]
     return env
 
 
-def mcs_tas_accordin_direct_preload_env(preload_library: Path) -> dict[str, str]:
+def is_leveldb_direct_accordin_lock(lock: str) -> bool:
+    return lock in LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS
+
+
+def leveldb_direct_accordin_uses_sampling(lock: str) -> bool:
+    return lock in LEVELDB_ACCORDIN_DIRECT_SAMPLED_LOCKS
+
+
+def leveldb_direct_accordin_disables_admission(lock: str) -> bool:
+    return lock in LEVELDB_ACCORDIN_DIRECT_ADMISSION_DISABLED_LOCKS
+
+
+def leveldb_direct_accordin_uses_taskset(lock: str) -> bool:
+    return lock in LEVELDB_ACCORDIN_DIRECT_TASKSET_LOCKS
+
+
+def mcs_tas_accordin_direct_preload_env(
+    preload_library: Path,
+    *,
+    lock: str = MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
+) -> dict[str, str | None]:
     env = preload_env(preload_library)
     if env is None:
         env = {}
     for key, value in os.environ.items():
         if key.startswith(MCS_TAS_ACCORDIN_DIRECT_ENV_PREFIX):
             env[key] = value
-    if "ACCORDIN_CPU_MASK_K" in os.environ:
-        env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
-    if "K" in os.environ:
-        env["K"] = os.environ["K"]
+    env.update(
+        {
+            ACCORDIN_HOOK_SCOPE_ENV: None,
+            "ACCORDIN_CPU_MASK_K": None,
+            "ACCORDIN_DISABLE_ADMISSION": None,
+            "K": None,
+            "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
+            MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
+            MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
+        }
+    )
+    if leveldb_direct_accordin_uses_sampling(lock):
+        env["K"] = str(experiment_defaults.DEFAULT_ACCORDIN_CONCURRENCY)
+    if leveldb_direct_accordin_disables_admission(lock):
+        env["ACCORDIN_DISABLE_ADMISSION"] = "1"
+        env[MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV] = "1"
     return env
 
 
@@ -402,14 +493,20 @@ def default_result_root() -> Path:
 
 
 def lock_label(lock: str) -> str:
-    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
-        return MCS_TAS_ACCORDIN_DIRECT_LOCK
+    if lock == MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK:
+        return "Accordin direct (admission only)"
+    if lock == MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK:
+        return "Accordin direct (sampled)"
+    if lock == MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK:
+        return "Accordin direct (controller only)"
+    if lock == MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK:
+        return "Accordin direct (taskset)"
     return experiment_defaults.lock_label(lock)
 
 
 def lock_sort_key(lock: str) -> tuple[int, str]:
-    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
-        return (experiment_defaults.lock_sort_key("mcs_tas_accordin")[0] + 1, lock)
+    if lock in LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS:
+        return (experiment_defaults.lock_sort_key("mcs_tas_accordin")[0], lock)
     return experiment_defaults.lock_sort_key(lock)
 
 
@@ -497,6 +594,55 @@ def ensure_leveldb_source(
         raise RuntimeError(f"LevelDB source directory is still unavailable after submodule init: {leveldb_dir}")
 
 
+def ensure_leveldb_patch_applied(
+    leveldb_dir: Path,
+    *,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    if leveldb_dir != DEFAULT_LEVELDB_DIR:
+        return
+    if not LEVELDB_ACCORDIN_PATCH.is_file():
+        raise RuntimeError(f"LevelDB patch is missing: {LEVELDB_ACCORDIN_PATCH}")
+
+    apply_check = subprocess.run(
+        ["git", "apply", "--check", str(LEVELDB_ACCORDIN_PATCH)],
+        cwd=leveldb_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if apply_check.returncode == 0:
+        logger.run(
+            ["git", "apply", str(LEVELDB_ACCORDIN_PATCH)],
+            log_name="apply_leveldb_patch.log",
+            cwd=leveldb_dir,
+            timeout_seconds=0,
+        )
+        return
+
+    reverse_check = subprocess.run(
+        ["git", "apply", "--reverse", "--check", str(LEVELDB_ACCORDIN_PATCH)],
+        cwd=leveldb_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if reverse_check.returncode == 0:
+        return
+
+    details = "\n".join(
+        line
+        for line in (
+            apply_check.stderr.strip(),
+            reverse_check.stderr.strip(),
+        )
+        if line
+    )
+    raise RuntimeError(f"LevelDB patch cannot be applied cleanly: {LEVELDB_ACCORDIN_PATCH}\n{details}")
+
+
 def ensure_db_bench(
     db_bench: Path,
     *,
@@ -504,6 +650,10 @@ def ensure_db_bench(
     build_missing: bool,
     logger: experiment_three.CommandLogger,
 ) -> None:
+    if build_missing and leveldb_dir == DEFAULT_LEVELDB_DIR:
+        ensure_leveldb_source(leveldb_dir, build_missing=build_missing, logger=logger)
+        ensure_leveldb_patch_applied(leveldb_dir, logger=logger)
+
     if db_bench.is_file() and os.access(db_bench, os.X_OK):
         if not (build_missing and db_bench_needs_rebuild(db_bench, leveldb_dir)):
             return
@@ -515,6 +665,7 @@ def ensure_db_bench(
         raise RuntimeError(f"Cannot build a custom db_bench path: {db_bench}")
 
     ensure_leveldb_source(leveldb_dir, build_missing=build_missing, logger=logger)
+    ensure_leveldb_patch_applied(leveldb_dir, logger=logger)
     logger.run(
         [
             "cmake",
@@ -555,11 +706,11 @@ def ensure_lock_helpers(
     build_missing: bool,
     logger: experiment_three.CommandLogger,
 ) -> None:
-    interpose_locks = tuple(lock for lock in locks if lock != MCS_TAS_ACCORDIN_DIRECT_LOCK)
+    interpose_locks = tuple(lock for lock in locks if not is_leveldb_direct_accordin_lock(lock))
     experiment_three.ensure_interpose_helpers(interpose_locks, build_missing=build_missing, logger=logger)
-    if "mcs_tas_accordin" in locks:
+    if any(experiment_defaults.is_accordin_lock(lock) for lock in locks):
         experiment_three.ensure_accordin_preload(build_missing=build_missing, logger=logger)
-    if MCS_TAS_ACCORDIN_DIRECT_LOCK in locks:
+    if any(is_leveldb_direct_accordin_lock(lock) for lock in locks):
         ensure_mcs_tas_accordin_direct_preload(build_missing=build_missing, logger=logger)
     if "mcs_extension" in locks:
         experiment_three.ensure_mcs_extension_preload(build_missing=build_missing, logger=logger)
@@ -590,15 +741,33 @@ def ensure_mcs_tas_accordin_direct_preload(
         )
 
 
-def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str] | None]:
+def leveldb_direct_accordin_command_prefix(
+    lock: str,
+) -> tuple[list[str], dict[str, str | None]]:
+    env = mcs_tas_accordin_direct_preload_env(
+        MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY,
+        lock=lock,
+    )
+    if leveldb_direct_accordin_uses_taskset(lock):
+        return (
+            [
+                "taskset",
+                "-c",
+                experiment_defaults.DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
+                "env",
+                *experiment_three.env_command_tokens(env),
+            ],
+            experiment_three.taskset_wrapper_env(env),
+        )
+    return [], env
+
+
+def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None] | None]:
+    lock = normalize_leveldb_lock(lock)
     if lock == "stock":
         return [], None
-    if lock == "mcs_tas_accordin":
-        return [], accordin_preload_env(experiment_three.ACCORDIN_PRELOAD_LIBRARY)
-    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
-        return [], mcs_tas_accordin_direct_preload_env(
-            MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY
-        )
+    if is_leveldb_direct_accordin_lock(lock):
+        return leveldb_direct_accordin_command_prefix(lock)
     if lock == "mcs_extension":
         return [], preload_env(experiment_three.MCS_EXTENSION_PRELOAD_LIBRARY)
     return experiment_three.interpose_command(lock)
@@ -637,8 +806,9 @@ def build_measured_command(
     num: int,
     use_existing_db: bool,
     reads: int | None = None,
-) -> tuple[list[str], dict[str, str] | None]:
-    cmd, env = lock_command_prefix(lock)
+) -> tuple[list[str], dict[str, str | None] | None]:
+    effective_lock = normalize_leveldb_lock(lock)
+    cmd, env = lock_command_prefix(effective_lock)
     cmd.extend(
         build_db_bench_args(
             db_bench=db_bench,
@@ -650,9 +820,9 @@ def build_measured_command(
             use_existing_db=use_existing_db,
         )
     )
-    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK and env is not None:
+    if is_leveldb_direct_accordin_lock(effective_lock) and env is not None:
         return experiment_three.with_sudo_env(cmd, env)
-    return experiment_three.benchmark_command(lock, cmd, env)
+    return experiment_three.benchmark_command(effective_lock, cmd, env)
 
 
 def build_init_command(
@@ -886,7 +1056,8 @@ def write_settings(
         "init_fill_threads": INIT_FILL_THREADS,
         "init_existing_benchmarks": list(init_existing_benchmarks),
         "accordin_hook_scope_env": ACCORDIN_HOOK_SCOPE_ENV,
-        "accordin_hook_scope": ACCORDIN_LEVELDB_HOOK_SCOPE,
+        "accordin_hook_scope": None,
+        "leveldb_accordin_direct_variants": list(LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS),
         "mcs_tas_accordin_direct_preload": str(MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY),
         "flexguard_dir": str(FLEXGUARD_DIR),
         "machine_core_count": experiment_defaults.MACHINE_CORE_COUNT,

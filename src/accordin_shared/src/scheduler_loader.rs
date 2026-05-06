@@ -19,7 +19,42 @@ macro_rules! define_scheduler_loader {
         const STATS_ONLY_ENV: &str = concat!($env_prefix, "_STATS_ONLY");
         const DEBUG_COUNTERS_ENV: &str = concat!($env_prefix, "_DEBUG_COUNTERS");
 
+        const _: () = assert!(
+            $crate::cpu_affinity::MAX_CPUS == crate::bpf_intf::MAX_CPUS as usize,
+            "cpu_affinity::MAX_CPUS and bpf_intf::MAX_CPUS must match"
+        );
+
         static SCHEDULER_STATE: ::std::sync::OnceLock<SchedulerState> = ::std::sync::OnceLock::new();
+
+        fn run_bpf_syscall_prog<T>(
+            fd: ::std::os::fd::RawFd,
+            args: &T,
+            label: &str,
+        ) -> ::std::result::Result<(), ::std::string::String> {
+            let mut opts = ::libbpf_rs::libbpf_sys::bpf_test_run_opts {
+                sz: ::std::mem::size_of::<::libbpf_rs::libbpf_sys::bpf_test_run_opts>() as _,
+                ctx_in: (args as *const T).cast(),
+                ctx_size_in: ::std::mem::size_of::<T>() as u32,
+                ..::std::default::Default::default()
+            };
+
+            let ret = unsafe {
+                ::libbpf_rs::libbpf_sys::bpf_prog_test_run_opts(fd, &mut opts)
+            };
+            if ret != 0 {
+                return Err(::std::format!(
+                    "bpf_prog_test_run_opts({label}) failed: {}",
+                    ::std::io::Error::last_os_error()
+                ));
+            }
+
+            let retval = opts.retval as i32;
+            if retval != 0 {
+                return Err(::std::format!("{label} returned {retval}"));
+            }
+
+            Ok(())
+        }
 
         struct ActiveCpusProgSink {
             set_prog_fd: ::std::os::fd::RawFd,
@@ -46,35 +81,7 @@ macro_rules! define_scheduler_loader {
                     wanted3: wanted_words[3],
                     nr_cpus: crate::bpf_intf::MAX_CPUS,
                 };
-                let mut opts = ::libbpf_rs::libbpf_sys::bpf_test_run_opts {
-                    sz: ::std::mem::size_of::<::libbpf_rs::libbpf_sys::bpf_test_run_opts>() as _,
-                    ctx_in: (&args as *const crate::bpf_intf::accordin_active_cpus_args).cast(),
-                    ctx_size_in: ::std::mem::size_of::<crate::bpf_intf::accordin_active_cpus_args>()
-                        as u32,
-                    ..::std::default::Default::default()
-                };
-
-                let ret = unsafe {
-                    ::libbpf_rs::libbpf_sys::bpf_prog_test_run_opts(
-                        self.set_prog_fd,
-                        &mut opts,
-                    )
-                };
-                if ret != 0 {
-                    return Err(::std::format!(
-                        "bpf_prog_test_run_opts(accordin_set_active_cpus) failed: {}",
-                        ::std::io::Error::last_os_error()
-                    ));
-                }
-
-                let retval = opts.retval as i32;
-                if retval != 0 {
-                    return Err(::std::format!(
-                        "accordin_set_active_cpus returned {retval}"
-                    ));
-                }
-
-                Ok(())
+                run_bpf_syscall_prog(self.set_prog_fd, &args, "accordin_set_active_cpus")
             }
 
             fn nudge_cpu(
@@ -86,33 +93,7 @@ macro_rules! define_scheduler_loader {
                     cpu: cpu as u32,
                     drain_inactive: u32::from(drain_inactive),
                 };
-                let mut opts = ::libbpf_rs::libbpf_sys::bpf_test_run_opts {
-                    sz: ::std::mem::size_of::<::libbpf_rs::libbpf_sys::bpf_test_run_opts>() as _,
-                    ctx_in: (&args as *const crate::bpf_intf::accordin_cpu_nudge_args).cast(),
-                    ctx_size_in: ::std::mem::size_of::<crate::bpf_intf::accordin_cpu_nudge_args>()
-                        as u32,
-                    ..::std::default::Default::default()
-                };
-
-                let ret = unsafe {
-                    ::libbpf_rs::libbpf_sys::bpf_prog_test_run_opts(
-                        self.nudge_prog_fd,
-                        &mut opts,
-                    )
-                };
-                if ret != 0 {
-                    return Err(::std::format!(
-                        "bpf_prog_test_run_opts(accordin_nudge_cpu) failed: {}",
-                        ::std::io::Error::last_os_error()
-                    ));
-                }
-
-                let retval = opts.retval as i32;
-                if retval != 0 {
-                    return Err(::std::format!("accordin_nudge_cpu returned {retval}"));
-                }
-
-                Ok(())
+                run_bpf_syscall_prog(self.nudge_prog_fd, &args, "accordin_nudge_cpu")
             }
 
             fn nudge_changed_cpus(
@@ -134,11 +115,7 @@ macro_rules! define_scheduler_loader {
                                 SCHEDULER_NAME, cpu, error
                             );
                         }
-                    }
-                }
-
-                for cpu in 0..$crate::cpu_affinity::MAX_CPUS {
-                    if previous[cpu] == 0 && wanted[cpu] != 0 {
+                    } else if previous[cpu] == 0 && wanted[cpu] != 0 {
                         if let Err(error) = self.nudge_cpu(cpu, false) {
                             eprintln!(
                                 "[{}] failed to kick newly active CPU {}: {}",

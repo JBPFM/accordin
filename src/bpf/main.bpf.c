@@ -263,11 +263,11 @@ static __always_inline __u32 pick_allowed_cpu(struct task_struct *p,
     return cpu;
 
   cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-  if (valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
+  if (valid_cpu(cpu) && cpu_is_active((__u32)cpu))
     return cpu;
 
   cpu = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
-  if (valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
+  if (valid_cpu(cpu) && cpu_is_active((__u32)cpu))
     return cpu;
 
   return ADMISSION_CPU_NONE;
@@ -285,11 +285,11 @@ static __always_inline __u32 pick_task_cpu(struct task_struct *p,
     return cpu;
 
   cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-  if (valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu))
+  if (valid_cpu(cpu))
     return cpu;
 
   cpu = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
-  if (valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu))
+  if (valid_cpu(cpu))
     return cpu;
 
   return 0;

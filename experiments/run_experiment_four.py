@@ -32,7 +32,8 @@ DEFAULT_LOCKS = experiment_defaults.DEFAULT_LOCKS
 FULL_LOCKS = experiment_defaults.FULL_LOCKS
 MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
 DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
-DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
+DEFAULT_REPEATS = 5
+SUMMARY_DISCARD_INITIAL_REPEATS = 1
 DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
@@ -119,7 +120,7 @@ Default benchmark settings:
   full locks={','.join(FULL_LOCKS)}
   machine-profile={experiment_defaults.ACTIVE_MACHINE_CONFIG.name} (override with {experiment_defaults.PROFILE_ENV})
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
-  repeats={DEFAULT_REPEATS}, num={DEFAULT_NUM}, total_ops={DEFAULT_TOTAL_OPS}
+  repeats={DEFAULT_REPEATS}, discard_initial_repeats={SUMMARY_DISCARD_INITIAL_REPEATS}, num={DEFAULT_NUM}, total_ops={DEFAULT_TOTAL_OPS}
   leveldb={DEFAULT_LEVELDB_DIR} (tag {LEVELDB_VERSION})
   db_bench={DEFAULT_DB_BENCH}
   fill_benchmark={DEFAULT_FILL_BENCHMARK}, init_fill_threads={INIT_FILL_THREADS}
@@ -873,6 +874,7 @@ def write_settings(
         "per_lock_max_threads": per_lock_max_threads_for_settings(locks, threads),
         "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
         "repeats": repeats,
+        "summary_discard_initial_repeats": SUMMARY_DISCARD_INITIAL_REPEATS,
         "num": num,
         "total_ops": total_ops,
         "command_timeout_seconds": command_timeout_seconds,
@@ -956,6 +958,13 @@ def mean_ops_per_second(rows: list[dict[str, str]]) -> str:
     return format_float(mean(values))
 
 
+def discard_initial_repeat_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    if len(rows) <= SUMMARY_DISCARD_INITIAL_REPEATS:
+        return rows
+    repeat_rows = sorted(rows, key=lambda row: int(row["repeat"]))
+    return repeat_rows[SUMMARY_DISCARD_INITIAL_REPEATS:]
+
+
 def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     groups: dict[tuple[str, str, int], list[dict[str, str]]] = {}
     for row in rows:
@@ -967,7 +976,7 @@ def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         groups.keys(),
         key=lambda item: (benchmark_sort_key(item[0]), lock_sort_key(item[1]), item[2]),
     ):
-        group_rows = groups[(benchmark, lock, thread_count)]
+        group_rows = discard_initial_repeat_rows(groups[(benchmark, lock, thread_count)])
         summary_rows.append(
             {
                 "benchmark": benchmark,

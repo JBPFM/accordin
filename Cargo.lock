@@ -948,6 +948,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcs_tas_accordin_direct"
+version = "0.1.0"
+dependencies = [
+ "accordin_shared",
+ "anyhow",
+ "libbpf-rs",
+ "libc",
+ "log",
+ "scx_cargo",
+ "scx_utils",
+ "simplelog",
+]
+
+[[package]]
 name = "mcs_tse"
 version = "0.1.0"
 dependencies = [

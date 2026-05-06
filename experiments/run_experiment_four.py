@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -35,10 +36,22 @@ DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
 DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
+INIT_FILL_THREADS = 1
 DEFAULT_INIT_EXISTING_BENCHMARKS = ("readrandom", "readseq", "overwrite")
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600
 ACCORDIN_HOOK_SCOPE_ENV = "ACCORDIN_HOOK_SCOPE"
 ACCORDIN_LEVELDB_HOOK_SCOPE = "registered"
+MCS_TAS_ACCORDIN_DIRECT_LOCK = "mcs_tas_accordin_direct"
+MCS_TAS_ACCORDIN_DIRECT_ALIASES = {
+    "mcs_tas_accordin_direct",
+    "mcs-tas-accordin-direct",
+    "accordin_direct",
+    "accordin-direct",
+}
+MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY = (
+    REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
+)
+MCS_TAS_ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
 LEVELDB_REBUILD_INPUTS = (
     Path("db/db_impl.cc"),
     Path("db/db_impl.h"),
@@ -109,7 +122,7 @@ Default benchmark settings:
   repeats={DEFAULT_REPEATS}, num={DEFAULT_NUM}, total_ops={DEFAULT_TOTAL_OPS}
   leveldb={DEFAULT_LEVELDB_DIR} (tag {LEVELDB_VERSION})
   db_bench={DEFAULT_DB_BENCH}
-  fill_benchmark={DEFAULT_FILL_BENCHMARK}
+  fill_benchmark={DEFAULT_FILL_BENCHMARK}, init_fill_threads={INIT_FILL_THREADS}
   init_existing_benchmarks={','.join(DEFAULT_INIT_EXISTING_BENCHMARKS)}
   per_lock_max_threads={','.join(f"{lock}:{max_threads}" for lock, max_threads in PER_LOCK_MAX_THREADS.items())}
 
@@ -188,7 +201,8 @@ Examples:
             "Comma-separated lock keys. Overrides --lock-profile. "
             "Use stock to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "accordin/mcs_accordin == mcs_tas_accordin."
+            "accordin/mcs_accordin == mcs_tas_accordin, "
+            "accordin_direct == mcs_tas_accordin_direct."
         ),
     )
     parser.add_argument(
@@ -264,6 +278,36 @@ def parse_csv_ints(value: str) -> tuple[int, ...]:
     return experiment_three.parse_csv_ints(value)
 
 
+def normalize_leveldb_lock(lock: str) -> str:
+    normalized = lock.strip().lower()
+    if normalized in MCS_TAS_ACCORDIN_DIRECT_ALIASES:
+        return MCS_TAS_ACCORDIN_DIRECT_LOCK
+    return experiment_defaults.normalize_lock(lock)
+
+
+def validate_leveldb_locks(locks: tuple[str, ...]) -> tuple[str, ...]:
+    supported = (
+        set(experiment_defaults.FULL_LOCKS)
+        | set(experiment_defaults.MINIMAL_LOCKS)
+        | set(experiment_defaults.LOCK_ALIASES.values())
+        | set(experiment_defaults.LOCK_LABELS)
+        | {MCS_TAS_ACCORDIN_DIRECT_LOCK}
+    )
+    unsupported = [lock for lock in locks if lock not in supported]
+    if unsupported:
+        raise ValueError(
+            f"Unsupported lock keys: {', '.join(unsupported)}. "
+            f"Supported keys: {', '.join(sorted(supported))}"
+        )
+    return locks
+
+
+def resolve_leveldb_locks(*, profile: str, locks: Iterable[str] | None) -> tuple[str, ...]:
+    raw_locks = experiment_defaults.lock_profile_locks(profile) if locks is None else tuple(locks)
+    normalized = tuple(dict.fromkeys(normalize_leveldb_lock(lock) for lock in raw_locks))
+    return validate_leveldb_locks(normalized)
+
+
 def validate_benchmark_names(benchmarks: tuple[str, ...]) -> tuple[str, ...]:
     invalid = [benchmark for benchmark in benchmarks if BENCHMARK_NAME_PATTERN.fullmatch(benchmark) is None]
     if invalid:
@@ -337,16 +381,34 @@ def accordin_preload_env(preload_library: Path) -> dict[str, str]:
     return env
 
 
+def mcs_tas_accordin_direct_preload_env(preload_library: Path) -> dict[str, str]:
+    env = preload_env(preload_library)
+    if env is None:
+        env = {}
+    for key, value in os.environ.items():
+        if key.startswith(MCS_TAS_ACCORDIN_DIRECT_ENV_PREFIX):
+            env[key] = value
+    if "ACCORDIN_CPU_MASK_K" in os.environ:
+        env["ACCORDIN_CPU_MASK_K"] = os.environ["ACCORDIN_CPU_MASK_K"]
+    if "K" in os.environ:
+        env["K"] = os.environ["K"]
+    return env
+
+
 def default_result_root() -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     return REPO_ROOT / "experiments" / "results" / f"experiment4_{timestamp}"
 
 
 def lock_label(lock: str) -> str:
+    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
+        return MCS_TAS_ACCORDIN_DIRECT_LOCK
     return experiment_defaults.lock_label(lock)
 
 
 def lock_sort_key(lock: str) -> tuple[int, str]:
+    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
+        return (experiment_defaults.lock_sort_key("mcs_tas_accordin")[0] + 1, lock)
     return experiment_defaults.lock_sort_key(lock)
 
 
@@ -492,11 +554,39 @@ def ensure_lock_helpers(
     build_missing: bool,
     logger: experiment_three.CommandLogger,
 ) -> None:
-    experiment_three.ensure_interpose_helpers(locks, build_missing=build_missing, logger=logger)
+    interpose_locks = tuple(lock for lock in locks if lock != MCS_TAS_ACCORDIN_DIRECT_LOCK)
+    experiment_three.ensure_interpose_helpers(interpose_locks, build_missing=build_missing, logger=logger)
     if "mcs_tas_accordin" in locks:
         experiment_three.ensure_accordin_preload(build_missing=build_missing, logger=logger)
+    if MCS_TAS_ACCORDIN_DIRECT_LOCK in locks:
+        ensure_mcs_tas_accordin_direct_preload(build_missing=build_missing, logger=logger)
     if "mcs_extension" in locks:
         experiment_three.ensure_mcs_extension_preload(build_missing=build_missing, logger=logger)
+
+
+def ensure_mcs_tas_accordin_direct_preload(
+    *,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    if MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY.is_file():
+        return
+    if not build_missing:
+        raise RuntimeError(
+            f"LD_PRELOAD helper is missing: {MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY}. "
+            "Run cargo build -p mcs_tas_accordin_direct --release or rerun with --build-missing."
+        )
+
+    logger.run(
+        ["cargo", "build", "-p", "mcs_tas_accordin_direct", "--release"],
+        log_name="build_mcs_tas_accordin_direct.log",
+        cwd=REPO_ROOT,
+        timeout_seconds=0,
+    )
+    if not MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY.is_file():
+        raise RuntimeError(
+            f"LD_PRELOAD helper was not built: {MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY}"
+        )
 
 
 def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str] | None]:
@@ -504,6 +594,10 @@ def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str] | None]:
         return [], None
     if lock == "mcs_tas_accordin":
         return [], accordin_preload_env(experiment_three.ACCORDIN_PRELOAD_LIBRARY)
+    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
+        return [], mcs_tas_accordin_direct_preload_env(
+            MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY
+        )
     if lock == "mcs_extension":
         return [], preload_env(experiment_three.MCS_EXTENSION_PRELOAD_LIBRARY)
     return experiment_three.interpose_command(lock)
@@ -555,6 +649,8 @@ def build_measured_command(
             use_existing_db=use_existing_db,
         )
     )
+    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK and env is not None:
+        return experiment_three.with_sudo_env(cmd, env)
     return experiment_three.benchmark_command(lock, cmd, env)
 
 
@@ -569,7 +665,7 @@ def build_init_command(
         db_bench=db_bench,
         db_path=db_path,
         benchmark=fill_benchmark,
-        threads=1,
+        threads=INIT_FILL_THREADS,
         num=num,
         use_existing_db=False,
     )
@@ -610,6 +706,15 @@ def cleanup_db_path(path: Path) -> None:
     except FileNotFoundError:
         return
     except PermissionError as exc:
+        if path.name.startswith("experiment4_leveldb_"):
+            result = subprocess.run(
+                ["sudo", "-n", "rm", "-rf", "--", str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode == 0:
+                return
         print(f"Warning: could not remove temporary DB path {path}: {exc}", file=sys.stderr)
 
 
@@ -776,9 +881,11 @@ def write_settings(
         "leveldb_dir": str(leveldb_dir),
         "leveldb_version": LEVELDB_VERSION if leveldb_dir == DEFAULT_LEVELDB_DIR else "custom",
         "fill_benchmark": fill_benchmark,
+        "init_fill_threads": INIT_FILL_THREADS,
         "init_existing_benchmarks": list(init_existing_benchmarks),
         "accordin_hook_scope_env": ACCORDIN_HOOK_SCOPE_ENV,
         "accordin_hook_scope": ACCORDIN_LEVELDB_HOOK_SCOPE,
+        "mcs_tas_accordin_direct_preload": str(MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY),
         "flexguard_dir": str(FLEXGUARD_DIR),
         "machine_core_count": experiment_defaults.MACHINE_CORE_COUNT,
     }
@@ -971,7 +1078,7 @@ def main() -> int:
             return 2
 
         benchmarks = validate_benchmark_names(parse_csv_strings(args.benchmarks))
-        locks = experiment_defaults.resolve_locks(
+        locks = resolve_leveldb_locks(
             profile=args.lock_profile,
             locks=None if args.locks is None else parse_csv_strings(args.locks),
         )

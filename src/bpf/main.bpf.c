@@ -382,6 +382,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   __u32 user_ctx_word = 0;
   bool is_idle = false;
   bool have_user = false;
+  bool wants_slow_path = false;
   s32 cpu;
 
   task_ctx = get_task_ctx(p);
@@ -395,27 +396,32 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
       (task_ctx->holds_admission || task_ctx->must_run_on_admission_cpu))
     return (s32)task_ctx->admission_cpu;
 
-  if (task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word) &&
-      valid_cpu(prev_cpu) && task_cpu_allowed(p, (__u32)prev_cpu)) {
+  wants_slow_path =
+      task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word);
+
+  if (wants_slow_path && valid_cpu(prev_cpu) &&
+      task_cpu_allowed(p, (__u32)prev_cpu)) {
     task_ctx->admission_cpu = (__u32)prev_cpu;
     return prev_cpu;
   }
 
   cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-  if (!valid_cpu(cpu) || !task_cpu_allowed(p, (__u32)cpu)) {
+  if (wants_slow_path &&
+      (!valid_cpu(cpu) || !task_cpu_allowed(p, (__u32)cpu))) {
     is_idle = false;
     cpu = pick_allowed_cpu(p, prev_cpu);
-  }
-  if (!valid_cpu(cpu))
+  } else if (!wants_slow_path &&
+             (!valid_cpu(cpu) || !task_cpumask_allows(p, (__u32)cpu))) {
+    is_idle = false;
     cpu = pick_task_cpu(p, prev_cpu);
+  }
 
-  if (task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word) &&
-      valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
+  if (wants_slow_path && valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
     task_ctx->admission_cpu = (__u32)cpu;
 
-  if (is_idle && valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu) &&
-      !(task_ctx && slow_path_requested(task_ctx, have_user, user_ctx_word)))
+  if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu) &&
+      !wants_slow_path)
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
   return cpu;
@@ -471,17 +477,24 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   __u32 *owner;
+  bool active;
   (void)prev;
 
-  if (!valid_cpu(cpu) || !cpu_is_active((__u32)cpu))
+  if (!valid_cpu(cpu))
     return;
 
-  owner = lookup_cpu_owner((__u32)cpu);
-  if (should_drain_inactive((__u32)cpu, owner) &&
-      scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
-    return;
+  active = cpu_is_active((__u32)cpu);
+  if (active) {
+    owner = lookup_cpu_owner((__u32)cpu);
+    if (should_drain_inactive((__u32)cpu, owner) &&
+        scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
+      return;
+  }
 
   if (scx_bpf_dsq_move_to_local(READY_DSQ_ID))
+    return;
+
+  if (!active)
     return;
 
   if (scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))

@@ -48,28 +48,30 @@ admission yield 是用户态锁与 BPF 调度器之间的握手机制。目标�
 
 用户态状态在 `src/accordin_shared/src/admission.rs`，BPF 侧调度逻辑在 `src/bpf/main.bpf.c`。
 
-每个线程有一个 admission word，当前使用两个 bit：
+每个线程有一个 admission word，当前使用三个 bit：
 
 - `SLOW_PATH_PENDING`：锁 fast path 失败，线程即将进入慢路径等待。
 - `IN_CRITICAL_SECTION`：线程已经获得锁，正在临界区中执行。
+- `SLOW_PATH_SEEN`：线程生命周期内曾经进入过锁慢路径。
 
 线程第一次经过 mutex hook 时，会把自己的 TID 与 admission word 地址注册到 BPF 的 `thread_ctx_addr_map`。之后 BPF 可以通过 `bpf_probe_read_user()` 读取用户态 admission word，并据此做 admission 决策。
 
 基本流程：
 
-1. mutex hook 的 fast path 失败后，由 shared adapter 在进入等待前调用 `mark_slow_path_pending()`。
+1. mutex hook 的 fast path 失败后，由 shared adapter 在进入等待前调用 `mark_slow_path_pending()`，同时设置 `SLOW_PATH_PENDING` 和持久的 `SLOW_PATH_SEEN`。
 2. BPF 看到 `SLOW_PATH_PENDING` 后，为该任务选择 admission CPU。
 3. `cpu_admission_owner_map` 对每个 CPU 只记录一个当前 admission owner。
 4. 拿不到 admission 的等待者会被放入该 CPU 的 inactive DSQ。
-5. 线程获得锁后设置 `IN_CRITICAL_SECTION`，并清除 `SLOW_PATH_PENDING`。
-6. BPF 在 `running`、`tick`、`stopping` 等路径中持续检查 admission word，保护仍在 CS 中的 runnable 线程。
-7. 解锁时清除 `IN_CRITICAL_SECTION`；当 admission word 为空时，BPF 释放对应 CPU 的 admission owner。
+5. 线程获得锁后设置 `IN_CRITICAL_SECTION`，并清除 `SLOW_PATH_PENDING`，但保留 `SLOW_PATH_SEEN`。
+6. 线程解锁后清除 `IN_CRITICAL_SECTION`；BPF 释放对应 CPU 的 admission owner，但保留该线程的 slow-path history。
+7. 之后只要 `SLOW_PATH_SEEN` 已经存在，该线程即使在锁外运行，也会进入 controller 的 active CPU 范围，通过 controlled DSQ 只由 active CPU 消费。
+8. 未进入过慢路径的普通任务使用内建 `SCX_DSQ_GLOBAL` / local DSQ；如果普通任务的 affinity 只允许一个 CPU，则 enqueue 直接投到该 CPU 的 local DSQ，避免被 controlled work 饥饿。
 
 关键 BPF 路径：
 
 - `accordin_select_cpu()`：让已 admission 的任务继续回到 admission CPU。
-- `accordin_enqueue()`：为慢路径等待者授予 admission，或放入 inactive DSQ。
-- `accordin_dispatch()`：优先调度 active work，并周期性检查 inactive waiters。
+- `accordin_enqueue()`：为慢路径等待者授予 admission，或放入 inactive DSQ；对 `SLOW_PATH_SEEN` 线程投递 controlled DSQ；普通任务投递内建 global/local DSQ。
+- `accordin_dispatch()`：内建 local/global DSQ 已经为空时才被调用；active CPU 周期性调度 inactive waiters，并消费 controlled DSQ；inactive CPU 不消费 controlled/inactive work。
 - `accordin_stopping()`：若 runnable 任务仍在 CS 中，则保护其 admission。
 - `accordin_exit_task()`：清理 task storage 与 thread-context map。
 
@@ -126,9 +128,10 @@ LD_PRELOAD 加载动态库
   -> 第一次 pthread mutex 操作注册当前线程 admission word
   -> try_lock fast path 成功则直接进入 CS
   -> fast path 失败则在慢路径前设置 SLOW_PATH_PENDING
-  -> BPF 根据 admission word 控制等待者是否进入 active 调度
+  -> BPF 根据 admission word 控制等待者是否进入 active 调度，并记录 SLOW_PATH_SEEN
   -> 加锁成功后设置 IN_CRITICAL_SECTION 并开始 CS 统计
-  -> 解锁时清除 CS 状态，更新统计，并可能调整 CPU 并发度
+  -> 解锁时清除 CS 状态，保留 slow-path history，更新统计，并可能调整 CPU 并发度
+  -> 曾经进入过慢路径的线程继续通过 controlled DSQ 限制在 active CPUs 上运行
   -> .fini_array 打印进程级锁统计
 ```
 

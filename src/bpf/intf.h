@@ -6,7 +6,7 @@
 #define __kptr
 #endif
 
-#define READY_DSQ_ID 0x100ULL
+#define CONTROLLED_DSQ_ID 0x100ULL
 #define SSC_DSQ_ID 0x5CCULL
 #define INACTIVE_DSQ_BASE 0x10000ULL
 #define MAX_TASKS 65536U
@@ -14,6 +14,7 @@
 #define ADMISSION_CPU_NONE MAX_CPUS
 #define USER_ADMISSION_IN_CRITICAL_SECTION (1U << 0)
 #define USER_ADMISSION_SLOW_PATH_PENDING (1U << 1)
+#define USER_ADMISSION_SLOW_PATH_SEEN (1U << 2)
 
 struct accordin_active_cpus_args {
   unsigned long long wanted0;
@@ -29,7 +30,7 @@ struct accordin_cpu_nudge_args {
 };
 
 struct task_scx_ctx {
-  unsigned int admitted;
+  unsigned int slow_path_seen;
   unsigned int initialized;
   unsigned int holds_admission;
   unsigned int admission_cpu;

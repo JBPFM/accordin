@@ -287,7 +287,7 @@ fn reset_thread_measurement_state(ctx: &mut LockSchedThreadCtx, aux: &mut Thread
     ctx.hold_ns_total = 0;
     ctx.hold_start_ns = 0;
     ctx.lock_count = 0;
-    admission::reset_state();
+    admission::reset_transient_state();
 }
 
 #[inline(always)]

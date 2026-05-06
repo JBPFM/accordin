@@ -1,4 +1,17 @@
+# Build artifacts
 /target
+/build/
+
+# Python bytecode
+/.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Local agent/planning notes
+/goal.md
+/progress.md
+
 .cache
 .clangd
 compile_commands.json
@@ -10,7 +23,6 @@ results
 .dmux/
 .dmux-hooks
 .claude
-experiments/__pycache__
 third_party/rocksdb/
 third_party/leveldb/
 third_party/leveldb-1.23/

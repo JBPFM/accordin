@@ -13,10 +13,12 @@ const SAMPLE_STRIDE_ENV: &str = "ACCORDIN_SAMPLE_STRIDE";
 const DYNAMIC_CPU_WINDOW_NS_ENV: &str = "ACCORDIN_DYNAMIC_CPU_WINDOW_NS";
 
 const DEFAULT_SAMPLE_STRIDE: u64 = 8;
-const DEFAULT_DYNAMIC_CPU_WINDOW_NS: u64 = 1_000_000;
+const DEFAULT_DYNAMIC_CPU_WINDOW_NS: u64 = 10_000_000;
 const DYNAMIC_CPU_CRITICAL_EWMA_ALPHA: f64 = 0.5;
 const DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA: f64 = 0.1;
 const DYNAMIC_CPU_MAX_TARGET_MULTIPLIER: usize = 8;
+const DYNAMIC_CPU_MULTICORE_CRITICAL_PENALTY_NS: f64 = 50.0;
+const DYNAMIC_CPU_CROSS_NUMA_CRITICAL_PENALTY_NS: f64 = 200.0;
 
 /// Per-thread lock statistics storage used by print_process_stats.
 #[repr(C)]
@@ -611,11 +613,13 @@ fn run_dynamic_cpu_control_tick() {
         .last_dynamic_cpu_count
         .or_else(cpu_affinity::current_dynamic_cpu_count);
     let target_cpu_limit = dynamic_cpu_target_limit(&mut control, current_cpu_count);
-    let Some(smoothed_target) = dynamic_cpu_target_from_smoothed_components(
+    let Some(smoothed_target) = dynamic_cpu_target_from_penalized_components(
         &mut control,
         critical_avg_ns,
         outside_avg_ns,
         target_cpu_limit,
+        current_cpu_count,
+        cpu_affinity::current_first_numa_available_cpu_count(),
     ) else {
         return;
     };
@@ -722,6 +726,41 @@ fn dynamic_cpu_target_from_smoothed_components(
     Some(target)
 }
 
+fn dynamic_cpu_target_from_penalized_components(
+    control: &mut WindowControlState,
+    critical_ns: f64,
+    outside_ns: f64,
+    target_cpu_limit: Option<usize>,
+    current_cpu_count: Option<usize>,
+    first_numa_available_cpu_count: Option<usize>,
+) -> Option<f64> {
+    let critical_ns = critical_ns
+        + dynamic_cpu_critical_penalty_ns(current_cpu_count, first_numa_available_cpu_count);
+    dynamic_cpu_target_from_smoothed_components(control, critical_ns, outside_ns, target_cpu_limit)
+}
+
+fn dynamic_cpu_critical_penalty_ns(
+    current_cpu_count: Option<usize>,
+    first_numa_available_cpu_count: Option<usize>,
+) -> f64 {
+    let Some(current_cpu_count) = current_cpu_count else {
+        return 0.0;
+    };
+    if current_cpu_count <= 1 {
+        return 0.0;
+    }
+
+    match first_numa_available_cpu_count {
+        Some(first_numa_available_cpu_count)
+            if first_numa_available_cpu_count > 0
+                && current_cpu_count > first_numa_available_cpu_count =>
+        {
+            DYNAMIC_CPU_CROSS_NUMA_CRITICAL_PENALTY_NS
+        }
+        _ => DYNAMIC_CPU_MULTICORE_CRITICAL_PENALTY_NS,
+    }
+}
+
 fn dynamic_cpu_target_limit(
     control: &mut WindowControlState,
     current_cpu_count: Option<usize>,
@@ -809,6 +848,7 @@ mod tests {
         ThreadStatsAux, WindowControlState, advance_periodic_sample,
         begin_outside_gap_sample_with_enabled, decide_operation_sampling_with_enabled,
         dynamic_cpu_count_from_target, dynamic_cpu_count_within_dead_zone,
+        dynamic_cpu_critical_penalty_ns, dynamic_cpu_target_from_penalized_components,
         dynamic_cpu_target_from_sample_averages, dynamic_cpu_target_from_smoothed_components,
         dynamic_cpu_target_limit, dynamic_sample_averages, finish_outside_gap_sample, next_ewma,
         parse_dynamic_cpu_window_ns, parse_sample_stride, record_lock_acquired, record_post_unlock,
@@ -865,9 +905,9 @@ mod tests {
 
     #[test]
     fn parse_dynamic_window_uses_default_for_missing_or_invalid_values() {
-        assert_eq!(parse_dynamic_cpu_window_ns(None), 1_000_000);
-        assert_eq!(parse_dynamic_cpu_window_ns(Some("0")), 1_000_000);
-        assert_eq!(parse_dynamic_cpu_window_ns(Some("abc")), 1_000_000);
+        assert_eq!(parse_dynamic_cpu_window_ns(None), 10_000_000);
+        assert_eq!(parse_dynamic_cpu_window_ns(Some("0")), 10_000_000);
+        assert_eq!(parse_dynamic_cpu_window_ns(Some("abc")), 10_000_000);
     }
 
     #[test]
@@ -1073,6 +1113,54 @@ mod tests {
             control.outside_ewma_ns.unwrap() <= control.critical_ewma_ns.unwrap() * 15.0,
             "stored outside EWMA should not keep an unbounded outlier"
         );
+    }
+
+    #[test]
+    fn dynamic_cpu_critical_penalty_is_tiered_by_current_concurrency() {
+        assert_eq!(dynamic_cpu_critical_penalty_ns(None, Some(4)), 0.0);
+        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(1), Some(4)), 0.0);
+        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(2), Some(4)), 50.0);
+        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(4), Some(4)), 50.0);
+        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(5), Some(4)), 200.0);
+        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(5), None), 50.0);
+    }
+
+    #[test]
+    fn dynamic_cpu_target_uses_penalized_critical_average_before_ewma() {
+        let mut control = WindowControlState::default();
+
+        let target = dynamic_cpu_target_from_penalized_components(
+            &mut control,
+            100.0,
+            1_000.0,
+            None,
+            Some(4),
+            Some(4),
+        )
+        .expect("valid penalized component samples should produce a target");
+
+        assert_eq!(control.critical_ewma_ns, Some(150.0));
+        assert_eq!(control.outside_ewma_ns, Some(1_000.0));
+        assert_eq!(target, 1.0 + 1_000.0 / 150.0);
+    }
+
+    #[test]
+    fn dynamic_cpu_target_uses_cross_numa_penalty_as_total_penalty() {
+        let mut control = WindowControlState::default();
+
+        let target = dynamic_cpu_target_from_penalized_components(
+            &mut control,
+            100.0,
+            1_000.0,
+            None,
+            Some(5),
+            Some(4),
+        )
+        .expect("valid cross-NUMA component samples should produce a target");
+
+        assert_eq!(control.critical_ewma_ns, Some(300.0));
+        assert_eq!(control.outside_ewma_ns, Some(1_000.0));
+        assert_eq!(target, 1.0 + 1_000.0 / 300.0);
     }
 
     #[test]

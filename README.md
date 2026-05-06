@@ -22,6 +22,9 @@ concurrency controller 主要在 `src/accordin_shared/src/lock_stats.rs` 和 `sr
 target_concurrency = 1 + avg_ncs / avg_cs
 ```
 
+计算目标前，controller 会按当前 active CPU 数给窗口平均 CS 加上惩罚：
+`>1` 时加 `50ns`，超过第一可用 NUMA node 的 CPU 数时总惩罚为 `200ns`。
+
 计算结果会经过 EWMA 平滑，当前 `alpha = 0.2`，然后四舍五入成 CPU 数。若新旧 CPU 数只差 1，则保持不变，避免频繁抖动。最终通过 `sched_setaffinity` 更新进程内线程可运行的 CPU 集合。
 
 关键入口：
@@ -175,7 +178,7 @@ sudo K=4 LD_PRELOAD=./target/release/libreciprocating_accordin.so ./your_program
 | --- | --- |
 | `ACCORDIN_CPU_MASK_K` / `K` | 启用 CPU affinity 控制，并设置初始 active CPU 数。 |
 | `ACCORDIN_SAMPLE_STRIDE` | 锁统计采样步长，默认 `8`。 |
-| `ACCORDIN_DYNAMIC_CPU_WINDOW_NS` | 动态并发控制窗口，默认 `1000000` ns。 |
+| `ACCORDIN_DYNAMIC_CPU_WINDOW_NS` | 动态并发控制窗口，默认 `10000000` ns。 |
 | `ACCORDIN_DISABLE_BPF` | 对根 crate `libaccordin.so` 禁用 BPF。 |
 | `MCS_ACCORDIN_DISABLE_BPF` | 对 `libmcs_accordin.so` 禁用 BPF。 |
 | `MCS_TAS_ACCORDIN_DISABLE_BPF` | 对 `libmcs_tas_accordin.so` 禁用 BPF。 |

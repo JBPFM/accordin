@@ -16,6 +16,7 @@ struct CpuAffinityConfig {
     env_name: &'static str,
     requested_cpus: usize,
     available_cpus: Vec<usize>,
+    first_numa_available_cpu_count: usize,
     active_cpu_count: AtomicUsize,
 }
 
@@ -152,6 +153,13 @@ pub fn current_dynamic_cpu_count() -> Option<usize> {
     }
 }
 
+pub fn current_first_numa_available_cpu_count() -> Option<usize> {
+    match cpu_affinity_state() {
+        CpuAffinityState::Configured(config) => Some(config.first_numa_available_cpu_count),
+        _ => None,
+    }
+}
+
 fn cpu_affinity_state() -> &'static CpuAffinityState {
     CPU_AFFINITY_STATE.get_or_init(load_cpu_affinity_state)
 }
@@ -166,12 +174,15 @@ fn load_cpu_affinity_state() -> CpuAffinityState {
         Err(error) => return CpuAffinityState::Invalid(error),
     };
 
-    let numa_cpus = match numa_ordered_cpus() {
-        Ok(cpus) => cpus,
+    let numa_cpu_nodes = match numa_ordered_cpu_nodes() {
+        Ok(nodes) => nodes,
         Err(error) => return CpuAffinityState::Invalid(error),
     };
     let current_allowed_cpus = current_affinity_cpus().ok();
-    let available_cpus = select_numa_available_cpus(&numa_cpus, current_allowed_cpus.as_deref());
+    let available_cpu_nodes =
+        select_numa_available_cpu_nodes(&numa_cpu_nodes, current_allowed_cpus.as_deref());
+    let first_numa_available_cpu_count = available_cpu_nodes.first().map_or(0, Vec::len);
+    let available_cpus = flatten_cpu_nodes(&available_cpu_nodes);
     if available_cpus.len() < requested_cpus {
         return CpuAffinityState::Invalid(format!(
             "requested {requested_cpus} CPUs from NUMA-ordered available CPUs but only {} are available",
@@ -183,6 +194,7 @@ fn load_cpu_affinity_state() -> CpuAffinityState {
         env_name,
         requested_cpus,
         available_cpus,
+        first_numa_available_cpu_count,
         active_cpu_count: AtomicUsize::new(requested_cpus),
     })
 }
@@ -209,25 +221,36 @@ fn parse_requested_cpu_count(value: &str, env_name: &str) -> Result<usize, Strin
     Ok(requested_cpus)
 }
 
-fn numa_ordered_cpus() -> Result<Vec<usize>, String> {
+fn numa_ordered_cpu_nodes() -> Result<Vec<Vec<usize>>, String> {
     let mut node_cpulists = numa_node_cpulist_paths("/sys/devices/system/node");
     node_cpulists.sort_by_key(|(node_id, _)| *node_id);
 
-    let mut cpus = Vec::new();
+    let mut nodes = Vec::new();
     let mut seen = BTreeSet::new();
     for (_node_id, cpulist_path) in node_cpulists {
+        let mut node_cpus = Vec::new();
         for cpu in read_cpu_list_file(&cpulist_path)? {
             if seen.insert(cpu) {
-                cpus.push(cpu);
+                node_cpus.push(cpu);
             }
+        }
+        if !node_cpus.is_empty() {
+            nodes.push(node_cpus);
         }
     }
 
-    if !cpus.is_empty() {
-        return Ok(cpus);
+    if !nodes.is_empty() {
+        return Ok(nodes);
     }
 
     read_cpu_list_file(Path::new("/sys/devices/system/cpu/online"))
+        .map(|cpus| {
+            if cpus.is_empty() {
+                Vec::new()
+            } else {
+                vec![cpus]
+            }
+        })
         .map_err(|error| format!("failed to find NUMA node CPUs: {error}"))
 }
 
@@ -313,10 +336,14 @@ fn select_numa_cpus(
     allowed_cpus: Option<&[usize]>,
     requested_cpus: usize,
 ) -> Result<Vec<usize>, String> {
-    let cpus = select_numa_available_cpus(numa_cpus, allowed_cpus)
-        .into_iter()
-        .take(requested_cpus)
-        .collect::<Vec<_>>();
+    let numa_cpu_nodes = vec![numa_cpus.to_vec()];
+    let cpus = flatten_cpu_nodes(&select_numa_available_cpu_nodes(
+        &numa_cpu_nodes,
+        allowed_cpus,
+    ))
+    .into_iter()
+    .take(requested_cpus)
+    .collect::<Vec<_>>();
 
     if cpus.len() < requested_cpus {
         return Err(format!(
@@ -328,12 +355,28 @@ fn select_numa_cpus(
     Ok(cpus)
 }
 
-fn select_numa_available_cpus(numa_cpus: &[usize], allowed_cpus: Option<&[usize]>) -> Vec<usize> {
+fn select_numa_available_cpu_nodes(
+    numa_cpu_nodes: &[Vec<usize>],
+    allowed_cpus: Option<&[usize]>,
+) -> Vec<Vec<usize>> {
     let allowed: Option<BTreeSet<usize>> = allowed_cpus.map(|cpus| cpus.iter().copied().collect());
-    numa_cpus
+    numa_cpu_nodes
         .iter()
-        .copied()
-        .filter(|cpu| allowed.as_ref().is_none_or(|allowed| allowed.contains(cpu)))
+        .filter_map(|node_cpus| {
+            let cpus = node_cpus
+                .iter()
+                .copied()
+                .filter(|cpu| allowed.as_ref().is_none_or(|allowed| allowed.contains(cpu)))
+                .collect::<Vec<_>>();
+            (!cpus.is_empty()).then_some(cpus)
+        })
+        .collect()
+}
+
+fn flatten_cpu_nodes(cpu_nodes: &[Vec<usize>]) -> Vec<usize> {
+    cpu_nodes
+        .iter()
+        .flat_map(|node_cpus| node_cpus.iter().copied())
         .collect()
 }
 
@@ -442,7 +485,7 @@ fn format_cpu_list(cpus: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_active_cpu_bitmap, format_cpu_list, parse_cpu_list, select_numa_available_cpus,
+        build_active_cpu_bitmap, format_cpu_list, parse_cpu_list, select_numa_available_cpu_nodes,
         select_numa_cpus, should_apply_userspace_affinity,
     };
 
@@ -482,13 +525,24 @@ mod tests {
     }
 
     #[test]
-    fn select_numa_available_cpus_keeps_full_pool_across_nodes() {
-        let numa_cpus = vec![0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11];
-        let allowed_cpus = vec![2, 6, 8, 1, 3, 12];
+    fn select_numa_available_cpu_nodes_keeps_node_boundaries() {
+        let numa_cpu_nodes = vec![vec![0, 2, 4, 6], vec![1, 3, 5, 7]];
+        let allowed_cpus = vec![2, 6, 1, 5, 12];
 
         assert_eq!(
-            select_numa_available_cpus(&numa_cpus, Some(&allowed_cpus)),
-            vec![2, 6, 8, 1, 3]
+            select_numa_available_cpu_nodes(&numa_cpu_nodes, Some(&allowed_cpus)),
+            vec![vec![2, 6], vec![1, 5]]
+        );
+    }
+
+    #[test]
+    fn select_numa_available_cpu_nodes_skips_empty_nodes() {
+        let numa_cpu_nodes = vec![vec![0, 2, 4], vec![1, 3, 5]];
+        let allowed_cpus = vec![1, 5];
+
+        assert_eq!(
+            select_numa_available_cpu_nodes(&numa_cpu_nodes, Some(&allowed_cpus)),
+            vec![vec![1, 5]]
         );
     }
 

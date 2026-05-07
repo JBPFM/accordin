@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median
 from typing import Iterable
 
 import experiment_defaults
@@ -32,6 +32,8 @@ DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
 DEFAULT_REPEATS = 5
 SUMMARY_DISCARD_INITIAL_REPEATS = 1
+SUMMARY_OUTLIER_ABS_DEVIATION_PCT = 20.0
+SUMMARY_OUTLIER_MIN_ROWS = 3
 DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
@@ -71,6 +73,13 @@ LEVELDB_ACCORDIN_DIRECT_ADMISSION_DISABLED_LOCKS = (
     MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
 )
 LEVELDB_ACCORDIN_DIRECT_TASKSET_LOCKS = (MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,)
+LEVELDB_ACCORDIN_DIRECT_LINESTYLES = {
+    MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK: "-",
+    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK: "--",
+    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK: ":",
+    MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK: "-.",
+}
+ACCORDIN_PLOT_COLOR_KEY = "accordin"
 LEVELDB_ACCORDIN_DIRECT_ALIAS_TARGETS = {
     experiment_defaults.ACCORDIN_BASE_LOCK: MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
     "accordin": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
@@ -143,6 +152,7 @@ SUMMARY_FIELDS = (
     "lock",
     "threads",
     "mean_latency_micros_per_op",
+    "mean_benchmark_seconds",
     "mean_ops_per_second",
     "mean_init_wall_seconds",
     "mean_wall_seconds",
@@ -496,12 +506,27 @@ def lock_label(lock: str) -> str:
     if lock == MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK:
         return "Accordin direct (admission only)"
     if lock == MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK:
-        return "Accordin direct (sampled)"
+        return "Accordin direct (both)"
     if lock == MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK:
         return "Accordin direct (controller only)"
     if lock == MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK:
         return "Accordin direct (taskset)"
     return experiment_defaults.lock_label(lock)
+
+
+def lock_plot_color_key(lock: str) -> str:
+    effective_lock = normalize_leveldb_lock(lock)
+    if effective_lock in LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS:
+        return ACCORDIN_PLOT_COLOR_KEY
+    return effective_lock
+
+
+def lock_plot_style(lock: str, color_by_key: dict[str, str]) -> dict[str, str]:
+    effective_lock = normalize_leveldb_lock(lock)
+    return {
+        "color": color_by_key[lock_plot_color_key(effective_lock)],
+        "linestyle": LEVELDB_ACCORDIN_DIRECT_LINESTYLES.get(effective_lock, "-"),
+    }
 
 
 def lock_sort_key(lock: str) -> tuple[int, str]:
@@ -1045,6 +1070,9 @@ def write_settings(
         "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
         "repeats": repeats,
         "summary_discard_initial_repeats": SUMMARY_DISCARD_INITIAL_REPEATS,
+        "summary_outlier_abs_deviation_pct": SUMMARY_OUTLIER_ABS_DEVIATION_PCT,
+        "summary_outlier_baseline": "median",
+        "summary_ops_source": "leveldb_internal_micros_per_op",
         "num": num,
         "total_ops": total_ops,
         "command_timeout_seconds": command_timeout_seconds,
@@ -1107,6 +1135,11 @@ def mean_field(rows: list[dict[str, str]], field: str) -> str:
 
 
 def row_ops_per_second(row: dict[str, str]) -> float | None:
+    benchmark_seconds = row_benchmark_seconds(row)
+    per_thread_ops = row_per_thread_ops(row)
+    if benchmark_seconds is not None and benchmark_seconds > 0 and per_thread_ops is not None:
+        return int(row["threads"]) * per_thread_ops / benchmark_seconds
+
     effective_total_ops = row["effective_total_ops"].strip()
     wall_seconds = row["wall_seconds"].strip()
     if effective_total_ops and wall_seconds:
@@ -1114,16 +1147,51 @@ def row_ops_per_second(row: dict[str, str]) -> float | None:
         if wall > 0:
             return float(effective_total_ops) / wall
 
-    latency = row["latency_micros_per_op"].strip()
-    if latency:
-        latency_micros = float(latency)
-        if latency_micros > 0:
-            return 1_000_000.0 / latency_micros
     return None
+
+
+def row_per_thread_ops(row: dict[str, str]) -> int | None:
+    reads_per_thread = row["reads_per_thread"].strip()
+    if reads_per_thread:
+        return int(reads_per_thread)
+
+    db_bench_num = row["db_bench_num"].strip()
+    if db_bench_num:
+        return int(db_bench_num)
+
+    effective_total_ops = row["effective_total_ops"].strip()
+    threads = row["threads"].strip()
+    if effective_total_ops and threads:
+        thread_count = int(threads)
+        if thread_count > 0:
+            return ceil_div(int(effective_total_ops), thread_count)
+    return None
+
+
+def row_benchmark_seconds(row: dict[str, str]) -> float | None:
+    latency = row["latency_micros_per_op"].strip()
+    per_thread_ops = row_per_thread_ops(row)
+    if not latency or per_thread_ops is None:
+        return None
+    latency_micros = float(latency)
+    if latency_micros <= 0:
+        return None
+    return per_thread_ops * latency_micros / 1_000_000.0
 
 
 def mean_ops_per_second(rows: list[dict[str, str]]) -> str:
     values = [ops for row in rows if (ops := row_ops_per_second(row)) is not None]
+    if not values:
+        return ""
+    return format_float(mean(values))
+
+
+def mean_benchmark_seconds(rows: list[dict[str, str]]) -> str:
+    values = [
+        seconds
+        for row in rows
+        if (seconds := row_benchmark_seconds(row)) is not None
+    ]
     if not values:
         return ""
     return format_float(mean(values))
@@ -1134,6 +1202,30 @@ def discard_initial_repeat_rows(rows: list[dict[str, str]]) -> list[dict[str, st
         return rows
     repeat_rows = sorted(rows, key=lambda row: int(row["repeat"]))
     return repeat_rows[SUMMARY_DISCARD_INITIAL_REPEATS:]
+
+
+def filter_summary_outlier_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    ops_values = [
+        (row, ops)
+        for row in rows
+        if (ops := row_ops_per_second(row)) is not None
+    ]
+    if len(ops_values) < SUMMARY_OUTLIER_MIN_ROWS:
+        return rows
+    baseline = median(ops for _, ops in ops_values)
+    if baseline <= 0:
+        return rows
+
+    max_deviation = SUMMARY_OUTLIER_ABS_DEVIATION_PCT / 100.0
+    outlier_ids = {
+        id(row)
+        for row, ops in ops_values
+        if abs((ops / baseline) - 1.0) + 1e-12 >= max_deviation
+    }
+    if not outlier_ids:
+        return rows
+    filtered_rows = [row for row in rows if id(row) not in outlier_ids]
+    return filtered_rows
 
 
 def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1147,13 +1239,18 @@ def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         groups.keys(),
         key=lambda item: (benchmark_sort_key(item[0]), lock_sort_key(item[1]), item[2]),
     ):
-        group_rows = discard_initial_repeat_rows(groups[(benchmark, lock, thread_count)])
+        group_rows = filter_summary_outlier_rows(
+            discard_initial_repeat_rows(groups[(benchmark, lock, thread_count)])
+        )
+        if not group_rows:
+            continue
         summary_rows.append(
             {
                 "benchmark": benchmark,
                 "lock": lock,
                 "threads": str(thread_count),
                 "mean_latency_micros_per_op": mean_field(group_rows, "latency_micros_per_op"),
+                "mean_benchmark_seconds": mean_benchmark_seconds(group_rows),
                 "mean_ops_per_second": mean_ops_per_second(group_rows),
                 "mean_init_wall_seconds": mean_field(group_rows, "init_wall_seconds"),
                 "mean_wall_seconds": mean_field(group_rows, "wall_seconds"),
@@ -1197,6 +1294,12 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
     fig, ax = plt.subplots(figsize=(9.5, 5.5))
     thread_values = unique_threads(summary_rows, benchmark)
     lock_keys = sorted({row["lock"] for row in rows}, key=lock_sort_key)
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
+    color_keys = list(dict.fromkeys(lock_plot_color_key(lock) for lock in lock_keys))
+    color_by_key = {
+        key: colors[index % len(colors)]
+        for index, key in enumerate(color_keys)
+    }
 
     for lock in lock_keys:
         points = [
@@ -1207,10 +1310,13 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
         if not points:
             continue
         points.sort()
+        style = lock_plot_style(lock, color_by_key)
         ax.plot(
             [thread for thread, _ in points],
             [value for _, value in points],
             marker="o",
+            color=style["color"],
+            linestyle=style["linestyle"],
             linewidth=1.8,
             markersize=4,
             label=lock_label(lock),

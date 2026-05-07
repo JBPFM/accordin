@@ -133,7 +133,7 @@ LOCK_LABELS = {
     "mcs_accordin": "Accordin (admission only)",
     "mcs_tas_accordin": "Accordin (admission only)",
     "mcs_tas_accordin_admission_only": "Accordin (admission only)",
-    "mcs_tas_accordin_sampled": "Accordin (sampled)",
+    "mcs_tas_accordin_sampled": "Accordin (both)",
     "mcs_tas_accordin_no_admission": "Accordin (controller only)",
     "mcs_tas_accordin_taskset": "Accordin (taskset)",
 }
@@ -208,7 +208,7 @@ EXPERIMENT_ONE_LOCKS = (
     ExperimentOneLockConfig("MCS-TAS", "mcs-tas"),
     ExperimentOneLockConfig("Reciprocating", "reciprocating", optional=True),
     ExperimentOneLockConfig("Accordin (admission only)", ACCORDIN_BASE_LOCK, optional=True),
-    ExperimentOneLockConfig("Accordin (sampled)", ACCORDIN_SAMPLED_LOCK, optional=True),
+    ExperimentOneLockConfig("Accordin (both)", ACCORDIN_SAMPLED_LOCK, optional=True),
     ExperimentOneLockConfig("Accordin (controller only)", ACCORDIN_NO_ADMISSION_LOCK, optional=True),
     ExperimentOneLockConfig("Accordin (taskset)", ACCORDIN_TASKSET_LOCK, optional=True),
     ExperimentOneLockConfig("MCS + TSE", "mcs_extension"),

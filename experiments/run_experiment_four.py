@@ -504,13 +504,13 @@ def default_result_root() -> Path:
 
 def lock_label(lock: str) -> str:
     if lock == MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK:
-        return "Accordin direct (admission only)"
+        return "Accordin (admission only)"
     if lock == MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK:
-        return "Accordin direct (both)"
+        return "Accordin (both)"
     if lock == MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK:
-        return "Accordin direct (controller only)"
+        return "Accordin (controller only)"
     if lock == MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK:
-        return "Accordin direct (taskset)"
+        return "Accordin (taskset)"
     return experiment_defaults.lock_label(lock)
 
 

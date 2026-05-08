@@ -111,6 +111,85 @@ class RunExperimentThreeTest(unittest.TestCase):
             experiment_defaults.DEFAULT_THREADS,
         )
 
+    def test_force_explicit_lock_runs_even_when_output_is_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_raw(root, "mcs_tas_accordin_taskset", threads=4, critical=100, outside=0)
+            matrix = experiment_three.BaselineMatrix(
+                threads=(4,),
+                critical_ns=(100,),
+                outside_ns=(0,),
+                repeats=1,
+                duration_ms=4000,
+            )
+
+            self.assertEqual(
+                experiment_three.resolve_requested_locks(
+                    root,
+                    root,
+                    "mcs_tas_accordin_taskset",
+                    matrix,
+                    force=False,
+                ),
+                (),
+            )
+            self.assertEqual(
+                experiment_three.resolve_requested_locks(
+                    root,
+                    root,
+                    "mcs_tas_accordin_taskset",
+                    matrix,
+                    force=True,
+                ),
+                ("mcs_tas_accordin_taskset",),
+            )
+
+    def test_taskset_target_cpu_count_uses_outside_over_critical_plus_one(self) -> None:
+        self.assertEqual(experiment_three.taskset_target_cpu_count(300, 3000, 96), 11)
+        self.assertEqual(experiment_three.taskset_target_cpu_count(300, 10000, 96), 34)
+        self.assertEqual(experiment_three.taskset_target_cpu_count(3000, 10000, 96), 4)
+        self.assertEqual(experiment_three.taskset_target_cpu_count(100, 10000, 96), 96)
+
+    def test_taskset_cpu_list_spills_from_first_numa_node_to_second(self) -> None:
+        topology = experiment_three.TasksetTopology(
+            source="test",
+            nodes=(
+                experiment_three.TasksetNode(node=0, cpus=(0, 2, 4)),
+                experiment_three.TasksetNode(node=1, cpus=(1, 3, 5)),
+            ),
+        )
+
+        self.assertEqual(experiment_three.taskset_cpu_list(topology, 2), (0, 2))
+        self.assertEqual(experiment_three.taskset_cpu_list(topology, 5), (0, 2, 4, 1, 3))
+
+    def test_taskset_sweeps_are_split_by_critical_outside_target(self) -> None:
+        topology = experiment_three.TasksetTopology(
+            source="test",
+            nodes=(
+                experiment_three.TasksetNode(node=0, cpus=(0, 2, 4)),
+                experiment_three.TasksetNode(node=1, cpus=(1, 3, 5)),
+            ),
+        )
+        matrix = experiment_three.BaselineMatrix(
+            threads=(4, 8),
+            critical_ns=(100, 300),
+            outside_ns=(10000,),
+            repeats=3,
+            duration_ms=4000,
+        )
+
+        sweeps = experiment_three.taskset_sweep_specs(matrix, topology)
+
+        self.assertEqual(
+            [(s.critical_ns, s.outside_ns, s.target_cpus, s.cpu_list) for s in sweeps],
+            [
+                (100, 10000, 6, "0,2,4,1,3,5"),
+                (300, 10000, 6, "0,2,4,1,3,5"),
+            ],
+        )
+        self.assertEqual(sweeps[0].matrix.critical_ns, (100,))
+        self.assertEqual(sweeps[0].matrix.outside_ns, (10000,))
+
 
 if __name__ == "__main__":
     unittest.main()

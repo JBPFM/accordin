@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import shutil
 import statistics
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -72,6 +74,38 @@ class BaselineMatrix:
         return len(self.threads) * len(self.critical_ns) * len(self.outside_ns) * self.repeats
 
 
+@dataclass(frozen=True)
+class TasksetNode:
+    node: int
+    cpus: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TasksetTopology:
+    source: str
+    nodes: tuple[TasksetNode, ...]
+
+    def ordered_cpus(self) -> tuple[int, ...]:
+        return tuple(cpu for node in self.nodes for cpu in node.cpus)
+
+    def cpu_to_node(self) -> dict[int, int]:
+        return {cpu: node.node for node in self.nodes for cpu in node.cpus}
+
+    def cpu_count(self) -> int:
+        return len(self.ordered_cpus())
+
+
+@dataclass(frozen=True)
+class TasksetSweepSpec:
+    critical_ns: int
+    outside_ns: int
+    target_cpus: int
+    cpus: tuple[int, ...]
+    cpu_list: str
+    numa_nodes: str
+    matrix: BaselineMatrix
+
+
 def matrix_with_threads(matrix: BaselineMatrix, threads: Iterable[int]) -> BaselineMatrix:
     return BaselineMatrix(
         threads=tuple(threads),
@@ -81,6 +115,112 @@ def matrix_with_threads(matrix: BaselineMatrix, threads: Iterable[int]) -> Basel
         duration_ms=matrix.duration_ms,
         warmup_duration_ms=matrix.warmup_duration_ms,
     )
+
+
+def topology_from_node_cpus(source: str, node_cpus: dict[int, Iterable[int]]) -> TasksetTopology:
+    nodes_list: list[TasksetNode] = []
+    for node, cpus in sorted(node_cpus.items()):
+        node_cpu_list = tuple(sorted(set(cpus)))
+        if node_cpu_list:
+            nodes_list.append(TasksetNode(node=node, cpus=node_cpu_list))
+    nodes = tuple(nodes_list)
+    if not nodes:
+        raise RuntimeError("CPU topology did not contain any online CPUs.")
+    return TasksetTopology(source=source, nodes=nodes)
+
+
+def detect_taskset_topology() -> TasksetTopology:
+    try:
+        completed = subprocess.run(
+            ["lscpu", "-p=CPU,NODE,ONLINE"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        completed = None
+
+    node_cpus: dict[int, list[int]] = {}
+    if completed is not None and completed.returncode == 0:
+        for line in completed.stdout.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) != 3:
+                continue
+            cpu_text, node_text, online_text = parts
+            if online_text.strip().upper() not in {"Y", "YES", "1"}:
+                continue
+            try:
+                cpu = int(cpu_text)
+                node = int(node_text)
+            except ValueError:
+                continue
+            node_cpus.setdefault(node, []).append(cpu)
+    if node_cpus:
+        return topology_from_node_cpus("lscpu -p=CPU,NODE,ONLINE", node_cpus)
+
+    cpu_count = os.cpu_count() or 1
+    return topology_from_node_cpus("fallback:os.cpu_count", {0: range(cpu_count)})
+
+
+def taskset_target_cpu_count(critical_ns: int, outside_ns: int, available_cpus: int) -> int:
+    if critical_ns <= 0:
+        raise ValueError("critical_ns must be positive")
+    if outside_ns < 0:
+        raise ValueError("outside_ns must be non-negative")
+    if available_cpus <= 0:
+        raise ValueError("available_cpus must be positive")
+    target = 1.0 + outside_ns / critical_ns
+    return min(available_cpus, max(1, math.floor(target + 0.5)))
+
+
+def taskset_cpu_list(topology: TasksetTopology, target_cpus: int) -> tuple[int, ...]:
+    ordered = topology.ordered_cpus()
+    if not ordered:
+        raise ValueError("taskset topology has no CPUs")
+    count = min(len(ordered), max(1, target_cpus))
+    return ordered[:count]
+
+
+def format_cpu_list(cpus: Iterable[int]) -> str:
+    return ",".join(str(cpu) for cpu in cpus)
+
+
+def numa_nodes_for_cpus(topology: TasksetTopology, cpus: Iterable[int]) -> str:
+    cpu_to_node = topology.cpu_to_node()
+    nodes = sorted({cpu_to_node[cpu] for cpu in cpus if cpu in cpu_to_node})
+    return ";".join(str(node) for node in nodes)
+
+
+def taskset_sweep_specs(matrix: BaselineMatrix, topology: TasksetTopology) -> tuple[TasksetSweepSpec, ...]:
+    specs: list[TasksetSweepSpec] = []
+    available_cpus = topology.cpu_count()
+    for critical_ns in matrix.critical_ns:
+        for outside_ns in matrix.outside_ns:
+            target_cpus = taskset_target_cpu_count(critical_ns, outside_ns, available_cpus)
+            cpus = taskset_cpu_list(topology, target_cpus)
+            pair_matrix = BaselineMatrix(
+                threads=matrix.threads,
+                critical_ns=(critical_ns,),
+                outside_ns=(outside_ns,),
+                repeats=matrix.repeats,
+                duration_ms=matrix.duration_ms,
+                warmup_duration_ms=matrix.warmup_duration_ms,
+            )
+            specs.append(
+                TasksetSweepSpec(
+                    critical_ns=critical_ns,
+                    outside_ns=outside_ns,
+                    target_cpus=target_cpus,
+                    cpus=cpus,
+                    cpu_list=format_cpu_list(cpus),
+                    numa_nodes=numa_nodes_for_cpus(topology, cpus),
+                    matrix=pair_matrix,
+                )
+            )
+    return tuple(specs)
 
 
 def runnable_threads_for_lock(lock: str, matrix: BaselineMatrix) -> tuple[int, ...]:
@@ -180,6 +320,8 @@ def resolve_requested_locks(
     output_root: Path,
     lock_arg: str,
     matrix: BaselineMatrix,
+    *,
+    force: bool = False,
 ) -> tuple[str, ...]:
     if lock_arg == "missing":
         return incomplete_or_missing_locks(output_root, missing_experiment_locks(baseline_root), matrix)
@@ -189,6 +331,8 @@ def resolve_requested_locks(
     if unsupported:
         supported = ",".join(REQUIRED_BASELINE_LOCKS)
         raise ValueError(f"Unsupported lock keys: {','.join(unsupported)}. Supported: {supported}")
+    if force:
+        return locks
     return incomplete_or_missing_locks(output_root, locks, matrix)
 
 
@@ -258,8 +402,18 @@ def accordin_direct_env(lock: str) -> dict[str, str | None]:
     return env
 
 
-def accordin_sweep_command(root: Path, lock: str, matrix: BaselineMatrix, taskset_cpus: str) -> tuple[list[str], dict[str, str | None]]:
+def accordin_sweep_command(
+    root: Path,
+    lock: str,
+    matrix: BaselineMatrix,
+    taskset_cpus: str | None,
+    *,
+    raw_path: Path | None = None,
+    summary_path: Path | None = None,
+) -> tuple[list[str], dict[str, str | None]]:
     lock_dir = root / lock
+    raw_path = raw_path or lock_dir / "raw.csv"
+    summary_path = summary_path or lock_dir / "summary.csv"
     cmd = [
         str(SWEEP_SINGLE),
         *common_sweep_args(matrix, runnable_threads_for_lock(lock, matrix)),
@@ -268,11 +422,13 @@ def accordin_sweep_command(root: Path, lock: str, matrix: BaselineMatrix, taskse
         "--timeslice-extension",
         "off",
         "--output-raw",
-        str(lock_dir / "raw.csv"),
+        str(raw_path),
         "--output-summary",
-        str(lock_dir / "summary.csv"),
+        str(summary_path),
     ]
     if experiment_defaults.accordin_uses_taskset(lock):
+        if not taskset_cpus:
+            raise RuntimeError(f"taskset CPU list is required for {lock}")
         cmd = ["taskset", "-c", taskset_cpus, *cmd]
     return cmd, accordin_direct_env(lock)
 
@@ -339,6 +495,51 @@ def run_command(
     logger.run(cmd, log_name=log_name, env=env)
 
 
+def csv_sort_key(row: dict[str, str], fields: tuple[str, ...]) -> tuple[int, ...]:
+    return tuple(int(row[field]) for field in fields)
+
+
+def merge_csv_files(paths: Sequence[Path], output_path: Path, *, sort_fields: tuple[str, ...]) -> None:
+    if not paths:
+        raise RuntimeError(f"No CSV parts available to merge into {output_path}")
+
+    fieldnames: list[str] | None = None
+    rows: list[dict[str, str]] = []
+    for path in paths:
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            current_fieldnames = list(reader.fieldnames or [])
+            if fieldnames is None:
+                fieldnames = current_fieldnames
+            elif current_fieldnames != fieldnames:
+                raise RuntimeError(f"CSV schema mismatch while merging {path}")
+            rows.extend(dict(row) for row in reader)
+
+    if fieldnames is None:
+        raise RuntimeError(f"CSV part had no header while merging into {output_path}")
+
+    rows.sort(key=lambda row: csv_sort_key(row, sort_fields))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
+def merge_taskset_part_csvs(lock_dir: Path, raw_paths: Sequence[Path], summary_paths: Sequence[Path]) -> None:
+    merge_csv_files(
+        raw_paths,
+        lock_dir / "raw.csv",
+        sort_fields=("threads", "critical_iters", "outside_iters", "repeat"),
+    )
+    merge_csv_files(
+        summary_paths,
+        lock_dir / "summary.csv",
+        sort_fields=("threads", "critical_iters", "outside_iters"),
+    )
+
+
 def prepare_target_dirs(root: Path, locks: tuple[str, ...], *, force: bool) -> None:
     for lock in locks:
         path = root / lock
@@ -354,6 +555,9 @@ def write_settings(
     locks: tuple[str, ...],
     matrix: BaselineMatrix,
     args: argparse.Namespace,
+    *,
+    taskset_topology: TasksetTopology | None = None,
+    taskset_sweeps: tuple[TasksetSweepSpec, ...] = (),
 ) -> None:
     settings = {
         "experiment": "experiment3_mutexbench_baseline_supplement",
@@ -375,7 +579,33 @@ def write_settings(
         "repeats": matrix.repeats,
         "mcs_extension_mode": args.mcs_extension_mode,
         "sudo_mode": args.sudo_mode,
+        "mcs_accordin_taskset_policy": (
+            "fixed_cli_override"
+            if args.mcs_accordin_taskset_cpus
+            else "dynamic_round(outside/critical + 1)_numa_first"
+        ),
         "mcs_accordin_taskset_cpus": args.mcs_accordin_taskset_cpus,
+        "mcs_accordin_taskset_topology": (
+            {
+                "source": taskset_topology.source,
+                "nodes": [
+                    {"node": node.node, "cpus": list(node.cpus)}
+                    for node in taskset_topology.nodes
+                ],
+            }
+            if taskset_topology is not None
+            else None
+        ),
+        "mcs_accordin_taskset_dynamic_sweeps": [
+            {
+                "critical_ns": sweep.critical_ns,
+                "outside_ns": sweep.outside_ns,
+                "target_cpus": sweep.target_cpus,
+                "cpu_list": sweep.cpu_list,
+                "numa_nodes": sweep.numa_nodes,
+            }
+            for sweep in taskset_sweeps
+        ],
     }
     with (root / "experiment3_baseline_supplement_settings.json").open("w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
@@ -407,6 +637,49 @@ def lock_thread_groups(locks: tuple[str, ...], matrix: BaselineMatrix) -> list[t
     return [(tuple(group_locks), threads) for group_locks, threads in groups]
 
 
+def run_dynamic_taskset_accordin_sweeps(
+    logger: CommandLogger,  # type: ignore[name-defined]
+    root: Path,
+    lock: str,
+    sweeps: tuple[TasksetSweepSpec, ...],
+    *,
+    dry_run: bool,
+) -> None:
+    lock_dir = root / lock
+    parts_dir = lock_dir / "taskset_parts"
+    if not dry_run:
+        if parts_dir.exists():
+            shutil.rmtree(parts_dir)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_paths: list[Path] = []
+    summary_paths: list[Path] = []
+    for sweep in sweeps:
+        raw_path = parts_dir / f"raw_c{sweep.critical_ns}_o{sweep.outside_ns}.csv"
+        summary_path = parts_dir / f"summary_c{sweep.critical_ns}_o{sweep.outside_ns}.csv"
+        cmd, env = accordin_sweep_command(
+            root,
+            lock,
+            sweep.matrix,
+            sweep.cpu_list,
+            raw_path=raw_path,
+            summary_path=summary_path,
+        )
+        run_command(
+            logger,
+            cmd,
+            log_name=f"sweep_{lock}_c{sweep.critical_ns}_o{sweep.outside_ns}.log",
+            dry_run=dry_run,
+            env=env,
+            sudo_env=True,
+        )
+        raw_paths.append(raw_path)
+        summary_paths.append(summary_path)
+
+    if not dry_run:
+        merge_taskset_part_csvs(lock_dir, raw_paths, summary_paths)
+
+
 def run_baseline_supplement(
     root: Path,
     baseline_root: Path,
@@ -417,10 +690,28 @@ def run_baseline_supplement(
     logger = CommandLogger(root, command_timeout_seconds=args.command_timeout_seconds)  # type: ignore[name-defined]
     ensure_executable(SWEEP_MULTI, "multi-lock sweep script")
     ensure_executable(SWEEP_SINGLE, "single-lock sweep script")
+    uses_dynamic_taskset = (
+        experiment_defaults.ACCORDIN_TASKSET_LOCK in locks
+        and args.mcs_accordin_taskset_cpus is None
+    )
+    taskset_topology = detect_taskset_topology() if uses_dynamic_taskset else None
+    taskset_sweeps = (
+        taskset_sweep_specs(matrix, taskset_topology)
+        if taskset_topology is not None
+        else ()
+    )
     if not args.dry_run:
         ensure_mutex_bench(logger)
         prepare_target_dirs(root, locks, force=args.force)
-        write_settings(root, baseline_root, locks, matrix, args)
+        write_settings(
+            root,
+            baseline_root,
+            locks,
+            matrix,
+            args,
+            taskset_topology=taskset_topology,
+            taskset_sweeps=taskset_sweeps,
+        )
 
     multi_locks = tuple(lock for lock in locks if lock in MULTI_LOCK_SWEEP_LOCKS)
     for group_locks, group_threads in lock_thread_groups(multi_locks, matrix):
@@ -446,6 +737,16 @@ def run_baseline_supplement(
     if accordin_locks and not args.dry_run:
         ensure_accordin_direct_library(logger)
     for lock in accordin_locks:
+        if experiment_defaults.accordin_uses_taskset(lock) and args.mcs_accordin_taskset_cpus is None:
+            run_dynamic_taskset_accordin_sweeps(
+                logger,
+                root,
+                lock,
+                taskset_sweeps,
+                dry_run=args.dry_run,
+            )
+            continue
+
         cmd, env = accordin_sweep_command(root, lock, matrix, args.mcs_accordin_taskset_cpus)
         run_command(logger, cmd, log_name=f"sweep_{lock}.log", dry_run=args.dry_run, env=env, sudo_env=True)
 
@@ -521,8 +822,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mcs-accordin-taskset-cpus",
-        default=experiment_defaults.DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
-        help=f"CPU list for {experiment_defaults.ACCORDIN_TASKSET_LOCK}.",
+        default=None,
+        help=(
+            f"Override CPU list for {experiment_defaults.ACCORDIN_TASKSET_LOCK}. "
+            "Default computes a per critical/outside taskset size as round(outside/critical + 1), "
+            "using first NUMA node CPUs first and spilling to later NUMA nodes."
+        ),
     )
     parser.add_argument(
         "--command-timeout-seconds",
@@ -552,7 +857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 duration_ms=args.duration_ms,
                 warmup_duration_ms=matrix.warmup_duration_ms,
             )
-        locks = resolve_requested_locks(baseline_root, root, args.locks, matrix)
+        locks = resolve_requested_locks(baseline_root, root, args.locks, matrix, force=args.force)
         if not locks:
             print(f"No missing or incomplete experiment locks under {root}.")
             return 0

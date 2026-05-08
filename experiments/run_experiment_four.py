@@ -34,6 +34,8 @@ DEFAULT_REPEATS = 5
 SUMMARY_DISCARD_INITIAL_REPEATS = 1
 SUMMARY_OUTLIER_ABS_DEVIATION_PCT = 20.0
 SUMMARY_OUTLIER_MIN_ROWS = 3
+PLOT_MIN_THREADS = 4
+PLOT_EXCLUDED_LOCKS = {"mcs_extension"}
 DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
@@ -504,13 +506,13 @@ def default_result_root() -> Path:
 
 def lock_label(lock: str) -> str:
     if lock == MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK:
-        return "Accordin (admission only)"
+        return "Admission only"
     if lock == MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK:
-        return "Accordin (both)"
+        return "Admission + core budget"
     if lock == MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK:
-        return "Accordin (controller only)"
+        return "Core budget only"
     if lock == MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK:
-        return "Accordin (taskset)"
+        return "Oracle static-K Accordin"
     return experiment_defaults.lock_label(lock)
 
 
@@ -1270,7 +1272,19 @@ def write_summary_csv(result_root: Path, rows: list[dict[str, str]]) -> Path:
 
 
 def unique_threads(summary_rows: list[dict[str, str]], benchmark: str) -> list[int]:
-    return sorted({int(row["threads"]) for row in summary_rows if row["benchmark"] == benchmark})
+    return sorted(
+        {
+            int(row["threads"])
+            for row in summary_rows
+            if row["benchmark"] == benchmark and plot_row_included(row)
+        }
+    )
+
+
+def plot_row_included(row: dict[str, str]) -> bool:
+    if int(row["threads"]) < PLOT_MIN_THREADS:
+        return False
+    return normalize_leveldb_lock(row["lock"]) not in PLOT_EXCLUDED_LOCKS
 
 
 def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path: Path) -> None:
@@ -1286,7 +1300,11 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
     rows = [
         row
         for row in summary_rows
-        if row["benchmark"] == benchmark and row["mean_ops_per_second"].strip()
+        if (
+            row["benchmark"] == benchmark
+            and row["mean_ops_per_second"].strip()
+            and plot_row_included(row)
+        )
     ]
     if not rows:
         raise RuntimeError(f"No summary rows available for benchmark {benchmark}.")

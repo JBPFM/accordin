@@ -1329,7 +1329,7 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.grid(True, axis="y", alpha=0.28)
     ax.grid(True, axis="x", which="major", alpha=0.16)
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, ncol=2)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)

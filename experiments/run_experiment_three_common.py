@@ -1469,17 +1469,6 @@ def add_thread_axis_formatting(ax, threads: list[int]) -> None:
         if threads[-1] > MACHINE_CORE_COUNT:
             ax.axvspan(MACHINE_CORE_COUNT, x_max, color="0.92", alpha=0.55, linewidth=0, zorder=0)
         ax.axvline(MACHINE_CORE_COUNT, color="0.22", linewidth=1.0, linestyle="--", alpha=0.75, zorder=1)
-        ax.annotate(
-            f"{MACHINE_CORE_COUNT} cores",
-            xy=(MACHINE_CORE_COUNT, 0.96),
-            xycoords=ax.get_xaxis_transform(),
-            xytext=(6, 0),
-            textcoords="offset points",
-            ha="left",
-            va="top",
-            fontsize=8,
-            color="0.2",
-        )
 
 
 def plot_throughput(summary_rows: list[dict[str, str]], *, benchmark: str, output_path: Path) -> None:

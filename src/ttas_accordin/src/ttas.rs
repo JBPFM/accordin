@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::admission::{mark_critical_section_exit, mark_slow_path_pending};
+use crate::admission::{mark_critical_section_exit, mark_slow_path_pending_for_lock};
 use crate::arch::{CacheAligned, pause};
 use crate::lock_backend::LockBackend;
 
@@ -19,7 +19,7 @@ impl TtasLockRaw {
     #[cfg_attr(feature = "perf-symbols", inline(never))]
     #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
     fn lock_slow(&self) {
-        mark_slow_path_pending();
+        mark_slow_path_pending_for_lock(self as *const Self as u64);
         std::thread::yield_now();
         loop {
             while self.locked.0.load(Ordering::Relaxed) {

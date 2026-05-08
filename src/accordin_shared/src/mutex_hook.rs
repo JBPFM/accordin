@@ -37,7 +37,8 @@ where
     }
 
     fn lock(state: &Self::LockState) {
-        if crate::admission::mark_slow_path_pending() {
+        let lock_id = state as *const Self::LockState as u64;
+        if crate::admission::mark_slow_path_pending_for_lock(lock_id) {
             std::thread::yield_now();
         }
         LockBackend::lock(state);
@@ -1060,14 +1061,17 @@ macro_rules! export_mutex_hooks {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use libbpf_rs::MapFlags;
 
+    use crate::lock_backend::LockBackend;
+
     use super::{
-        ThreadCtxMapOps, hook_scope_value_is_registered, hooked_cond_registered,
-        hooked_mutex_registered, register_hooked_cond_addr, register_hooked_mutex_addr,
-        register_thread_ctx_with_map, unregister_hooked_cond_addr, unregister_hooked_mutex_addr,
-        unregister_thread_ctx_with_map,
+        LockBackendAdapter, MutexHookBackend, ThreadCtxMapOps, hook_scope_value_is_registered,
+        hooked_cond_registered, hooked_mutex_registered, register_hooked_cond_addr,
+        register_hooked_mutex_addr, register_thread_ctx_with_map, unregister_hooked_cond_addr,
+        unregister_hooked_mutex_addr, unregister_thread_ctx_with_map,
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1085,6 +1089,23 @@ mod tests {
     #[derive(Default)]
     struct RecordingMap {
         calls: RefCell<Vec<MapCall>>,
+    }
+
+    #[derive(Default)]
+    struct DummyLock {
+        locks: AtomicU32,
+    }
+
+    impl LockBackend for DummyLock {
+        fn lock(&self) {
+            self.locks.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn try_lock(&self) -> bool {
+            false
+        }
+
+        fn unlock(&self) {}
     }
 
     impl ThreadCtxMapOps for RecordingMap {
@@ -1178,5 +1199,19 @@ mod tests {
 
         assert!(unregister_hooked_cond_addr(ptr));
         assert!(!hooked_cond_registered(ptr));
+    }
+
+    #[test]
+    fn lock_backend_adapter_marks_slow_path_with_lock_state_address() {
+        crate::admission::reset_state();
+        let lock = DummyLock::default();
+
+        <LockBackendAdapter<DummyLock> as MutexHookBackend>::lock(&lock);
+
+        assert_eq!(lock.locks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            crate::admission::requested_lock_id_for_test(),
+            &lock as *const DummyLock as u64
+        );
     }
 }

@@ -4,7 +4,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::admission::{
-    mark_critical_section_entered, mark_critical_section_exit, mark_slow_path_pending,
+    mark_critical_section_entered, mark_critical_section_exit, mark_slow_path_pending_for_lock,
 };
 use crate::arch::{CacheAligned, pause};
 use crate::lock_backend::LockBackend;
@@ -104,7 +104,7 @@ impl ReciprocatingLockRaw {
 
     #[inline(always)]
     fn ensure_slow_path_admission(&self) {
-        mark_slow_path_pending();
+        mark_slow_path_pending_for_lock(self as *const Self as u64);
         std::thread::yield_now();
     }
 

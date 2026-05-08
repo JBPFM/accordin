@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const CPU_MASK_K_ENV: &str = "ACCORDIN_CPU_MASK_K";
 pub const CPU_MASK_K_SHORT_ENV: &str = "K";
-pub const MAX_CPUS: usize = 256;
-pub const ACTIVE_CPU_WORDS: usize = MAX_CPUS / 64;
+pub const MAX_CPUS: usize = 96;
+pub const ACTIVE_CPU_WORDS: usize = 4;
 
 #[derive(Debug)]
 struct CpuAffinityConfig {

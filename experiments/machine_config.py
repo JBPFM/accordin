@@ -26,7 +26,7 @@ CURRENT_MACHINE = MachineConfig(
     logical_cpus=40,
     thread_counts=(4, 8, 16, 20, 32, 40, 64, 96),
     decomposition_threads=(40, 64, 96),
-    mcs_accordin_taskset_cpus="0,1,2,3,4,5,6,7,8,9,10",
+    mcs_accordin_taskset_cpus="0,2,4,6,8,10,12,14,16,18,20",
     leveldb_per_lock_max_threads=96,
 )
 

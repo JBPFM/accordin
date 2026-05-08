@@ -160,6 +160,13 @@ pub fn current_first_numa_available_cpu_count() -> Option<usize> {
     }
 }
 
+pub fn current_available_cpu_count() -> Option<usize> {
+    match cpu_affinity_state() {
+        CpuAffinityState::Configured(config) => Some(config.available_cpus.len()),
+        _ => None,
+    }
+}
+
 fn cpu_affinity_state() -> &'static CpuAffinityState {
     CPU_AFFINITY_STATE.get_or_init(load_cpu_affinity_state)
 }

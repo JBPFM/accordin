@@ -198,13 +198,13 @@ macro_rules! define_scheduler_loader {
             $crate::cpu_affinity::set_bpf_sink(Box::new(ActiveCpusProgSink {
                 set_prog_fd: active_cpus_prog_fd,
                 nudge_prog_fd: nudge_cpu_prog_fd,
-                previous: ::std::sync::Mutex::new(None),
+                previous: ::std::sync::Mutex::new(Some([0; $crate::cpu_affinity::MAX_CPUS])),
             }))
             .map_err(::anyhow::Error::msg)?;
             $crate::cpu_affinity::init_from_env(SCHEDULER_NAME);
-            $crate::cpu_affinity::push_initial_mask_to_bpf().map_err(::anyhow::Error::msg)?;
 
             let link = ::scx_utils::scx_ops_attach!(skel, accordin_ops)?;
+            $crate::cpu_affinity::push_initial_mask_to_bpf().map_err(::anyhow::Error::msg)?;
 
             ::log::info!("{SCHEDULER_NAME} scheduler started via LD_PRELOAD");
             Ok(SchedulerState {

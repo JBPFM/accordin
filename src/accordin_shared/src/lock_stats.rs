@@ -8,6 +8,7 @@ use crate::arch::{
     wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns, wait_time_total_to_ns,
 };
 use crate::cpu_affinity;
+use crate::mutex_hook;
 
 const SAMPLE_STRIDE_ENV: &str = "ACCORDIN_SAMPLE_STRIDE";
 const DYNAMIC_CPU_WINDOW_NS_ENV: &str = "ACCORDIN_DYNAMIC_CPU_WINDOW_NS";
@@ -17,6 +18,8 @@ const DEFAULT_DYNAMIC_CPU_WINDOW_NS: u64 = 10_000_000;
 const DYNAMIC_CPU_CRITICAL_EWMA_ALPHA: f64 = 0.5;
 const DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA: f64 = 0.1;
 const DYNAMIC_CPU_MAX_TARGET_MULTIPLIER: usize = 8;
+const DYNAMIC_CPU_LOW_LOAD_BYPASS_MIN_FLOOR: usize = 8;
+const DYNAMIC_CPU_LOW_LOAD_BYPASS_MULTIPLIER: usize = 2;
 const DYNAMIC_CPU_MULTICORE_CRITICAL_PENALTY_NS: f64 = 50.0;
 const DYNAMIC_CPU_CROSS_NUMA_CRITICAL_PENALTY_NS: f64 = 200.0;
 
@@ -102,6 +105,7 @@ impl ThreadStatsAux {
 #[derive(Default)]
 struct WindowControlState {
     last_dynamic_cpu_count: Option<usize>,
+    target_cpu_floor: Option<usize>,
     target_cpu_limit: Option<usize>,
     critical_ewma_ns: Option<f64>,
     outside_ewma_ns: Option<f64>,
@@ -612,6 +616,18 @@ fn run_dynamic_cpu_control_tick() {
     let current_cpu_count = control
         .last_dynamic_cpu_count
         .or_else(cpu_affinity::current_dynamic_cpu_count);
+    let target_cpu_floor = dynamic_cpu_target_floor(&mut control, current_cpu_count);
+    if let Some(low_load_target) = dynamic_cpu_low_load_bypass_target(
+        target_cpu_floor,
+        mutex_hook::registered_thread_count(),
+        cpu_affinity::current_available_cpu_count(),
+    ) {
+        control.critical_ewma_ns = None;
+        control.outside_ewma_ns = None;
+        apply_dynamic_cpu_count_update(&mut control, low_load_target);
+        return;
+    }
+
     let target_cpu_limit = dynamic_cpu_target_limit(&mut control, current_cpu_count);
     let Some(smoothed_target) = dynamic_cpu_target_from_penalized_components(
         &mut control,
@@ -623,14 +639,20 @@ fn run_dynamic_cpu_control_tick() {
     ) else {
         return;
     };
-    let rounded_target = dynamic_cpu_count_from_target(smoothed_target);
+    let bounded_target =
+        dynamic_cpu_target_bounded(smoothed_target, target_cpu_floor, target_cpu_limit);
+    let rounded_target = dynamic_cpu_count_from_target(bounded_target);
 
     if dynamic_cpu_count_within_dead_zone(current_cpu_count, rounded_target) {
         control.last_dynamic_cpu_count = current_cpu_count;
         return;
     }
 
-    match cpu_affinity::update_dynamic_cpu_count(rounded_target) {
+    apply_dynamic_cpu_count_update(&mut control, rounded_target);
+}
+
+fn apply_dynamic_cpu_count_update(control: &mut WindowControlState, requested_target: usize) {
+    match cpu_affinity::update_dynamic_cpu_count(requested_target) {
         Ok(Some(update)) => {
             control.last_dynamic_cpu_count = Some(update.applied_cpus);
             if update.changed {
@@ -775,6 +797,47 @@ fn dynamic_cpu_target_limit(
     control.target_cpu_limit
 }
 
+fn dynamic_cpu_target_floor(
+    control: &mut WindowControlState,
+    current_cpu_count: Option<usize>,
+) -> Option<usize> {
+    if control.target_cpu_floor.is_none() {
+        control.target_cpu_floor = current_cpu_count.map(|count| count.max(1));
+    }
+    control.target_cpu_floor
+}
+
+fn dynamic_cpu_target_bounded(
+    target: f64,
+    target_cpu_floor: Option<usize>,
+    target_cpu_limit: Option<usize>,
+) -> f64 {
+    let target = target_cpu_floor
+        .map(|floor| target.max(floor.max(1) as f64))
+        .unwrap_or(target);
+    target_cpu_limit
+        .map(|limit| target.min(limit.max(1) as f64))
+        .unwrap_or(target)
+}
+
+fn dynamic_cpu_low_load_bypass_target(
+    target_cpu_floor: Option<usize>,
+    registered_thread_count: usize,
+    available_cpu_count: Option<usize>,
+) -> Option<usize> {
+    let floor = target_cpu_floor?;
+    let available_cpu_count = available_cpu_count?;
+    if floor < DYNAMIC_CPU_LOW_LOAD_BYPASS_MIN_FLOOR
+        || registered_thread_count == 0
+        || available_cpu_count <= floor
+    {
+        return None;
+    }
+
+    let bypass_limit = floor.saturating_mul(DYNAMIC_CPU_LOW_LOAD_BYPASS_MULTIPLIER);
+    (registered_thread_count <= bypass_limit).then_some(available_cpu_count)
+}
+
 fn next_ewma(previous: Option<f64>, value: f64, alpha: f64) -> f64 {
     match previous {
         Some(previous) => alpha * value + (1.0 - alpha) * previous,
@@ -848,10 +911,12 @@ mod tests {
         ThreadStatsAux, WindowControlState, advance_periodic_sample,
         begin_outside_gap_sample_with_enabled, decide_operation_sampling_with_enabled,
         dynamic_cpu_count_from_target, dynamic_cpu_count_within_dead_zone,
-        dynamic_cpu_critical_penalty_ns, dynamic_cpu_target_from_penalized_components,
-        dynamic_cpu_target_from_sample_averages, dynamic_cpu_target_from_smoothed_components,
-        dynamic_cpu_target_limit, dynamic_sample_averages, finish_outside_gap_sample, next_ewma,
-        parse_dynamic_cpu_window_ns, parse_sample_stride, record_lock_acquired, record_post_unlock,
+        dynamic_cpu_critical_penalty_ns, dynamic_cpu_low_load_bypass_target,
+        dynamic_cpu_target_bounded, dynamic_cpu_target_floor,
+        dynamic_cpu_target_from_penalized_components, dynamic_cpu_target_from_sample_averages,
+        dynamic_cpu_target_from_smoothed_components, dynamic_cpu_target_limit,
+        dynamic_sample_averages, finish_outside_gap_sample, next_ewma, parse_dynamic_cpu_window_ns,
+        parse_sample_stride, record_lock_acquired, record_post_unlock,
         refresh_thread_elapsed_for_aux,
     };
 
@@ -1169,6 +1234,49 @@ mod tests {
 
         assert_eq!(dynamic_cpu_target_limit(&mut control, Some(2)), Some(16));
         assert_eq!(dynamic_cpu_target_limit(&mut control, Some(32)), Some(16));
+    }
+
+    #[test]
+    fn dynamic_cpu_target_floor_is_based_on_initial_cpu_count() {
+        let mut control = WindowControlState::default();
+
+        assert_eq!(dynamic_cpu_target_floor(&mut control, Some(11)), Some(11));
+        assert_eq!(dynamic_cpu_target_floor(&mut control, Some(4)), Some(11));
+    }
+
+    #[test]
+    fn dynamic_cpu_target_bounds_keep_floor_and_limit() {
+        assert_eq!(dynamic_cpu_target_bounded(1.0, Some(11), Some(88)), 11.0);
+        assert_eq!(dynamic_cpu_target_bounded(12.0, Some(11), Some(88)), 12.0);
+        assert_eq!(dynamic_cpu_target_bounded(128.0, Some(11), Some(88)), 88.0);
+    }
+
+    #[test]
+    fn dynamic_cpu_low_load_bypass_uses_available_cpus_for_taskset_sized_floor() {
+        assert_eq!(
+            dynamic_cpu_low_load_bypass_target(Some(11), 16, Some(96)),
+            Some(96)
+        );
+        assert_eq!(
+            dynamic_cpu_low_load_bypass_target(Some(11), 23, Some(96)),
+            None
+        );
+    }
+
+    #[test]
+    fn dynamic_cpu_low_load_bypass_keeps_small_k_strict() {
+        assert_eq!(
+            dynamic_cpu_low_load_bypass_target(Some(2), 4, Some(96)),
+            None
+        );
+        assert_eq!(
+            dynamic_cpu_low_load_bypass_target(Some(11), 0, Some(96)),
+            None
+        );
+        assert_eq!(
+            dynamic_cpu_low_load_bypass_target(Some(11), 16, Some(11)),
+            None
+        );
     }
 
     #[test]

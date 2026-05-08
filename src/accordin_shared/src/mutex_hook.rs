@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
@@ -54,6 +55,7 @@ where
 }
 
 static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
+static REGISTERED_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 const HOOK_SCOPE_ENV: &str = "ACCORDIN_HOOK_SCOPE";
 
 #[inline(always)]
@@ -173,7 +175,11 @@ pub fn register_current_thread() -> bool {
 
     let tid = current_tid();
     let admission_word_ptr = crate::admission::user_word_addr() as u64;
-    register_thread_ctx_with_map(map, tid, admission_word_ptr)
+    let registered = register_thread_ctx_with_map(map, tid, admission_word_ptr);
+    if registered {
+        REGISTERED_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    registered
 }
 
 #[doc(hidden)]
@@ -182,7 +188,13 @@ pub fn unregister_current_thread() {
         return;
     };
 
-    let _ = unregister_thread_ctx_with_map(map, current_tid());
+    if unregister_thread_ctx_with_map(map, current_tid()) {
+        REGISTERED_THREAD_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+pub fn registered_thread_count() -> usize {
+    REGISTERED_THREAD_COUNT.load(Ordering::Relaxed)
 }
 
 #[macro_export]

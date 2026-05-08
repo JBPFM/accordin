@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import json
 import math
 import os
@@ -28,7 +29,8 @@ SWEEP_SINGLE = MUTEXBENCH_DIR / "scripts" / "sweep_mutex_throughput.sh"
 DEFAULT_BASELINE_ROOT = MUTEXBENCH_DIR / "results_baseline"
 DEFAULT_WARMUP_DURATION_MS = 1000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 21600
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "experiments" / "results" / "experiment3_mutexbench_results_baseline"
+DEFAULT_OUTPUT_ROOT_PARENT = REPO_ROOT / "experiments" / "results"
+DEFAULT_OUTPUT_ROOT_STEM = "experiment3_mutexbench_results_baseline"
 ACCORDIN_DIRECT_PACKAGE = "mcs_tas_accordin_direct"
 ACCORDIN_DIRECT_LOCK_KIND = "mcs_tas_accordin_direct"
 ACCORDIN_DIRECT_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
@@ -36,9 +38,18 @@ ACCORDIN_DIRECT_LIB_ENV = "MCS_TAS_ACCORDIN_DIRECT_LIB"
 ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
+ACCORDIN_TASKSET_RATIO_COMBOS = (
+    (100, 3000),
+    (300, 3000),
+    (1000, 3000),
+    (3000, 3000),
+)
 
 REQUIRED_BASELINE_LOCKS = experiment_defaults.EXPERIMENT_ONE_FULL_LOCKS
 ACCORDIN_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
+DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
+MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
+FULL_LOCKS = experiment_defaults.FULL_LOCKS
 MULTI_LOCK_SWEEP_LOCKS = (
     "mcs",
     "mcstp",
@@ -194,32 +205,35 @@ def numa_nodes_for_cpus(topology: TasksetTopology, cpus: Iterable[int]) -> str:
     return ";".join(str(node) for node in nodes)
 
 
+def taskset_ratio_combos() -> tuple[tuple[int, int], ...]:
+    return ACCORDIN_TASKSET_RATIO_COMBOS
+
+
 def taskset_sweep_specs(matrix: BaselineMatrix, topology: TasksetTopology) -> tuple[TasksetSweepSpec, ...]:
     specs: list[TasksetSweepSpec] = []
     available_cpus = topology.cpu_count()
-    for critical_ns in matrix.critical_ns:
-        for outside_ns in matrix.outside_ns:
-            target_cpus = taskset_target_cpu_count(critical_ns, outside_ns, available_cpus)
-            cpus = taskset_cpu_list(topology, target_cpus)
-            pair_matrix = BaselineMatrix(
-                threads=matrix.threads,
-                critical_ns=(critical_ns,),
-                outside_ns=(outside_ns,),
-                repeats=matrix.repeats,
-                duration_ms=matrix.duration_ms,
-                warmup_duration_ms=matrix.warmup_duration_ms,
+    for critical_ns, outside_ns in taskset_ratio_combos():
+        target_cpus = taskset_target_cpu_count(critical_ns, outside_ns, available_cpus)
+        cpus = taskset_cpu_list(topology, target_cpus)
+        pair_matrix = BaselineMatrix(
+            threads=matrix.threads,
+            critical_ns=(critical_ns,),
+            outside_ns=(outside_ns,),
+            repeats=matrix.repeats,
+            duration_ms=matrix.duration_ms,
+            warmup_duration_ms=matrix.warmup_duration_ms,
+        )
+        specs.append(
+            TasksetSweepSpec(
+                critical_ns=critical_ns,
+                outside_ns=outside_ns,
+                target_cpus=target_cpus,
+                cpus=cpus,
+                cpu_list=format_cpu_list(cpus),
+                numa_nodes=numa_nodes_for_cpus(topology, cpus),
+                matrix=pair_matrix,
             )
-            specs.append(
-                TasksetSweepSpec(
-                    critical_ns=critical_ns,
-                    outside_ns=outside_ns,
-                    target_cpus=target_cpus,
-                    cpus=cpus,
-                    cpu_list=format_cpu_list(cpus),
-                    numa_nodes=numa_nodes_for_cpus(topology, cpus),
-                    matrix=pair_matrix,
-                )
-            )
+        )
     return tuple(specs)
 
 
@@ -229,11 +243,24 @@ def runnable_threads_for_lock(lock: str, matrix: BaselineMatrix) -> tuple[int, .
 
 def expected_rows_for_lock(lock: str, matrix: BaselineMatrix) -> int:
     threads = runnable_threads_for_lock(lock, matrix)
+    if lock == experiment_defaults.ACCORDIN_TASKSET_LOCK:
+        return len(threads) * len(taskset_ratio_combos()) * matrix.repeats
     return len(threads) * len(matrix.critical_ns) * len(matrix.outside_ns) * matrix.repeats
 
 
 def csv_join(values: Iterable[int | str]) -> str:
     return ",".join(str(value) for value in values)
+
+
+def default_result_root() -> Path:
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = DEFAULT_OUTPUT_ROOT_PARENT / f"{DEFAULT_OUTPUT_ROOT_STEM}_{timestamp}"
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}_{suffix}")
+        suffix += 1
+    return candidate
 
 
 def lock_aliases(lock: str) -> tuple[str, ...]:
@@ -318,11 +345,15 @@ def normalize_lock(lock: str) -> str:
 def resolve_requested_locks(
     baseline_root: Path,
     output_root: Path,
-    lock_arg: str,
+    lock_arg: str | None,
     matrix: BaselineMatrix,
     *,
     force: bool = False,
+    lock_profile: str | None = None,
 ) -> tuple[str, ...]:
+    if lock_arg is None:
+        lock_arg = csv_join(experiment_defaults.lock_profile_locks(lock_profile)) if lock_profile else "missing"
+
     if lock_arg == "missing":
         return incomplete_or_missing_locks(output_root, missing_experiment_locks(baseline_root), matrix)
 
@@ -540,6 +571,25 @@ def merge_taskset_part_csvs(lock_dir: Path, raw_paths: Sequence[Path], summary_p
     )
 
 
+def csv_data_row_count(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        if next(reader, None) is None:
+            return 0
+        return sum(1 for _ in reader)
+
+
+def taskset_part_is_complete(raw_path: Path, summary_path: Path, sweep: TasksetSweepSpec) -> bool:
+    expected_raw_rows = len(sweep.matrix.threads) * sweep.matrix.repeats
+    expected_summary_rows = len(sweep.matrix.threads)
+    return (
+        csv_data_row_count(raw_path) == expected_raw_rows
+        and csv_data_row_count(summary_path) == expected_summary_rows
+    )
+
+
 def prepare_target_dirs(root: Path, locks: tuple[str, ...], *, force: bool) -> None:
     for lock in locks:
         path = root / lock
@@ -582,7 +632,7 @@ def write_settings(
         "mcs_accordin_taskset_policy": (
             "fixed_cli_override"
             if args.mcs_accordin_taskset_cpus
-            else "dynamic_round(outside/critical + 1)_numa_first"
+            else "selected_out3000_ratio_combos_dynamic_round(outside/critical + 1)_numa_first"
         ),
         "mcs_accordin_taskset_cpus": args.mcs_accordin_taskset_cpus,
         "mcs_accordin_taskset_topology": (
@@ -600,6 +650,7 @@ def write_settings(
             {
                 "critical_ns": sweep.critical_ns,
                 "outside_ns": sweep.outside_ns,
+                "critical_ratio": sweep.critical_ns / (sweep.critical_ns + sweep.outside_ns),
                 "target_cpus": sweep.target_cpus,
                 "cpu_list": sweep.cpu_list,
                 "numa_nodes": sweep.numa_nodes,
@@ -648,8 +699,6 @@ def run_dynamic_taskset_accordin_sweeps(
     lock_dir = root / lock
     parts_dir = lock_dir / "taskset_parts"
     if not dry_run:
-        if parts_dir.exists():
-            shutil.rmtree(parts_dir)
         parts_dir.mkdir(parents=True, exist_ok=True)
 
     raw_paths: list[Path] = []
@@ -657,6 +706,14 @@ def run_dynamic_taskset_accordin_sweeps(
     for sweep in sweeps:
         raw_path = parts_dir / f"raw_c{sweep.critical_ns}_o{sweep.outside_ns}.csv"
         summary_path = parts_dir / f"summary_c{sweep.critical_ns}_o{sweep.outside_ns}.csv"
+        if not dry_run and taskset_part_is_complete(raw_path, summary_path, sweep):
+            print(f"Skipping complete taskset part: critical={sweep.critical_ns} outside={sweep.outside_ns}")
+            raw_paths.append(raw_path)
+            summary_paths.append(summary_path)
+            continue
+        if not dry_run:
+            raw_path.unlink(missing_ok=True)
+            summary_path.unlink(missing_ok=True)
         cmd, env = accordin_sweep_command(
             root,
             lock,
@@ -781,15 +838,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=DEFAULT_OUTPUT_ROOT,
-        help=f"Experiment result root for supplemental outputs. Default: {DEFAULT_OUTPUT_ROOT}.",
+        default=None,
+        help=(
+            "Experiment result root for supplemental outputs. "
+            f"Default: {DEFAULT_OUTPUT_ROOT_PARENT}/{DEFAULT_OUTPUT_ROOT_STEM}_<timestamp>."
+        ),
+    )
+    parser.add_argument(
+        "--lock-profile",
+        choices=experiment_defaults.lock_profile_names(),
+        default=None,
+        help=(
+            "Named lock set to run when --locks is omitted. "
+            "Default without this flag is still 'missing'. "
+            f"minimal={','.join(MINIMAL_LOCKS)}; full={','.join(FULL_LOCKS)}."
+        ),
     )
     parser.add_argument(
         "--locks",
-        default="missing",
+        default=None,
         help=(
             "Comma-separated locks to run, or 'missing' to infer missing/incomplete experiment locks. "
-            f"Default: missing. Supported: {','.join(REQUIRED_BASELINE_LOCKS)}."
+            f"Default: missing unless --lock-profile is set. Supported: {','.join(REQUIRED_BASELINE_LOCKS)}."
         ),
     )
     parser.add_argument("--duration-ms", type=positive_int, default=None, help="Override inferred hot duration.")
@@ -825,8 +895,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             f"Override CPU list for {experiment_defaults.ACCORDIN_TASKSET_LOCK}. "
-            "Default computes a per critical/outside taskset size as round(outside/critical + 1), "
-            "using first NUMA node CPUs first and spilling to later NUMA nodes."
+            "Default runs only out=3000 ratio combos "
+            "(crit=100,300,1000,3000) and computes per-combo taskset size as "
+            "round(outside/critical + 1), using first NUMA node CPUs first and spilling to later NUMA nodes."
         ),
     )
     parser.add_argument(
@@ -845,7 +916,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         baseline_root = parsec_common.resolve_path(args.baseline_root)
-        root = parsec_common.resolve_path(args.output_root)
+        root = parsec_common.resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         matrix = infer_baseline_matrix(baseline_root, warmup_duration_ms=args.warmup_duration_ms)
         matrix = matrix_with_threads(matrix, args.threads)
         if args.duration_ms is not None:
@@ -857,7 +928,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 duration_ms=args.duration_ms,
                 warmup_duration_ms=matrix.warmup_duration_ms,
             )
-        locks = resolve_requested_locks(baseline_root, root, args.locks, matrix, force=args.force)
+        locks = resolve_requested_locks(
+            baseline_root,
+            root,
+            args.locks,
+            matrix,
+            force=args.force,
+            lock_profile=args.lock_profile,
+        )
         if not locks:
             print(f"No missing or incomplete experiment locks under {root}.")
             return 0

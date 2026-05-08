@@ -38,12 +38,13 @@ ACCORDIN_DIRECT_LIB_ENV = "MCS_TAS_ACCORDIN_DIRECT_LIB"
 ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
-ACCORDIN_TASKSET_RATIO_COMBOS = (
+FIXED_MUTEXBENCH_COMBOS = (
     (100, 3000),
     (300, 3000),
     (1000, 3000),
     (3000, 3000),
 )
+ACCORDIN_TASKSET_RATIO_COMBOS = FIXED_MUTEXBENCH_COMBOS
 
 REQUIRED_BASELINE_LOCKS = experiment_defaults.EXPERIMENT_ONE_FULL_LOCKS
 ACCORDIN_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
@@ -125,6 +126,32 @@ def matrix_with_threads(matrix: BaselineMatrix, threads: Iterable[int]) -> Basel
         repeats=matrix.repeats,
         duration_ms=matrix.duration_ms,
         warmup_duration_ms=matrix.warmup_duration_ms,
+    )
+
+
+def fixed_baseline_matrix(
+    threads: Iterable[int],
+    *,
+    duration_ms: int | None = None,
+    warmup_duration_ms: int = DEFAULT_WARMUP_DURATION_MS,
+) -> BaselineMatrix:
+    critical_ns = tuple(
+        dict.fromkeys(critical for critical, _outside in FIXED_MUTEXBENCH_COMBOS)
+    )
+    outside_ns = tuple(
+        dict.fromkeys(outside for _critical, outside in FIXED_MUTEXBENCH_COMBOS)
+    )
+    return BaselineMatrix(
+        threads=tuple(threads),
+        critical_ns=critical_ns,
+        outside_ns=outside_ns,
+        repeats=experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS,
+        duration_ms=(
+            duration_ms
+            if duration_ms is not None
+            else experiment_defaults.MUTEXBENCH_DEFAULT_DURATION_MS
+        ),
+        warmup_duration_ms=warmup_duration_ms,
     )
 
 
@@ -613,6 +640,11 @@ def write_settings(
         "experiment": "experiment3_mutexbench_baseline_supplement",
         "output_root": str(root),
         "baseline_root": str(baseline_root),
+        "baseline_matrix_source": "fixed",
+        "fixed_mutexbench_combos": [
+            {"critical_ns": critical_ns, "outside_ns": outside_ns}
+            for critical_ns, outside_ns in FIXED_MUTEXBENCH_COMBOS
+        ],
         "locks": list(locks),
         "baseline_required_locks": list(REQUIRED_BASELINE_LOCKS),
         "baseline_present_locks": list(present_lock_names(baseline_root)),
@@ -827,13 +859,16 @@ def non_negative_int(value: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Supplement bench/mutexbench/results_baseline with experiment-one locks missing from the baseline matrix.",
+        description="Supplement mutexbench experiment-three locks using the fixed mutexbench matrix.",
     )
     parser.add_argument(
         "--baseline-root",
         type=Path,
         default=DEFAULT_BASELINE_ROOT,
-        help=f"Existing mutexbench baseline root used to infer missing locks and non-thread matrix. Default: {DEFAULT_BASELINE_ROOT}.",
+        help=(
+            "Existing mutexbench baseline root used only to infer missing locks. "
+            f"The critical/outside matrix is fixed. Default: {DEFAULT_BASELINE_ROOT}."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -862,7 +897,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             f"Default: missing unless --lock-profile is set. Supported: {','.join(REQUIRED_BASELINE_LOCKS)}."
         ),
     )
-    parser.add_argument("--duration-ms", type=positive_int, default=None, help="Override inferred hot duration.")
+    parser.add_argument("--duration-ms", type=positive_int, default=None, help="Override fixed hot duration.")
     parser.add_argument(
         "--threads",
         type=parsec_common.parse_csv_ints,
@@ -917,17 +952,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         baseline_root = parsec_common.resolve_path(args.baseline_root)
         root = parsec_common.resolve_path(args.output_root) if args.output_root is not None else default_result_root()
-        matrix = infer_baseline_matrix(baseline_root, warmup_duration_ms=args.warmup_duration_ms)
-        matrix = matrix_with_threads(matrix, args.threads)
-        if args.duration_ms is not None:
-            matrix = BaselineMatrix(
-                threads=matrix.threads,
-                critical_ns=matrix.critical_ns,
-                outside_ns=matrix.outside_ns,
-                repeats=matrix.repeats,
-                duration_ms=args.duration_ms,
-                warmup_duration_ms=matrix.warmup_duration_ms,
-            )
+        matrix = fixed_baseline_matrix(
+            args.threads,
+            duration_ms=args.duration_ms,
+            warmup_duration_ms=args.warmup_duration_ms,
+        )
         locks = resolve_requested_locks(
             baseline_root,
             root,
@@ -942,6 +971,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Baseline root: {baseline_root}")
         print(f"Result root: {root}")
         print(f"Supplement locks: {csv_join(locks)}")
+        print("Matrix source: fixed")
         print(
             "Matrix: "
             f"threads={csv_join(matrix.threads)} "

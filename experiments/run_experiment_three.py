@@ -880,6 +880,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--plot-only",
+        type=Path,
+        default=None,
+        metavar="RESULT_ROOT",
+        help="Skip benchmark execution and regenerate mutexbench baseline PNGs from RESULT_ROOT.",
+    )
+    parser.add_argument(
         "--lock-profile",
         choices=experiment_defaults.lock_profile_names(),
         default=None,
@@ -949,7 +956,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.output_root is not None and args.plot_only is not None:
+        print("--output-root cannot be used together with --plot-only.", file=sys.stderr)
+        return 2
+    if args.skip_plots and args.plot_only is not None:
+        print("--skip-plots cannot be used together with --plot-only.", file=sys.stderr)
+        return 2
+
     try:
+        if args.plot_only is not None:
+            root = parsec_common.resolve_path(args.plot_only)
+            if not root.is_dir():
+                print(f"Plot-only result root does not exist: {root}", file=sys.stderr)
+                return 2
+            logger = CommandLogger(root, command_timeout_seconds=args.command_timeout_seconds)  # type: ignore[name-defined]
+            run_plots(root, logger, dry_run=args.dry_run)
+            return 0
+
         baseline_root = parsec_common.resolve_path(args.baseline_root)
         root = parsec_common.resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         matrix = fixed_baseline_matrix(

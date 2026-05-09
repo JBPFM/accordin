@@ -19,18 +19,6 @@ static __always_inline bool stats_only_enabled(void) {
   return stats_only_mode != 0;
 }
 
-static __always_inline struct active_cpumask_slot *lookup_active_cpumask_slot(void) {
-  __u32 key = 0;
-
-  return bpf_map_lookup_elem(&active_cpumask_map, &key);
-}
-
-static __always_inline struct dispatch_state *lookup_dispatch_state(void) {
-  __u32 key = 0;
-
-  return bpf_map_lookup_elem(&dispatch_state_map, &key);
-}
-
 static __always_inline struct cpu_inactive_hint *lookup_inactive_hint(__u32 cpu) {
   if (cpu >= MAX_CPUS)
     return 0;
@@ -39,26 +27,24 @@ static __always_inline struct cpu_inactive_hint *lookup_inactive_hint(__u32 cpu)
 }
 
 static __always_inline bool cpu_is_active(__u32 cpu) {
-  struct dispatch_state *state;
-  struct active_cpumask_slot *slot;
-  struct bpf_cpumask *mask;
-  bool active = true;
+  __u64 word;
 
   if (cpu >= MAX_CPUS)
     return false;
 
-  state = lookup_dispatch_state();
-  if (state && state->all_cpus_active)
+  if (active_cpus_all)
     return true;
 
-  bpf_rcu_read_lock();
-  slot = lookup_active_cpumask_slot();
-  mask = slot ? slot->mask : NULL;
-  if (mask)
-    active = bpf_cpumask_test_cpu(cpu, (const struct cpumask *)mask);
-  bpf_rcu_read_unlock();
+  if (cpu < 64)
+    word = active_cpu_word0;
+  else if (cpu < 128)
+    word = active_cpu_word1;
+  else if (cpu < 192)
+    word = active_cpu_word2;
+  else
+    word = active_cpu_word3;
 
-  return active;
+  return word & (1ULL << (cpu & 63));
 }
 
 static __always_inline bool task_cpumask_allows(struct task_struct *p,
@@ -740,11 +726,9 @@ static __always_inline void drain_inactive_to_controlled(__u32 cpu) {
 
 SEC("syscall")
 int accordin_set_active_cpus(struct accordin_active_cpus_args *args) {
-  struct dispatch_state *state;
-  struct active_cpumask_slot *slot;
-  struct bpf_cpumask *new_mask, *old_mask;
   __u64 wanted0, wanted1, wanted2, wanted3;
-  __u32 i, n;
+  __u32 all_active;
+  __u32 n;
 
   if (!args)
     return -EINVAL;
@@ -757,29 +741,18 @@ int accordin_set_active_cpus(struct accordin_active_cpus_args *args) {
   if (n > MAX_CPUS)
     n = MAX_CPUS;
 
-  new_mask = bpf_cpumask_create();
-  if (!new_mask)
-    return -ENOMEM;
+  all_active = active_words_cover_online_cpus(wanted0, wanted1, wanted2,
+                                             wanted3, n);
+  if (!all_active)
+    active_cpus_all = 0;
 
-  slot = lookup_active_cpumask_slot();
-  if (!slot) {
-    bpf_cpumask_release(new_mask);
-    return -EINVAL;
-  }
+  active_cpu_word0 = wanted0;
+  active_cpu_word1 = wanted1;
+  active_cpu_word2 = wanted2;
+  active_cpu_word3 = wanted3;
 
-  for (i = 0; i < MAX_CPUS; i++) {
-    if (active_words_want_cpu(wanted0, wanted1, wanted2, wanted3, i, n))
-      bpf_cpumask_set_cpu(i, new_mask);
-  }
-
-  old_mask = bpf_kptr_xchg(&slot->mask, new_mask);
-  if (old_mask)
-    bpf_cpumask_release(old_mask);
-
-  state = lookup_dispatch_state();
-  if (state)
-    state->all_cpus_active =
-        active_words_cover_online_cpus(wanted0, wanted1, wanted2, wanted3, n);
+  if (all_active)
+    active_cpus_all = 1;
 
   return 0;
 }
@@ -860,9 +833,6 @@ void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
-  struct dispatch_state *state;
-  struct active_cpumask_slot *slot;
-  struct bpf_cpumask *mask, *old_mask;
   __u32 cpu;
   __u32 nr_cpus = scx_bpf_nr_cpu_ids();
   s32 ret;
@@ -874,9 +844,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   if (ret)
     return ret;
 
-  state = lookup_dispatch_state();
-  if (state)
-    state->all_cpus_active = 1;
+  active_cpus_all = 1;
+  active_cpu_word0 = ~0ULL;
+  active_cpu_word1 = ~0ULL;
+  active_cpu_word2 = ~0ULL;
+  active_cpu_word3 = ~0ULL;
 
   for (cpu = 0; cpu < nr_cpus; cpu++) {
     ret = scx_bpf_create_dsq(inactive_dsq_id(1, cpu), -1);
@@ -902,37 +874,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
       return ret;
   }
 
-  slot = lookup_active_cpumask_slot();
-  if (!slot)
-    return -EINVAL;
-
-  bpf_rcu_read_lock();
-  old_mask = slot->mask;
-  bpf_rcu_read_unlock();
-  if (!old_mask) {
-    mask = bpf_cpumask_create();
-    if (!mask)
-      return -ENOMEM;
-    bpf_cpumask_setall(mask);
-    old_mask = bpf_kptr_xchg(&slot->mask, mask);
-    if (old_mask)
-      bpf_cpumask_release(old_mask);
-  }
-
   return 0;
 }
 
 void BPF_STRUCT_OPS(accordin_exit, struct scx_exit_info *ei) {
-  struct active_cpumask_slot *slot;
-  struct bpf_cpumask *mask;
-
-  slot = lookup_active_cpumask_slot();
-  if (slot) {
-    mask = bpf_kptr_xchg(&slot->mask, NULL);
-    if (mask)
-      bpf_cpumask_release(mask);
-  }
-
   UEI_RECORD(uei, ei);
 }
 

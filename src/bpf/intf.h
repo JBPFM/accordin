@@ -45,10 +45,6 @@ struct task_scx_ctx {
   unsigned int admission_lock_id; /* 0 = no admission held */
 };
 
-struct dispatch_state {
-  unsigned int all_cpus_active;
-};
-
 struct cpu_inactive_hint {
   unsigned int total;
   unsigned int lock_mask;

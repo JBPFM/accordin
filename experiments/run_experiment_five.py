@@ -2205,7 +2205,10 @@ def plot_ops(
     rows = [
         row
         for row in summary_rows
-        if row["workload"] == workload and row["benchmark"] == benchmark and row["mean_ops_per_second"].strip()
+        if row["workload"] == workload
+        and row["benchmark"] == benchmark
+        and row["lock"] not in EXCLUDED_PROFILE_LOCKS
+        and row["mean_ops_per_second"].strip()
     ]
     if not rows:
         raise RuntimeError(f"No summary rows available for {workload}/{benchmark}.")
@@ -2238,7 +2241,7 @@ def plot_ops(
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.grid(True, axis="y", alpha=0.28)
     ax.grid(True, axis="x", which="major", alpha=0.16)
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, ncol=2, fontsize=11)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)

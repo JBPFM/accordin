@@ -47,7 +47,7 @@ INIT_FILL_THREADS = 1
 DEFAULT_INIT_EXISTING_BENCHMARKS = ("readrandom", "readseq", "overwrite")
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600
 ACCORDIN_HOOK_SCOPE_ENV = "ACCORDIN_HOOK_SCOPE"
-ACCORDIN_LEVELDB_HOOK_SCOPE = "registered"
+ACCORDIN_LEVELDB_HOOK_SCOPE: str | None = None
 ACCORDIN_MODE_DIRECT = "accordin_direct"
 ACCORDIN_MODE_MUTEX_HOOK = "mutex_hook"
 ACCORDIN_MODES = (ACCORDIN_MODE_DIRECT, ACCORDIN_MODE_MUTEX_HOOK)
@@ -296,7 +296,7 @@ Examples:
         help=(
             "Accordin implementation used for Accordin lock profiles and aliases. "
             f"{ACCORDIN_MODE_DIRECT} uses libmcs_tas_accordin_direct.so; "
-            f"{ACCORDIN_MODE_MUTEX_HOOK} uses libmcs_tas_accordin.so with registered mutex-hook scope. "
+            f"{ACCORDIN_MODE_MUTEX_HOOK} uses libmcs_tas_accordin.so for all pthread mutex hooks. "
             f"Default: {DEFAULT_ACCORDIN_MODE}."
         ),
     )

@@ -10,6 +10,7 @@ type DirectBackend = LockBackendAdapter<crate::mcs_tas::McsTasLockRaw>;
 #[repr(C)]
 pub struct mcs_tas_accordin_direct_mutex {
     lock: <DirectBackend as MutexHookBackend>::LockState,
+    lock_id: u32,
 }
 
 struct ThreadCtxGuard;
@@ -43,22 +44,27 @@ fn ensure_registered() {
 }
 
 #[inline(always)]
-fn lock_with_stats(lock: &<DirectBackend as MutexHookBackend>::LockState) {
+fn lock_with_stats(lock: &<DirectBackend as MutexHookBackend>::LockState, lock_id: u32) {
     if DirectBackend::try_lock(lock) {
-        accordin_shared::lock_stats::record_lock_acquired();
+        accordin_shared::lock_stats::record_lock_acquired_for_lock(lock_id);
         return;
     }
 
     let wait_start = accordin_shared::lock_stats::record_wait_start();
+    let scope = accordin_shared::admission::begin_lock_scope(lock_id);
+    if accordin_shared::admission::mark_slow_path_pending_for_scope(scope) {
+        std::thread::yield_now();
+    }
     DirectBackend::lock(lock);
     accordin_shared::lock_stats::record_wait_end(wait_start);
-    accordin_shared::lock_stats::record_lock_acquired();
+    accordin_shared::lock_stats::record_lock_acquired_for_scope(scope);
 }
 
 #[inline(always)]
-fn unlock_with_stats(lock: &<DirectBackend as MutexHookBackend>::LockState) {
+fn unlock_with_stats(lock: &<DirectBackend as MutexHookBackend>::LockState, lock_id: u32) {
     let hold_end = accordin_shared::lock_stats::record_hold_end_sample();
     DirectBackend::unlock(lock);
+    accordin_shared::admission::finish_lock_scope(lock_id);
     accordin_shared::lock_stats::record_post_unlock(hold_end);
 }
 
@@ -76,6 +82,7 @@ unsafe fn mutex_ref<'a>(
 pub extern "C" fn mcs_tas_accordin_direct_mutex_create() -> *mut mcs_tas_accordin_direct_mutex {
     Box::into_raw(Box::new(mcs_tas_accordin_direct_mutex {
         lock: DirectBackend::create_state(),
+        lock_id: accordin_shared::admission::allocate_lock_id(),
     }))
 }
 
@@ -101,7 +108,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_lock(
     };
 
     ensure_registered();
-    lock_with_stats(&mutex.lock);
+    lock_with_stats(&mutex.lock, mutex.lock_id);
     0
 }
 
@@ -116,7 +123,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_trylock(
 
     ensure_registered();
     if DirectBackend::try_lock(&mutex.lock) {
-        accordin_shared::lock_stats::record_lock_acquired();
+        accordin_shared::lock_stats::record_lock_acquired_for_lock(mutex.lock_id);
         0
     } else {
         libc::EBUSY
@@ -132,7 +139,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_unlock(
         Err(ret) => return ret,
     };
 
-    unlock_with_stats(&mutex.lock);
+    unlock_with_stats(&mutex.lock, mutex.lock_id);
     0
 }
 

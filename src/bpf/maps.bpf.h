@@ -27,7 +27,7 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, MAX_CPUS);
+  __uint(max_entries, MAX_LOCK_CLASSES * MAX_CPUS);
   __type(key, __u32);
   __type(value, __u32); /* current admission owner pid, or 0 if empty */
 } cpu_admission_owner_map SEC(".maps");

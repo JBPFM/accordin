@@ -15,6 +15,10 @@
 #define USER_ADMISSION_IN_CRITICAL_SECTION (1U << 0)
 #define USER_ADMISSION_SLOW_PATH_PENDING (1U << 1)
 #define USER_ADMISSION_SLOW_PATH_SEEN (1U << 2)
+#define USER_ADMISSION_FLAG_MASK 0x7U
+#define USER_ADMISSION_LOCK_ID_SHIFT 3U
+#define MAX_LOCK_CLASSES 8U
+#define UNMANAGED_LOCK_ID 0U
 
 struct accordin_active_cpus_args {
   unsigned long long wanted0;
@@ -38,6 +42,7 @@ struct task_scx_ctx {
   unsigned int inactive_wait;
   unsigned long long
       user_ctx_ptr; /* cached pointer to user-space admission word */
+  unsigned int admission_lock_id; /* 0 = no admission held */
 };
 
 enum stat_key {

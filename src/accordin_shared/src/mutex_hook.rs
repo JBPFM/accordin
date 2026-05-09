@@ -11,6 +11,7 @@ use crate::lock_backend::LockBackend;
 
 pub trait MutexHookBackend {
     type LockState;
+    const USES_ADMISSION_SCOPE: bool = false;
 
     fn create_state() -> Self::LockState;
     fn lock(state: &Self::LockState);
@@ -32,15 +33,13 @@ where
     L: LockBackend + Default,
 {
     type LockState = L;
+    const USES_ADMISSION_SCOPE: bool = true;
 
     fn create_state() -> Self::LockState {
         L::default()
     }
 
     fn lock(state: &Self::LockState) {
-        if crate::admission::mark_slow_path_pending() {
-            std::thread::yield_now();
-        }
         LockBackend::lock(state);
     }
 
@@ -50,7 +49,6 @@ where
 
     fn unlock(state: &Self::LockState) {
         LockBackend::unlock(state);
-        crate::admission::mark_critical_section_exit();
     }
 }
 
@@ -207,8 +205,9 @@ macro_rules! export_mutex_hooks {
             use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
             use $crate::lock_stats::{
-                record_hold_end_sample, record_lock_acquired, record_post_unlock,
-                record_thread_start, record_wait_end, record_wait_start,
+                record_hold_end_sample, record_lock_acquired, record_lock_acquired_for_lock,
+                record_lock_acquired_for_scope, record_post_unlock, record_thread_start,
+                record_wait_end, record_wait_start,
             };
             use $crate::mutex_hook::MutexHookBackend;
 
@@ -216,6 +215,7 @@ macro_rules! export_mutex_hooks {
 
             struct HookState {
                 lock: <Backend as MutexHookBackend>::LockState,
+                lock_id: u32,
             }
 
             unsafe impl Send for HookState {}
@@ -258,21 +258,38 @@ macro_rules! export_mutex_hooks {
             }
 
             #[inline(always)]
-            fn lock_with_stats(lock: &<Backend as MutexHookBackend>::LockState) {
+            fn lock_with_stats(lock: &<Backend as MutexHookBackend>::LockState, lock_id: u32) {
                 if Backend::try_lock(lock) {
-                    record_lock_acquired();
+                    if Backend::USES_ADMISSION_SCOPE {
+                        record_lock_acquired_for_lock(lock_id);
+                    } else {
+                        record_lock_acquired();
+                    }
                     return;
                 }
                 let wait_start = record_wait_start();
-                Backend::lock(lock);
-                record_wait_end(wait_start);
-                record_lock_acquired();
+                if Backend::USES_ADMISSION_SCOPE {
+                    let scope = $crate::admission::begin_lock_scope(lock_id);
+                    if $crate::admission::mark_slow_path_pending_for_scope(scope) {
+                        std::thread::yield_now();
+                    }
+                    Backend::lock(lock);
+                    record_wait_end(wait_start);
+                    record_lock_acquired_for_scope(scope);
+                } else {
+                    Backend::lock(lock);
+                    record_wait_end(wait_start);
+                    record_lock_acquired();
+                }
             }
 
             #[inline(always)]
-            fn unlock_with_stats(lock: &<Backend as MutexHookBackend>::LockState) {
+            fn unlock_with_stats(lock: &<Backend as MutexHookBackend>::LockState, lock_id: u32) {
                 let hold_end = record_hold_end_sample();
                 Backend::unlock(lock);
+                if Backend::USES_ADMISSION_SCOPE {
+                    $crate::admission::finish_lock_scope(lock_id);
+                }
                 record_post_unlock(hold_end);
             }
 
@@ -511,6 +528,11 @@ macro_rules! export_mutex_hooks {
 
                     let state = Box::new(HookState {
                         lock: Backend::create_state(),
+                        lock_id: if Backend::USES_ADMISSION_SCOPE {
+                            $crate::admission::allocate_lock_id()
+                        } else {
+                            $crate::admission::UNMANAGED_LOCK_ID
+                        },
                     });
                     let ptr = Box::into_raw(state);
 
@@ -590,6 +612,11 @@ macro_rules! export_mutex_hooks {
 
                     let state = Box::new(HookState {
                         lock: Backend::create_state(),
+                        lock_id: if Backend::USES_ADMISSION_SCOPE {
+                            $crate::admission::allocate_lock_id()
+                        } else {
+                            $crate::admission::UNMANAGED_LOCK_ID
+                        },
                     });
                     let ptr = Box::into_raw(state);
 
@@ -858,7 +885,7 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    lock_with_stats(&(*state).lock);
+                    lock_with_stats(&(*state).lock, (*state).lock_id);
                     0
                 }
             }
@@ -877,7 +904,11 @@ macro_rules! export_mutex_hooks {
                         Err(ret) => return ret,
                     };
                     if Backend::try_lock(&(*state).lock) {
-                        record_lock_acquired();
+                        if Backend::USES_ADMISSION_SCOPE {
+                            record_lock_acquired_for_lock((*state).lock_id);
+                        } else {
+                            record_lock_acquired();
+                        }
                         0
                     } else {
                         libc::EBUSY
@@ -901,7 +932,8 @@ macro_rules! export_mutex_hooks {
                     let atomic = state_atomic(mutex);
                     let val = atomic.load(Ordering::Acquire);
                     if val > SENTINEL {
-                        unlock_with_stats(&(*(val as *mut HookState)).lock);
+                        let state = &*(val as *mut HookState);
+                        unlock_with_stats(&state.lock, state.lock_id);
                         return 0;
                     }
                     libc::EINVAL
@@ -1013,11 +1045,11 @@ macro_rules! export_mutex_hooks {
                     };
                     let seq = (*cond_state).seq.load(Ordering::Acquire);
                     (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
-                    unlock_with_stats(&(*state).lock);
+                    unlock_with_stats(&(*state).lock, (*state).lock_id);
                     while (*cond_state).seq.load(Ordering::Acquire) == seq {
                         futex_wait(&(*cond_state).seq, seq);
                     }
-                    lock_with_stats(&(*state).lock);
+                    lock_with_stats(&(*state).lock, (*state).lock_id);
                     0
                 }
             }
@@ -1048,7 +1080,7 @@ macro_rules! export_mutex_hooks {
                     let seq = (*cond_state).seq.load(Ordering::Acquire);
                     let mut ret = 0;
                     (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
-                    unlock_with_stats(&(*state).lock);
+                    unlock_with_stats(&(*state).lock, (*state).lock_id);
                     while (*cond_state).seq.load(Ordering::Acquire) == seq {
                         if futex_wait_until_realtime(&(*cond_state).seq, seq, abstime) != 0 {
                             let errno = *libc::__errno_location();
@@ -1061,7 +1093,7 @@ macro_rules! export_mutex_hooks {
                             }
                         }
                     }
-                    lock_with_stats(&(*state).lock);
+                    lock_with_stats(&(*state).lock, (*state).lock_id);
                     ret
                 }
             }

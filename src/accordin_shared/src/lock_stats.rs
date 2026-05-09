@@ -427,7 +427,23 @@ pub fn record_wait_end(wait_start: u64) {
 #[inline(always)]
 pub fn record_lock_acquired() {
     admission::mark_critical_section_entered();
+    record_lock_acquired_stats();
+}
 
+#[inline(always)]
+pub fn record_lock_acquired_for_lock(lock_id: u32) {
+    let scope = admission::begin_lock_scope(lock_id);
+    record_lock_acquired_for_scope(scope);
+}
+
+#[inline(always)]
+pub fn record_lock_acquired_for_scope(scope: admission::LockAdmissionScope) {
+    admission::mark_critical_section_entered_for_scope(scope);
+    record_lock_acquired_stats();
+}
+
+#[inline(always)]
+fn record_lock_acquired_stats() {
     unsafe {
         let aux = &mut *thread_aux();
         decide_operation_sampling(aux);

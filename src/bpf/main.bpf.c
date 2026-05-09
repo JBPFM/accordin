@@ -62,8 +62,21 @@ static __always_inline bool task_cpu_allowed(struct task_struct *p, __u32 cpu) {
   return cpu_is_active(cpu);
 }
 
-static __always_inline __u64 inactive_dsq_id(__u32 cpu) {
-  return INACTIVE_DSQ_BASE + cpu;
+static __always_inline bool valid_lock_id(__u32 lock_id) {
+  return lock_id != UNMANAGED_LOCK_ID && lock_id < MAX_LOCK_CLASSES;
+}
+
+static __always_inline __u32 user_admission_lock_id(__u32 user_ctx_word) {
+  return (user_ctx_word & ~USER_ADMISSION_FLAG_MASK) >>
+         USER_ADMISSION_LOCK_ID_SHIFT;
+}
+
+static __always_inline __u32 owner_key(__u32 lock_id, __u32 cpu) {
+  return lock_id * MAX_CPUS + cpu;
+}
+
+static __always_inline __u64 inactive_dsq_id(__u32 lock_id, __u32 cpu) {
+  return INACTIVE_DSQ_BASE + ((__u64)lock_id * MAX_CPUS) + cpu;
 }
 
 static __always_inline bool active_words_want_cpu(__u64 wanted0, __u64 wanted1,
@@ -92,6 +105,7 @@ static __always_inline void init_task_ctx_if_needed(struct task_scx_ctx *task_ct
 
   task_ctx->initialized = 1;
   task_ctx->admission_cpu = ADMISSION_CPU_NONE;
+  task_ctx->admission_lock_id = UNMANAGED_LOCK_ID;
 }
 
 static __always_inline struct task_scx_ctx *lookup_task_ctx(struct task_struct *p) {
@@ -117,11 +131,14 @@ static __always_inline struct task_scx_ctx *get_task_ctx(struct task_struct *p) 
   return task_ctx;
 }
 
-static __always_inline __u32 *lookup_cpu_owner(__u32 cpu) {
-  if (cpu >= MAX_CPUS)
+static __always_inline __u32 *lookup_lock_cpu_owner(__u32 lock_id, __u32 cpu) {
+  __u32 key;
+
+  if (!valid_lock_id(lock_id) || cpu >= MAX_CPUS)
     return 0;
 
-  return bpf_map_lookup_elem(&cpu_admission_owner_map, &cpu);
+  key = owner_key(lock_id, cpu);
+  return bpf_map_lookup_elem(&cpu_admission_owner_map, &key);
 }
 
 static __always_inline bool should_drain_inactive(__u32 cpu, __u32 *owner) {
@@ -142,6 +159,7 @@ static __always_inline bool should_drain_inactive(__u32 cpu, __u32 *owner) {
 
 static __always_inline bool steal_inactive(__u32 cpu) {
   __u32 nr_cpus = scx_bpf_nr_cpu_ids();
+  __u32 lock_id;
   __u32 i;
 
   if (nr_cpus > MAX_CPUS)
@@ -151,17 +169,25 @@ static __always_inline bool steal_inactive(__u32 cpu) {
     return false;
 
 #pragma unroll
-  for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
-    __u32 victim = cpu + i;
+  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+    __u32 *owner = lookup_lock_cpu_owner(lock_id, cpu);
 
-    if (i >= nr_cpus)
-      break;
+    if (!owner || *owner)
+      continue;
 
-    if (victim >= nr_cpus)
-      victim -= nr_cpus;
+#pragma unroll
+    for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
+      __u32 victim = cpu + i;
 
-    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(victim)))
-      return true;
+      if (i >= nr_cpus)
+        break;
+
+      if (victim >= nr_cpus)
+        victim -= nr_cpus;
+
+      if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, victim)))
+        return true;
+    }
   }
 
   return false;
@@ -219,15 +245,17 @@ static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx)
   task_ctx->must_run_on_admission_cpu = 0;
   task_ctx->inactive_wait = 0;
   task_ctx->admission_cpu = ADMISSION_CPU_NONE;
+  task_ctx->admission_lock_id = UNMANAGED_LOCK_ID;
 }
 
 static __always_inline void release_admission(struct task_struct *p,
                                               struct task_scx_ctx *task_ctx) {
   __u32 cpu = task_ctx->admission_cpu;
+  __u32 lock_id = task_ctx->admission_lock_id;
   __u32 pid = p->pid;
   __u32 *owner;
 
-  owner = lookup_cpu_owner(cpu);
+  owner = lookup_lock_cpu_owner(lock_id, cpu);
   if (owner && *owner == pid)
     *owner = 0;
 
@@ -239,11 +267,11 @@ static __always_inline void release_admission(struct task_struct *p,
 
 static __always_inline bool grant_admission(struct task_struct *p,
                                             struct task_scx_ctx *task_ctx,
-                                            __u32 cpu) {
+                                            __u32 lock_id, __u32 cpu) {
   __u32 pid = p->pid;
   __u32 *owner;
 
-  owner = lookup_cpu_owner(cpu);
+  owner = lookup_lock_cpu_owner(lock_id, cpu);
   if (!owner)
     return false;
 
@@ -256,6 +284,7 @@ static __always_inline bool grant_admission(struct task_struct *p,
   task_ctx->must_run_on_admission_cpu = 0;
   task_ctx->inactive_wait = 0;
   task_ctx->admission_cpu = cpu;
+  task_ctx->admission_lock_id = lock_id;
   return true;
 }
 
@@ -326,7 +355,8 @@ static __always_inline bool slow_path_requested(
     return false;
 
   if (have_user)
-    return user_slow_path_pending(user_ctx_word);
+    return user_slow_path_pending(user_ctx_word) &&
+           valid_lock_id(user_admission_lock_id(user_ctx_word));
 
   return false;
 }
@@ -356,8 +386,12 @@ static __always_inline bool task_in_critical_section(
 }
 
 static __always_inline void protect_critical_section(struct task_struct *p,
-                                                     struct task_scx_ctx *task_ctx) {
+                                                     struct task_scx_ctx *task_ctx,
+                                                     __u32 lock_id) {
   __u32 cpu = task_ctx->admission_cpu;
+
+  if (!valid_lock_id(lock_id))
+    return;
 
   if (cpu >= MAX_CPUS || !task_cpu_allowed(p, cpu))
     cpu = pick_allowed_cpu(p, bpf_get_smp_processor_id());
@@ -367,7 +401,7 @@ static __always_inline void protect_critical_section(struct task_struct *p,
 
   task_ctx->admission_cpu = cpu;
   if (!task_ctx->holds_admission)
-    grant_admission(p, task_ctx, cpu);
+    grant_admission(p, task_ctx, lock_id, cpu);
 
   task_ctx->must_run_on_admission_cpu = 1;
 }
@@ -375,6 +409,7 @@ static __always_inline void protect_critical_section(struct task_struct *p,
 static __always_inline void refresh_running_state(struct task_struct *p) {
   struct task_scx_ctx *task_ctx;
   __u32 user_ctx_word = 0;
+  __u32 lock_id = UNMANAGED_LOCK_ID;
   bool have_user = false;
   __u32 cpu = bpf_get_smp_processor_id();
 
@@ -386,11 +421,18 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
     return;
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
+  if (have_user)
+    lock_id = user_admission_lock_id(user_ctx_word);
   refresh_slow_path_seen(task_ctx, have_user, user_ctx_word);
   if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
     return;
   }
+
+  if (!task_ctx->holds_admission && have_user &&
+      user_slow_path_pending(user_ctx_word) && valid_lock_id(lock_id) &&
+      cpu < MAX_CPUS && task_cpu_allowed(p, cpu))
+    grant_admission(p, task_ctx, lock_id, cpu);
 
   if (task_ctx->must_run_on_admission_cpu && task_ctx->admission_cpu == cpu)
     task_ctx->must_run_on_admission_cpu = 0;
@@ -475,6 +517,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   struct task_scx_ctx *task_ctx;
   __u32 user_ctx_word = 0;
+  __u32 lock_id = UNMANAGED_LOCK_ID;
   bool have_user = false;
   bool slow_path_seen = false;
   __u32 cpu;
@@ -500,6 +543,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   }
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
+  if (have_user)
+    lock_id = user_admission_lock_id(user_ctx_word);
   slow_path_seen = refresh_slow_path_seen(task_ctx, have_user, user_ctx_word);
 
   clear_invalid_admission_cpu(p, task_ctx);
@@ -522,13 +567,14 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     }
     task_ctx->admission_cpu = cpu;
 
-    if (grant_admission(p, task_ctx, cpu)) {
+    if (grant_admission(p, task_ctx, lock_id, cpu)) {
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
       return;
     }
 
     task_ctx->inactive_wait = 1;
-    scx_bpf_dsq_insert(p, inactive_dsq_id(cpu), SCX_SLICE_DFL, enq_flags);
+    task_ctx->admission_lock_id = lock_id;
+    scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id, cpu), SCX_SLICE_DFL, enq_flags);
     return;
   }
 
@@ -558,7 +604,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 }
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
-  __u32 *owner;
+  __u32 lock_id;
   bool active;
   (void)prev;
 
@@ -572,15 +618,19 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   if (stats_only_enabled())
     return;
 
-  owner = lookup_cpu_owner((__u32)cpu);
-  if (should_drain_inactive((__u32)cpu, owner) &&
-      scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
-    return;
+#pragma unroll
+  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+    __u32 *owner = lookup_lock_cpu_owner(lock_id, (__u32)cpu);
+
+    if (!owner || *owner)
+      continue;
+
+    if (should_drain_inactive((__u32)cpu, owner) &&
+        scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, (__u32)cpu)))
+      return;
+  }
 
   if (scx_bpf_dsq_move_to_local(CONTROLLED_DSQ_ID))
-    return;
-
-  if (scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
     return;
 
   steal_inactive((__u32)cpu);
@@ -588,13 +638,17 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
 
 static __always_inline void drain_inactive_to_controlled(__u32 cpu) {
   struct task_struct *p;
+  __u32 lock_id;
 
-  bpf_rcu_read_lock();
-  bpf_for_each(scx_dsq, p, inactive_dsq_id(cpu), 0) {
-    if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, CONTROLLED_DSQ_ID, 0))
-      break;
+#pragma unroll
+  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+    bpf_rcu_read_lock();
+    bpf_for_each(scx_dsq, p, inactive_dsq_id(lock_id, cpu), 0) {
+      if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, CONTROLLED_DSQ_ID, 0))
+        break;
+    }
+    bpf_rcu_read_unlock();
   }
-  bpf_rcu_read_unlock();
 }
 
 SEC("syscall")
@@ -666,6 +720,7 @@ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
 void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   struct task_scx_ctx *task_ctx;
   __u32 user_ctx_word = 0;
+  __u32 lock_id = UNMANAGED_LOCK_ID;
   bool have_user = false;
 
   task_ctx = lookup_task_ctx(p);
@@ -676,6 +731,8 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
     return;
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
+  if (have_user)
+    lock_id = user_admission_lock_id(user_ctx_word);
   refresh_slow_path_seen(task_ctx, have_user, user_ctx_word);
 
   if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
@@ -684,7 +741,7 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   }
 
   if (runnable && task_in_critical_section(task_ctx, have_user, user_ctx_word)) {
-    protect_critical_section(p, task_ctx);
+    protect_critical_section(p, task_ctx, lock_id);
     return;
   }
 
@@ -724,7 +781,25 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
     return ret;
 
   for (cpu = 0; cpu < nr_cpus; cpu++) {
-    ret = scx_bpf_create_dsq(inactive_dsq_id(cpu), -1);
+    ret = scx_bpf_create_dsq(inactive_dsq_id(1, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(2, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(3, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(4, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(5, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(6, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(7, cpu), -1);
     if (ret)
       return ret;
   }

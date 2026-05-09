@@ -9,7 +9,6 @@ UEI_DEFINE(uei);
 
 #include "maps.bpf.h"
 
-#define INACTIVE_DRAIN_INTERVAL 64U
 #define INACTIVE_STEAL_SCAN 8U
 
 static __always_inline bool valid_cpu(s32 cpu) {
@@ -26,13 +25,31 @@ static __always_inline struct active_cpumask_slot *lookup_active_cpumask_slot(vo
   return bpf_map_lookup_elem(&active_cpumask_map, &key);
 }
 
+static __always_inline struct dispatch_state *lookup_dispatch_state(void) {
+  __u32 key = 0;
+
+  return bpf_map_lookup_elem(&dispatch_state_map, &key);
+}
+
+static __always_inline struct cpu_inactive_hint *lookup_inactive_hint(__u32 cpu) {
+  if (cpu >= MAX_CPUS)
+    return 0;
+
+  return bpf_map_lookup_elem(&cpu_inactive_hint_map, &cpu);
+}
+
 static __always_inline bool cpu_is_active(__u32 cpu) {
+  struct dispatch_state *state;
   struct active_cpumask_slot *slot;
   struct bpf_cpumask *mask;
   bool active = true;
 
   if (cpu >= MAX_CPUS)
     return false;
+
+  state = lookup_dispatch_state();
+  if (state && state->all_cpus_active)
+    return true;
 
   bpf_rcu_read_lock();
   slot = lookup_active_cpumask_slot();
@@ -66,6 +83,13 @@ static __always_inline bool valid_lock_id(__u32 lock_id) {
   return lock_id != UNMANAGED_LOCK_ID && lock_id < MAX_LOCK_CLASSES;
 }
 
+static __always_inline __u32 lock_id_bit(__u32 lock_id) {
+  if (!valid_lock_id(lock_id))
+    return 0;
+
+  return 1U << lock_id;
+}
+
 static __always_inline __u32 user_admission_lock_id(__u32 user_ctx_word) {
   return (user_ctx_word & ~USER_ADMISSION_FLAG_MASK) >>
          USER_ADMISSION_LOCK_ID_SHIFT;
@@ -77,6 +101,34 @@ static __always_inline __u32 owner_key(__u32 lock_id, __u32 cpu) {
 
 static __always_inline __u64 inactive_dsq_id(__u32 lock_id, __u32 cpu) {
   return INACTIVE_DSQ_BASE + ((__u64)lock_id * MAX_CPUS) + cpu;
+}
+
+static __always_inline void record_inactive_enqueue(__u32 lock_id, __u32 cpu) {
+  struct cpu_inactive_hint *hint;
+  __u32 bit = lock_id_bit(lock_id);
+
+  if (!bit || cpu >= MAX_CPUS)
+    return;
+
+  hint = lookup_inactive_hint(cpu);
+  if (!hint)
+    return;
+
+  __sync_fetch_and_or(&hint->lock_mask, bit);
+  __sync_fetch_and_add(&hint->total, 1);
+}
+
+static __always_inline void record_inactive_dequeue(__u32 lock_id, __u32 cpu) {
+  struct cpu_inactive_hint *hint;
+
+  if (!valid_lock_id(lock_id) || cpu >= MAX_CPUS)
+    return;
+
+  hint = lookup_inactive_hint(cpu);
+  if (!hint || !hint->total)
+    return;
+
+  __sync_fetch_and_sub(&hint->total, 1);
 }
 
 static __always_inline bool active_words_want_cpu(__u64 wanted0, __u64 wanted1,
@@ -97,6 +149,27 @@ static __always_inline bool active_words_want_cpu(__u64 wanted0, __u64 wanted1,
     word = wanted3;
 
   return word & (1ULL << (cpu & 63));
+}
+
+static __always_inline bool active_words_cover_online_cpus(__u64 wanted0,
+                                                           __u64 wanted1,
+                                                           __u64 wanted2,
+                                                           __u64 wanted3,
+                                                           __u32 nr_cpus) {
+  __u32 online = scx_bpf_nr_cpu_ids();
+  __u32 i;
+
+  if (online > MAX_CPUS)
+    online = MAX_CPUS;
+
+  for (i = 0; i < MAX_CPUS; i++) {
+    if (i >= online)
+      break;
+    if (!active_words_want_cpu(wanted0, wanted1, wanted2, wanted3, i, nr_cpus))
+      return false;
+  }
+
+  return true;
 }
 
 static __always_inline void init_task_ctx_if_needed(struct task_scx_ctx *task_ctx) {
@@ -141,22 +214,6 @@ static __always_inline __u32 *lookup_lock_cpu_owner(__u32 lock_id, __u32 cpu) {
   return bpf_map_lookup_elem(&cpu_admission_owner_map, &key);
 }
 
-static __always_inline bool should_drain_inactive(__u32 cpu, __u32 *owner) {
-  __u32 *seq;
-  __u32 next;
-
-  if (!owner || !*owner)
-    return true;
-
-  seq = bpf_map_lookup_elem(&cpu_dispatch_seq_map, &cpu);
-  if (!seq)
-    return false;
-
-  next = *seq + 1;
-  *seq = next;
-  return (next & (INACTIVE_DRAIN_INTERVAL - 1)) == 0;
-}
-
 static __always_inline bool steal_inactive(__u32 cpu) {
   __u32 nr_cpus = scx_bpf_nr_cpu_ids();
   __u32 lock_id;
@@ -169,24 +226,35 @@ static __always_inline bool steal_inactive(__u32 cpu) {
     return false;
 
 #pragma unroll
-  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
-    __u32 *owner = lookup_lock_cpu_owner(lock_id, cpu);
+  for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
+    struct cpu_inactive_hint *hint;
+    __u32 victim = cpu + i;
 
-    if (!owner || *owner)
+    if (i >= nr_cpus)
+      break;
+
+    if (victim >= nr_cpus)
+      victim -= nr_cpus;
+
+    hint = lookup_inactive_hint(victim);
+    if (!hint || !hint->total)
       continue;
 
 #pragma unroll
-    for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
-      __u32 victim = cpu + i;
+    for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+      __u32 *owner;
 
-      if (i >= nr_cpus)
-        break;
+      if (!(hint->lock_mask & lock_id_bit(lock_id)))
+        continue;
 
-      if (victim >= nr_cpus)
-        victim -= nr_cpus;
+      owner = lookup_lock_cpu_owner(lock_id, cpu);
+      if (!owner || *owner)
+        continue;
 
-      if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, victim)))
+      if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, victim))) {
+        record_inactive_dequeue(lock_id, victim);
         return true;
+      }
     }
   }
 
@@ -574,6 +642,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
     task_ctx->inactive_wait = 1;
     task_ctx->admission_lock_id = lock_id;
+    record_inactive_enqueue(lock_id, cpu);
     scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id, cpu), SCX_SLICE_DFL, enq_flags);
     return;
   }
@@ -603,8 +672,34 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
 }
 
-void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
+static __always_inline bool drain_local_inactive(__u32 cpu) {
+  struct cpu_inactive_hint *hint = lookup_inactive_hint(cpu);
   __u32 lock_id;
+
+  if (!hint || !hint->total)
+    return false;
+
+#pragma unroll
+  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+    __u32 *owner;
+
+    if (!(hint->lock_mask & lock_id_bit(lock_id)))
+      continue;
+
+    owner = lookup_lock_cpu_owner(lock_id, cpu);
+    if (!owner || *owner)
+      continue;
+
+    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, cpu))) {
+      record_inactive_dequeue(lock_id, cpu);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   bool active;
   (void)prev;
 
@@ -618,17 +713,8 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   if (stats_only_enabled())
     return;
 
-#pragma unroll
-  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
-    __u32 *owner = lookup_lock_cpu_owner(lock_id, (__u32)cpu);
-
-    if (!owner || *owner)
-      continue;
-
-    if (should_drain_inactive((__u32)cpu, owner) &&
-        scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, (__u32)cpu)))
-      return;
-  }
+  if (drain_local_inactive((__u32)cpu))
+    return;
 
   if (scx_bpf_dsq_move_to_local(CONTROLLED_DSQ_ID))
     return;
@@ -646,6 +732,7 @@ static __always_inline void drain_inactive_to_controlled(__u32 cpu) {
     bpf_for_each(scx_dsq, p, inactive_dsq_id(lock_id, cpu), 0) {
       if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, CONTROLLED_DSQ_ID, 0))
         break;
+      record_inactive_dequeue(lock_id, cpu);
     }
     bpf_rcu_read_unlock();
   }
@@ -653,6 +740,7 @@ static __always_inline void drain_inactive_to_controlled(__u32 cpu) {
 
 SEC("syscall")
 int accordin_set_active_cpus(struct accordin_active_cpus_args *args) {
+  struct dispatch_state *state;
   struct active_cpumask_slot *slot;
   struct bpf_cpumask *new_mask, *old_mask;
   __u64 wanted0, wanted1, wanted2, wanted3;
@@ -687,6 +775,11 @@ int accordin_set_active_cpus(struct accordin_active_cpus_args *args) {
   old_mask = bpf_kptr_xchg(&slot->mask, new_mask);
   if (old_mask)
     bpf_cpumask_release(old_mask);
+
+  state = lookup_dispatch_state();
+  if (state)
+    state->all_cpus_active =
+        active_words_cover_online_cpus(wanted0, wanted1, wanted2, wanted3, n);
 
   return 0;
 }
@@ -767,6 +860,7 @@ void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
+  struct dispatch_state *state;
   struct active_cpumask_slot *slot;
   struct bpf_cpumask *mask, *old_mask;
   __u32 cpu;
@@ -779,6 +873,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   ret = scx_bpf_create_dsq(CONTROLLED_DSQ_ID, -1);
   if (ret)
     return ret;
+
+  state = lookup_dispatch_state();
+  if (state)
+    state->all_cpus_active = 1;
 
   for (cpu = 0; cpu < nr_cpus; cpu++) {
     ret = scx_bpf_create_dsq(inactive_dsq_id(1, cpu), -1);

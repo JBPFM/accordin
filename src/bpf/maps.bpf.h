@@ -36,8 +36,15 @@ struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, MAX_CPUS);
   __type(key, __u32);
-  __type(value, __u32);
-} cpu_dispatch_seq_map SEC(".maps");
+  __type(value, struct cpu_inactive_hint);
+} cpu_inactive_hint_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct dispatch_state);
+} dispatch_state_map SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);

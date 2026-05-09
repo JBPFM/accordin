@@ -9,13 +9,10 @@ import json
 import math
 import os
 import re
-import signal
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Iterable
@@ -32,7 +29,7 @@ DEFAULT_CACHELIB_LIBURING_PREFIX = REPO_ROOT / ".cache" / "experiment5_liburing"
 DEFAULT_ROCKSDB_DIR = REPO_ROOT / "third_party" / "rocksdb"
 ROCKSDB_GIT_URL = "https://github.com/facebook/rocksdb.git"
 
-DEFAULT_WORKLOADS = ("cachebench", "rocksdb", "memcached")
+DEFAULT_WORKLOADS = ("cachebench", "rocksdb")
 DEFAULT_ROCKSDB_BENCHMARKS = ("readrandom", "fillrandom")
 DEFAULT_ROCKSDB_COMPRESSION_TYPE = "none"
 DEFAULT_ROCKSDB_EXTRA_ARGS = ("--disable_auto_compactions=true",)
@@ -52,23 +49,6 @@ DEFAULT_CACHEBENCH_COMMAND_TIMEOUT_SECONDS = 300
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 COMMAND_TIMEOUT_KILL_AFTER_SECONDS = 60
 DEFAULT_CACHELIB_BUILD_JOBS = os.cpu_count() or 1
-DEFAULT_MEMCACHED_HOST = "127.0.0.1"
-DEFAULT_MEMCACHED_MEMORY_MB = 512
-DEFAULT_MEMCACHED_CONN_LIMIT = 0
-DEFAULT_MEMTIER_CLIENT_THREADS = 48
-DEFAULT_MEMTIER_CLIENTS = 32
-DEFAULT_MEMTIER_REQUESTS = 10_000
-DEFAULT_MEMTIER_RATIO = "1:10"
-DEFAULT_MEMTIER_KEY_PATTERN = "R:R"
-DEFAULT_MEMTIER_FILL_KEY_PATTERN = "P:P"
-DEFAULT_MEMTIER_KEY_MINIMUM = 1
-DEFAULT_MEMTIER_KEY_MAXIMUM = 10_000
-DEFAULT_MEMTIER_WARMUP_REQUESTS = 1_000
-DEFAULT_MEMTIER_DATA_SIZE = 128
-MEMCACHED_SYSTEM_PACKAGES = {
-    "memcached": "memcached",
-    "memtier_benchmark": "memtier-benchmark",
-}
 
 SINGLE_OVERSUBSCRIBED_LOCKS = experiment_defaults.SINGLE_OVERSUBSCRIBED_LOCKS
 PER_LOCK_MAX_THREADS = experiment_defaults.per_lock_max_threads_for_settings(
@@ -91,6 +71,7 @@ RAW_FIELDS = (
     "setup_log",
     "server_log",
 )
+RAW_LOG_FIELDS = ("command_log", "setup_log", "server_log")
 SUMMARY_FIELDS = (
     "workload",
     "benchmark",
@@ -138,9 +119,6 @@ OPS_PATTERNS = (
     re.compile(r"(?i)\bqps\b\s*[:=]?\s*(?P<value>\d+(?:\.\d+)?)"),
     re.compile(r"(?i)\bthroughput\b.*?\b(?P<value>\d+(?:\.\d+)?)\s*(?:ops/s|ops/sec|qps)\b"),
 )
-MEMTIER_PROGRESS_AVG_PATTERN = re.compile(
-    r"(?i)\(avg:\s*(?P<value>\d+(?:\.\d+)?)\)\s*ops/sec"
-)
 CACHEBENCH_THROUGHPUT_PATTERN = re.compile(
     r"^\s*(?:get|set|del|couldExist)\s*:\s*(?P<value>\d[\d,]*(?:\.\d+)?)/s\b",
     re.MULTILINE,
@@ -179,6 +157,22 @@ def parse_csv_ints(value: str) -> tuple[int, ...]:
     return experiment_three.parse_csv_ints(value)
 
 
+def parse_optional_csv_strings(value: str) -> tuple[str, ...]:
+    if not value.strip():
+        return ()
+    return parse_csv_strings(value)
+
+
+def parse_optional_csv_strings_lower(value: str) -> tuple[str, ...]:
+    return tuple(item.lower() for item in parse_optional_csv_strings(value))
+
+
+def parse_optional_merge_locks(value: str) -> tuple[str, ...]:
+    if not value.strip():
+        return ()
+    return experiment_defaults.normalize_locks(parse_csv_strings(value))
+
+
 def validate_workloads(workloads: tuple[str, ...]) -> tuple[str, ...]:
     supported = set(DEFAULT_WORKLOADS)
     normalized = tuple(workload.strip().lower() for workload in workloads)
@@ -204,50 +198,6 @@ def configured_executable_path(value: Path | None, env_name: str, binary_name: s
             raise RuntimeError(f"{binary_name} is missing or not executable: {resolved}")
         return resolved
     return None
-
-
-def root_command(command: list[str], *, env: dict[str, str] | None = None) -> list[str]:
-    full_command = command
-    if env:
-        full_command = ["env", *(f"{key}={value}" for key, value in env.items()), *command]
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        return full_command
-    sudo = shutil.which("sudo")
-    if sudo is None:
-        raise RuntimeError(f"Cannot run as root because sudo is unavailable: {' '.join(command)}")
-    return [sudo, "-n", *full_command]
-
-
-def install_system_packages(
-    packages: tuple[str, ...],
-    *,
-    log_prefix: str,
-    logger: experiment_three.CommandLogger,
-) -> None:
-    packages = tuple(dict.fromkeys(package for package in packages if package))
-    if not packages:
-        return
-
-    apt_get = shutil.which("apt-get")
-    if apt_get is None:
-        raise RuntimeError(
-            "Cannot install missing system packages automatically because apt-get was not found: "
-            + ", ".join(packages)
-        )
-
-    env = {"DEBIAN_FRONTEND": "noninteractive"}
-    logger.run(
-        root_command([apt_get, "update"], env=env),
-        log_name=f"{log_prefix}_apt_update.log",
-        cwd=REPO_ROOT,
-        timeout_seconds=0,
-    )
-    logger.run(
-        root_command([apt_get, "install", "-y", *packages], env=env),
-        log_name=f"{log_prefix}_apt_install.log",
-        cwd=REPO_ROOT,
-        timeout_seconds=0,
-    )
 
 
 def default_cachelib_dir() -> Path:
@@ -672,7 +622,7 @@ def default_rocksdb_db_bench(rocksdb_dir: Path) -> Path | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run or plot external workload lock sweeps: CacheBench, RocksDB db_bench, and Memcached+memtier.",
+        description="Run or plot external workload lock sweeps: CacheBench and RocksDB db_bench.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""\
 Default benchmark settings:
@@ -686,20 +636,50 @@ Default benchmark settings:
   cachebench_pool_rebalance_interval_sec={DEFAULT_CACHEBENCH_POOL_REBALANCE_INTERVAL_SEC}
   rocksdb_benchmarks={','.join(DEFAULT_ROCKSDB_BENCHMARKS)}
   rocksdb_extra_args={' '.join(DEFAULT_ROCKSDB_EXTRA_ARGS)}
-  memtier=-t {DEFAULT_MEMTIER_CLIENT_THREADS} -c {DEFAULT_MEMTIER_CLIENTS} --requests {DEFAULT_MEMTIER_REQUESTS}
-  memtier_key_range={DEFAULT_MEMTIER_KEY_MINIMUM}..{DEFAULT_MEMTIER_KEY_MAXIMUM}, warmup_requests={DEFAULT_MEMTIER_WARMUP_REQUESTS}
   per_lock_max_threads={','.join(f"{lock}:{max_threads}" for lock, max_threads in PER_LOCK_MAX_THREADS.items())}
 
 Examples:
   python3 experiments/run_experiment_five.py --workloads rocksdb --locks stock --threads 1 --repeats 1 --rocksdb-benchmarks fillrandom --total-ops 1000
-  python3 experiments/run_experiment_five.py --workloads memcached --locks stock --threads 4 --repeats 1 --memtier-requests 1000
-  python3 experiments/run_experiment_five.py --workloads cachebench,rocksdb,memcached --build-missing
+  python3 experiments/run_experiment_five.py --workloads cachebench,rocksdb --build-missing
   python3 experiments/run_experiment_five.py --workloads cachebench --cachebench-config /path/to/config.json
   python3 experiments/run_experiment_five.py --plot-only experiments/results/experiment5_manual
+  python3 experiments/run_experiment_five.py --plot-only experiments/results/experiment5_manual --merge-raw-root experiments/results/experiment5_partial --merge-workloads cachebench
 """,
     )
     parser.add_argument("--output-root", type=Path, default=None, help="Directory for a new run.")
     parser.add_argument("--plot-only", type=Path, default=None, metavar="RESULT_ROOT", help="Regenerate summary and plots from raw.csv.")
+    parser.add_argument(
+        "--merge-raw-root",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="RESULT_ROOT",
+        help=(
+            "Additional result root whose raw.csv rows are merged into --plot-only output. "
+            "May be repeated; later roots replace earlier rows with the same result key."
+        ),
+    )
+    parser.add_argument(
+        "--merge-workloads",
+        default="",
+        metavar="CSV",
+        help="Optional workload filter for --merge-raw-root rows, for example cachebench. Empty means all.",
+    )
+    parser.add_argument(
+        "--merge-benchmarks",
+        default="",
+        metavar="CSV",
+        help="Optional benchmark filter for --merge-raw-root rows. Empty means all.",
+    )
+    parser.add_argument(
+        "--merge-locks",
+        default="",
+        metavar="CSV",
+        help=(
+            "Optional lock filter for --merge-raw-root rows. Aliases are accepted and normalized. "
+            "Empty means all."
+        ),
+    )
     parser.add_argument("--force", action="store_true", help="Allow output into an existing non-empty output root.")
     parser.add_argument(
         "--resume",
@@ -709,7 +689,7 @@ Examples:
     parser.add_argument(
         "--build-missing",
         action="store_true",
-        help="Build/install missing lock helpers, CacheBench, RocksDB db_bench, or memcached/memtier where possible.",
+        help="Build/install missing lock helpers, CacheBench, or RocksDB db_bench where possible.",
     )
     parser.add_argument("--skip-plots", action="store_true", help="Write CSVs but skip PNG generation.")
     parser.add_argument(
@@ -721,7 +701,7 @@ Examples:
             f"Default: {DEFAULT_COMMAND_TIMEOUT_SECONDS}."
         ),
     )
-    parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS), metavar="CSV", help="cachebench,rocksdb,memcached.")
+    parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS), metavar="CSV", help="cachebench,rocksdb.")
     parser.add_argument(
         "--lock-profile",
         choices=experiment_defaults.lock_profile_names(),
@@ -815,43 +795,6 @@ Examples:
             f"Default: {' '.join(DEFAULT_ROCKSDB_EXTRA_ARGS)}."
         ),
     )
-
-    parser.add_argument("--memcached-bin", type=Path, default=None, help="Path to memcached. Default: MEMCACHED_BIN or PATH.")
-    parser.add_argument("--memtier-bin", type=Path, default=None, help="Path to memtier_benchmark. Default: MEMTIER_BIN or PATH.")
-    parser.add_argument("--memcached-host", default=DEFAULT_MEMCACHED_HOST)
-    parser.add_argument("--memcached-port", type=non_negative_int, default=0, help="0 chooses a free localhost port per run.")
-    parser.add_argument("--memcached-memory-mb", type=positive_int, default=DEFAULT_MEMCACHED_MEMORY_MB)
-    parser.add_argument(
-        "--memcached-conn-limit",
-        type=non_negative_int,
-        default=DEFAULT_MEMCACHED_CONN_LIMIT,
-        help="Passed to memcached as -c. Default 0 auto-sizes from server threads.",
-    )
-    parser.add_argument("--memcached-user", default=os.environ.get("USER", "nobody"), help="User passed with -u when memcached is launched through sudo.")
-    parser.add_argument("--memcached-start-timeout", type=positive_int, default=10)
-    parser.add_argument("--memtier-client-threads", type=positive_int, default=DEFAULT_MEMTIER_CLIENT_THREADS)
-    parser.add_argument("--memtier-clients", type=positive_int, default=DEFAULT_MEMTIER_CLIENTS)
-    parser.add_argument("--memtier-requests", type=positive_int, default=DEFAULT_MEMTIER_REQUESTS)
-    parser.add_argument("--memtier-ratio", default=DEFAULT_MEMTIER_RATIO)
-    parser.add_argument("--memtier-key-pattern", default=DEFAULT_MEMTIER_KEY_PATTERN)
-    parser.add_argument("--memtier-key-minimum", type=non_negative_int, default=DEFAULT_MEMTIER_KEY_MINIMUM)
-    parser.add_argument("--memtier-key-maximum", type=non_negative_int, default=DEFAULT_MEMTIER_KEY_MAXIMUM)
-    parser.add_argument("--memtier-no-fill", action="store_true", help="Skip the SET-only key fill before measured memtier runs.")
-    parser.add_argument(
-        "--memtier-fill-requests",
-        type=non_negative_int,
-        default=0,
-        help="SET-only fill requests per memtier client. Default 0 covers the configured key range once.",
-    )
-    parser.add_argument("--memtier-fill-key-pattern", default=DEFAULT_MEMTIER_FILL_KEY_PATTERN)
-    parser.add_argument(
-        "--memtier-warmup-requests",
-        type=non_negative_int,
-        default=DEFAULT_MEMTIER_WARMUP_REQUESTS,
-        help="Unmeasured warmup requests per memtier client after fill. 0 disables warmup.",
-    )
-    parser.add_argument("--memtier-data-size", type=positive_int, default=DEFAULT_MEMTIER_DATA_SIZE)
-    parser.add_argument("--memtier-extra-arg", action="append", default=[], help="Extra argument passed through to memtier_benchmark; repeatable.")
     return parser.parse_args()
 
 
@@ -870,8 +813,6 @@ def workload_label(workload: str, benchmark: str) -> str:
         return "CacheLib CacheBench"
     if workload == "rocksdb":
         return f"RocksDB {benchmark}"
-    if workload == "memcached":
-        return "Memcached + memtier"
     return benchmark
 
 
@@ -1042,57 +983,6 @@ def cmake_build_dir_matches_source(build_dir: Path, source_dir: Path) -> bool:
     return False
 
 
-def path_executable(binary_name: str) -> Path | None:
-    found = shutil.which(binary_name)
-    return Path(found).resolve() if found is not None else None
-
-
-def ensure_memcached_binaries(
-    args: argparse.Namespace,
-    *,
-    build_missing: bool,
-    logger: experiment_three.CommandLogger,
-) -> tuple[Path, Path]:
-    configured_memcached = configured_executable_path(args.memcached_bin, "MEMCACHED_BIN", "memcached")
-    configured_memtier = configured_executable_path(args.memtier_bin, "MEMTIER_BIN", "memtier_benchmark")
-
-    memcached_bin = configured_memcached or path_executable("memcached")
-    memtier_bin = configured_memtier or path_executable("memtier_benchmark")
-    missing_packages: list[str] = []
-    if memcached_bin is None and configured_memcached is None:
-        missing_packages.append(MEMCACHED_SYSTEM_PACKAGES["memcached"])
-    if memtier_bin is None and configured_memtier is None:
-        missing_packages.append(MEMCACHED_SYSTEM_PACKAGES["memtier_benchmark"])
-
-    if missing_packages:
-        if not build_missing:
-            missing = []
-            if memcached_bin is None:
-                missing.append("memcached")
-            if memtier_bin is None:
-                missing.append("memtier_benchmark")
-            raise RuntimeError(
-                f"{', '.join(missing)} missing from PATH. Pass explicit paths, install them, "
-                "or rerun with --build-missing."
-            )
-        install_system_packages(
-            tuple(missing_packages),
-            log_prefix="install_memcached_deps",
-            logger=logger,
-        )
-        memcached_bin = configured_memcached or path_executable("memcached")
-        memtier_bin = configured_memtier or path_executable("memtier_benchmark")
-
-    if memcached_bin is None or memtier_bin is None:
-        missing = []
-        if memcached_bin is None:
-            missing.append("memcached")
-        if memtier_bin is None:
-            missing.append("memtier_benchmark")
-        raise RuntimeError(f"Missing memcached workload binaries after install: {', '.join(missing)}")
-    return memcached_bin, memtier_bin
-
-
 def ensure_required_binaries(
     workloads: tuple[str, ...],
     *,
@@ -1124,14 +1014,6 @@ def ensure_required_binaries(
             build_missing=args.build_missing,
             logger=logger,
         )
-    if "memcached" in workloads:
-        memcached_bin, memtier_bin = ensure_memcached_binaries(
-            args,
-            build_missing=args.build_missing,
-            logger=logger,
-        )
-        binaries["memcached"] = memcached_bin
-        binaries["memtier"] = memtier_bin
     return binaries
 
 
@@ -1173,32 +1055,6 @@ def parse_generic_ops_per_second(output: str) -> float | None:
         if match is not None:
             return float(match.group("value"))
     return None
-
-
-def parse_memtier_ops_per_second(output: str) -> float | None:
-    totals_value: float | None = None
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("Totals"):
-            continue
-        fields = stripped.split()
-        if len(fields) >= 2:
-            try:
-                totals_value = float(fields[1])
-            except ValueError:
-                return None
-    if totals_value is not None and totals_value > 0.0:
-        return totals_value
-
-    progress_values = [
-        float(match.group("value"))
-        for match in MEMTIER_PROGRESS_AVG_PATTERN.finditer(output)
-    ]
-    if progress_values:
-        return progress_values[-1]
-    if totals_value is not None:
-        return totals_value
-    return parse_generic_ops_per_second(output)
 
 
 def parse_cachebench_ops_per_second(output: str) -> float | None:
@@ -1340,8 +1196,6 @@ def target_keys(
             benchmarks = ("cachebench",)
         elif workload == "rocksdb":
             benchmarks = rocksdb_benchmarks
-        elif workload == "memcached":
-            benchmarks = ("memtier",)
         else:
             continue
         for benchmark in benchmarks:
@@ -1457,49 +1311,6 @@ def completed_rows_from_records(
                     "command_log": relative_log(result_root, log_path),
                     "setup_log": setup_log,
                     "server_log": "",
-                }
-            )
-        elif workload == "memcached":
-            log_name = f"memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log"
-            completed = records_by_log.get(log_name)
-            if completed is None:
-                continue
-            record, output, log_path = completed
-            wall_seconds = record_wall_seconds(record, output)
-            ops_per_second = parse_memtier_ops_per_second(output)
-            total_ops = memtier_total_requests(args)
-            if ops_per_second is None and wall_seconds > 0.0:
-                ops_per_second = total_ops / wall_seconds
-            server_log = result_root / "server_logs" / log_name
-            setup_log_names: list[str] = []
-            if not args.memtier_no_fill:
-                setup_log_names.append(f"fill_memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log")
-            if args.memtier_warmup_requests > 0:
-                setup_log_names.append(f"warmup_memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log")
-            setup_wall_seconds = 0.0
-            setup_logs: list[str] = []
-            for setup_log_name in setup_log_names:
-                setup_completed = records_by_log.get(setup_log_name)
-                if setup_completed is None:
-                    continue
-                setup_record, setup_output, setup_path = setup_completed
-                setup_wall_seconds += record_wall_seconds(setup_record, setup_output)
-                setup_logs.append(relative_log(result_root, setup_path))
-            rows.append(
-                {
-                    "workload": workload,
-                    "benchmark": benchmark,
-                    "lock": lock,
-                    "threads": str(thread),
-                    "repeat": str(repeat),
-                    "ops_per_second": "" if ops_per_second is None else format_float(ops_per_second),
-                    "latency_micros_per_op": "",
-                    "wall_seconds": format_float(wall_seconds),
-                    "setup_wall_seconds": format_float(setup_wall_seconds) if setup_wall_seconds > 0.0 else "",
-                    "total_ops": str(total_ops),
-                    "command_log": relative_log(result_root, log_path),
-                    "setup_log": ";".join(setup_logs),
-                    "server_log": relative_log(result_root, server_log) if server_log.is_file() else "",
                 }
             )
     return rows
@@ -1879,367 +1690,6 @@ def run_rocksdb(
     return rows
 
 
-def choose_free_port(host: str) -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((host, 0))
-        return int(sock.getsockname()[1])
-
-
-def tail_file(path: Path, max_lines: int = 20) -> str:
-    try:
-        return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:])
-    except OSError:
-        return ""
-
-
-def wait_for_tcp(
-    host: str,
-    port: int,
-    timeout_seconds: int,
-    *,
-    process: subprocess.Popen[str] | None = None,
-    log_path: Path | None = None,
-) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    last_error: OSError | None = None
-    while time.monotonic() < deadline:
-        if process is not None and process.poll() is not None:
-            detail = (
-                f"memcached exited before accepting connections on {host}:{port} "
-                f"(returncode {process.returncode})"
-            )
-            if log_path is not None:
-                detail += f"; server log: {log_path}"
-                log_tail = tail_file(log_path)
-                if log_tail:
-                    detail += f"\nserver log tail:\n{log_tail}"
-            raise RuntimeError(detail)
-        try:
-            with socket.create_connection((host, port), timeout=0.2):
-                return
-        except OSError as exc:
-            last_error = exc
-            time.sleep(0.05)
-    raise RuntimeError(f"Timed out waiting for memcached on {host}:{port}: {last_error}")
-
-
-def terminate_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
-
-
-def terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        process_group_id = os.getpgid(process.pid)
-    except ProcessLookupError:
-        return
-
-    try:
-        os.killpg(process_group_id, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    try:
-        os.killpg(process_group_id, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    process.wait(timeout=5)
-
-
-def command_uses_sudo(command: list[str]) -> bool:
-    return bool(command) and Path(command[0]).name == "sudo"
-
-
-def memcached_conn_limit_for_thread(thread: int, args: argparse.Namespace) -> int:
-    if args.memcached_conn_limit > 0:
-        return args.memcached_conn_limit
-    client_connections = args.memtier_client_threads * args.memtier_clients
-    return max(1024, thread * 16, client_connections * 4)
-
-
-def memtier_client_count(args: argparse.Namespace) -> int:
-    return args.memtier_client_threads * args.memtier_clients
-
-
-def memtier_total_requests(args: argparse.Namespace) -> int:
-    return memtier_client_count(args) * args.memtier_requests
-
-
-def memtier_key_count(args: argparse.Namespace) -> int:
-    return args.memtier_key_maximum - args.memtier_key_minimum + 1
-
-
-def memtier_fill_requests(args: argparse.Namespace) -> int:
-    if args.memtier_fill_requests > 0:
-        return args.memtier_fill_requests
-    return ceil_div(memtier_key_count(args), memtier_client_count(args))
-
-
-def memtier_command(
-    memtier_bin: Path,
-    *,
-    host: str,
-    port: int,
-    client_threads: int,
-    clients: int,
-    requests: int,
-    ratio: str,
-    key_pattern: str,
-    args: argparse.Namespace,
-) -> list[str]:
-    command = [
-        str(memtier_bin),
-        "-s",
-        host,
-        "-p",
-        str(port),
-        "--protocol=memcache_text",
-        "-t",
-        str(client_threads),
-        "-c",
-        str(clients),
-        "--requests",
-        str(requests),
-        "--ratio",
-        ratio,
-        "--key-pattern",
-        key_pattern,
-        "--key-minimum",
-        str(args.memtier_key_minimum),
-        "--key-maximum",
-        str(args.memtier_key_maximum),
-        "--data-size",
-        str(args.memtier_data_size),
-        "--hide-histogram",
-    ]
-    command.extend(args.memtier_extra_arg)
-    return command
-
-
-def run_memtier_setup(
-    result_root: Path,
-    *,
-    lock: str,
-    thread: int,
-    repeat: int,
-    port: int,
-    memtier_bin: Path,
-    args: argparse.Namespace,
-    logger: experiment_three.CommandLogger,
-) -> tuple[float, str]:
-    setup_wall_seconds = 0.0
-    setup_logs: list[str] = []
-
-    if not args.memtier_no_fill:
-        result = logger.run(
-            memtier_command(
-                memtier_bin,
-                host=args.memcached_host,
-                port=port,
-                client_threads=args.memtier_client_threads,
-                clients=args.memtier_clients,
-                requests=memtier_fill_requests(args),
-                ratio="1:0",
-                key_pattern=args.memtier_fill_key_pattern,
-                args=args,
-            ),
-            log_name=f"fill_memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
-            cwd=REPO_ROOT,
-        )
-        setup_wall_seconds += result.wall_seconds
-        setup_logs.append(relative_log(result_root, result.log_path))
-
-    if args.memtier_warmup_requests > 0:
-        result = logger.run(
-            memtier_command(
-                memtier_bin,
-                host=args.memcached_host,
-                port=port,
-                client_threads=args.memtier_client_threads,
-                clients=args.memtier_clients,
-                requests=args.memtier_warmup_requests,
-                ratio=args.memtier_ratio,
-                key_pattern=args.memtier_key_pattern,
-                args=args,
-            ),
-            log_name=f"warmup_memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
-            cwd=REPO_ROOT,
-        )
-        setup_wall_seconds += result.wall_seconds
-        setup_logs.append(relative_log(result_root, result.log_path))
-
-    return setup_wall_seconds, ";".join(setup_logs)
-
-
-def run_memcached(
-    result_root: Path,
-    *,
-    locks: tuple[str, ...],
-    threads: tuple[int, ...],
-    repeats: int,
-    memcached_bin: Path,
-    memtier_bin: Path,
-    args: argparse.Namespace,
-    logger: experiment_three.CommandLogger,
-    failures: list[dict[str, str]],
-    existing_rows: list[dict[str, str]] | None = None,
-) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = existing_rows if existing_rows is not None else []
-    completed_keys = completed_keys_from_rows(rows)
-    server_log_dir = result_root / "server_logs"
-    server_log_dir.mkdir(parents=True, exist_ok=True)
-
-    for lock in locks:
-        for thread in runnable_threads_for_lock(lock, threads):
-            for repeat in range(1, repeats + 1):
-                key = ("memcached", "memtier", lock, thread, repeat)
-                if key in completed_keys:
-                    continue
-                port = args.memcached_port or choose_free_port(args.memcached_host)
-                server_command = [
-                    str(memcached_bin),
-                    "-l",
-                    args.memcached_host,
-                    "-p",
-                    str(port),
-                    "-U",
-                    "0",
-                    "-t",
-                    str(thread),
-                    "-m",
-                    str(args.memcached_memory_mb),
-                    "-c",
-                    str(memcached_conn_limit_for_thread(thread, args)),
-                ]
-                locked_server_command, server_env = build_lock_command(lock, server_command)
-                if command_uses_sudo(locked_server_command):
-                    server_command.extend(["-u", args.memcached_user])
-                    locked_server_command, server_env = build_lock_command(lock, server_command)
-
-                server_log = server_log_dir / f"memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log"
-                with server_log.open("w", encoding="utf-8") as server_log_file:
-                    server_log_file.write(f"command: {' '.join(locked_server_command)}\n\n")
-                    server_log_file.flush()
-                    run_env = os.environ.copy()
-                    if server_env is not None:
-                        run_env.update(server_env)
-                    server_process = subprocess.Popen(
-                        locked_server_command,
-                        cwd=str(REPO_ROOT),
-                        env=run_env,
-                        stdout=server_log_file,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        start_new_session=True,
-                    )
-                    try:
-                        wait_for_tcp(
-                            args.memcached_host,
-                            port,
-                            args.memcached_start_timeout,
-                            process=server_process,
-                            log_path=server_log,
-                        )
-                        setup_wall_seconds, setup_log = run_memtier_setup(
-                            result_root,
-                            lock=lock,
-                            thread=thread,
-                            repeat=repeat,
-                            port=port,
-                            memtier_bin=memtier_bin,
-                            args=args,
-                            logger=logger,
-                        )
-                        client_command = memtier_command(
-                            memtier_bin,
-                            host=args.memcached_host,
-                            port=port,
-                            client_threads=args.memtier_client_threads,
-                            clients=args.memtier_clients,
-                            requests=args.memtier_requests,
-                            ratio=args.memtier_ratio,
-                            key_pattern=args.memtier_key_pattern,
-                            args=args,
-                        )
-                        result = logger.run(
-                            client_command,
-                            log_name=f"memcached_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
-                            cwd=REPO_ROOT,
-                        )
-                        ops_per_second = parse_memtier_ops_per_second(result.output)
-                        total_ops = memtier_total_requests(args)
-                        if ops_per_second is None and result.wall_seconds > 0.0:
-                            ops_per_second = total_ops / result.wall_seconds
-                        rows.append(
-                            {
-                                "workload": "memcached",
-                                "benchmark": "memtier",
-                                "lock": lock,
-                                "threads": str(thread),
-                                "repeat": str(repeat),
-                                "ops_per_second": "" if ops_per_second is None else format_float(ops_per_second),
-                                "latency_micros_per_op": "",
-                                "wall_seconds": format_float(result.wall_seconds),
-                                "setup_wall_seconds": format_float(setup_wall_seconds) if setup_wall_seconds > 0.0 else "",
-                                "total_ops": str(total_ops),
-                                "command_log": relative_log(result_root, result.log_path),
-                                "setup_log": setup_log,
-                                "server_log": relative_log(result_root, server_log),
-                            }
-                        )
-                        completed_keys.add(key)
-                        write_progress_csvs(result_root, rows)
-                    except experiment_three.CommandError as exc:
-                        experiment_failures.append_command_failure(
-                            failures,
-                            result_root=result_root,
-                            experiment="experiment5",
-                            workload="memcached",
-                            benchmark="memtier",
-                            lock=lock,
-                            threads=thread,
-                            repeat=repeat,
-                            exc=exc,
-                        )
-                        experiment_failures.write_failures_csv(result_root, failures)
-                        continue
-                    except RuntimeError as exc:
-                        experiment_failures.append_failure(
-                            failures,
-                            result_root=result_root,
-                            experiment="experiment5",
-                            workload="memcached",
-                            benchmark="memtier",
-                            lock=lock,
-                            threads=thread,
-                            repeat=repeat,
-                            stage="server_start",
-                            status="failed",
-                            command_log=server_log,
-                            message=str(exc),
-                        )
-                        experiment_failures.write_failures_csv(result_root, failures)
-                        continue
-                    finally:
-                        terminate_process_group(server_process)
-                        server_log_file.write(f"\nserver_returncode: {server_process.returncode}\n")
-
-    return rows
-
-
 def mean_field(rows: list[dict[str, str]], field: str) -> str:
     values = [float(row[field]) for row in rows if row[field].strip()]
     if not values:
@@ -2296,6 +1746,123 @@ def load_raw_rows(result_root: Path) -> list[dict[str, str]]:
         if missing:
             raise RuntimeError(f"raw.csv is missing required columns: {', '.join(missing)}")
         return [dict(row) for row in reader]
+
+
+def relative_or_absolute(root: Path, value: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    path = Path(stripped)
+    if path.is_absolute():
+        return str(path)
+    return str((root / path).resolve())
+
+
+def remap_log_field(root: Path, value: str) -> str:
+    if not value.strip():
+        return ""
+    return ";".join(
+        relative_or_absolute(root, part)
+        for part in (entry.strip() for entry in value.split(";"))
+        if part
+    )
+
+
+def prepare_merged_raw_row(row: dict[str, str], source_root: Path, output_root: Path) -> dict[str, str]:
+    merged_row = dict(row)
+    merged_row["lock"] = experiment_defaults.normalize_lock(merged_row["lock"])
+    if source_root.resolve() == output_root.resolve():
+        return merged_row
+    for field in RAW_LOG_FIELDS:
+        merged_row[field] = remap_log_field(source_root, merged_row.get(field, ""))
+    return merged_row
+
+
+def merge_result_key(row: dict[str, str]) -> tuple[str, str, str, int, int] | None:
+    key = result_key(row)
+    if key is None:
+        return None
+    workload, benchmark, lock, threads, repeat = key
+    return workload, benchmark, experiment_defaults.normalize_lock(lock), threads, repeat
+
+
+def raw_row_sort_key(row: dict[str, str]) -> tuple[tuple[int, str], tuple[int, str], tuple[int, str], int, int]:
+    key = result_key(row)
+    if key is None:
+        return (
+            workload_sort_key(row.get("workload", "")),
+            (len(DEFAULT_ROCKSDB_BENCHMARKS), row.get("benchmark", "")),
+            lock_sort_key(row.get("lock", "")),
+            -1,
+            -1,
+        )
+    workload, benchmark, lock, threads, repeat = key
+    return (
+        workload_sort_key(workload),
+        benchmark_sort_key(workload, benchmark),
+        lock_sort_key(lock),
+        threads,
+        repeat,
+    )
+
+
+def row_matches_merge_filters(
+    row: dict[str, str],
+    *,
+    workloads: set[str],
+    benchmarks: set[str],
+    locks: set[str],
+) -> bool:
+    if workloads and row["workload"].lower() not in workloads:
+        return False
+    if benchmarks and row["benchmark"].lower() not in benchmarks:
+        return False
+    if locks and experiment_defaults.normalize_lock(row["lock"]) not in locks:
+        return False
+    return True
+
+
+def merge_raw_rows(
+    base_rows: list[dict[str, str]],
+    *,
+    output_root: Path,
+    merge_roots: tuple[Path, ...],
+    workloads: tuple[str, ...],
+    benchmarks: tuple[str, ...],
+    locks: tuple[str, ...],
+) -> tuple[list[dict[str, str]], int, int]:
+    rows_by_key: dict[tuple[str, str, str, int, int], dict[str, str]] = {}
+    for row in base_rows:
+        key = merge_result_key(row)
+        if key is not None:
+            rows_by_key[key] = dict(row)
+
+    workload_filter = set(workloads)
+    benchmark_filter = set(benchmarks)
+    lock_filter = set(locks)
+    imported = 0
+    replaced = 0
+    for merge_root in merge_roots:
+        source_root = resolve_path(merge_root)
+        for row in load_raw_rows(source_root):
+            if not row_matches_merge_filters(
+                row,
+                workloads=workload_filter,
+                benchmarks=benchmark_filter,
+                locks=lock_filter,
+            ):
+                continue
+            prepared_row = prepare_merged_raw_row(row, source_root, output_root)
+            key = merge_result_key(prepared_row)
+            if key is None:
+                continue
+            if key in rows_by_key:
+                replaced += 1
+            rows_by_key[key] = prepared_row
+            imported += 1
+
+    rows = sorted(rows_by_key.values(), key=raw_row_sort_key)
+    return rows, imported, replaced
 
 
 def write_summary_csv(result_root: Path, rows: list[dict[str, str]]) -> Path:
@@ -2725,29 +2292,6 @@ def write_settings(
             "init_existing_benchmarks": list(init_existing_benchmarks(args.rocksdb_init_existing_benchmarks)),
             "extra_args": list(args.rocksdb_extra_arg),
         },
-        "memcached": {
-            "host": args.memcached_host,
-            "port": args.memcached_port,
-            "memory_mb": args.memcached_memory_mb,
-            "conn_limit": args.memcached_conn_limit,
-            "effective_conn_limits_by_thread": {
-                str(thread): memcached_conn_limit_for_thread(thread, args)
-                for thread in threads
-            },
-            "memtier_client_threads": args.memtier_client_threads,
-            "memtier_clients": args.memtier_clients,
-            "memtier_requests": args.memtier_requests,
-            "memtier_ratio": args.memtier_ratio,
-            "memtier_key_pattern": args.memtier_key_pattern,
-            "memtier_key_minimum": args.memtier_key_minimum,
-            "memtier_key_maximum": args.memtier_key_maximum,
-            "memtier_fill_enabled": not args.memtier_no_fill,
-            "memtier_fill_requests": None if args.memtier_no_fill else memtier_fill_requests(args),
-            "memtier_fill_key_pattern": args.memtier_fill_key_pattern,
-            "memtier_warmup_requests": args.memtier_warmup_requests,
-            "memtier_data_size": args.memtier_data_size,
-            "memtier_extra_args": list(args.memtier_extra_arg),
-        },
     }
     with (result_root / "settings.json").open("w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
@@ -2782,6 +2326,9 @@ def main() -> int:
         if args.resume and args.output_root is None:
             print("--resume requires --output-root.", file=sys.stderr)
             return 2
+        if args.merge_raw_root and args.plot_only is None:
+            print("--merge-raw-root requires --plot-only.", file=sys.stderr)
+            return 2
 
         workloads = validate_workloads(parse_csv_strings(args.workloads))
         rocksdb_benchmarks = validate_benchmark_names(parse_csv_strings(args.rocksdb_benchmarks))
@@ -2790,11 +2337,11 @@ def main() -> int:
             locks=None if args.locks is None else parse_csv_strings(args.locks),
         )
         threads = parse_csv_ints(args.threads)
+        merge_workloads = parse_optional_csv_strings_lower(args.merge_workloads)
+        merge_benchmarks = parse_optional_csv_strings_lower(args.merge_benchmarks)
+        merge_locks = parse_optional_merge_locks(args.merge_locks)
         validate_benchmark_names((args.rocksdb_fill_benchmark,))
         init_existing_benchmarks(args.rocksdb_init_existing_benchmarks)
-        if args.memtier_key_maximum < args.memtier_key_minimum:
-            print("--memtier-key-maximum must be greater than or equal to --memtier-key-minimum.", file=sys.stderr)
-            return 2
 
         if args.plot_only is not None:
             result_root = resolve_path(args.plot_only)
@@ -2803,6 +2350,19 @@ def main() -> int:
                 return 2
             raw_rows = load_raw_rows(result_root)
             raw_path = result_root / "raw.csv"
+            if args.merge_raw_root:
+                raw_rows, imported_rows, replaced_rows = merge_raw_rows(
+                    raw_rows,
+                    output_root=result_root,
+                    merge_roots=tuple(args.merge_raw_root),
+                    workloads=merge_workloads,
+                    benchmarks=merge_benchmarks,
+                    locks=merge_locks,
+                )
+                raw_path = write_raw_csv(result_root, raw_rows)
+                print(
+                    f"Merged raw rows: imported={imported_rows} replaced={replaced_rows} total={len(raw_rows)}"
+                )
             summary_rows = summarize_rows(raw_rows)
             summary_path = write_summary_csv(result_root, summary_rows)
             plot_paths = write_plots(result_root, summary_rows, skip_plots=args.skip_plots)
@@ -2873,20 +2433,6 @@ def main() -> int:
                 failures=failures,
                 existing_rows=raw_rows,
             )
-        if "memcached" in workloads:
-            run_memcached(
-                result_root,
-                locks=locks,
-                threads=threads,
-                repeats=args.repeats,
-                memcached_bin=binaries["memcached"],
-                memtier_bin=binaries["memtier"],
-                args=args,
-                logger=logger,
-                failures=failures,
-                existing_rows=raw_rows,
-            )
-
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)
         summary_path = write_summary_csv(result_root, summary_rows)

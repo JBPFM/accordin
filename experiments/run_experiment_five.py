@@ -34,9 +34,23 @@ DEFAULT_ROCKSDB_BENCHMARKS = ("readrandom", "fillrandom")
 DEFAULT_ROCKSDB_COMPRESSION_TYPE = "none"
 DEFAULT_ROCKSDB_EXTRA_ARGS = ("--disable_auto_compactions=true",)
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
-DEFAULT_LOCKS = experiment_defaults.DEFAULT_LOCKS
-FULL_LOCKS = experiment_defaults.FULL_LOCKS
-MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
+EXCLUDED_PROFILE_LOCKS = (experiment_defaults.ACCORDIN_TASKSET_LOCK,)
+
+
+def experiment_five_profile_locks(profile: str) -> tuple[str, ...]:
+    locks = experiment_defaults.lock_profile_locks(profile)
+    return tuple(lock for lock in locks if lock not in EXCLUDED_PROFILE_LOCKS)
+
+
+def resolve_experiment_five_locks(*, profile: str, locks: Iterable[str] | None) -> tuple[str, ...]:
+    if locks is not None:
+        return experiment_defaults.resolve_locks(profile=profile, locks=locks)
+    return experiment_five_profile_locks(profile)
+
+
+DEFAULT_LOCKS = experiment_five_profile_locks(DEFAULT_LOCK_PROFILE)
+FULL_LOCKS = experiment_five_profile_locks("full")
+MINIMAL_LOCKS = experiment_five_profile_locks("minimal")
 DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
 DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
 DEFAULT_TOTAL_OPS = 1_572_864
@@ -630,6 +644,7 @@ Default benchmark settings:
   lock-profile={DEFAULT_LOCK_PROFILE}
   minimal locks={','.join(MINIMAL_LOCKS)}
   full locks={','.join(FULL_LOCKS)}
+  excluded profile locks={','.join(EXCLUDED_PROFILE_LOCKS)}
   machine-profile={experiment_defaults.ACTIVE_MACHINE_CONFIG.name} (override with {experiment_defaults.PROFILE_ENV})
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
   repeats={DEFAULT_REPEATS}, total_ops={DEFAULT_TOTAL_OPS}
@@ -720,7 +735,8 @@ Examples:
             "Comma-separated lock keys. Overrides --lock-profile. Use stock for no interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
             "accordin == mcs_tas_accordin_admission_only, accordin_sampled, "
-            "accordin_no_admission, accordin_taskset."
+            "accordin_no_admission. mcs_tas_accordin_taskset is excluded from "
+            "experiment5 profiles; pass it explicitly only for manual oracle runs."
         ),
     )
     parser.add_argument("--threads", default=",".join(str(thread) for thread in DEFAULT_THREADS), metavar="CSV")
@@ -2332,7 +2348,7 @@ def main() -> int:
 
         workloads = validate_workloads(parse_csv_strings(args.workloads))
         rocksdb_benchmarks = validate_benchmark_names(parse_csv_strings(args.rocksdb_benchmarks))
-        locks = experiment_defaults.resolve_locks(
+        locks = resolve_experiment_five_locks(
             profile=args.lock_profile,
             locks=None if args.locks is None else parse_csv_strings(args.locks),
         )

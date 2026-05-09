@@ -135,7 +135,7 @@ LOCK_LABELS = {
     "mcs_tas_accordin_admission_only": "Admission only",
     "mcs_tas_accordin_sampled": "Admission + core budget",
     "mcs_tas_accordin_no_admission": "Core budget only",
-    "mcs_tas_accordin_taskset": "Oracle static-K Accordin",
+    "mcs_tas_accordin_taskset": "Profiled static-K Accordin",
 }
 
 LOCK_ALIASES = {
@@ -210,7 +210,7 @@ EXPERIMENT_ONE_LOCKS = (
     ExperimentOneLockConfig("Admission only", ACCORDIN_BASE_LOCK, optional=True),
     ExperimentOneLockConfig("Admission + core budget", ACCORDIN_SAMPLED_LOCK, optional=True),
     ExperimentOneLockConfig("Core budget only", ACCORDIN_NO_ADMISSION_LOCK, optional=True),
-    ExperimentOneLockConfig("Oracle static-K Accordin", ACCORDIN_TASKSET_LOCK, optional=True),
+    ExperimentOneLockConfig("Profiled static-K Accordin", ACCORDIN_TASKSET_LOCK, optional=True),
     ExperimentOneLockConfig("MCS + TSE", "mcs_extension"),
     ExperimentOneLockConfig("Malthusian", "malthusian", optional=True),
     ExperimentOneLockConfig("FlexGuard", "flexguard"),

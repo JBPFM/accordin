@@ -36,6 +36,10 @@ SUMMARY_OUTLIER_ABS_DEVIATION_PCT = 20.0
 SUMMARY_OUTLIER_MIN_ROWS = 3
 PLOT_MIN_THREADS = 4
 PLOT_EXCLUDED_LOCKS = {"mcs_extension"}
+PLOT_TITLE_FONTSIZE = 18
+PLOT_LABEL_FONTSIZE = 16
+PLOT_TICK_FONTSIZE = 13
+PLOT_LEGEND_FONTSIZE = 13
 DEFAULT_NUM = 500_000
 DEFAULT_TOTAL_OPS = 1_572_864
 DEFAULT_FILL_BENCHMARK = "fillseq"
@@ -512,7 +516,7 @@ def lock_label(lock: str) -> str:
     if lock == MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK:
         return "Core budget only"
     if lock == MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK:
-        return "Oracle static-K Accordin"
+        return "Profiled static-K Accordin"
     return experiment_defaults.lock_label(lock)
 
 
@@ -1227,7 +1231,7 @@ def filter_summary_outlier_rows(rows: list[dict[str, str]]) -> list[dict[str, st
     if not outlier_ids:
         return rows
     filtered_rows = [row for row in rows if id(row) not in outlier_ids]
-    return filtered_rows
+    return filtered_rows or rows
 
 
 def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1309,7 +1313,7 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
     if not rows:
         raise RuntimeError(f"No summary rows available for benchmark {benchmark}.")
 
-    fig, ax = plt.subplots(figsize=(9.5, 5.5))
+    fig, ax = plt.subplots(figsize=(10.5, 6.2))
     thread_values = unique_threads(summary_rows, benchmark)
     lock_keys = sorted({row["lock"] for row in rows}, key=lock_sort_key)
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
@@ -1340,14 +1344,18 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
             label=lock_label(lock),
         )
 
-    ax.set_title(f"Throughput vs Threads: {benchmark_label(benchmark)}")
-    ax.set_xlabel("Threads")
-    ax.set_ylabel("Mean throughput (ops/s, higher is better)")
+    ax.set_title(
+        f"Throughput vs Threads: {benchmark_label(benchmark)}",
+        fontsize=PLOT_TITLE_FONTSIZE,
+    )
+    ax.set_xlabel("Threads", fontsize=PLOT_LABEL_FONTSIZE)
+    ax.set_ylabel("Mean throughput (ops/s, higher is better)", fontsize=PLOT_LABEL_FONTSIZE)
     experiment_three.add_thread_axis_formatting(ax, thread_values)
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.grid(True, axis="y", alpha=0.28)
     ax.grid(True, axis="x", which="major", alpha=0.16)
-    ax.legend(frameon=False, ncol=2)
+    ax.tick_params(axis="both", labelsize=PLOT_TICK_FONTSIZE)
+    ax.legend(frameon=False, ncol=2, fontsize=PLOT_LEGEND_FONTSIZE)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)

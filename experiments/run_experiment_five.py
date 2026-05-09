@@ -35,6 +35,14 @@ DEFAULT_ROCKSDB_COMPRESSION_TYPE = "none"
 DEFAULT_ROCKSDB_EXTRA_ARGS = ("--disable_auto_compactions=true",)
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 EXCLUDED_PROFILE_LOCKS = (experiment_defaults.ACCORDIN_TASKSET_LOCK,)
+ACCORDIN_PLOT_COLOR_KEY = "accordin"
+ACCORDIN_PLOT_COLOR = "#607D8B"
+ACCORDIN_PLOT_LINESTYLES = {
+    experiment_defaults.ACCORDIN_BASE_LOCK: "-",
+    experiment_defaults.ACCORDIN_SAMPLED_LOCK: "--",
+    experiment_defaults.ACCORDIN_NO_ADMISSION_LOCK: ":",
+    experiment_defaults.ACCORDIN_TASKSET_LOCK: "-.",
+}
 
 
 def experiment_five_profile_locks(profile: str) -> tuple[str, ...]:
@@ -822,6 +830,32 @@ def init_existing_benchmarks(value: str) -> tuple[str, ...]:
 
 def lock_label(lock: str) -> str:
     return experiment_defaults.lock_label(lock)
+
+
+def lock_plot_color_key(lock: str) -> str:
+    normalized = experiment_defaults.normalize_lock(lock)
+    if experiment_defaults.is_accordin_lock(normalized):
+        return ACCORDIN_PLOT_COLOR_KEY
+    return lock
+
+
+def lock_plot_linestyle(lock: str) -> str:
+    normalized = experiment_defaults.normalize_lock(lock)
+    return ACCORDIN_PLOT_LINESTYLES.get(normalized, "-")
+
+
+def plot_color_map(lock_keys: Iterable[str], fallback_colors: list[str]) -> dict[str, str]:
+    color_keys = tuple(dict.fromkeys(lock_plot_color_key(lock) for lock in lock_keys))
+    colors = fallback_colors or ["C0"]
+    color_by_key: dict[str, str] = {}
+    color_index = 0
+    for color_key in color_keys:
+        if color_key == ACCORDIN_PLOT_COLOR_KEY:
+            color_by_key[color_key] = ACCORDIN_PLOT_COLOR
+            continue
+        color_by_key[color_key] = colors[color_index % len(colors)]
+        color_index += 1
+    return color_by_key
 
 
 def workload_label(workload: str, benchmark: str) -> str:
@@ -2216,6 +2250,8 @@ def plot_ops(
     fig, ax = plt.subplots(figsize=(9.5, 5.5))
     thread_values = unique_threads(summary_rows, workload, benchmark)
     lock_keys = sorted({row["lock"] for row in rows}, key=lock_sort_key)
+    fallback_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
+    color_by_key = plot_color_map(lock_keys, fallback_colors)
     for lock in lock_keys:
         points = [
             (int(row["threads"]), float(row["mean_ops_per_second"]))
@@ -2231,6 +2267,8 @@ def plot_ops(
             marker="o",
             linewidth=1.8,
             markersize=4,
+            color=color_by_key[lock_plot_color_key(lock)],
+            linestyle=lock_plot_linestyle(lock),
             label=lock_label(lock),
         )
 

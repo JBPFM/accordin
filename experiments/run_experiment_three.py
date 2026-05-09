@@ -31,6 +31,7 @@ DEFAULT_WARMUP_DURATION_MS = 1000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 21600
 DEFAULT_OUTPUT_ROOT_PARENT = REPO_ROOT / "experiments" / "results"
 DEFAULT_OUTPUT_ROOT_STEM = "experiment3_mutexbench_results_baseline"
+_PLOT_STYLE_MODULE = None
 ACCORDIN_DIRECT_PACKAGE = "mcs_tas_accordin_direct"
 ACCORDIN_DIRECT_LOCK_KIND = "mcs_tas_accordin_direct"
 ACCORDIN_DIRECT_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
@@ -70,6 +71,46 @@ LOCK_PRESENCE_ALIASES = {
         "accordin",
     ),
 }
+
+
+def experiment_three_plot_styles():
+    global _PLOT_STYLE_MODULE
+    if _PLOT_STYLE_MODULE is None:
+        scripts_dir = str(MUTEXBENCH_DIR / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import plot_throughput_by_ratio
+
+        _PLOT_STYLE_MODULE = plot_throughput_by_ratio
+    return _PLOT_STYLE_MODULE
+
+
+def accordin_plot_color() -> str:
+    return experiment_three_plot_styles().ACCORDIN_COLOR
+
+
+def plot_color(lock: str, fallback: str = "C0") -> str:
+    return experiment_three_plot_styles().lock_color(lock, fallback)
+
+
+def plot_linestyle(lock: str) -> str:
+    return experiment_three_plot_styles().lock_linestyle(lock)
+
+
+def plot_marker(lock: str, fallback: str = "o") -> str:
+    return experiment_three_plot_styles().lock_marker(lock, fallback)
+
+
+def is_accordin_plot_lock(lock: str) -> bool:
+    return lock in experiment_three_plot_styles().ACCORDIN_LOCKS
+
+
+def accordin_plot_linestyle(lock: str) -> str:
+    return plot_linestyle(lock)
+
+
+def accordin_plot_marker(lock: str) -> str:
+    return plot_marker(lock)
 
 
 @dataclass(frozen=True)

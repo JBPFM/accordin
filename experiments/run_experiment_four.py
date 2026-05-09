@@ -79,13 +79,12 @@ LEVELDB_ACCORDIN_DIRECT_ADMISSION_DISABLED_LOCKS = (
     MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
 )
 LEVELDB_ACCORDIN_DIRECT_TASKSET_LOCKS = (MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,)
-LEVELDB_ACCORDIN_DIRECT_LINESTYLES = {
-    MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK: "-",
-    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK: "--",
-    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK: ":",
-    MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK: "-.",
+LEVELDB_ACCORDIN_DIRECT_STYLE_LOCKS = {
+    MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK: experiment_defaults.ACCORDIN_BASE_LOCK,
+    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK: experiment_defaults.ACCORDIN_SAMPLED_LOCK,
+    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK: experiment_defaults.ACCORDIN_NO_ADMISSION_LOCK,
+    MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK: experiment_defaults.ACCORDIN_TASKSET_LOCK,
 }
-ACCORDIN_PLOT_COLOR_KEY = "accordin"
 LEVELDB_ACCORDIN_DIRECT_ALIAS_TARGETS = {
     experiment_defaults.ACCORDIN_BASE_LOCK: MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
     "accordin": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
@@ -521,17 +520,20 @@ def lock_label(lock: str) -> str:
 
 
 def lock_plot_color_key(lock: str) -> str:
+    return lock_plot_style_key(lock)
+
+
+def lock_plot_style_key(lock: str) -> str:
     effective_lock = normalize_leveldb_lock(lock)
-    if effective_lock in LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS:
-        return ACCORDIN_PLOT_COLOR_KEY
-    return effective_lock
+    return LEVELDB_ACCORDIN_DIRECT_STYLE_LOCKS.get(effective_lock, effective_lock)
 
 
 def lock_plot_style(lock: str, color_by_key: dict[str, str]) -> dict[str, str]:
-    effective_lock = normalize_leveldb_lock(lock)
+    style_lock = lock_plot_style_key(lock)
     return {
-        "color": color_by_key[lock_plot_color_key(effective_lock)],
-        "linestyle": LEVELDB_ACCORDIN_DIRECT_LINESTYLES.get(effective_lock, "-"),
+        "color": experiment_three.plot_color(style_lock, color_by_key[style_lock]),
+        "linestyle": experiment_three.plot_linestyle(style_lock),
+        "marker": experiment_three.plot_marker(style_lock),
     }
 
 
@@ -1316,7 +1318,7 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
     fig, ax = plt.subplots(figsize=(10.5, 6.2))
     thread_values = unique_threads(summary_rows, benchmark)
     lock_keys = sorted({row["lock"] for row in rows}, key=lock_sort_key)
-    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"]) or ["C0"]
     color_keys = list(dict.fromkeys(lock_plot_color_key(lock) for lock in lock_keys))
     color_by_key = {
         key: colors[index % len(colors)]
@@ -1336,11 +1338,13 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
         ax.plot(
             [thread for thread, _ in points],
             [value for _, value in points],
-            marker="o",
+            marker=style["marker"],
             color=style["color"],
             linestyle=style["linestyle"],
             linewidth=1.8,
             markersize=4,
+            markerfacecolor="white",
+            markeredgewidth=1.4,
             label=lock_label(lock),
         )
 

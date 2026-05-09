@@ -35,16 +35,6 @@ DEFAULT_ROCKSDB_COMPRESSION_TYPE = "none"
 DEFAULT_ROCKSDB_EXTRA_ARGS = ("--disable_auto_compactions=true",)
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 EXCLUDED_PROFILE_LOCKS = (experiment_defaults.ACCORDIN_TASKSET_LOCK,)
-ACCORDIN_PLOT_COLOR_KEY = "accordin"
-ACCORDIN_PLOT_COLOR = "#607D8B"
-ACCORDIN_PLOT_LINESTYLES = {
-    experiment_defaults.ACCORDIN_BASE_LOCK: "-",
-    experiment_defaults.ACCORDIN_SAMPLED_LOCK: "--",
-    experiment_defaults.ACCORDIN_NO_ADMISSION_LOCK: ":",
-    experiment_defaults.ACCORDIN_TASKSET_LOCK: "-.",
-}
-
-
 def experiment_five_profile_locks(profile: str) -> tuple[str, ...]:
     locks = experiment_defaults.lock_profile_locks(profile)
     return tuple(lock for lock in locks if lock not in EXCLUDED_PROFILE_LOCKS)
@@ -833,15 +823,24 @@ def lock_label(lock: str) -> str:
 
 
 def lock_plot_color_key(lock: str) -> str:
-    normalized = experiment_defaults.normalize_lock(lock)
-    if experiment_defaults.is_accordin_lock(normalized):
-        return ACCORDIN_PLOT_COLOR_KEY
-    return lock
+    return lock_plot_style_key(lock)
+
+
+def lock_plot_style_key(lock: str) -> str:
+    return experiment_defaults.normalize_lock(lock)
 
 
 def lock_plot_linestyle(lock: str) -> str:
-    normalized = experiment_defaults.normalize_lock(lock)
-    return ACCORDIN_PLOT_LINESTYLES.get(normalized, "-")
+    return experiment_three.plot_linestyle(lock_plot_style_key(lock))
+
+
+def lock_plot_marker(lock: str) -> str:
+    return experiment_three.plot_marker(lock_plot_style_key(lock))
+
+
+def lock_plot_color(lock: str, color_by_key: dict[str, str]) -> str:
+    style_key = lock_plot_style_key(lock)
+    return experiment_three.plot_color(style_key, color_by_key[style_key])
 
 
 def plot_color_map(lock_keys: Iterable[str], fallback_colors: list[str]) -> dict[str, str]:
@@ -850,9 +849,6 @@ def plot_color_map(lock_keys: Iterable[str], fallback_colors: list[str]) -> dict
     color_by_key: dict[str, str] = {}
     color_index = 0
     for color_key in color_keys:
-        if color_key == ACCORDIN_PLOT_COLOR_KEY:
-            color_by_key[color_key] = ACCORDIN_PLOT_COLOR
-            continue
         color_by_key[color_key] = colors[color_index % len(colors)]
         color_index += 1
     return color_by_key
@@ -2264,10 +2260,12 @@ def plot_ops(
         ax.plot(
             [thread for thread, _ in points],
             [value for _, value in points],
-            marker="o",
+            marker=lock_plot_marker(lock),
             linewidth=1.8,
             markersize=4,
-            color=color_by_key[lock_plot_color_key(lock)],
+            markerfacecolor="white",
+            markeredgewidth=1.4,
+            color=lock_plot_color(lock, color_by_key),
             linestyle=lock_plot_linestyle(lock),
             label=lock_label(lock),
         )

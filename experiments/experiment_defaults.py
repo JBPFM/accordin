@@ -62,14 +62,18 @@ def _cpu_list_count(cpu_list: str) -> int:
 
 DEFAULT_ACCORDIN_CONCURRENCY = _cpu_list_count(DEFAULT_MCS_ACCORDIN_TASKSET_CPUS)
 
-FULL_LOCKS = (
+BASELINE_LOCKS = (
+    "mutex",
     "mcs",
-    "mcstp",
-    "mcs-tas",
     "mcs_extension",
-    "flexguard",
-    "malthusian",
     "reciprocating",
+    "flexguard",
+    "cna",
+    "gcr",
+)
+OTHERLOCKS_INTERPOSE_LOCKS = ("cna", "gcr")
+FULL_LOCKS = (
+    *BASELINE_LOCKS,
     *ACCORDIN_VARIANT_LOCKS,
 )
 MINIMAL_LOCKS = ACCORDIN_VARIANT_LOCKS
@@ -111,15 +115,16 @@ EXPERIMENT_ONE_SUPPLEMENT_DEFAULT_LOCKS = ("reciprocating", "malthusian")
 
 SINGLE_OVERSUBSCRIBED_LOCKS = (
     "mcs",
-    "mcstp",
     "mcs_extension",
-    "malthusian",
     "reciprocating",
+    "cna",
+    "gcr",
 )
 
 LOCK_LABELS = {
     "stock": "Stock",
     "mutex": "Mutex",
+    "pthread": "Mutex",
     "mcs": "MCS",
     "mcstp": "MCS-TP",
     "mcs-tas": "MCS-TAS",
@@ -130,6 +135,8 @@ LOCK_LABELS = {
     "flexguard": "FlexGuard",
     "malthusian": "Malthusian",
     "reciprocating": "Reciprocating",
+    "cna": "CNA",
+    "gcr": "GCR",
     "accordin": "Admission only",
     "mcs_accordin": "Admission only",
     "mcs_tas_accordin": "Admission only",
@@ -160,7 +167,11 @@ LOCK_ALIASES = {
     "mcs-extension": "mcs_extension",
     "mcs-tse": "mcs_extension",
     "mcs_tse": "mcs_extension",
-    "stock": "stock",
+    "mutex": "mutex",
+    "pthread": "mutex",
+    "stock": "mutex",
+    "cna": "cna",
+    "gcr": "gcr",
 }
 
 EXPERIMENT_TWO_LOCK_ALIASES = {
@@ -174,18 +185,20 @@ EXPERIMENT_TWO_LOCK_ALIASES = {
 }
 
 LOCK_ORDER = (
-    "stock",
     "mutex",
+    "stock",
     "mcs",
-    "mcstp",
     "mcs-tas",
     "mcs_tas",
     "mcstas",
     "mcs_tse",
     "mcs_extension",
-    "flexguard",
-    "malthusian",
     "reciprocating",
+    "flexguard",
+    "cna",
+    "gcr",
+    "mcstp",
+    "malthusian",
     "mcs_tas_accordin_admission_only",
     "mcs_tas_accordin",
     "mcs_tas_accordin_sampled",
@@ -313,6 +326,10 @@ def accordin_disables_admission(lock: str) -> bool:
 
 def accordin_uses_taskset(lock: str) -> bool:
     return lock in ACCORDIN_TASKSET_LOCKS
+
+
+def is_otherlocks_interpose_lock(lock: str) -> bool:
+    return lock in OTHERLOCKS_INTERPOSE_LOCKS
 
 
 def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:

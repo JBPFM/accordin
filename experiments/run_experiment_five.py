@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
-import hashlib
 import json
 import math
 import os
@@ -12,7 +11,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Iterable
@@ -26,13 +24,8 @@ REPO_ROOT = experiment_three.REPO_ROOT
 FLEXGUARD_DIR = experiment_three.FLEXGUARD_DIR
 DEFAULT_CACHELIB_DIR = REPO_ROOT / "third_party" / "CacheLib"
 DEFAULT_CACHELIB_LIBURING_PREFIX = REPO_ROOT / ".cache" / "experiment5_liburing"
-DEFAULT_ROCKSDB_DIR = REPO_ROOT / "third_party" / "rocksdb"
-ROCKSDB_GIT_URL = "https://github.com/facebook/rocksdb.git"
 
-DEFAULT_WORKLOADS = ("cachebench", "rocksdb")
-DEFAULT_ROCKSDB_BENCHMARKS = ("readrandom", "fillrandom")
-DEFAULT_ROCKSDB_COMPRESSION_TYPE = "none"
-DEFAULT_ROCKSDB_EXTRA_ARGS = ("--disable_auto_compactions=true",)
+DEFAULT_WORKLOADS = ("cachebench",)
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 EXCLUDED_PROFILE_LOCKS = (experiment_defaults.ACCORDIN_TASKSET_LOCK,)
 def experiment_five_profile_locks(profile: str) -> tuple[str, ...]:
@@ -53,8 +46,6 @@ FULL_LOCKS = experiment_five_profile_locks("full")
 MINIMAL_LOCKS = experiment_five_profile_locks("minimal")
 DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
 DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
-DEFAULT_TOTAL_OPS = 1_572_864
-DEFAULT_DB_NUM = 500_000
 DEFAULT_CACHEBENCH_NUM_OPS = 500_000
 DEFAULT_CACHEBENCH_NUM_KEYS = 1_000_000
 DEFAULT_CACHEBENCH_CACHE_MB = 512
@@ -123,11 +114,6 @@ REPEAT_OUTLIER_CV_THRESHOLD_PERCENT = 15.0
 REPEAT_OUTLIER_MAX_MIN_RATIO_THRESHOLD = 2.0
 LOCAL_SHAPE_RATIO_THRESHOLD = 2.0
 
-DB_BENCH_LATENCY_PATTERN = re.compile(
-    r"^(?P<name>[A-Za-z0-9_]+)\s+:\s+(?P<micros>\d+(?:\.\d+)?)\s+micros/op"
-    r"(?:\s+(?P<ops>\d+(?:\.\d+)?)\s+ops/sec)?",
-    re.MULTILINE,
-)
 OPS_PATTERNS = (
     re.compile(r"(?i)\bops/sec(?:ond)?\b\s*[:=]?\s*(?P<value>\d+(?:\.\d+)?)"),
     re.compile(r"(?i)\bqps\b\s*[:=]?\s*(?P<value>\d+(?:\.\d+)?)"),
@@ -137,7 +123,6 @@ CACHEBENCH_THROUGHPUT_PATTERN = re.compile(
     r"^\s*(?:get|set|del|couldExist)\s*:\s*(?P<value>\d[\d,]*(?:\.\d+)?)/s\b",
     re.MULTILINE,
 )
-BENCHMARK_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def positive_int(value: str) -> int:
@@ -194,13 +179,6 @@ def validate_workloads(workloads: tuple[str, ...]) -> tuple[str, ...]:
     if unsupported:
         raise ValueError(f"Unsupported workloads: {', '.join(unsupported)}. Supported: {', '.join(DEFAULT_WORKLOADS)}")
     return normalized
-
-
-def validate_benchmark_names(benchmarks: tuple[str, ...]) -> tuple[str, ...]:
-    invalid = [benchmark for benchmark in benchmarks if BENCHMARK_NAME_PATTERN.fullmatch(benchmark) is None]
-    if invalid:
-        raise ValueError(f"Unsupported benchmark names: {', '.join(invalid)}")
-    return benchmarks
 
 
 def configured_executable_path(value: Path | None, env_name: str, binary_name: str) -> Path | None:
@@ -550,93 +528,9 @@ def ensure_cachebench_bin(
     return rebuilt
 
 
-def default_rocksdb_dir() -> Path:
-    env_value = os.environ.get("ROCKSDB_HOME")
-    if env_value:
-        return resolve_path(Path(env_value))
-
-    candidates = (
-        DEFAULT_ROCKSDB_DIR,
-        Path("/home/jz/Projects/tests/rocksdb"),
-    )
-    for candidate in candidates:
-        if (candidate / "CMakeLists.txt").is_file() or (candidate / "Makefile").is_file():
-            return candidate.resolve()
-    return candidates[0].resolve()
-
-
-def rocksdb_source_is_available(rocksdb_dir: Path) -> bool:
-    return (
-        (rocksdb_dir / "CMakeLists.txt").is_file()
-        and (
-            (rocksdb_dir / "tools" / "db_bench_tool.cc").is_file()
-            or (rocksdb_dir / "tools" / "db_bench.cc").is_file()
-        )
-    )
-
-
-def ensure_rocksdb_source(
-    rocksdb_dir: Path,
-    *,
-    build_missing: bool,
-    logger: experiment_three.CommandLogger,
-) -> None:
-    if rocksdb_source_is_available(rocksdb_dir):
-        return
-    if not build_missing:
-        raise RuntimeError(
-            f"RocksDB source directory is missing or incomplete: {rocksdb_dir}. "
-            "Rerun with --build-missing or set ROCKSDB_HOME/--rocksdb-dir."
-        )
-    if rocksdb_dir != DEFAULT_ROCKSDB_DIR.resolve():
-        raise RuntimeError(f"Cannot initialize a custom RocksDB source directory: {rocksdb_dir}")
-
-    rocksdb_dir.parent.mkdir(parents=True, exist_ok=True)
-    logger.run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            ROCKSDB_GIT_URL,
-            str(DEFAULT_ROCKSDB_DIR.relative_to(REPO_ROOT)),
-        ],
-        log_name="init_rocksdb_source.log",
-        cwd=REPO_ROOT,
-        timeout_seconds=0,
-    )
-    if not rocksdb_source_is_available(rocksdb_dir):
-        raise RuntimeError(f"RocksDB source directory is still unavailable after clone: {rocksdb_dir}")
-
-
-def accordin_rocksdb_build_dir(rocksdb_dir: Path) -> Path:
-    digest = hashlib.sha1(str(rocksdb_dir.resolve()).encode("utf-8")).hexdigest()[:12]
-    return REPO_ROOT / ".cache" / "rocksdb_db_bench" / digest
-
-
-def default_rocksdb_db_bench(rocksdb_dir: Path) -> Path | None:
-    env_value = os.environ.get("ROCKSDB_DB_BENCH")
-    if env_value:
-        return resolve_path(Path(env_value))
-
-    accordin_build_dir = accordin_rocksdb_build_dir(rocksdb_dir)
-    for candidate in (
-        rocksdb_dir / "db_bench",
-        rocksdb_dir / "build" / "db_bench",
-        rocksdb_dir / "build" / "tools" / "db_bench",
-        accordin_build_dir / "db_bench",
-        accordin_build_dir / "tools" / "db_bench",
-    ):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate.resolve()
-
-    found = shutil.which("db_bench")
-    return Path(found).resolve() if found is not None else None
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run or plot external workload lock sweeps: CacheBench and RocksDB db_bench.",
+        description="Run or plot the external CacheBench lock sweep.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""\
 Default benchmark settings:
@@ -647,15 +541,13 @@ Default benchmark settings:
   excluded profile locks={','.join(EXCLUDED_PROFILE_LOCKS)}
   machine-profile={experiment_defaults.ACTIVE_MACHINE_CONFIG.name} (override with {experiment_defaults.PROFILE_ENV})
   threads={','.join(str(thread) for thread in DEFAULT_THREADS)}
-  repeats={DEFAULT_REPEATS}, total_ops={DEFAULT_TOTAL_OPS}
+  repeats={DEFAULT_REPEATS}
   cachebench_pool_rebalance_interval_sec={DEFAULT_CACHEBENCH_POOL_REBALANCE_INTERVAL_SEC}
-  rocksdb_benchmarks={','.join(DEFAULT_ROCKSDB_BENCHMARKS)}
-  rocksdb_extra_args={' '.join(DEFAULT_ROCKSDB_EXTRA_ARGS)}
   per_lock_max_threads={','.join(f"{lock}:{max_threads}" for lock, max_threads in PER_LOCK_MAX_THREADS.items())}
 
 Examples:
-  python3 experiments/run_experiment_five.py --workloads rocksdb --locks stock --threads 1 --repeats 1 --rocksdb-benchmarks fillrandom --total-ops 1000
-  python3 experiments/run_experiment_five.py --workloads cachebench,rocksdb --build-missing
+  python3 experiments/run_experiment_five.py --workloads cachebench --locks mutex --threads 1 --repeats 1 --cachebench-num-ops 1000
+  python3 experiments/run_experiment_five.py --workloads cachebench --build-missing
   python3 experiments/run_experiment_five.py --workloads cachebench --cachebench-config /path/to/config.json
   python3 experiments/run_experiment_five.py --plot-only experiments/results/experiment5_manual
   python3 experiments/run_experiment_five.py --plot-only experiments/results/experiment5_manual --merge-raw-root experiments/results/experiment5_partial --merge-workloads cachebench
@@ -704,7 +596,7 @@ Examples:
     parser.add_argument(
         "--build-missing",
         action="store_true",
-        help="Build/install missing lock helpers, CacheBench, or RocksDB db_bench where possible.",
+        help="Build/install missing lock helpers or CacheBench where possible.",
     )
     parser.add_argument("--skip-plots", action="store_true", help="Write CSVs but skip PNG generation.")
     parser.add_argument(
@@ -712,11 +604,11 @@ Examples:
         type=non_negative_int,
         default=DEFAULT_COMMAND_TIMEOUT_SECONDS,
         help=(
-            "Outer timeout for each non-CacheBench workload command. 0 disables it. "
+            "Default timeout for helper/build commands. 0 disables it. "
             f"Default: {DEFAULT_COMMAND_TIMEOUT_SECONDS}."
         ),
     )
-    parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS), metavar="CSV", help="cachebench,rocksdb.")
+    parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS), metavar="CSV", help="cachebench.")
     parser.add_argument(
         "--lock-profile",
         choices=experiment_defaults.lock_profile_names(),
@@ -732,7 +624,7 @@ Examples:
         default=None,
         metavar="CSV",
         help=(
-            "Comma-separated lock keys. Overrides --lock-profile. Use stock for no interpose. "
+            "Comma-separated lock keys. Overrides --lock-profile. Use mutex for no interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
             "accordin == mcs_tas_accordin_admission_only, accordin_sampled, "
             "accordin_no_admission. mcs_tas_accordin_taskset is excluded from "
@@ -741,8 +633,6 @@ Examples:
     )
     parser.add_argument("--threads", default=",".join(str(thread) for thread in DEFAULT_THREADS), metavar="CSV")
     parser.add_argument("--repeats", type=positive_int, default=DEFAULT_REPEATS)
-    parser.add_argument("--total-ops", type=positive_int, default=DEFAULT_TOTAL_OPS)
-    parser.add_argument("--db-num", type=positive_int, default=DEFAULT_DB_NUM, help="RocksDB keyspace/DB size.")
 
     parser.add_argument(
         "--cachebench-bin",
@@ -786,38 +676,7 @@ Examples:
         ),
     )
     parser.add_argument("--cachebench-extra-arg", action="append", default=[], help="Extra argument passed through to cachebench; repeatable.")
-
-    parser.add_argument("--rocksdb-dir", type=Path, default=None, help="RocksDB source/build directory. Default: ROCKSDB_HOME or local probe.")
-    parser.add_argument("--rocksdb-db-bench", type=Path, default=None, help="Path to RocksDB db_bench. Default: ROCKSDB_DB_BENCH, rocksdb build paths, or PATH.")
-    parser.add_argument("--rocksdb-benchmarks", default=",".join(DEFAULT_ROCKSDB_BENCHMARKS), metavar="CSV")
-    parser.add_argument("--rocksdb-fill-benchmark", default="fillrandom")
-    parser.add_argument(
-        "--rocksdb-compression-type",
-        default=DEFAULT_ROCKSDB_COMPRESSION_TYPE,
-        help="Passed to db_bench as --compression_type when non-empty. Default: none.",
-    )
-    parser.add_argument(
-        "--rocksdb-progress-reports",
-        action="store_true",
-        help="Allow db_bench progress output. Default: disabled to keep long experiment logs manageable.",
-    )
-    parser.add_argument("--rocksdb-init-existing-benchmarks", default="readrandom,readseq,seekrandom,overwrite", metavar="CSV")
-    parser.add_argument(
-        "--rocksdb-extra-arg",
-        action="append",
-        default=list(DEFAULT_ROCKSDB_EXTRA_ARGS),
-        help=(
-            "Extra argument passed through to db_bench; repeatable. "
-            f"Default: {' '.join(DEFAULT_ROCKSDB_EXTRA_ARGS)}."
-        ),
-    )
     return parser.parse_args()
-
-
-def init_existing_benchmarks(value: str) -> tuple[str, ...]:
-    if value.strip().lower() in {"", "none"}:
-        return ()
-    return validate_benchmark_names(parse_csv_strings(value))
 
 
 def lock_label(lock: str) -> str:
@@ -859,8 +718,6 @@ def plot_color_map(lock_keys: Iterable[str], fallback_colors: list[str]) -> dict
 def workload_label(workload: str, benchmark: str) -> str:
     if workload == "cachebench":
         return "CacheLib CacheBench"
-    if workload == "rocksdb":
-        return f"RocksDB {benchmark}"
     return benchmark
 
 
@@ -875,9 +732,9 @@ def workload_sort_key(workload: str) -> tuple[int, str]:
 
 
 def benchmark_sort_key(workload: str, benchmark: str) -> tuple[int, str]:
-    if workload == "rocksdb" and benchmark in DEFAULT_ROCKSDB_BENCHMARKS:
-        return (DEFAULT_ROCKSDB_BENCHMARKS.index(benchmark), benchmark)
-    return (len(DEFAULT_ROCKSDB_BENCHMARKS), benchmark)
+    if workload == "cachebench" and benchmark == "cachebench":
+        return (0, benchmark)
+    return (1, benchmark)
 
 
 def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:
@@ -892,7 +749,7 @@ def per_lock_max_threads_for_settings(
 
 
 def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None] | None]:
-    if lock in {"stock", "mutex"}:
+    if experiment_three.is_native_mutex_lock(lock):
         return [], None
     if experiment_defaults.is_accordin_lock(lock):
         return experiment_three.accordin_command_prefix(lock)
@@ -915,7 +772,7 @@ def build_lock_command(
     *,
     extra_env: dict[str, str | None] | None = None,
 ) -> tuple[list[str], dict[str, str | None] | None]:
-    if lock in {"stock", "mutex"}:
+    if experiment_three.is_native_mutex_lock(lock):
         return command, extra_env
     if experiment_defaults.is_accordin_lock(lock):
         prefix, accordin_env = experiment_three.accordin_command_prefix(lock)
@@ -945,92 +802,6 @@ def ensure_lock_helpers(
         experiment_three.ensure_mcs_extension_preload(build_missing=build_missing, logger=logger)
 
 
-def ensure_rocksdb_db_bench(
-    db_bench: Path | None,
-    *,
-    rocksdb_dir: Path,
-    build_missing: bool,
-    logger: experiment_three.CommandLogger,
-) -> Path:
-    if db_bench is not None and db_bench.is_file() and os.access(db_bench, os.X_OK):
-        return db_bench
-    if not build_missing:
-        target = db_bench if db_bench is not None else rocksdb_dir / "db_bench"
-        raise RuntimeError(f"RocksDB db_bench is missing or not executable: {target}. Rerun with --build-missing.")
-    ensure_rocksdb_source(rocksdb_dir, build_missing=build_missing, logger=logger)
-
-    existing_build_dir = rocksdb_dir / "build"
-    if cmake_build_dir_matches_source(existing_build_dir, rocksdb_dir):
-        logger.run(
-            ["cmake", "--build", str(existing_build_dir), "--target", "db_bench", "--parallel"],
-            log_name="build_rocksdb_db_bench.log",
-            cwd=rocksdb_dir,
-            timeout_seconds=0,
-        )
-    else:
-        build_dir = accordin_rocksdb_build_dir(rocksdb_dir)
-        logger.run(
-            [
-                "cmake",
-                "-S",
-                str(rocksdb_dir),
-                "-B",
-                str(build_dir),
-                "-DCMAKE_BUILD_TYPE=Release",
-                "-DFAIL_ON_WARNINGS=OFF",
-                "-DWITH_BENCHMARK_TOOLS=ON",
-                "-DWITH_CORE_TOOLS=OFF",
-                "-DWITH_TOOLS=OFF",
-                "-DWITH_TRACE_TOOLS=OFF",
-                "-DWITH_TESTS=OFF",
-                "-DWITH_JEMALLOC=OFF",
-                "-DWITH_LIBURING=OFF",
-                "-DWITH_SNAPPY=OFF",
-                "-DWITH_LZ4=OFF",
-                "-DWITH_ZLIB=OFF",
-                "-DWITH_ZSTD=OFF",
-                "-DWITH_BZ2=OFF",
-            ],
-            log_name="configure_rocksdb_db_bench.log",
-            cwd=REPO_ROOT,
-            timeout_seconds=0,
-        )
-        logger.run(
-            [
-                "cmake",
-                "--build",
-                str(build_dir),
-                "--target",
-                "db_bench",
-                "--parallel",
-            ],
-            log_name="build_rocksdb_db_bench.log",
-            cwd=REPO_ROOT,
-            timeout_seconds=0,
-        )
-
-    rebuilt = default_rocksdb_db_bench(rocksdb_dir)
-    if rebuilt is None or not rebuilt.is_file() or not os.access(rebuilt, os.X_OK):
-        raise RuntimeError(f"RocksDB db_bench is still unavailable after build under {rocksdb_dir}")
-    return rebuilt
-
-
-def cmake_build_dir_matches_source(build_dir: Path, source_dir: Path) -> bool:
-    cache_path = build_dir / "CMakeCache.txt"
-    if not cache_path.is_file():
-        return False
-    expected = source_dir.resolve()
-    try:
-        for line in cache_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL="):
-                continue
-            configured = Path(line.split("=", 1)[1]).expanduser().resolve()
-            return configured == expected
-    except OSError:
-        return False
-    return False
-
-
 def ensure_required_binaries(
     workloads: tuple[str, ...],
     *,
@@ -1048,20 +819,6 @@ def ensure_required_binaries(
             build_missing=args.build_missing,
             logger=logger,
         )
-    if "rocksdb" in workloads:
-        rocksdb_dir = resolve_path(args.rocksdb_dir) if args.rocksdb_dir is not None else default_rocksdb_dir()
-        db_bench = (
-            resolve_path(args.rocksdb_db_bench)
-            if args.rocksdb_db_bench is not None
-            else default_rocksdb_db_bench(rocksdb_dir)
-        )
-        binaries["rocksdb_dir"] = rocksdb_dir
-        binaries["rocksdb_db_bench"] = ensure_rocksdb_db_bench(
-            db_bench,
-            rocksdb_dir=rocksdb_dir,
-            build_missing=args.build_missing,
-            logger=logger,
-        )
     return binaries
 
 
@@ -1075,26 +832,8 @@ def relative_log(result_root: Path, path: Path | None) -> str:
     return str(path.relative_to(result_root))
 
 
-def ceil_div(numerator: int, denominator: int) -> int:
-    return -(-numerator // denominator)
-
-
 def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
-
-
-def parse_db_bench_output(output: str, benchmark: str) -> tuple[float | None, float | None]:
-    fallback_latency: float | None = None
-    fallback_ops: float | None = None
-    for match in DB_BENCH_LATENCY_PATTERN.finditer(output):
-        latency = float(match.group("micros"))
-        ops = float(match.group("ops")) if match.group("ops") is not None else None
-        if match.group("name") == benchmark:
-            return latency, ops
-        if fallback_latency is None:
-            fallback_latency = latency
-            fallback_ops = ops
-    return fallback_latency, fallback_ops
 
 
 def parse_generic_ops_per_second(output: str) -> float | None:
@@ -1233,7 +972,6 @@ def result_key(row: dict[str, str]) -> tuple[str, str, str, int, int] | None:
 def target_keys(
     *,
     workloads: tuple[str, ...],
-    rocksdb_benchmarks: tuple[str, ...],
     locks: tuple[str, ...],
     threads: tuple[int, ...],
     repeats: int,
@@ -1242,8 +980,6 @@ def target_keys(
     for workload in workloads:
         if workload == "cachebench":
             benchmarks = ("cachebench",)
-        elif workload == "rocksdb":
-            benchmarks = rocksdb_benchmarks
         else:
             continue
         for benchmark in benchmarks:
@@ -1276,12 +1012,6 @@ def completed_keys_from_rows(rows: list[dict[str, str]]) -> set[tuple[str, str, 
     return keys
 
 
-def rocksdb_effective_total_ops(benchmark: str, thread: int, args: argparse.Namespace) -> int:
-    if benchmark.startswith("read") or benchmark.startswith("seek"):
-        return ceil_div(args.total_ops, thread) * thread
-    return ceil_div(args.total_ops, thread) * thread
-
-
 def completed_rows_from_records(
     result_root: Path,
     records: list[dict[str, object]],
@@ -1289,7 +1019,6 @@ def completed_rows_from_records(
     args: argparse.Namespace,
 ) -> list[dict[str, str]]:
     records_by_log = successful_records_by_log_name(records)
-    init_benchmarks = set(init_existing_benchmarks(args.rocksdb_init_existing_benchmarks))
     rows: list[dict[str, str]] = []
 
     for workload, benchmark, lock, thread, repeat in ordered_targets:
@@ -1317,47 +1046,6 @@ def completed_rows_from_records(
                     "total_ops": str(args.cachebench_num_ops),
                     "command_log": relative_log(result_root, log_path),
                     "setup_log": "",
-                    "server_log": "",
-                }
-            )
-        elif workload == "rocksdb":
-            log_name = f"rocksdb_{safe_name(benchmark)}_{safe_name(lock)}_{thread:03d}_r{repeat}.log"
-            completed = records_by_log.get(log_name)
-            if completed is None:
-                continue
-            record, output, log_path = completed
-            setup_completed = None
-            if benchmark in init_benchmarks:
-                setup_log_name = f"init_rocksdb_{safe_name(benchmark)}_{safe_name(lock)}_{thread:03d}_r{repeat}.log"
-                setup_completed = records_by_log.get(setup_log_name)
-            wall_seconds = record_wall_seconds(record, output)
-            latency, parsed_ops = parse_db_bench_output(output, benchmark)
-            ops_per_second = parsed_ops
-            if ops_per_second is None and latency is not None and latency > 0.0:
-                ops_per_second = 1_000_000.0 / latency
-            total_ops = rocksdb_effective_total_ops(benchmark, thread, args)
-            if ops_per_second is None and wall_seconds > 0.0:
-                ops_per_second = total_ops / wall_seconds
-            setup_wall_seconds = ""
-            setup_log = ""
-            if setup_completed is not None:
-                setup_record, setup_output, setup_path = setup_completed
-                setup_wall_seconds = format_float(record_wall_seconds(setup_record, setup_output))
-                setup_log = relative_log(result_root, setup_path)
-            rows.append(
-                {
-                    "workload": workload,
-                    "benchmark": benchmark,
-                    "lock": lock,
-                    "threads": str(thread),
-                    "repeat": str(repeat),
-                    "ops_per_second": "" if ops_per_second is None else format_float(ops_per_second),
-                    "latency_micros_per_op": "" if latency is None else format_float(latency),
-                    "wall_seconds": format_float(wall_seconds),
-                    "setup_wall_seconds": setup_wall_seconds,
-                    "total_ops": str(total_ops),
-                    "command_log": relative_log(result_root, log_path),
-                    "setup_log": setup_log,
                     "server_log": "",
                 }
             )
@@ -1556,188 +1244,6 @@ def run_cachebench(
     return rows
 
 
-def build_db_bench_args(
-    *,
-    db_bench: Path,
-    db_path: Path,
-    benchmark: str,
-    threads: int,
-    num: int,
-    use_existing_db: bool,
-    reads: int | None,
-    writes: int | None,
-    compression_type: str,
-    progress_reports: bool,
-    extra_args: list[str],
-) -> list[str]:
-    command = [
-        str(db_bench),
-        f"--benchmarks={benchmark}",
-        f"--threads={threads}",
-        f"--num={num}",
-        f"--db={db_path}",
-        f"--use_existing_db={1 if use_existing_db else 0}",
-    ]
-    if reads is not None:
-        command.append(f"--reads={reads}")
-    if writes is not None:
-        command.append(f"--writes={writes}")
-    if compression_type:
-        command.append(f"--compression_type={compression_type}")
-    if not progress_reports:
-        command.append("--progress_reports=false")
-    command.extend(extra_args)
-    return command
-
-
-def cleanup_path(path: Path) -> None:
-    try:
-        shutil.rmtree(path)
-    except FileNotFoundError:
-        return
-    except PermissionError as exc:
-        if shutil.which("sudo") is not None:
-            completed = subprocess.run(
-                ["sudo", "-n", "rm", "-rf", str(path)],
-                cwd=str(REPO_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            if completed.returncode == 0:
-                return
-        print(f"Warning: could not remove temporary path {path}: {exc}", file=sys.stderr)
-
-
-def run_rocksdb(
-    result_root: Path,
-    *,
-    benchmarks: tuple[str, ...],
-    locks: tuple[str, ...],
-    threads: tuple[int, ...],
-    repeats: int,
-    db_bench: Path,
-    args: argparse.Namespace,
-    logger: experiment_three.CommandLogger,
-    failures: list[dict[str, str]],
-    existing_rows: list[dict[str, str]] | None = None,
-) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = existing_rows if existing_rows is not None else []
-    completed_keys = completed_keys_from_rows(rows)
-    init_benchmarks = set(init_existing_benchmarks(args.rocksdb_init_existing_benchmarks))
-
-    for benchmark in benchmarks:
-        use_existing_db = benchmark in init_benchmarks
-        uses_reads = benchmark.startswith("read") or benchmark.startswith("seek")
-        for lock in locks:
-            for thread in runnable_threads_for_lock(lock, threads):
-                if uses_reads:
-                    db_bench_num = args.db_num
-                    reads_per_thread = ceil_div(args.total_ops, thread)
-                    writes_per_thread = None
-                    effective_total_ops = reads_per_thread * thread
-                else:
-                    db_bench_num = args.db_num
-                    reads_per_thread = None
-                    writes_per_thread = ceil_div(args.total_ops, thread)
-                    effective_total_ops = writes_per_thread * thread
-                for repeat in range(1, repeats + 1):
-                    key = ("rocksdb", benchmark, lock, thread, repeat)
-                    if key in completed_keys:
-                        continue
-                    db_path = Path(tempfile.mkdtemp(prefix="experiment5_rocksdb_"))
-                    setup_result: experiment_three.CommandResult | None = None
-                    try:
-                        if use_existing_db:
-                            setup_command = build_db_bench_args(
-                                db_bench=db_bench,
-                                db_path=db_path,
-                                benchmark=args.rocksdb_fill_benchmark,
-                                threads=1,
-                                num=args.db_num,
-                                use_existing_db=False,
-                                reads=None,
-                                writes=None,
-                                compression_type=args.rocksdb_compression_type,
-                                progress_reports=args.rocksdb_progress_reports,
-                                extra_args=args.rocksdb_extra_arg,
-                            )
-                            setup_result = logger.run(
-                                setup_command,
-                                log_name=(
-                                    f"init_rocksdb_{safe_name(benchmark)}_{safe_name(lock)}_"
-                                    f"{thread:03d}_r{repeat}.log"
-                                ),
-                                cwd=REPO_ROOT,
-                            )
-
-                        measured = build_db_bench_args(
-                            db_bench=db_bench,
-                            db_path=db_path,
-                            benchmark=benchmark,
-                            threads=thread,
-                            num=db_bench_num,
-                            use_existing_db=use_existing_db,
-                            reads=reads_per_thread,
-                            writes=writes_per_thread,
-                            compression_type=args.rocksdb_compression_type,
-                            progress_reports=args.rocksdb_progress_reports,
-                            extra_args=args.rocksdb_extra_arg,
-                        )
-                        measured, env = build_lock_command(lock, measured)
-                        result = logger.run(
-                            measured,
-                            log_name=f"rocksdb_{safe_name(benchmark)}_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
-                            cwd=REPO_ROOT,
-                            env=env,
-                        )
-                        latency, parsed_ops = parse_db_bench_output(result.output, benchmark)
-                        ops_per_second = parsed_ops
-                        if ops_per_second is None and latency is not None and latency > 0.0:
-                            ops_per_second = 1_000_000.0 / latency
-                        if ops_per_second is None and result.wall_seconds > 0.0:
-                            ops_per_second = effective_total_ops / result.wall_seconds
-                        rows.append(
-                            {
-                                "workload": "rocksdb",
-                                "benchmark": benchmark,
-                                "lock": lock,
-                                "threads": str(thread),
-                                "repeat": str(repeat),
-                                "ops_per_second": "" if ops_per_second is None else format_float(ops_per_second),
-                                "latency_micros_per_op": "" if latency is None else format_float(latency),
-                                "wall_seconds": format_float(result.wall_seconds),
-                                "setup_wall_seconds": "" if setup_result is None else format_float(setup_result.wall_seconds),
-                                "total_ops": str(effective_total_ops),
-                                "command_log": relative_log(result_root, result.log_path),
-                                "setup_log": relative_log(result_root, None if setup_result is None else setup_result.log_path),
-                                "server_log": "",
-                            }
-                        )
-                        completed_keys.add(key)
-                        write_progress_csvs(result_root, rows)
-                    except experiment_three.CommandError as exc:
-                        stage = "setup" if use_existing_db and setup_result is None else "run"
-                        experiment_failures.append_command_failure(
-                            failures,
-                            result_root=result_root,
-                            experiment="experiment5",
-                            workload="rocksdb",
-                            benchmark=benchmark,
-                            lock=lock,
-                            threads=thread,
-                            repeat=repeat,
-                            stage=stage,
-                            exc=exc,
-                        )
-                        experiment_failures.write_failures_csv(result_root, failures)
-                        continue
-                    finally:
-                        cleanup_path(db_path)
-    return rows
-
-
 def mean_field(rows: list[dict[str, str]], field: str) -> str:
     values = [float(row[field]) for row in rows if row[field].strip()]
     if not values:
@@ -1839,7 +1345,7 @@ def raw_row_sort_key(row: dict[str, str]) -> tuple[tuple[int, str], tuple[int, s
     if key is None:
         return (
             workload_sort_key(row.get("workload", "")),
-            (len(DEFAULT_ROCKSDB_BENCHMARKS), row.get("benchmark", "")),
+            benchmark_sort_key(row.get("workload", ""), row.get("benchmark", "")),
             lock_sort_key(row.get("lock", "")),
             -1,
             -1,
@@ -2304,7 +1810,6 @@ def write_settings(
     result_root: Path,
     *,
     workloads: tuple[str, ...],
-    rocksdb_benchmarks: tuple[str, ...],
     locks: tuple[str, ...],
     threads: tuple[int, ...],
     binaries: dict[str, Path],
@@ -2312,7 +1817,6 @@ def write_settings(
 ) -> None:
     settings = {
         "workloads": list(workloads),
-        "rocksdb_benchmarks": list(rocksdb_benchmarks),
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
         "lock_profile": args.lock_profile,
         "lock_profile_source": "manual" if args.locks is not None else "profile",
@@ -2323,9 +1827,7 @@ def write_settings(
         "per_lock_max_threads": per_lock_max_threads_for_settings(locks, threads),
         "runnable_threads_by_lock": {lock: list(runnable_threads_for_lock(lock, threads)) for lock in locks},
         "repeats": args.repeats,
-        "total_ops": args.total_ops,
         "command_timeout_seconds": args.command_timeout_seconds,
-        "db_num": args.db_num,
         "build_missing": args.build_missing,
         "binaries": {key: str(value) for key, value in binaries.items()},
         "flexguard_dir": str(FLEXGUARD_DIR),
@@ -2341,13 +1843,6 @@ def write_settings(
             "timeout_seconds": args.cachebench_timeout_seconds,
             "command_timeout_seconds": args.cachebench_command_timeout_seconds,
             "extra_args": list(args.cachebench_extra_arg),
-        },
-        "rocksdb": {
-            "fill_benchmark": args.rocksdb_fill_benchmark,
-            "compression_type": args.rocksdb_compression_type,
-            "progress_reports": args.rocksdb_progress_reports,
-            "init_existing_benchmarks": list(init_existing_benchmarks(args.rocksdb_init_existing_benchmarks)),
-            "extra_args": list(args.rocksdb_extra_arg),
         },
     }
     with (result_root / "settings.json").open("w", encoding="utf-8") as f:
@@ -2388,7 +1883,6 @@ def main() -> int:
             return 2
 
         workloads = validate_workloads(parse_csv_strings(args.workloads))
-        rocksdb_benchmarks = validate_benchmark_names(parse_csv_strings(args.rocksdb_benchmarks))
         locks = resolve_experiment_five_locks(
             profile=args.lock_profile,
             locks=None if args.locks is None else parse_csv_strings(args.locks),
@@ -2397,8 +1891,6 @@ def main() -> int:
         merge_workloads = parse_optional_csv_strings_lower(args.merge_workloads)
         merge_benchmarks = parse_optional_csv_strings_lower(args.merge_benchmarks)
         merge_locks = parse_optional_merge_locks(args.merge_locks)
-        validate_benchmark_names((args.rocksdb_fill_benchmark,))
-        init_existing_benchmarks(args.rocksdb_init_existing_benchmarks)
 
         if args.plot_only is not None:
             result_root = resolve_path(args.plot_only)
@@ -2441,7 +1933,6 @@ def main() -> int:
         write_settings(
             result_root,
             workloads=workloads,
-            rocksdb_benchmarks=rocksdb_benchmarks,
             locks=locks,
             threads=threads,
             binaries=binaries,
@@ -2450,7 +1941,6 @@ def main() -> int:
 
         ordered_targets = target_keys(
             workloads=workloads,
-            rocksdb_benchmarks=rocksdb_benchmarks,
             locks=locks,
             threads=threads,
             repeats=args.repeats,
@@ -2472,19 +1962,6 @@ def main() -> int:
                 threads=threads,
                 repeats=args.repeats,
                 cachebench_bin=binaries["cachebench"],
-                args=args,
-                logger=logger,
-                failures=failures,
-                existing_rows=raw_rows,
-            )
-        if "rocksdb" in workloads:
-            run_rocksdb(
-                result_root,
-                benchmarks=rocksdb_benchmarks,
-                locks=locks,
-                threads=threads,
-                repeats=args.repeats,
-                db_bench=binaries["rocksdb_db_bench"],
                 args=args,
                 logger=logger,
                 failures=failures,

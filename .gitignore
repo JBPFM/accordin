@@ -1,6 +1,7 @@
 # Build artifacts
 /target
 /build/
+bench/otherlocks/build/
 
 # Python bytecode
 /.venv/
@@ -24,5 +25,6 @@ results
 .dmux-hooks
 .claude
 third_party/rocksdb/
+third_party/libvsync/
 third_party/leveldb/
 third_party/leveldb-1.23/

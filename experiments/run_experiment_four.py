@@ -250,7 +250,7 @@ Default benchmark settings:
 Examples:
   python3 experiments/run_experiment_four.py
   python3 experiments/run_experiment_four.py --accordin-mode mutex_hook
-  python3 experiments/run_experiment_four.py --locks stock --threads 1 --repeats 1 --benchmarks fillseq --num 1000
+  python3 experiments/run_experiment_four.py --locks mutex --threads 1 --repeats 1 --benchmarks fillseq --num 1000
   {experiment_defaults.PROFILE_ENV}=original python3 experiments/run_experiment_four.py
   python3 experiments/run_experiment_four.py --plot-only experiments/results/experiment4_manual
 """,
@@ -268,6 +268,7 @@ Examples:
         metavar="RESULT_ROOT",
         help="Skip benchmark execution and regenerate summary.csv and PNGs from RESULT_ROOT/raw.csv.",
     )
+    parser.add_argument("--skip-plots", action="store_true", help="Write CSVs but skip PNG generation.")
     parser.add_argument(
         "--force",
         action="store_true",
@@ -336,7 +337,7 @@ Examples:
         metavar="CSV",
         help=(
             "Comma-separated lock keys. Overrides --lock-profile. "
-            "Use stock to run without interpose. "
+            "Use mutex to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
             "fillrandom uses LevelDB direct adapters for non-Accordin benchmark locks, "
             "accordin aliases follow --accordin-mode before benchmark-specific "
@@ -1023,7 +1024,7 @@ def lock_command_prefix(
     benchmark: str,
 ) -> tuple[list[str], dict[str, str | None] | None]:
     lock = canonical_leveldb_lock(lock)
-    if lock in {"stock", "mutex"}:
+    if experiment_three.is_native_mutex_lock(lock):
         return [], None
     if is_leveldb_direct_accordin_lock(lock):
         return leveldb_direct_accordin_command_prefix(lock)
@@ -1684,6 +1685,9 @@ def main() -> int:
         if args.output_root is not None and args.plot_only is not None:
             print("--output-root cannot be used together with --plot-only.", file=sys.stderr)
             return 2
+        if args.skip_plots and args.plot_only is not None:
+            print("--skip-plots cannot be used together with --plot-only.", file=sys.stderr)
+            return 2
 
         benchmarks = validate_benchmark_names(parse_csv_strings(args.benchmarks))
         locks = resolve_leveldb_locks(
@@ -1772,7 +1776,7 @@ def main() -> int:
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)
         summary_path = write_summary_csv(result_root, summary_rows)
-        plot_paths = write_plots(result_root, summary_rows) if summary_rows else []
+        plot_paths = [] if args.skip_plots else write_plots(result_root, summary_rows) if summary_rows else []
         print_outputs(result_root, raw_path, summary_path, plot_paths)
         failures_path = experiment_failures.write_failures_csv(result_root, failures)
         experiment_failures.print_failure_summary(failures, failures_path)

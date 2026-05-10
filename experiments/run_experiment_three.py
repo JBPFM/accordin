@@ -47,11 +47,11 @@ FIXED_MUTEXBENCH_COMBOS = (
 )
 ACCORDIN_TASKSET_RATIO_COMBOS = FIXED_MUTEXBENCH_COMBOS
 
-REQUIRED_BASELINE_LOCKS = (*experiment_defaults.EXPERIMENT_ONE_FULL_LOCKS, "mutex")
+REQUIRED_BASELINE_LOCKS = experiment_defaults.FULL_LOCKS
 ACCORDIN_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
-FULL_LOCKS = (*experiment_defaults.FULL_LOCKS, "mutex")
+FULL_LOCKS = experiment_defaults.FULL_LOCKS
 LOCK_PROFILES = {
     "minimal": MINIMAL_LOCKS,
     "full": FULL_LOCKS,
@@ -59,11 +59,10 @@ LOCK_PROFILES = {
 MULTI_LOCK_SWEEP_LOCKS = (
     "mutex",
     "mcs",
-    "mcstp",
-    "mcs-tas",
     "flexguard",
-    "malthusian",
     "reciprocating",
+    "cna",
+    "gcr",
 )
 SUPPORTED_LOCKS = set(REQUIRED_BASELINE_LOCKS)
 LOCK_PRESENCE_ALIASES = {
@@ -180,6 +179,7 @@ def fixed_baseline_matrix(
     *,
     duration_ms: int | None = None,
     warmup_duration_ms: int = DEFAULT_WARMUP_DURATION_MS,
+    repeats: int | None = None,
 ) -> BaselineMatrix:
     critical_ns = tuple(
         dict.fromkeys(critical for critical, _outside in FIXED_MUTEXBENCH_COMBOS)
@@ -191,7 +191,7 @@ def fixed_baseline_matrix(
         threads=tuple(threads),
         critical_ns=critical_ns,
         outside_ns=outside_ns,
-        repeats=experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS,
+        repeats=repeats if repeats is not None else experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS,
         duration_ms=(
             duration_ms
             if duration_ms is not None
@@ -458,10 +458,13 @@ def ensure_mutex_bench(logger: CommandLogger) -> None:  # type: ignore[name-defi
     ensure_executable(MUTEXBENCH_DIR / "mutex_bench", "mutexbench binary")
 
 
-def ensure_flexguard_helpers(locks: Iterable[str], logger: CommandLogger) -> None:  # type: ignore[name-defined]
+def ensure_multi_lock_helpers(locks: Iterable[str], logger: CommandLogger) -> None:  # type: ignore[name-defined]
     for lock in locks:
         if lock in {"mcstp", "malthusian", "flexguard"}:
             experiment_one.ensure_flexguard_interpose(lock, logger)
+    otherlocks = tuple(lock for lock in locks if experiment_defaults.is_otherlocks_interpose_lock(lock))
+    if otherlocks:
+        ensure_interpose_helpers(otherlocks, build_missing=True, logger=logger)
 
 
 def ensure_accordin_direct_library(logger: CommandLogger) -> None:  # type: ignore[name-defined]
@@ -568,10 +571,14 @@ def multi_lock_command(
     sudo_mode: str,
     threads: tuple[int, ...],
 ) -> list[str]:
+    lock_items = tuple(
+        f"{lock}={interpose_script_path(lock)}" if experiment_defaults.is_otherlocks_interpose_lock(lock) else lock
+        for lock in locks
+    )
     return [
         str(SWEEP_MULTI),
         "--locks",
-        csv_join(locks),
+        csv_join(lock_items),
         "--output-root",
         str(root),
         "--sudo-mode",
@@ -859,7 +866,7 @@ def run_baseline_supplement(
     multi_locks = tuple(lock for lock in locks if lock in MULTI_LOCK_SWEEP_LOCKS)
     for group_locks, group_threads in lock_thread_groups(multi_locks, matrix):
         if not args.dry_run:
-            ensure_flexguard_helpers(group_locks, logger)
+            ensure_multi_lock_helpers(group_locks, logger)
         run_command(
             logger,
             multi_lock_command(root, group_locks, matrix, args.sudo_mode, group_threads),
@@ -960,6 +967,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--duration-ms", type=positive_int, default=None, help="Override fixed hot duration.")
     parser.add_argument(
+        "--repeats",
+        type=positive_int,
+        default=None,
+        help=f"Override fixed repeats. Default: {experiment_defaults.MUTEXBENCH_DEFAULT_REPEATS}.",
+    )
+    parser.add_argument(
         "--threads",
         type=parsec_common.parse_csv_ints,
         default=experiment_defaults.DEFAULT_THREADS,
@@ -1033,6 +1046,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.threads,
             duration_ms=args.duration_ms,
             warmup_duration_ms=args.warmup_duration_ms,
+            repeats=args.repeats,
         )
         locks = resolve_requested_locks(
             baseline_root,

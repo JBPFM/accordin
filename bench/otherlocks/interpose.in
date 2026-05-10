@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_DIR="@base_dir@"
+LOCK_NAME="@lock_name@"
+INTERPOSE_PRELOAD="$BASE_DIR/build/interpose_${LOCK_NAME}.so"
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: interpose_${LOCK_NAME}.sh APPLICATION [ARGUMENTS...]" >&2
+  exit 1
+fi
+
+if [[ -n "${LD_PRELOAD:-}" ]]; then
+  export LD_PRELOAD="${LD_PRELOAD}:${INTERPOSE_PRELOAD}"
+else
+  export LD_PRELOAD="${INTERPOSE_PRELOAD}"
+fi
+
+exec "$@"

@@ -26,6 +26,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
 FLEXGUARD_BUILD_DIR = FLEXGUARD_DIR / "build"
 MAKE_ALL_SCRIPT = FLEXGUARD_DIR / "scripts" / "make_all.sh"
+OTHERLOCKS_DIR = REPO_ROOT / "bench" / "otherlocks"
+OTHERLOCKS_BUILD_DIR = OTHERLOCKS_DIR / "build"
 BUILD_DEDUP_SCRIPT = FLEXGUARD_DIR / "scripts" / "build_dedup.sh"
 BUILD_STREAMCLUSTER_SCRIPT = FLEXGUARD_DIR / "scripts" / "build_streamcluster.sh"
 DEDUP_BINARY = (
@@ -353,16 +355,16 @@ def parse_args(
         f"  python3 {script_path}",
     ]
     if fixed_benchmarks == ("dedup",):
-        examples.append(f"  python3 {script_path} --locks stock --threads 1 --repeats 1")
+        examples.append(f"  python3 {script_path} --locks mutex --threads 1 --repeats 1")
     elif fixed_benchmarks == ("streamcluster",):
         examples.append(
-            f"  python3 {script_path} --locks stock --threads 1 --repeats 1 "
+            f"  python3 {script_path} --locks mutex --threads 1 --repeats 1 "
             "--streamcluster-dimensions 16 --streamcluster-num-points 64 "
             "--streamcluster-chunksize 64 --streamcluster-clustersize 16"
         )
     else:
         examples.append(
-            f"  python3 {script_path} --benchmarks streamcluster --locks stock --threads 1 "
+            f"  python3 {script_path} --benchmarks streamcluster --locks mutex --threads 1 "
             "--repeats 1 --streamcluster-dimensions 16 --streamcluster-num-points 64 "
             "--streamcluster-chunksize 64 --streamcluster-clustersize 16"
         )
@@ -456,7 +458,7 @@ def parse_args(
         metavar="CSV",
         help=(
             "Comma-separated lock keys. Overrides --lock-profile. "
-            "Use stock to run without interpose. "
+            "Use mutex to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
             "accordin == mcs_tas_accordin_admission_only, accordin_sampled, "
             "accordin_no_admission, accordin_taskset."
@@ -690,11 +692,25 @@ def benchmark_build_script(benchmark: str) -> Path:
 
 
 def interpose_script_path(lock: str) -> Path:
+    if experiment_defaults.is_otherlocks_interpose_lock(lock):
+        return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.sh"
     return FLEXGUARD_BUILD_DIR / f"interpose_{lock}.sh"
 
 
 def interpose_library_path(lock: str) -> Path:
+    if experiment_defaults.is_otherlocks_interpose_lock(lock):
+        return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.so"
     return FLEXGUARD_BUILD_DIR / f"interpose_{lock}.so"
+
+
+def interpose_expected_base_dir(lock: str) -> Path:
+    if experiment_defaults.is_otherlocks_interpose_lock(lock):
+        return OTHERLOCKS_DIR.resolve()
+    return FLEXGUARD_DIR.resolve()
+
+
+def is_native_mutex_lock(lock: str) -> bool:
+    return lock in {"mutex", "stock"}
 
 
 def interpose_needs_sudo(lock: str) -> bool:
@@ -757,7 +773,7 @@ def interpose_helper_error(lock: str) -> str | None:
         return f"{lock} wrapper is not executable: {script}"
 
     script_base_dir = interpose_script_base_dir(script)
-    expected_base_dir = FLEXGUARD_DIR.resolve()
+    expected_base_dir = interpose_expected_base_dir(lock)
     if script_base_dir != expected_base_dir:
         if script_base_dir is None:
             return f"{lock} wrapper does not declare BASE_DIR: {script}"
@@ -771,12 +787,22 @@ def interpose_helper_error(lock: str) -> str | None:
 def invalid_interpose_helpers(locks: Iterable[str]) -> list[str]:
     invalid: list[str] = []
     for lock in locks:
-        if lock in {"stock", "mutex", "mcs_extension"} or experiment_defaults.is_accordin_lock(lock):
+        if is_native_mutex_lock(lock) or lock == "mcs_extension" or experiment_defaults.is_accordin_lock(lock):
             continue
         error = interpose_helper_error(lock)
         if error is not None:
             invalid.append(error)
     return invalid
+
+
+def invalid_interpose_helper_locks(locks: Iterable[str]) -> tuple[str, ...]:
+    invalid: list[str] = []
+    for lock in locks:
+        if is_native_mutex_lock(lock) or lock == "mcs_extension" or experiment_defaults.is_accordin_lock(lock):
+            continue
+        if interpose_helper_error(lock) is not None:
+            invalid.append(lock)
+    return tuple(invalid)
 
 
 def ensure_accordin_preload(
@@ -831,6 +857,7 @@ def ensure_interpose_helpers(
     build_missing: bool,
     logger: CommandLogger,
 ) -> None:
+    invalid_locks = invalid_interpose_helper_locks(locks)
     invalid = invalid_interpose_helpers(locks)
     if not invalid:
         return
@@ -838,18 +865,33 @@ def ensure_interpose_helpers(
     if not build_missing:
         raise RuntimeError(
             "Interpose helpers are missing or stale: "
-            f"{'; '.join(invalid)}. Run bench/flexguard/scripts/make_all.sh or rerun with --build-missing."
+            f"{'; '.join(invalid)}. Rerun with --build-missing."
         )
 
-    if not MAKE_ALL_SCRIPT.is_file():
-        raise RuntimeError(f"Build helper was not found: {MAKE_ALL_SCRIPT}")
-
-    logger.run(
-        ["bash", str(MAKE_ALL_SCRIPT)],
-        log_name="build_interpose_helpers.log",
-        cwd=FLEXGUARD_DIR,
-        timeout_seconds=0,
+    flexguard_locks = tuple(
+        lock for lock in invalid_locks if not experiment_defaults.is_otherlocks_interpose_lock(lock)
     )
+    otherlocks_locks = tuple(
+        lock for lock in invalid_locks if experiment_defaults.is_otherlocks_interpose_lock(lock)
+    )
+
+    if flexguard_locks:
+        if not MAKE_ALL_SCRIPT.is_file():
+            raise RuntimeError(f"Build helper was not found: {MAKE_ALL_SCRIPT}")
+        logger.run(
+            ["bash", str(MAKE_ALL_SCRIPT)],
+            log_name="build_flexguard_interpose_helpers.log",
+            cwd=FLEXGUARD_DIR,
+            timeout_seconds=0,
+        )
+
+    for lock in otherlocks_locks:
+        logger.run(
+            ["make", "-C", str(OTHERLOCKS_DIR), f"build/interpose_{lock}.sh"],
+            log_name=f"build_otherlocks_{lock}.log",
+            cwd=REPO_ROOT,
+            timeout_seconds=0,
+        )
 
     invalid_after_build = invalid_interpose_helpers(locks)
     if invalid_after_build:
@@ -1102,7 +1144,7 @@ def build_dedup_command(
     output_path: Path,
 ) -> tuple[list[str], dict[str, str | None] | None]:
     cmd: list[str] = []
-    if lock not in {"stock", "mutex"}:
+    if not is_native_mutex_lock(lock):
         if experiment_defaults.is_accordin_lock(lock):
             cmd, env = accordin_command_prefix(lock)
         elif lock == "mcs_extension":
@@ -1134,7 +1176,7 @@ def build_streamcluster_command(
     args: argparse.Namespace,
 ) -> tuple[list[str], dict[str, str | None] | None]:
     cmd: list[str] = []
-    if lock not in {"stock", "mutex"}:
+    if not is_native_mutex_lock(lock):
         if experiment_defaults.is_accordin_lock(lock):
             cmd, env = accordin_command_prefix(lock)
         elif lock == "mcs_extension":

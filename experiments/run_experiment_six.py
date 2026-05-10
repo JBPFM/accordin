@@ -22,6 +22,8 @@ MUTEXBENCH_DIR = REPO_ROOT / "bench" / "mutexbench"
 MUTEX_BENCH = MUTEXBENCH_DIR / "mutex_bench"
 SAMPLE_BPF = MUTEXBENCH_DIR / "scripts" / "sample_accordin_bpf.py"
 FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
+OTHERLOCKS_DIR = REPO_ROOT / "bench" / "otherlocks"
+OTHERLOCKS_BUILD_DIR = OTHERLOCKS_DIR / "build"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "experiments" / "results" / "experiment6_multilock"
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 21600
 ACCORDIN_DIRECT_PACKAGE = "mcs_tas_accordin_direct"
@@ -56,7 +58,7 @@ CASES = (
 )
 
 BUILTIN_LOCK_KINDS = {
-    "stock": "mutex",
+    "mutex": "mutex",
     "mcs": "mcs",
     "mcstas": "mcs-tas",
     "mcs_extension": "mcs-tas-tse",
@@ -75,12 +77,13 @@ FLEXGUARD_INTERPOSE_BUILD_SPECS = {
     ),
 }
 LOCAL_LOCK_ALIASES = {
-    "mutex": "stock",
-    "pthread": "stock",
+    "pthread": "mutex",
+    "stock": "mutex",
 }
 SUPPORTED_LOCKS = (
     set(BUILTIN_LOCK_KINDS)
     | FLEXGUARD_INTERPOSE_LOCKS
+    | set(experiment_defaults.OTHERLOCKS_INTERPOSE_LOCKS)
     | set(experiment_defaults.ACCORDIN_VARIANT_LOCKS)
 )
 
@@ -279,6 +282,10 @@ def is_flexguard_interpose_lock(lock: str) -> bool:
     return lock in FLEXGUARD_INTERPOSE_LOCKS
 
 
+def is_otherlocks_interpose_lock(lock: str) -> bool:
+    return experiment_defaults.is_otherlocks_interpose_lock(lock)
+
+
 def flexguard_interpose_script(lock: str) -> Path:
     return FLEXGUARD_DIR / "build" / f"interpose_{lock}.sh"
 
@@ -289,6 +296,14 @@ def flexguard_interpose_library(lock: str) -> Path:
 
 def flexguard_interpose_needs_sudo(lock: str) -> bool:
     return lock.startswith("flexguard")
+
+
+def otherlocks_interpose_script(lock: str) -> Path:
+    return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.sh"
+
+
+def otherlocks_interpose_library(lock: str) -> Path:
+    return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.so"
 
 
 def accordin_env(lock: str) -> dict[str, str | None]:
@@ -313,11 +328,12 @@ def accordin_env(lock: str) -> dict[str, str | None]:
 
 
 def mutexbench_command(case: TwoLockCase, lock: str, threads: int, args: argparse.Namespace) -> tuple[list[str], dict[str, str | None], bool]:
-    if is_flexguard_interpose_lock(lock):
+    if is_flexguard_interpose_lock(lock) or is_otherlocks_interpose_lock(lock):
         lock_kind = "mutex"
         env: dict[str, str | None] = {}
-        needs_sudo = flexguard_interpose_needs_sudo(lock)
-        cmd_prefix = [str(flexguard_interpose_script(lock))]
+        needs_sudo = flexguard_interpose_needs_sudo(lock) if is_flexguard_interpose_lock(lock) else False
+        script = flexguard_interpose_script(lock) if is_flexguard_interpose_lock(lock) else otherlocks_interpose_script(lock)
+        cmd_prefix = [str(script)]
     else:
         lock_kind = BUILTIN_LOCK_KINDS.get(lock, ACCORDIN_DIRECT_LOCK_KIND)
         env = accordin_env(lock) if is_accordin_direct_lock(lock) else {}
@@ -394,6 +410,19 @@ def ensure_flexguard_interpose(lock: str, *, dry_run: bool) -> None:
             raise RuntimeError(f"FlexGuard interpose library was not produced: {library}")
 
 
+def ensure_otherlocks_interpose(lock: str, *, dry_run: bool) -> None:
+    script = otherlocks_interpose_script(lock)
+    library = otherlocks_interpose_library(lock)
+    if not dry_run and script.is_file() and os.access(script, os.X_OK) and library.is_file():
+        return
+    run_build_command(["make", "-C", str(OTHERLOCKS_DIR), f"build/interpose_{lock}.sh"], dry_run=dry_run)
+    if not dry_run:
+        if not os.access(script, os.X_OK):
+            raise RuntimeError(f"otherlocks interpose script was not produced: {script}")
+        if not library.is_file():
+            raise RuntimeError(f"otherlocks interpose library was not produced: {library}")
+
+
 def ensure_builds(locks: Iterable[str], *, dry_run: bool) -> None:
     run_build_command(["make", "-C", str(MUTEXBENCH_DIR), "mutex_bench"], dry_run=dry_run)
 
@@ -407,6 +436,8 @@ def ensure_builds(locks: Iterable[str], *, dry_run: bool) -> None:
                 raise RuntimeError(f"{ACCORDIN_DIRECT_PACKAGE} library was not produced: {ACCORDIN_DIRECT_RELEASE_LIB}")
     for lock in sorted(lock for lock in locks if is_flexguard_interpose_lock(lock)):
         ensure_flexguard_interpose(lock, dry_run=dry_run)
+    for lock in sorted(lock for lock in locks if is_otherlocks_interpose_lock(lock)):
+        ensure_otherlocks_interpose(lock, dry_run=dry_run)
 
 
 def read_existing_keys(raw_path: Path) -> set[tuple[str, str, int, int]]:

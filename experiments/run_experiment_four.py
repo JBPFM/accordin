@@ -22,6 +22,7 @@ import run_experiment_three as experiment_three
 
 REPO_ROOT = experiment_three.REPO_ROOT
 FLEXGUARD_DIR = experiment_three.FLEXGUARD_DIR
+FLEXGUARD_BUILD_DIR = experiment_three.FLEXGUARD_BUILD_DIR
 LEVELDB_VERSION = "1.23"
 DEFAULT_LEVELDB_DIR = REPO_ROOT / "third_party" / f"leveldb-{LEVELDB_VERSION}"
 DEFAULT_DB_BENCH = DEFAULT_LEVELDB_DIR / "build" / "db_bench"
@@ -52,6 +53,25 @@ ACCORDIN_MODE_DIRECT = "accordin_direct"
 ACCORDIN_MODE_MUTEX_HOOK = "mutex_hook"
 ACCORDIN_MODES = (ACCORDIN_MODE_DIRECT, ACCORDIN_MODE_MUTEX_HOOK)
 DEFAULT_ACCORDIN_MODE = ACCORDIN_MODE_DIRECT
+BENCHMARK_ACCORDIN_MODE_OVERRIDES = {
+    "readrandom": ACCORDIN_MODE_MUTEX_HOOK,
+    "fillrandom": ACCORDIN_MODE_DIRECT,
+}
+LEVELDB_DIRECT_ADAPTER_BENCHMARKS = ("fillrandom",)
+LEVELDB_DIRECT_ADAPTER_LOCKS = (
+    "mcs",
+    "mcstp",
+    "mcstas",
+    "mcs_extension",
+    "flexguard",
+    "malthusian",
+    "reciprocating",
+)
+LEVELDB_DIRECT_ADAPTER_ROOT_LOCKS = ("flexguard",)
+LEVELDB_DIRECT_ADAPTER_BUILD_TARGETS = {
+    lock: f"build/leveldb_direct_{lock}.so"
+    for lock in LEVELDB_DIRECT_ADAPTER_LOCKS
+}
 MCS_TAS_ACCORDIN_DIRECT_LOCK = "mcs_tas_accordin_direct"
 MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK = MCS_TAS_ACCORDIN_DIRECT_LOCK
 MCS_TAS_ACCORDIN_DIRECT_ALIASES = {
@@ -122,24 +142,29 @@ LEVELDB_ACCORDIN_DIRECT_TO_MUTEX_HOOK_LOCKS = {
     MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK: experiment_defaults.ACCORDIN_NO_ADMISSION_LOCK,
     MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK: experiment_defaults.ACCORDIN_TASKSET_LOCK,
 }
+LEVELDB_ACCORDIN_MUTEX_HOOK_TO_DIRECT_LOCKS = {
+    hook_lock: direct_lock
+    for direct_lock, hook_lock in LEVELDB_ACCORDIN_DIRECT_TO_MUTEX_HOOK_LOCKS.items()
+}
 LEVELDB_ACCORDIN_MUTEX_HOOK_ALIAS_TARGETS = {
     alias: LEVELDB_ACCORDIN_DIRECT_TO_MUTEX_HOOK_LOCKS[target]
     for alias, target in LEVELDB_ACCORDIN_DIRECT_ALIAS_TARGETS.items()
 }
 LEVELDB_ACCORDIN_MUTEX_HOOK_VARIANT_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
 MINIMAL_LOCKS = LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS
-FULL_LOCKS = tuple(
+LEVELDB_BASE_FULL_LOCKS = tuple(
     lock
     for lock in experiment_defaults.FULL_LOCKS
     if lock not in experiment_defaults.ACCORDIN_VARIANT_LOCKS
-) + LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS
+)
+FULL_LOCKS = tuple(dict.fromkeys(("mutex", *LEVELDB_BASE_FULL_LOCKS, *LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS)))
 LOCK_PROFILES = {
     "minimal": MINIMAL_LOCKS,
     "full": FULL_LOCKS,
 }
 MUTEX_HOOK_LOCK_PROFILES = {
     "minimal": LEVELDB_ACCORDIN_MUTEX_HOOK_VARIANT_LOCKS,
-    "full": experiment_defaults.FULL_LOCKS,
+    "full": tuple(dict.fromkeys(("mutex", *experiment_defaults.FULL_LOCKS))),
 }
 DEFAULT_LOCKS = LOCK_PROFILES[DEFAULT_LOCK_PROFILE]
 LEVELDB_REBUILD_INPUTS = (
@@ -207,6 +232,9 @@ Default benchmark settings:
   benchmarks={','.join(DEFAULT_BENCHMARKS)}
   lock-profile={DEFAULT_LOCK_PROFILE}
   accordin-mode={DEFAULT_ACCORDIN_MODE}
+  benchmark accordin modes={','.join(f"{benchmark}:{mode}" for benchmark, mode in BENCHMARK_ACCORDIN_MODE_OVERRIDES.items())}
+  leveldb direct adapter benchmarks={','.join(LEVELDB_DIRECT_ADAPTER_BENCHMARKS)}
+  leveldb direct adapter locks={','.join(LEVELDB_DIRECT_ADAPTER_LOCKS)}
   minimal locks={','.join(MINIMAL_LOCKS)}
   mutex_hook minimal locks={','.join(MUTEX_HOOK_LOCK_PROFILES["minimal"])}
   full locks={','.join(FULL_LOCKS)}
@@ -260,7 +288,7 @@ Examples:
     parser.add_argument(
         "--build-missing",
         action="store_true",
-        help="Build missing interpose helpers or db_bench before running.",
+        help="Build missing interpose helpers, LevelDB direct adapters, or db_bench before running.",
     )
     parser.add_argument(
         "--command-timeout-seconds",
@@ -297,7 +325,9 @@ Examples:
             "Accordin implementation used for Accordin lock profiles and aliases. "
             f"{ACCORDIN_MODE_DIRECT} uses libmcs_tas_accordin_direct.so; "
             f"{ACCORDIN_MODE_MUTEX_HOOK} uses libmcs_tas_accordin.so for all pthread mutex hooks. "
-            f"Default: {DEFAULT_ACCORDIN_MODE}."
+            "readrandom is forced to mutex_hook and fillrandom is forced to accordin_direct; "
+            "fillrandom also uses LevelDB direct adapters for non-Accordin benchmark locks; "
+            f"other benchmarks use this mode. Default: {DEFAULT_ACCORDIN_MODE}."
         ),
     )
     parser.add_argument(
@@ -308,8 +338,10 @@ Examples:
             "Comma-separated lock keys. Overrides --lock-profile. "
             "Use stock to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "accordin aliases follow --accordin-mode; accordin_sampled, "
-            "accordin_no_admission, accordin_taskset select the matching mode variant."
+            "fillrandom uses LevelDB direct adapters for non-Accordin benchmark locks, "
+            "accordin aliases follow --accordin-mode before benchmark-specific "
+            "readrandom/fillrandom remapping; accordin_sampled, accordin_no_admission, "
+            "accordin_taskset select the matching mode variant."
         ),
     )
     parser.add_argument(
@@ -426,6 +458,45 @@ def canonical_leveldb_lock(lock: str) -> str:
     return normalize_leveldb_lock(normalized)
 
 
+def benchmark_accordin_mode(benchmark: str, *, fallback: str) -> str:
+    return BENCHMARK_ACCORDIN_MODE_OVERRIDES.get(benchmark, fallback)
+
+
+def effective_lock_for_benchmark(
+    benchmark: str,
+    lock: str,
+    *,
+    accordin_mode: str = DEFAULT_ACCORDIN_MODE,
+) -> str:
+    effective_mode = benchmark_accordin_mode(benchmark, fallback=accordin_mode)
+    normalized = canonical_leveldb_lock(lock)
+    if effective_mode == ACCORDIN_MODE_DIRECT:
+        return LEVELDB_ACCORDIN_MUTEX_HOOK_TO_DIRECT_LOCKS.get(normalized, normalized)
+    if effective_mode == ACCORDIN_MODE_MUTEX_HOOK:
+        return LEVELDB_ACCORDIN_DIRECT_TO_MUTEX_HOOK_LOCKS.get(normalized, normalized)
+    supported = ", ".join(ACCORDIN_MODES)
+    raise ValueError(f"Unsupported Accordin mode: {effective_mode}. Supported modes: {supported}.")
+
+
+def effective_locks_for_benchmarks(
+    benchmarks: tuple[str, ...],
+    locks: tuple[str, ...],
+    *,
+    accordin_mode: str = DEFAULT_ACCORDIN_MODE,
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            effective_lock_for_benchmark(
+                benchmark,
+                lock,
+                accordin_mode=accordin_mode,
+            )
+            for benchmark in benchmarks
+            for lock in locks
+        )
+    )
+
+
 def lock_profiles_for_accordin_mode(accordin_mode: str) -> dict[str, tuple[str, ...]]:
     if accordin_mode == ACCORDIN_MODE_DIRECT:
         return LOCK_PROFILES
@@ -531,6 +602,29 @@ def accordin_preload_env(
 
 def is_leveldb_direct_accordin_lock(lock: str) -> bool:
     return lock in LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS
+
+
+def is_leveldb_direct_adapter_lock(lock: str) -> bool:
+    return lock in LEVELDB_DIRECT_ADAPTER_LOCKS
+
+
+def benchmark_uses_leveldb_direct_adapter(benchmark: str, lock: str) -> bool:
+    return benchmark in LEVELDB_DIRECT_ADAPTER_BENCHMARKS and is_leveldb_direct_adapter_lock(lock)
+
+
+def leveldb_direct_adapter_library_path(lock: str) -> Path:
+    if not is_leveldb_direct_adapter_lock(lock):
+        supported = ", ".join(LEVELDB_DIRECT_ADAPTER_LOCKS)
+        raise ValueError(f"Unsupported LevelDB direct adapter lock: {lock}. Supported locks: {supported}.")
+    return FLEXGUARD_BUILD_DIR / f"leveldb_direct_{lock}.so"
+
+
+def is_leveldb_direct_flexguard_lock(lock: str) -> bool:
+    return is_leveldb_direct_adapter_lock(lock)
+
+
+def leveldb_direct_flexguard_library_path(lock: str) -> Path:
+    return leveldb_direct_adapter_library_path(lock)
 
 
 def leveldb_direct_accordin_uses_sampling(lock: str) -> bool:
@@ -809,21 +903,68 @@ def ensure_db_bench(
 def ensure_lock_helpers(
     locks: tuple[str, ...],
     *,
+    benchmarks: tuple[str, ...],
     build_missing: bool,
     logger: experiment_three.CommandLogger,
 ) -> None:
     interpose_locks = tuple(
         lock
         for lock in locks
-        if not (is_leveldb_direct_accordin_lock(lock) or experiment_defaults.is_accordin_lock(lock))
+        if lock != "mutex"
+        and not (is_leveldb_direct_accordin_lock(lock) or experiment_defaults.is_accordin_lock(lock))
+        and any(not benchmark_uses_leveldb_direct_adapter(benchmark, lock) for benchmark in benchmarks)
     )
     experiment_three.ensure_interpose_helpers(interpose_locks, build_missing=build_missing, logger=logger)
+    direct_adapter_locks = tuple(
+        lock
+        for lock in locks
+        if any(benchmark_uses_leveldb_direct_adapter(benchmark, lock) for benchmark in benchmarks)
+    )
+    ensure_leveldb_direct_adapter_helpers(
+        direct_adapter_locks,
+        build_missing=build_missing,
+        logger=logger,
+    )
     if any(experiment_defaults.is_accordin_lock(lock) for lock in locks):
         experiment_three.ensure_accordin_preload(build_missing=build_missing, logger=logger)
     if any(is_leveldb_direct_accordin_lock(lock) for lock in locks):
         ensure_mcs_tas_accordin_direct_preload(build_missing=build_missing, logger=logger)
-    if "mcs_extension" in locks:
+    if any(
+        lock == "mcs_extension"
+        and not benchmark_uses_leveldb_direct_adapter(benchmark, lock)
+        for lock in locks
+        for benchmark in benchmarks
+    ):
         experiment_three.ensure_mcs_extension_preload(build_missing=build_missing, logger=logger)
+
+
+def ensure_leveldb_direct_adapter_helpers(
+    locks: tuple[str, ...],
+    *,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    missing = tuple(lock for lock in locks if not leveldb_direct_adapter_library_path(lock).is_file())
+    if not missing:
+        return
+    if not build_missing:
+        missing_paths = ", ".join(str(leveldb_direct_adapter_library_path(lock)) for lock in missing)
+        raise RuntimeError(
+            f"LevelDB direct adapter helpers are missing: {missing_paths}. "
+            "Run make leveldb_direct_<lock> in bench/flexguard or rerun with --build-missing."
+        )
+
+    for lock in missing:
+        logger.run(
+            ["make", LEVELDB_DIRECT_ADAPTER_BUILD_TARGETS[lock]],
+            log_name=f"build_leveldb_direct_{safe_name(lock)}.log",
+            cwd=FLEXGUARD_DIR,
+            timeout_seconds=0,
+        )
+        if not leveldb_direct_adapter_library_path(lock).is_file():
+            raise RuntimeError(
+                f"LevelDB direct adapter helper was not built: {leveldb_direct_adapter_library_path(lock)}"
+            )
 
 
 def ensure_mcs_tas_accordin_direct_preload(
@@ -872,12 +1013,22 @@ def leveldb_direct_accordin_command_prefix(
     return [], env
 
 
-def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None] | None]:
+def leveldb_direct_adapter_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None]]:
+    return [], preload_env(leveldb_direct_adapter_library_path(lock))
+
+
+def lock_command_prefix(
+    lock: str,
+    *,
+    benchmark: str,
+) -> tuple[list[str], dict[str, str | None] | None]:
     lock = canonical_leveldb_lock(lock)
-    if lock == "stock":
+    if lock in {"stock", "mutex"}:
         return [], None
     if is_leveldb_direct_accordin_lock(lock):
         return leveldb_direct_accordin_command_prefix(lock)
+    if benchmark_uses_leveldb_direct_adapter(benchmark, lock):
+        return leveldb_direct_adapter_command_prefix(lock)
     if experiment_defaults.is_accordin_lock(lock):
         return experiment_three.accordin_command_prefix_from_env(
             lock,
@@ -922,8 +1073,8 @@ def build_measured_command(
     use_existing_db: bool,
     reads: int | None = None,
 ) -> tuple[list[str], dict[str, str | None] | None]:
-    effective_lock = canonical_leveldb_lock(lock)
-    cmd, env = lock_command_prefix(effective_lock)
+    lock = canonical_leveldb_lock(lock)
+    cmd, env = lock_command_prefix(lock, benchmark=benchmark)
     cmd.extend(
         build_db_bench_args(
             db_bench=db_bench,
@@ -935,9 +1086,15 @@ def build_measured_command(
             use_existing_db=use_existing_db,
         )
     )
-    if is_leveldb_direct_accordin_lock(effective_lock) and env is not None:
+    if is_leveldb_direct_accordin_lock(lock) and env is not None:
         return experiment_three.with_sudo_env(cmd, env)
-    return experiment_three.benchmark_command(effective_lock, cmd, env)
+    if (
+        benchmark_uses_leveldb_direct_adapter(benchmark, lock)
+        and lock in LEVELDB_DIRECT_ADAPTER_ROOT_LOCKS
+        and env is not None
+    ):
+        return experiment_three.with_sudo_env(cmd, env)
+    return experiment_three.benchmark_command(lock, cmd, env)
 
 
 def build_init_command(
@@ -1020,6 +1177,7 @@ def run_benchmarks(
     failures: list[dict[str, str]],
     selected_runs: set[RunKey] | None,
     keep_db: bool,
+    accordin_mode: str,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     init_benchmarks = set(init_existing_benchmarks)
@@ -1028,7 +1186,12 @@ def run_benchmarks(
         use_existing_db = benchmark in init_benchmarks
         uses_reads = benchmark.startswith("read")
         for lock in locks:
-            for thread in runnable_threads_for_lock(lock, threads):
+            effective_lock = effective_lock_for_benchmark(
+                benchmark,
+                lock,
+                accordin_mode=accordin_mode,
+            )
+            for thread in runnable_threads_for_lock(effective_lock, threads):
                 if uses_reads:
                     db_bench_num = num
                     reads_per_thread = ceil_div(total_ops, thread)
@@ -1038,7 +1201,7 @@ def run_benchmarks(
                     reads_per_thread = None
                     effective_total_ops = db_bench_num * thread
                 for repeat in range(1, repeats + 1):
-                    run_key = (benchmark, lock, thread, repeat)
+                    run_key = (benchmark, effective_lock, thread, repeat)
                     if selected_runs is not None and run_key not in selected_runs:
                         continue
                     db_path = Path(tempfile.mkdtemp(prefix="experiment4_leveldb_"))
@@ -1054,14 +1217,14 @@ def run_benchmarks(
                             init_result = logger.run(
                                 init_cmd,
                                 log_name=(
-                                    f"init_{safe_name(benchmark)}_{safe_name(lock)}_"
+                                    f"init_{safe_name(benchmark)}_{safe_name(effective_lock)}_"
                                     f"{thread:03d}_r{repeat}.log"
                                 ),
                                 cwd=REPO_ROOT,
                             )
 
                         cmd, env = build_measured_command(
-                            lock=lock,
+                            lock=effective_lock,
                             db_bench=db_bench,
                             db_path=db_path,
                             benchmark=benchmark,
@@ -1072,7 +1235,10 @@ def run_benchmarks(
                         )
                         result = logger.run(
                             cmd,
-                            log_name=f"{safe_name(benchmark)}_{safe_name(lock)}_{thread:03d}_r{repeat}.log",
+                            log_name=(
+                                f"{safe_name(benchmark)}_{safe_name(effective_lock)}_"
+                                f"{thread:03d}_r{repeat}.log"
+                            ),
                             cwd=REPO_ROOT,
                             env=env,
                         )
@@ -1080,7 +1246,7 @@ def run_benchmarks(
                         rows.append(
                             {
                                 "benchmark": benchmark,
-                                "lock": lock,
+                                "lock": effective_lock,
                                 "threads": str(thread),
                                 "repeat": str(repeat),
                                 "num": str(num),
@@ -1112,7 +1278,7 @@ def run_benchmarks(
                             experiment="experiment4",
                             workload="leveldb",
                             benchmark=benchmark,
-                            lock=lock,
+                            lock=effective_lock,
                             threads=thread,
                             repeat=repeat,
                             stage=stage,
@@ -1148,10 +1314,43 @@ def write_settings(
     accordin_mode: str,
     command_timeout_seconds: int,
 ) -> None:
-    uses_mutex_hook_accordin = any(experiment_defaults.is_accordin_lock(lock) for lock in locks)
+    effective_locks_by_benchmark = {
+        benchmark: list(
+            effective_locks_for_benchmarks(
+                (benchmark,),
+                locks,
+                accordin_mode=accordin_mode,
+            )
+        )
+        for benchmark in benchmarks
+    }
+    effective_locks = tuple(
+        dict.fromkeys(
+            lock
+            for benchmark_locks in effective_locks_by_benchmark.values()
+            for lock in benchmark_locks
+        )
+    )
+    uses_mutex_hook_accordin = any(
+        experiment_defaults.is_accordin_lock(lock)
+        for lock in effective_locks
+    )
     settings = {
         "benchmarks": [{"key": benchmark, "label": benchmark_label(benchmark)} for benchmark in benchmarks],
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
+        "benchmark_accordin_modes": {
+            benchmark: benchmark_accordin_mode(benchmark, fallback=accordin_mode)
+            for benchmark in benchmarks
+        },
+        "benchmark_leveldb_direct_adapter_locks": {
+            benchmark: [
+                lock
+                for lock in benchmark_locks
+                if benchmark_uses_leveldb_direct_adapter(benchmark, lock)
+            ]
+            for benchmark, benchmark_locks in effective_locks_by_benchmark.items()
+        },
+        "effective_locks_by_benchmark": effective_locks_by_benchmark,
         "lock_profile": lock_profile,
         "lock_profile_source": lock_profile_source,
         "accordin_mode": accordin_mode,
@@ -1180,6 +1379,12 @@ def write_settings(
         "accordin_hook_scope": ACCORDIN_LEVELDB_HOOK_SCOPE if uses_mutex_hook_accordin else None,
         "leveldb_accordin_direct_variants": list(LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS),
         "leveldb_accordin_mutex_hook_variants": list(LEVELDB_ACCORDIN_MUTEX_HOOK_VARIANT_LOCKS),
+        "leveldb_direct_adapter_benchmarks": list(LEVELDB_DIRECT_ADAPTER_BENCHMARKS),
+        "leveldb_direct_adapter_locks": list(LEVELDB_DIRECT_ADAPTER_LOCKS),
+        "leveldb_direct_adapter_preloads": {
+            lock: str(leveldb_direct_adapter_library_path(lock))
+            for lock in LEVELDB_DIRECT_ADAPTER_LOCKS
+        },
         "mcs_tas_accordin_direct_preload": str(MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY),
         "mcs_tas_accordin_mutex_hook_preload": str(experiment_three.ACCORDIN_PRELOAD_LIBRARY),
         "flexguard_dir": str(FLEXGUARD_DIR),
@@ -1515,7 +1720,17 @@ def main() -> int:
             output_filter=drop_leveldb_progress_line,
         )
 
-        ensure_lock_helpers(locks, build_missing=args.build_missing, logger=logger)
+        effective_locks = effective_locks_for_benchmarks(
+            benchmarks,
+            locks,
+            accordin_mode=args.accordin_mode,
+        )
+        ensure_lock_helpers(
+            effective_locks,
+            benchmarks=benchmarks,
+            build_missing=args.build_missing,
+            logger=logger,
+        )
         ensure_db_bench(db_bench, leveldb_dir=leveldb_dir, build_missing=args.build_missing, logger=logger)
 
         write_settings(
@@ -1552,6 +1767,7 @@ def main() -> int:
             failures=failures,
             selected_runs=selected_runs,
             keep_db=args.keep_db,
+            accordin_mode=args.accordin_mode,
         )
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)

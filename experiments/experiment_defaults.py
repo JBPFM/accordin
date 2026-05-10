@@ -119,6 +119,7 @@ SINGLE_OVERSUBSCRIBED_LOCKS = (
 
 LOCK_LABELS = {
     "stock": "Stock",
+    "mutex": "Mutex",
     "mcs": "MCS",
     "mcstp": "MCS-TP",
     "mcs-tas": "MCS-TAS",
@@ -174,6 +175,7 @@ EXPERIMENT_TWO_LOCK_ALIASES = {
 
 LOCK_ORDER = (
     "stock",
+    "mutex",
     "mcs",
     "mcstp",
     "mcs-tas",

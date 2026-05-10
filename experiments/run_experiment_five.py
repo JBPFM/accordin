@@ -37,7 +37,9 @@ DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 EXCLUDED_PROFILE_LOCKS = (experiment_defaults.ACCORDIN_TASKSET_LOCK,)
 def experiment_five_profile_locks(profile: str) -> tuple[str, ...]:
     locks = experiment_defaults.lock_profile_locks(profile)
-    return tuple(lock for lock in locks if lock not in EXCLUDED_PROFILE_LOCKS)
+    if profile == "full":
+        locks = ("mutex", *locks)
+    return tuple(dict.fromkeys(lock for lock in locks if lock not in EXCLUDED_PROFILE_LOCKS))
 
 
 def resolve_experiment_five_locks(*, profile: str, locks: Iterable[str] | None) -> tuple[str, ...]:
@@ -890,7 +892,7 @@ def per_lock_max_threads_for_settings(
 
 
 def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None] | None]:
-    if lock == "stock":
+    if lock in {"stock", "mutex"}:
         return [], None
     if experiment_defaults.is_accordin_lock(lock):
         return experiment_three.accordin_command_prefix(lock)
@@ -913,7 +915,7 @@ def build_lock_command(
     *,
     extra_env: dict[str, str | None] | None = None,
 ) -> tuple[list[str], dict[str, str | None] | None]:
-    if lock == "stock":
+    if lock in {"stock", "mutex"}:
         return command, extra_env
     if experiment_defaults.is_accordin_lock(lock):
         prefix, accordin_env = experiment_three.accordin_command_prefix(lock)

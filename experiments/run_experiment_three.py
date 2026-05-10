@@ -47,12 +47,17 @@ FIXED_MUTEXBENCH_COMBOS = (
 )
 ACCORDIN_TASKSET_RATIO_COMBOS = FIXED_MUTEXBENCH_COMBOS
 
-REQUIRED_BASELINE_LOCKS = experiment_defaults.EXPERIMENT_ONE_FULL_LOCKS
+REQUIRED_BASELINE_LOCKS = (*experiment_defaults.EXPERIMENT_ONE_FULL_LOCKS, "mutex")
 ACCORDIN_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
-FULL_LOCKS = experiment_defaults.FULL_LOCKS
+FULL_LOCKS = (*experiment_defaults.FULL_LOCKS, "mutex")
+LOCK_PROFILES = {
+    "minimal": MINIMAL_LOCKS,
+    "full": FULL_LOCKS,
+}
 MULTI_LOCK_SWEEP_LOCKS = (
+    "mutex",
     "mcs",
     "mcstp",
     "mcs-tas",
@@ -420,7 +425,7 @@ def resolve_requested_locks(
     lock_profile: str | None = None,
 ) -> tuple[str, ...]:
     if lock_arg is None:
-        lock_arg = csv_join(experiment_defaults.lock_profile_locks(lock_profile)) if lock_profile else "missing"
+        lock_arg = csv_join(lock_profile_locks(lock_profile)) if lock_profile else "missing"
 
     if lock_arg == "missing":
         return incomplete_or_missing_locks(output_root, missing_experiment_locks(baseline_root), matrix)
@@ -433,6 +438,14 @@ def resolve_requested_locks(
     if force:
         return locks
     return incomplete_or_missing_locks(output_root, locks, matrix)
+
+
+def lock_profile_locks(profile: str) -> tuple[str, ...]:
+    try:
+        return LOCK_PROFILES[profile]
+    except KeyError as exc:
+        supported = ",".join(LOCK_PROFILES)
+        raise ValueError(f"Unsupported lock profile: {profile}. Supported: {supported}") from exc
 
 
 def ensure_executable(path: Path, description: str) -> None:

@@ -771,7 +771,7 @@ def interpose_helper_error(lock: str) -> str | None:
 def invalid_interpose_helpers(locks: Iterable[str]) -> list[str]:
     invalid: list[str] = []
     for lock in locks:
-        if lock in {"stock", "mcs_extension"} or experiment_defaults.is_accordin_lock(lock):
+        if lock in {"stock", "mutex", "mcs_extension"} or experiment_defaults.is_accordin_lock(lock):
             continue
         error = interpose_helper_error(lock)
         if error is not None:
@@ -1102,7 +1102,7 @@ def build_dedup_command(
     output_path: Path,
 ) -> tuple[list[str], dict[str, str | None] | None]:
     cmd: list[str] = []
-    if lock != "stock":
+    if lock not in {"stock", "mutex"}:
         if experiment_defaults.is_accordin_lock(lock):
             cmd, env = accordin_command_prefix(lock)
         elif lock == "mcs_extension":
@@ -1134,7 +1134,7 @@ def build_streamcluster_command(
     args: argparse.Namespace,
 ) -> tuple[list[str], dict[str, str | None] | None]:
     cmd: list[str] = []
-    if lock != "stock":
+    if lock not in {"stock", "mutex"}:
         if experiment_defaults.is_accordin_lock(lock):
             cmd, env = accordin_command_prefix(lock)
         elif lock == "mcs_extension":

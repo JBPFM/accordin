@@ -32,6 +32,11 @@ static inline int futex_wake_private(_Atomic int *addr, int n) {
                       0);
 }
 
+static inline void approve_passive_head(gcr_mcs_mutex_t *m) {
+  atomic_store_explicit(&m->top_approved, 1, memory_order_release);
+  futex_wake_private(&m->top_approved, 1);
+}
+
 /* ---------------- MCS lock ---------------- */
 
 static inline void mcs_init(mcs_lock_t *l) {
@@ -139,6 +144,9 @@ static inline gcr_passive_node_t *gcr_push_self(gcr_mcs_mutex_t *m,
   } else {
     atomic_store_explicit(&m->top, me, memory_order_release);
     atomic_store_explicit(&me->event, 1, memory_order_release);
+    if (atomic_load_explicit(&m->num_active, memory_order_acquire) == 0) {
+      approve_passive_head(m);
+    }
     futex_wake_private(&me->event, 1);
   }
   return me;
@@ -175,24 +183,15 @@ static inline void wait_as_passive_head(gcr_mcs_mutex_t *m) {
     if (atomic_load_explicit(&m->top_approved, memory_order_acquire) != 0) {
       return;
     }
-    if (atomic_load_explicit(&m->num_active, memory_order_acquire) == 0) {
-      return;
-    }
 
     for (uint32_t i = 0; i < spins; ++i) {
       if (atomic_load_explicit(&m->top_approved, memory_order_acquire) != 0) {
         return;
       }
-      if (atomic_load_explicit(&m->num_active, memory_order_acquire) == 0) {
-        return;
-      }
       cpu_relax();
     }
 
-    /* Sleep on top_approved. Unlock wakes this futex both on approval and
-     * when num_active may have dropped to zero. */
-    if (atomic_load_explicit(&m->top_approved, memory_order_acquire) == 0 &&
-        atomic_load_explicit(&m->num_active, memory_order_acquire) != 0) {
+    if (atomic_load_explicit(&m->top_approved, memory_order_acquire) == 0) {
       int rc = futex_wait_private(&m->top_approved, 0);
       if (rc == -1 && errno != EAGAIN && errno != EINTR) {
         sched_yield();
@@ -260,8 +259,7 @@ void gcr_mcs_unlock(gcr_mcs_mutex_t *m) {
       atomic_fetch_add_explicit(&m->num_acqs, 1, memory_order_relaxed) + 1;
   if ((acqs % m->signal_period) == 0 &&
       atomic_load_explicit(&m->top, memory_order_acquire) != NULL) {
-    atomic_store_explicit(&m->top_approved, 1, memory_order_release);
-    futex_wake_private(&m->top_approved, 1);
+    approve_passive_head(m);
   }
 
   uint32_t old =
@@ -271,9 +269,9 @@ void gcr_mcs_unlock(gcr_mcs_mutex_t *m) {
     abort();
   }
   if (old == 1) {
-    /* The passive head may proceed when the active set becomes empty even
-     * if it has not received periodic approval. */
-    futex_wake_private(&m->top_approved, 1);
+    if (atomic_load_explicit(&m->top, memory_order_acquire) != NULL) {
+      approve_passive_head(m);
+    }
   }
 
   mcs_lock_release(&m->inner, &slot->node);

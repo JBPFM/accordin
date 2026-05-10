@@ -15,15 +15,20 @@ COMMON_SOURCES := otherlocks_pthread_interpose.c
 GCR_SOURCES := $(COMMON_SOURCES) gcr_mcs.c
 CNA_SOURCES := $(COMMON_SOURCES)
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: $(BUILD_DIR)/interpose_gcr.sh $(BUILD_DIR)/interpose_cna.sh
+test: $(BUILD_DIR)/gcr_mcs_empty_active_wakeup_test
+	$<
 
 $(BUILD_DIR):
 	mkdir -p $@
 
 $(BUILD_DIR)/interpose_gcr.so: $(GCR_SOURCES) gcr_mcs.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DOTHERLOCK_KIND_GCR $(GCR_SOURCES) -shared -o $@ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD_DIR)/gcr_mcs_empty_active_wakeup_test: tests/gcr_mcs_empty_active_wakeup_test.c gcr_mcs.c gcr_mcs.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gcr_mcs_empty_active_wakeup_test.c gcr_mcs.c -o $@ $(LDFLAGS) -pthread
 
 $(LIBVSYNC_DIR)/include/vsync/spinlock/cnalock.h:
 	mkdir -p $(dir $(LIBVSYNC_DIR))

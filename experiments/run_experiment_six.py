@@ -512,6 +512,18 @@ def selected_k_summary(path: Path) -> tuple[str, str, str]:
     return str(min(values)), str(max(values)), f"{statistics.mean(values):.6f}"
 
 
+def csv_has_data_row(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        try:
+            next(reader)
+        except StopIteration:
+            return False
+        return any(row for row in reader)
+
+
 def run_one(
     case: TwoLockCase,
     lock: str,
@@ -548,6 +560,7 @@ def run_one(
             stderr=subprocess.STDOUT,
         )
         sampler_proc: subprocess.Popen[str] | None = None
+        sampler_stopped_by_harness = False
         sampler_stderr = sample_path.with_suffix(".bpf_samples.stderr")
         if wait_for_sched_ext_enabled():
             with sampler_stderr.open("w", encoding="utf-8") as err:
@@ -578,12 +591,17 @@ def run_one(
                 sampler_proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 sampler_proc.terminate()
+                sampler_stopped_by_harness = True
                 try:
                     sampler_proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     sampler_proc.kill()
+                    sampler_stopped_by_harness = True
                     sampler_proc.wait()
-            if sampler_proc.returncode != 0:
+            sampler_has_rows = csv_has_data_row(sample_path)
+            if sampler_proc.returncode != 0 and not (sampler_stopped_by_harness and sampler_has_rows):
+                raise RuntimeError(f"BPF sampler failed for case={case.name} lock={lock} threads={threads} repeat={repeat}; see {sampler_stderr}")
+            if not sampler_has_rows:
                 raise RuntimeError(f"BPF sampler failed for case={case.name} lock={lock} threads={threads} repeat={repeat}; see {sampler_stderr}")
     end_ns = time.time_ns()
     bench_wall_seconds = (end_ns - start_ns) / 1_000_000_000.0

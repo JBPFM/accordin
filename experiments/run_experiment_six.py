@@ -33,6 +33,7 @@ ACCORDIN_DIRECT_LIB_ENV = "MCS_TAS_ACCORDIN_DIRECT_LIB"
 ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
+EXCLUDED_PLOT_LOCKS = {experiment_defaults.ACCORDIN_TASKSET_LOCK}
 
 
 @dataclass(frozen=True)
@@ -195,6 +196,8 @@ def parse_args() -> argparse.Namespace:
         description="Run Experiment 6: two independent locks with two half-sized worker groups."
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--plot-only", type=Path, default=None, metavar="RESULT_ROOT", help="Regenerate summary.csv and PNGs from raw.csv.")
+    parser.add_argument("--skip-plots", action="store_true", help="Do not generate PNG plots after running benchmarks.")
     parser.add_argument("--force", action="store_true", help="Replace existing raw/summary/settings files")
     parser.add_argument("--resume", action="store_true", help="Skip complete raw rows already present")
     parser.add_argument("--dry-run", action="store_true", help="Print commands and CSV schema without running")
@@ -690,12 +693,133 @@ def write_summary(raw_path: Path, summary_path: Path) -> None:
             out: dict[str, str] = {
                 "case": first["case"],
                 "lock": first["lock"],
-                "lock_label": first["lock_label"],
+                "lock_label": lock_label(first["lock"]),
             }
             for field in SUMMARY_NUMERIC_FIELDS:
                 values = [float(row[field]) for row in group_rows if row.get(field) not in ("", None)]
                 out[field] = f"{statistics.mean(values):.6f}" if values else ""
             writer.writerow(out)
+
+
+def safe_name(value: str) -> str:
+    out = "".join(ch.lower() if ch.isalnum() else "_" for ch in value.strip())
+    return "_".join(part for part in out.split("_") if part) or "unknown"
+
+
+def case_sort_key(name: str) -> tuple[int, str]:
+    case_order = {case.name: index for index, case in enumerate(CASES)}
+    return (case_order.get(name, len(case_order)), name)
+
+
+def load_summary_rows(summary_path: Path) -> list[dict[str, str]]:
+    if not summary_path.is_file():
+        raise RuntimeError(f"{summary_path} does not exist")
+    with summary_path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def plot_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, str]]:
+    return [row for row in rows if row["lock"] not in EXCLUDED_PLOT_LOCKS]
+
+
+def plot_metric_for_case(
+    result_root: Path,
+    rows: list[dict[str, str]],
+    case: str,
+    metric: str,
+    output_name: str,
+    ylabel: str,
+) -> Path:
+    try:
+        import matplotlib
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to generate experiment6 plots") from exc
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
+
+    case_rows = [row for row in rows if row["case"] == case and row.get(metric)]
+    locks = tuple(dict.fromkeys(row["lock"] for row in case_rows))
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    for lock in locks:
+        lock_rows = sorted(
+            (row for row in case_rows if row["lock"] == lock),
+            key=lambda row: float(row["threads"]),
+        )
+        if not lock_rows:
+            continue
+        label = lock_rows[0].get("lock_label") or lock
+        xs = [float(row["threads"]) for row in lock_rows]
+        ys = [float(row[metric]) for row in lock_rows]
+        if metric.endswith("throughput_ops_per_sec"):
+            ys = [value / 1_000_000.0 for value in ys]
+        ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4.5, label=label)
+
+    ax.set_title(case.replace("_", " ").title())
+    ax.set_xlabel("Threads")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, which="major", linestyle="--", linewidth=0.5, alpha=0.45)
+    ax.xaxis.set_major_formatter(ScalarFormatter())
+    if metric == "fairness_jain":
+        ax.set_ylim(0.0, 1.05)
+    if locks:
+        ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    output_path = result_root / output_name
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return output_path
+
+
+def generate_plots(result_root: Path) -> tuple[Path, ...]:
+    rows = plot_rows(load_summary_rows(result_root / "summary.csv"))
+    cases = sorted(tuple(dict.fromkeys(row["case"] for row in rows)), key=case_sort_key)
+    plot_paths: list[Path] = []
+    for path in result_root.glob("ops_vs_threads_*.png"):
+        path.unlink()
+    for case in cases:
+        suffix = safe_name(case)
+        plot_paths.append(
+            plot_metric_for_case(
+                result_root,
+                rows,
+                case,
+                "group_a_throughput_ops_per_sec",
+                f"group_a_ops_vs_threads_{suffix}.png",
+                "Group A throughput (M ops/s)",
+            )
+        )
+        plot_paths.append(
+            plot_metric_for_case(
+                result_root,
+                rows,
+                case,
+                "group_b_throughput_ops_per_sec",
+                f"group_b_ops_vs_threads_{suffix}.png",
+                "Group B throughput (M ops/s)",
+            )
+        )
+        plot_paths.append(
+            plot_metric_for_case(
+                result_root,
+                rows,
+                case,
+                "fairness_jain",
+                f"fairness_vs_threads_{suffix}.png",
+                "Jain fairness index",
+            )
+        )
+    return tuple(plot_paths)
+
+
+def regenerate_summary_and_plots(result_root: Path) -> tuple[Path, tuple[Path, ...]]:
+    raw_path = result_root / "raw.csv"
+    summary_path = result_root / "summary.csv"
+    if not raw_path.is_file():
+        raise RuntimeError(f"{raw_path} does not exist")
+    write_summary(raw_path, summary_path)
+    return summary_path, generate_plots(result_root)
 
 
 def prepare_output(root: Path, *, force: bool, resume: bool) -> tuple[Path, Path, Path]:
@@ -758,12 +882,21 @@ def run_experiment(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.plot_only is not None:
+        summary_path, plot_paths = regenerate_summary_and_plots(args.plot_only)
+        print(f"Summary results: {summary_path}")
+        for path in plot_paths:
+            print(f"Plot: {path}")
+        return 0
     if args.dry_run:
         dry_run(args)
         return 0
     root = run_experiment(args)
     print(f"Raw results: {root / 'raw.csv'}")
     print(f"Summary results: {root / 'summary.csv'}")
+    if not args.skip_plots:
+        for path in generate_plots(root):
+            print(f"Plot: {path}")
     return 0
 
 

@@ -81,10 +81,6 @@ static __always_inline __u32 user_admission_lock_id(__u32 user_ctx_word) {
          USER_ADMISSION_LOCK_ID_SHIFT;
 }
 
-static __always_inline __u32 owner_key(__u32 lock_id, __u32 cpu) {
-  return lock_id * MAX_CPUS + cpu;
-}
-
 static __always_inline __u64 inactive_dsq_id(__u32 lock_id, __u32 cpu) {
   return INACTIVE_DSQ_BASE + ((__u64)lock_id * MAX_CPUS) + cpu;
 }
@@ -190,14 +186,15 @@ static __always_inline struct task_scx_ctx *get_task_ctx(struct task_struct *p) 
   return task_ctx;
 }
 
-static __always_inline __u32 *lookup_lock_cpu_owner(__u32 lock_id, __u32 cpu) {
-  __u32 key;
+static __always_inline volatile __u32 *lookup_cpu_owner(__u32 cpu) {
+  __u32 idx;
 
-  if (!valid_lock_id(lock_id) || cpu >= MAX_CPUS)
+  if (cpu >= MAX_CPUS)
     return 0;
 
-  key = owner_key(lock_id, cpu);
-  return bpf_map_lookup_elem(&cpu_admission_owner_map, &key);
+  idx = cpu & (MAX_CPUS - 1);
+  barrier_var(idx);
+  return &cpu_admission_owner[idx];
 }
 
 static __always_inline bool steal_inactive(__u32 cpu) {
@@ -228,12 +225,12 @@ static __always_inline bool steal_inactive(__u32 cpu) {
 
 #pragma unroll
     for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
-      __u32 *owner;
+      volatile __u32 *owner;
 
       if (!(hint->lock_mask & lock_id_bit(lock_id)))
         continue;
 
-      owner = lookup_lock_cpu_owner(lock_id, cpu);
+      owner = lookup_cpu_owner(cpu);
       if (!owner || *owner)
         continue;
 
@@ -305,11 +302,10 @@ static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx)
 static __always_inline void release_admission(struct task_struct *p,
                                               struct task_scx_ctx *task_ctx) {
   __u32 cpu = task_ctx->admission_cpu;
-  __u32 lock_id = task_ctx->admission_lock_id;
   __u32 pid = p->pid;
-  __u32 *owner;
+  volatile __u32 *owner;
 
-  owner = lookup_lock_cpu_owner(lock_id, cpu);
+  owner = lookup_cpu_owner(cpu);
   if (owner && *owner == pid)
     *owner = 0;
 
@@ -323,9 +319,12 @@ static __always_inline bool grant_admission(struct task_struct *p,
                                             struct task_scx_ctx *task_ctx,
                                             __u32 lock_id, __u32 cpu) {
   __u32 pid = p->pid;
-  __u32 *owner;
+  volatile __u32 *owner;
 
-  owner = lookup_lock_cpu_owner(lock_id, cpu);
+  if (!valid_lock_id(lock_id))
+    return false;
+
+  owner = lookup_cpu_owner(cpu);
   if (!owner)
     return false;
 
@@ -667,12 +666,12 @@ static __always_inline bool drain_local_inactive(__u32 cpu) {
 
 #pragma unroll
   for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
-    __u32 *owner;
+    volatile __u32 *owner;
 
     if (!(hint->lock_mask & lock_id_bit(lock_id)))
       continue;
 
-    owner = lookup_lock_cpu_owner(lock_id, cpu);
+    owner = lookup_cpu_owner(cpu);
     if (!owner || *owner)
       continue;
 

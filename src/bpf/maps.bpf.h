@@ -27,13 +27,6 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, MAX_LOCK_CLASSES * MAX_CPUS);
-  __type(key, __u32);
-  __type(value, __u32); /* current admission owner pid, or 0 if empty */
-} cpu_admission_owner_map SEC(".maps");
-
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, MAX_CPUS);
   __type(key, __u32);
   __type(value, struct cpu_inactive_hint);
@@ -52,6 +45,7 @@ volatile __u64 active_cpu_word0 = ~0ULL;
 volatile __u64 active_cpu_word1 = ~0ULL;
 volatile __u64 active_cpu_word2 = ~0ULL;
 volatile __u64 active_cpu_word3 = ~0ULL;
+volatile __u32 cpu_admission_owner[MAX_CPUS];
 volatile __u64 dbg_acct_calls = 0;
 volatile __u64 dbg_acct_read_ok = 0;
 

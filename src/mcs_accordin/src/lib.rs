@@ -16,4 +16,5 @@ mod mutex_hook;
 accordin_shared::define_scheduler_loader!(
     scheduler_name = "mcs_accordin",
     env_prefix = "MCS_ACCORDIN",
+    single_lock_mode = true,
 );

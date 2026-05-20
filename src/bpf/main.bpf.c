@@ -19,6 +19,10 @@ static __always_inline bool stats_only_enabled(void) {
   return stats_only_mode != 0;
 }
 
+static __always_inline bool single_lock_enabled(void) {
+  return single_lock_mode != 0;
+}
+
 static __always_inline struct cpu_inactive_hint *lookup_inactive_hint(__u32 cpu) {
   if (cpu >= MAX_CPUS)
     return 0;
@@ -79,6 +83,13 @@ static __always_inline __u32 lock_id_bit(__u32 lock_id) {
 static __always_inline __u32 user_admission_lock_id(__u32 user_ctx_word) {
   return (user_ctx_word & ~USER_ADMISSION_FLAG_MASK) >>
          USER_ADMISSION_LOCK_ID_SHIFT;
+}
+
+static __always_inline __u32 effective_lock_id(__u32 user_ctx_word) {
+  if (single_lock_enabled())
+    return 1;
+
+  return user_admission_lock_id(user_ctx_word);
 }
 
 static __always_inline __u64 inactive_dsq_id(__u32 lock_id, __u32 cpu) {
@@ -238,6 +249,60 @@ static __always_inline bool steal_inactive(__u32 cpu) {
         record_inactive_dequeue(lock_id, victim);
         return true;
       }
+    }
+  }
+
+  return false;
+}
+
+static __always_inline bool drain_single_inactive(__u32 cpu) {
+  volatile __u32 *owner;
+
+  owner = lookup_cpu_owner(cpu);
+  if (!owner || *owner)
+    return false;
+
+  if (scx_bpf_dsq_move_to_local(inactive_dsq_id(1, cpu))) {
+    record_inactive_dequeue(1, cpu);
+    return true;
+  }
+
+  return false;
+}
+
+static __always_inline bool steal_single_inactive(__u32 cpu) {
+  __u32 nr_cpus = scx_bpf_nr_cpu_ids();
+  __u32 i;
+
+  if (nr_cpus > MAX_CPUS)
+    nr_cpus = MAX_CPUS;
+
+  if (nr_cpus <= 1)
+    return false;
+
+#pragma unroll
+  for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
+    struct cpu_inactive_hint *hint;
+    __u32 victim = cpu + i;
+    volatile __u32 *owner;
+
+    if (i >= nr_cpus)
+      break;
+
+    if (victim >= nr_cpus)
+      victim -= nr_cpus;
+
+    hint = lookup_inactive_hint(victim);
+    if (!hint || !hint->total)
+      continue;
+
+    owner = lookup_cpu_owner(cpu);
+    if (!owner || *owner)
+      continue;
+
+    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(1, victim))) {
+      record_inactive_dequeue(1, victim);
+      return true;
     }
   }
 
@@ -407,9 +472,12 @@ static __always_inline bool slow_path_requested(
   if (task_ctx->holds_admission)
     return false;
 
-  if (have_user)
-    return user_slow_path_pending(user_ctx_word) &&
-           valid_lock_id(user_admission_lock_id(user_ctx_word));
+  if (have_user && user_slow_path_pending(user_ctx_word)) {
+    if (single_lock_enabled())
+      return true;
+
+    return valid_lock_id(user_admission_lock_id(user_ctx_word));
+  }
 
   return false;
 }
@@ -475,7 +543,7 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
   if (have_user)
-    lock_id = user_admission_lock_id(user_ctx_word);
+    lock_id = effective_lock_id(user_ctx_word);
   refresh_slow_path_seen(task_ctx, have_user, user_ctx_word);
   if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
@@ -597,7 +665,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
   if (have_user)
-    lock_id = user_admission_lock_id(user_ctx_word);
+    lock_id = effective_lock_id(user_ctx_word);
   slow_path_seen = refresh_slow_path_seen(task_ctx, have_user, user_ctx_word);
 
   clear_invalid_admission_cpu(p, task_ctx);
@@ -698,6 +766,17 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   if (stats_only_enabled())
     return;
 
+  if (single_lock_enabled()) {
+    if (drain_single_inactive((__u32)cpu))
+      return;
+
+    if (scx_bpf_dsq_move_to_local(CONTROLLED_DSQ_ID))
+      return;
+
+    steal_single_inactive((__u32)cpu);
+    return;
+  }
+
   if (drain_local_inactive((__u32)cpu))
     return;
 
@@ -721,6 +800,18 @@ static __always_inline void drain_inactive_to_controlled(__u32 cpu) {
     }
     bpf_rcu_read_unlock();
   }
+}
+
+static __always_inline void drain_single_inactive_to_controlled(__u32 cpu) {
+  struct task_struct *p;
+
+  bpf_rcu_read_lock();
+  bpf_for_each(scx_dsq, p, inactive_dsq_id(1, cpu), 0) {
+    if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, CONTROLLED_DSQ_ID, 0))
+      break;
+    record_inactive_dequeue(1, cpu);
+  }
+  bpf_rcu_read_unlock();
 }
 
 SEC("syscall")
@@ -767,8 +858,12 @@ int accordin_nudge_cpu(struct accordin_cpu_nudge_args *args) {
   if (cpu >= MAX_CPUS)
     return -EINVAL;
 
-  if (!stats_only_enabled() && args->drain_inactive)
-    drain_inactive_to_controlled(cpu);
+  if (!stats_only_enabled() && args->drain_inactive) {
+    if (single_lock_enabled())
+      drain_single_inactive_to_controlled(cpu);
+    else
+      drain_inactive_to_controlled(cpu);
+  }
 
   scx_bpf_kick_cpu(cpu, 0);
   return 0;
@@ -797,7 +892,7 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
 
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
   if (have_user)
-    lock_id = user_admission_lock_id(user_ctx_word);
+    lock_id = effective_lock_id(user_ctx_word);
   refresh_slow_path_seen(task_ctx, have_user, user_ctx_word);
 
   if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
@@ -842,6 +937,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   ret = scx_bpf_create_dsq(CONTROLLED_DSQ_ID, -1);
   if (ret)
     return ret;
+
+  if (single_lock_enabled()) {
+    for (cpu = 0; cpu < nr_cpus; cpu++) {
+      ret = scx_bpf_create_dsq(inactive_dsq_id(1, cpu), -1);
+      if (ret)
+        return ret;
+    }
+    return 0;
+  }
 
   active_cpus_all = 1;
   active_cpu_word0 = ~0ULL;

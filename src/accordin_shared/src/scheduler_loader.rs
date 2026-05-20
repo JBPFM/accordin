@@ -11,9 +11,22 @@
 ///   argument to `cpu_affinity::init_from_env` and `lock_stats::print_process_stats`.
 /// - `env_prefix` — uppercase prefix for the three `*_DISABLE_BPF` / `*_STATS_ONLY` /
 ///   `*_DEBUG_COUNTERS` environment variables.
+/// - `single_lock_mode` — optional boolean that tells the BPF scheduler this backend uses the
+///   legacy global admission word and therefore does not need per-lock inactive DSQs.
 #[macro_export]
 macro_rules! define_scheduler_loader {
     (scheduler_name = $scheduler:expr, env_prefix = $env_prefix:expr $(,)?) => {
+        $crate::define_scheduler_loader!(
+            scheduler_name = $scheduler,
+            env_prefix = $env_prefix,
+            single_lock_mode = false,
+        );
+    };
+    (
+        scheduler_name = $scheduler:expr,
+        env_prefix = $env_prefix:expr,
+        single_lock_mode = $single_lock_mode:expr $(,)?
+    ) => {
         const SCHEDULER_NAME: &str = $scheduler;
         const DISABLE_BPF_ENV: &str = concat!($env_prefix, "_DISABLE_BPF");
         const STATS_ONLY_ENV: &str = concat!($env_prefix, "_STATS_ONLY");
@@ -181,6 +194,7 @@ macro_rules! define_scheduler_loader {
             let mut skel = ::scx_utils::scx_ops_open!(skel_builder, open_object, accordin_ops, None)?;
             if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
                 bss.stats_only_mode = u32::from(stats_only);
+                bss.single_lock_mode = u32::from($single_lock_mode);
             }
             let mut skel = ::scx_utils::scx_ops_load!(skel, accordin_ops, uei)?;
 
@@ -260,6 +274,10 @@ macro_rules! define_scheduler_loader {
                             "[{}] stats-only env {} requested; lock-aware scheduling disabled",
                             SCHEDULER_NAME, STATS_ONLY_ENV
                         );
+                    }
+                    if $single_lock_mode {
+                        ::log::info!("{SCHEDULER_NAME} single-lock BPF mode enabled");
+                        eprintln!("[{}] single-lock BPF mode enabled", SCHEDULER_NAME);
                     }
                     if debug_counters {
                         ::log::info!(

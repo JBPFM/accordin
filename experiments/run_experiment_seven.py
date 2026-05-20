@@ -13,10 +13,14 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import experiment_defaults
+import run_experiment_three as experiment_three
 import run_experiment_six as experiment_six
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+LEGACY_MCS_ACCORDIN_LOCK = "mcs_accordin"
+LEGACY_MCS_ACCORDIN_PACKAGE = "mcs_accordin"
+LEGACY_MCS_ACCORDIN_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 DEFAULT_CRITICAL_NS = (100, 300, 1000, 30000)
 DEFAULT_OUTSIDE_NS = 3000
 DEFAULT_THREADS = (48, 96, 192)
@@ -25,6 +29,18 @@ DEFAULT_DURATION_MS = 8000
 DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 21600
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
+FALLBACK_PLOT_COLORS = (
+    "C0",
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+    "C5",
+    "C6",
+    "C7",
+    "C8",
+    "C9",
+)
 
 RAW_FIELDS = (
     "lock",
@@ -144,7 +160,71 @@ def fairness_factor(ops: Iterable[int]) -> float:
 
 
 def parse_locks(text: str | None, profile: str) -> tuple[str, ...]:
-    return experiment_six.parse_locks(text, profile)
+    raw_locks = (
+        experiment_defaults.lock_profile_locks(profile)
+        if text is None
+        else experiment_six.parse_csv_strings(text)
+    )
+    locks: list[str] = []
+    for raw in raw_locks:
+        if raw.strip().lower() == LEGACY_MCS_ACCORDIN_LOCK:
+            lock = LEGACY_MCS_ACCORDIN_LOCK
+        else:
+            lock = experiment_six.normalize_lock(raw)
+        if lock != LEGACY_MCS_ACCORDIN_LOCK and lock not in experiment_six.SUPPORTED_LOCKS:
+            supported = sorted(
+                experiment_six.SUPPORTED_LOCKS
+                | set(experiment_six.LOCAL_LOCK_ALIASES)
+                | {LEGACY_MCS_ACCORDIN_LOCK}
+            )
+            raise argparse.ArgumentTypeError(
+                f"Unsupported experiment7 lock {raw!r}. Supported locks: {', '.join(supported)}"
+            )
+        if lock not in locks:
+            locks.append(lock)
+    if not locks:
+        raise argparse.ArgumentTypeError("At least one lock must be selected")
+    return tuple(locks)
+
+
+def is_legacy_mcs_accordin_lock(lock: str) -> bool:
+    return lock == LEGACY_MCS_ACCORDIN_LOCK
+
+
+def lock_label(lock: str) -> str:
+    if is_legacy_mcs_accordin_lock(lock):
+        return LEGACY_MCS_ACCORDIN_LOCK
+    return experiment_six.lock_label(lock)
+
+
+def legacy_mcs_accordin_env() -> dict[str, str | None]:
+    return {
+        "ACCORDIN_CPU_MASK_K": None,
+        "ACCORDIN_DISABLE_ADMISSION": None,
+        "K": None,
+        "LD_PRELOAD": str(LEGACY_MCS_ACCORDIN_LIBRARY),
+        "MCS_ACCORDIN_DISABLE_BPF": None,
+        "MCS_ACCORDIN_STATS_ONLY": None,
+    }
+
+
+def ensure_builds(locks: Iterable[str], *, dry_run: bool) -> None:
+    lock_list = tuple(locks)
+    experiment_six.ensure_builds(
+        (lock for lock in lock_list if not is_legacy_mcs_accordin_lock(lock)),
+        dry_run=dry_run,
+    )
+    if any(is_legacy_mcs_accordin_lock(lock) for lock in lock_list):
+        build_cmd = ["cargo", "build", "-p", LEGACY_MCS_ACCORDIN_PACKAGE, "--release"]
+        if dry_run:
+            print(shlex_join(build_cmd))
+        else:
+            subprocess.run(build_cmd, cwd=REPO_ROOT, check=True)
+            if not LEGACY_MCS_ACCORDIN_LIBRARY.is_file():
+                raise RuntimeError(
+                    f"{LEGACY_MCS_ACCORDIN_PACKAGE} library was not produced: "
+                    f"{LEGACY_MCS_ACCORDIN_LIBRARY}"
+                )
 
 
 def parse_args() -> argparse.Namespace:
@@ -235,7 +315,12 @@ def mutexbench_command(
     critical_ns: int,
     args: argparse.Namespace,
 ) -> tuple[list[str], dict[str, str | None], bool]:
-    if experiment_six.is_flexguard_interpose_lock(lock) or experiment_six.is_otherlocks_interpose_lock(lock):
+    if is_legacy_mcs_accordin_lock(lock):
+        lock_kind = "mutex"
+        env = legacy_mcs_accordin_env()
+        needs_sudo = True
+        cmd_prefix = []
+    elif experiment_six.is_flexguard_interpose_lock(lock) or experiment_six.is_otherlocks_interpose_lock(lock):
         lock_kind = "mutex"
         env: dict[str, str | None] = {}
         needs_sudo = (
@@ -348,7 +433,7 @@ def run_one(
 
     row = {
         "lock": lock,
-        "lock_label": experiment_six.lock_label(lock),
+        "lock_label": lock_label(lock),
         "threads": str(threads),
         "critical_ns": str(critical_ns),
         "outside_ns": str(args.outside_ns),
@@ -368,13 +453,21 @@ def run_one(
 
 
 def write_settings(root: Path, args: argparse.Namespace) -> None:
+    settings_path = root / "settings.json"
+    previous: dict[str, object] = {}
+    if args.resume and settings_path.is_file():
+        try:
+            previous = json.loads(settings_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous = {}
+    locks = list(dict.fromkeys([*previous.get("locks", []), *args.lock_keys]))
     settings = {
         "experiment": "experiment7_mutexbench_fairness",
         "description": "Single-lock mutexbench per-thread operation fairness. fairness_factor is top-half per-thread ops divided by total ops.",
         "output_root": str(root),
         "lock_profile": args.lock_profile,
         "lock_profile_source": args.lock_profile_source,
-        "locks": list(args.lock_keys),
+        "locks": locks,
         "threads": list(args.threads),
         "critical_ns": list(args.critical_ns),
         "outside_ns": args.outside_ns,
@@ -385,8 +478,9 @@ def write_settings(root: Path, args: argparse.Namespace) -> None:
         "command_timeout_seconds": args.command_timeout_seconds,
         "mcs_accordin_taskset_cpus": args.mcs_accordin_taskset_cpus,
         "fairness_formula": "sum(sorted(ops, reverse=True)[:n//2]) / sum(ops)",
+        "legacy_mcs_accordin_library": str(LEGACY_MCS_ACCORDIN_LIBRARY) if LEGACY_MCS_ACCORDIN_LOCK in locks else None,
     }
-    (root / "settings.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
 
 
 def write_summary(raw_path: Path, summary_path: Path) -> None:
@@ -427,6 +521,27 @@ def safe_name(value: str) -> str:
     return "_".join(part for part in out.split("_") if part) or "unknown"
 
 
+def lock_plot_style_key(lock: str) -> str:
+    return experiment_defaults.normalize_lock(lock)
+
+
+def plot_color_map(lock_keys: Iterable[str]) -> dict[str, str]:
+    color_keys = tuple(dict.fromkeys(lock_plot_style_key(lock) for lock in lock_keys))
+    return {
+        lock: FALLBACK_PLOT_COLORS[index % len(FALLBACK_PLOT_COLORS)]
+        for index, lock in enumerate(color_keys)
+    }
+
+
+def lock_plot_style(lock: str, color_by_key: dict[str, str]) -> dict[str, str]:
+    style_key = lock_plot_style_key(lock)
+    return {
+        "color": experiment_three.plot_color(style_key, color_by_key[style_key]),
+        "linestyle": experiment_three.plot_linestyle(style_key),
+        "marker": experiment_three.plot_marker(style_key),
+    }
+
+
 def load_summary_rows(summary_path: Path) -> list[dict[str, str]]:
     if not summary_path.is_file():
         raise RuntimeError(f"{summary_path} does not exist")
@@ -438,6 +553,7 @@ def plot_fairness_for_critical(
     result_root: Path,
     rows: list[dict[str, str]],
     critical_ns: str,
+    color_by_key: dict[str, str],
 ) -> Path:
     try:
         import matplotlib
@@ -450,7 +566,8 @@ def plot_fairness_for_critical(
 
     critical_rows = [row for row in rows if row["critical_ns"] == critical_ns and row.get("fairness_factor")]
     locks = tuple(dict.fromkeys(row["lock"] for row in critical_rows))
-    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+    thread_values = sorted({int(row["threads"]) for row in critical_rows})
+    fig, ax = plt.subplots(figsize=(9.5, 5.5))
     for lock in locks:
         lock_rows = sorted(
             (row for row in critical_rows if row["lock"] == lock),
@@ -461,16 +578,30 @@ def plot_fairness_for_critical(
         xs = [float(row["threads"]) for row in lock_rows]
         ys = [float(row["fairness_factor"]) for row in lock_rows]
         label = lock_rows[0].get("lock_label") or lock
-        ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4.5, label=label)
+        style = lock_plot_style(lock, color_by_key)
+        ax.plot(
+            xs,
+            ys,
+            marker=style["marker"],
+            color=style["color"],
+            linestyle=style["linestyle"],
+            linewidth=1.8,
+            markersize=4.5,
+            markerfacecolor="white",
+            markeredgewidth=1.4,
+            label=label,
+        )
 
     ax.set_title(f"Fairness Factor, critical={critical_ns} ns")
     ax.set_xlabel("Threads")
     ax.set_ylabel("Fairness factor (top half ops / total ops)")
     ax.set_ylim(0.45, 1.02)
-    ax.grid(True, which="major", linestyle="--", linewidth=0.5, alpha=0.45)
+    experiment_three.add_thread_axis_formatting(ax, thread_values)
     ax.xaxis.set_major_formatter(ScalarFormatter())
+    ax.grid(True, axis="y", alpha=0.28)
+    ax.grid(True, axis="x", which="major", alpha=0.16)
     if locks:
-        ax.legend(loc="best", fontsize=8)
+        ax.legend(loc="best", fontsize=8, frameon=False)
     fig.tight_layout()
     output_path = result_root / f"fairness_factor_vs_threads_c{safe_name(critical_ns)}.png"
     fig.savefig(output_path, dpi=180)
@@ -481,7 +612,8 @@ def plot_fairness_for_critical(
 def generate_plots(result_root: Path) -> tuple[Path, ...]:
     rows = load_summary_rows(result_root / "summary.csv")
     critical_values = sorted(tuple(dict.fromkeys(row["critical_ns"] for row in rows)), key=lambda value: int(value))
-    return tuple(plot_fairness_for_critical(result_root, rows, critical_ns) for critical_ns in critical_values)
+    color_by_key = plot_color_map(row["lock"] for row in rows)
+    return tuple(plot_fairness_for_critical(result_root, rows, critical_ns, color_by_key) for critical_ns in critical_values)
 
 
 def regenerate_summary_and_plots(result_root: Path) -> tuple[Path, tuple[Path, ...]]:
@@ -510,7 +642,7 @@ def prepare_output(root: Path, *, force: bool, resume: bool) -> tuple[Path, Path
 def dry_run(args: argparse.Namespace) -> None:
     print("raw_fields: " + ",".join(RAW_FIELDS))
     print("summary_fields: " + ",".join(SUMMARY_FIELDS))
-    experiment_six.ensure_builds(args.lock_keys, dry_run=True)
+    ensure_builds(args.lock_keys, dry_run=True)
     for lock in args.lock_keys:
         for threads in args.threads:
             for critical_ns in args.critical_ns:
@@ -523,7 +655,7 @@ def run_experiment(args: argparse.Namespace) -> Path:
     root = args.output_root
     raw_path, summary_path, logs_dir = prepare_output(root, force=args.force, resume=args.resume)
     write_settings(root, args)
-    experiment_six.ensure_builds(args.lock_keys, dry_run=False)
+    ensure_builds(args.lock_keys, dry_run=False)
     existing = read_existing_keys(raw_path) if args.resume else set()
     raw_exists = raw_path.exists() and args.resume
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import experiment_defaults
+import run_experiment_three as experiment_three
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,18 @@ ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
 EXCLUDED_PLOT_LOCKS = {experiment_defaults.ACCORDIN_TASKSET_LOCK}
+FALLBACK_PLOT_COLORS = [
+    "C0",
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+    "C5",
+    "C6",
+    "C7",
+    "C8",
+    "C9",
+]
 
 
 @dataclass(frozen=True)
@@ -722,6 +735,27 @@ def plot_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, str]]:
     return [row for row in rows if row["lock"] not in EXCLUDED_PLOT_LOCKS]
 
 
+def lock_plot_style_key(lock: str) -> str:
+    return experiment_defaults.normalize_lock(lock)
+
+
+def plot_color_map(lock_keys: Iterable[str]) -> dict[str, str]:
+    color_keys = tuple(dict.fromkeys(lock_plot_style_key(lock) for lock in lock_keys))
+    return {
+        lock: FALLBACK_PLOT_COLORS[index % len(FALLBACK_PLOT_COLORS)]
+        for index, lock in enumerate(color_keys)
+    }
+
+
+def lock_plot_style(lock: str, color_by_key: dict[str, str]) -> dict[str, str]:
+    style_key = lock_plot_style_key(lock)
+    return {
+        "color": experiment_three.plot_color(style_key, color_by_key[style_key]),
+        "linestyle": experiment_three.plot_linestyle(style_key),
+        "marker": experiment_three.plot_marker(style_key),
+    }
+
+
 def plot_metric_for_case(
     result_root: Path,
     rows: list[dict[str, str]],
@@ -729,6 +763,7 @@ def plot_metric_for_case(
     metric: str,
     output_name: str,
     ylabel: str,
+    color_by_key: dict[str, str],
 ) -> Path:
     try:
         import matplotlib
@@ -754,7 +789,11 @@ def plot_metric_for_case(
         ys = [float(row[metric]) for row in lock_rows]
         if metric.endswith("throughput_ops_per_sec"):
             ys = [value / 1_000_000.0 for value in ys]
+        style = lock_plot_style(lock, color_by_key)
         ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4.5, label=label)
+        ax.lines[-1].set_color(style["color"])
+        ax.lines[-1].set_linestyle(style["linestyle"])
+        ax.lines[-1].set_marker(style["marker"])
 
     ax.set_title(case.replace("_", " ").title())
     ax.set_xlabel("Threads")
@@ -775,6 +814,7 @@ def plot_metric_for_case(
 def generate_plots(result_root: Path) -> tuple[Path, ...]:
     rows = plot_rows(load_summary_rows(result_root / "summary.csv"))
     cases = sorted(tuple(dict.fromkeys(row["case"] for row in rows)), key=case_sort_key)
+    color_by_key = plot_color_map(row["lock"] for row in rows)
     plot_paths: list[Path] = []
     for path in result_root.glob("ops_vs_threads_*.png"):
         path.unlink()
@@ -788,6 +828,7 @@ def generate_plots(result_root: Path) -> tuple[Path, ...]:
                 "group_a_throughput_ops_per_sec",
                 f"group_a_ops_vs_threads_{suffix}.png",
                 "Group A throughput (M ops/s)",
+                color_by_key,
             )
         )
         plot_paths.append(
@@ -798,6 +839,7 @@ def generate_plots(result_root: Path) -> tuple[Path, ...]:
                 "group_b_throughput_ops_per_sec",
                 f"group_b_ops_vs_threads_{suffix}.png",
                 "Group B throughput (M ops/s)",
+                color_by_key,
             )
         )
         plot_paths.append(
@@ -808,6 +850,7 @@ def generate_plots(result_root: Path) -> tuple[Path, ...]:
                 "fairness_jain",
                 f"fairness_vs_threads_{suffix}.png",
                 "Jain fairness index",
+                color_by_key,
             )
         )
     return tuple(plot_paths)

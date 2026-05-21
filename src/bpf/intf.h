@@ -50,7 +50,6 @@ struct task_scx_ctx {
 
 struct cpu_inactive_hint {
   unsigned int total;
-  unsigned int lock_mask;
 };
 
 struct cpu_admission_debug {

@@ -30,6 +30,7 @@ ACCORDIN_BASE_LOCK = ACCORDIN_ADMISSION_ONLY_LOCK
 ACCORDIN_SAMPLED_LOCK = "mcs_tas_accordin_sampled"
 ACCORDIN_NO_ADMISSION_LOCK = "mcs_tas_accordin_no_admission"
 ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin_taskset"
+MCS_ACCORDIN_LOCK = "mcs_accordin"
 ACCORDIN_VARIANT_LOCKS = (
     ACCORDIN_BASE_LOCK,
     ACCORDIN_SAMPLED_LOCK,
@@ -138,7 +139,7 @@ LOCK_LABELS = {
     "cna": "CNA",
     "gcr": "GCR",
     "accordin": "Accordin",
-    "mcs_accordin": "Accordin",
+    "mcs_accordin": "MCS Accordin",
     "mcs_tas_accordin": "Accordin",
     "mcs_tas_accordin_admission_only": "Accordin",
     "mcs_tas_accordin_sampled": "Accordin with budget optimization",
@@ -151,7 +152,7 @@ LOCK_ALIASES = {
     "accordin_admission_only": ACCORDIN_ADMISSION_ONLY_LOCK,
     "mcs_tas_accordin": ACCORDIN_ADMISSION_ONLY_LOCK,
     "mcs_tas_accordin_admission_only": ACCORDIN_ADMISSION_ONLY_LOCK,
-    "mcs_accordin": ACCORDIN_ADMISSION_ONLY_LOCK,
+    "mcs_accordin": MCS_ACCORDIN_LOCK,
     "accordin_sampled": "mcs_tas_accordin_sampled",
     "accordin_sampling": "mcs_tas_accordin_sampled",
     "mcs_tas_accordin_sampled": "mcs_tas_accordin_sampled",
@@ -314,6 +315,10 @@ def lock_sort_key(lock: str) -> tuple[int, str]:
 
 def is_accordin_lock(lock: str) -> bool:
     return lock in ACCORDIN_VARIANT_LOCKS
+
+
+def is_mcs_accordin_lock(lock: str) -> bool:
+    return lock == MCS_ACCORDIN_LOCK
 
 
 def accordin_uses_sampling(lock: str) -> bool:

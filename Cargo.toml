@@ -14,6 +14,7 @@ resolver = "3"
 members = [
     "src/accordin_shared",
     "src/mcs_accordin",
+    "src/mcs_accordin_direct",
     "src/mcs_tas_accordin",
     "src/mcs_tas_accordin_direct",
     "src/mcs_tse",
@@ -24,6 +25,7 @@ default-members = [
     ".",
     "src/accordin_shared",
     "src/mcs_accordin",
+    "src/mcs_accordin_direct",
     "src/mcs_tas_accordin",
     "src/mcs_tas_accordin_direct",
     "src/mcs_tse",

@@ -34,6 +34,16 @@ ACCORDIN_DIRECT_LIB_ENV = "MCS_TAS_ACCORDIN_DIRECT_LIB"
 ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
+MCS_ACCORDIN_LOCK = experiment_defaults.MCS_ACCORDIN_LOCK
+MCS_ACCORDIN_PACKAGE = "mcs_accordin"
+MCS_ACCORDIN_RELEASE_LIB = experiment_three.MCS_ACCORDIN_RELEASE_LIB
+MCS_ACCORDIN_DIRECT_PACKAGE = experiment_three.MCS_ACCORDIN_DIRECT_PACKAGE
+MCS_ACCORDIN_DIRECT_LOCK_KIND = experiment_three.MCS_ACCORDIN_DIRECT_LOCK_KIND
+MCS_ACCORDIN_DIRECT_RELEASE_LIB = experiment_three.MCS_ACCORDIN_DIRECT_RELEASE_LIB
+MCS_ACCORDIN_DIRECT_LIB_ENV = experiment_three.MCS_ACCORDIN_DIRECT_LIB_ENV
+MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = experiment_three.MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV
+MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV = experiment_three.MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV
+MCS_ACCORDIN_DIRECT_ENV_PREFIX = experiment_three.MCS_ACCORDIN_DIRECT_ENV_PREFIX
 EXCLUDED_PLOT_LOCKS = {experiment_defaults.ACCORDIN_TASKSET_LOCK}
 FALLBACK_PLOT_COLORS = [
     "C0",
@@ -99,6 +109,7 @@ SUPPORTED_LOCKS = (
     | FLEXGUARD_INTERPOSE_LOCKS
     | set(experiment_defaults.OTHERLOCKS_INTERPOSE_LOCKS)
     | set(experiment_defaults.ACCORDIN_VARIANT_LOCKS)
+    | {MCS_ACCORDIN_LOCK}
 )
 
 RAW_FIELDS = (
@@ -294,6 +305,10 @@ def is_accordin_direct_lock(lock: str) -> bool:
     return experiment_defaults.is_accordin_lock(lock)
 
 
+def is_mcs_accordin_lock(lock: str) -> bool:
+    return experiment_defaults.is_mcs_accordin_lock(lock)
+
+
 def is_flexguard_interpose_lock(lock: str) -> bool:
     return lock in FLEXGUARD_INTERPOSE_LOCKS
 
@@ -343,8 +358,17 @@ def accordin_env(lock: str) -> dict[str, str | None]:
     return env
 
 
+def mcs_accordin_env() -> dict[str, str | None]:
+    return experiment_three.mcs_accordin_direct_env()
+
+
 def mutexbench_command(case: TwoLockCase, lock: str, threads: int, args: argparse.Namespace) -> tuple[list[str], dict[str, str | None], bool]:
-    if is_flexguard_interpose_lock(lock) or is_otherlocks_interpose_lock(lock):
+    if is_mcs_accordin_lock(lock):
+        lock_kind = MCS_ACCORDIN_DIRECT_LOCK_KIND
+        env = mcs_accordin_env()
+        needs_sudo = True
+        cmd_prefix = []
+    elif is_flexguard_interpose_lock(lock) or is_otherlocks_interpose_lock(lock):
         lock_kind = "mutex"
         env: dict[str, str | None] = {}
         needs_sudo = flexguard_interpose_needs_sudo(lock) if is_flexguard_interpose_lock(lock) else False
@@ -450,6 +474,16 @@ def ensure_builds(locks: Iterable[str], *, dry_run: bool) -> None:
             subprocess.run(build_cmd, cwd=REPO_ROOT, check=True)
             if not ACCORDIN_DIRECT_RELEASE_LIB.is_file():
                 raise RuntimeError(f"{ACCORDIN_DIRECT_PACKAGE} library was not produced: {ACCORDIN_DIRECT_RELEASE_LIB}")
+    if any(is_mcs_accordin_lock(lock) for lock in locks):
+        build_cmd = ["cargo", "build", "-p", MCS_ACCORDIN_DIRECT_PACKAGE, "--release"]
+        if dry_run:
+            print(shlex_join(build_cmd))
+        else:
+            subprocess.run(build_cmd, cwd=REPO_ROOT, check=True)
+            if not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+                raise RuntimeError(
+                    f"{MCS_ACCORDIN_DIRECT_PACKAGE} library was not produced: {MCS_ACCORDIN_DIRECT_RELEASE_LIB}"
+                )
     for lock in sorted(lock for lock in locks if is_flexguard_interpose_lock(lock)):
         ensure_flexguard_interpose(lock, dry_run=dry_run)
     for lock in sorted(lock for lock in locks if is_otherlocks_interpose_lock(lock)):

@@ -183,7 +183,7 @@ macro_rules! define_scheduler_loader {
         fn init_scheduler(
             debug: bool,
             stats_only: bool,
-            _debug_counters: bool,
+            debug_counters: bool,
         ) -> ::anyhow::Result<SchedulerState> {
             let mut skel_builder = BpfSkelBuilder::default();
             skel_builder.obj_builder.debug(debug);
@@ -195,6 +195,7 @@ macro_rules! define_scheduler_loader {
             if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
                 bss.stats_only_mode = u32::from(stats_only);
                 bss.single_lock_mode = u32::from($single_lock_mode);
+                bss.admission_debug_mode = u32::from(debug_counters);
             }
             let mut skel = ::scx_utils::scx_ops_load!(skel, accordin_ops, uei)?;
 
@@ -281,11 +282,11 @@ macro_rules! define_scheduler_loader {
                     }
                     if debug_counters {
                         ::log::info!(
-                            "{SCHEDULER_NAME} debug-counter env {} requested but ignored by minimal BPF controller",
+                            "{SCHEDULER_NAME} admission debug counters enabled by env {}",
                             DEBUG_COUNTERS_ENV
                         );
                         eprintln!(
-                            "[{}] debug-counter env {} requested but ignored by minimal BPF controller",
+                            "[{}] admission debug counters enabled by env {}",
                             SCHEDULER_NAME, DEBUG_COUNTERS_ENV
                         );
                     }

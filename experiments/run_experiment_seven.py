@@ -19,8 +19,12 @@ import run_experiment_six as experiment_six
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LEGACY_MCS_ACCORDIN_LOCK = "mcs_accordin"
-LEGACY_MCS_ACCORDIN_PACKAGE = "mcs_accordin"
-LEGACY_MCS_ACCORDIN_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
+MCS_ACCORDIN_DIRECT_PACKAGE = experiment_six.MCS_ACCORDIN_DIRECT_PACKAGE
+MCS_ACCORDIN_DIRECT_LOCK_KIND = experiment_six.MCS_ACCORDIN_DIRECT_LOCK_KIND
+MCS_ACCORDIN_DIRECT_RELEASE_LIB = experiment_six.MCS_ACCORDIN_DIRECT_RELEASE_LIB
+MCS_ACCORDIN_DIRECT_LIB_ENV = experiment_six.MCS_ACCORDIN_DIRECT_LIB_ENV
+LEGACY_MCS_ACCORDIN_PACKAGE = MCS_ACCORDIN_DIRECT_PACKAGE
+LEGACY_MCS_ACCORDIN_LIBRARY = MCS_ACCORDIN_DIRECT_RELEASE_LIB
 DEFAULT_CRITICAL_NS = (100, 300, 1000, 30000)
 DEFAULT_OUTSIDE_NS = 3000
 DEFAULT_THREADS = (48, 96, 192)
@@ -198,14 +202,7 @@ def lock_label(lock: str) -> str:
 
 
 def legacy_mcs_accordin_env() -> dict[str, str | None]:
-    return {
-        "ACCORDIN_CPU_MASK_K": None,
-        "ACCORDIN_DISABLE_ADMISSION": None,
-        "K": None,
-        "LD_PRELOAD": str(LEGACY_MCS_ACCORDIN_LIBRARY),
-        "MCS_ACCORDIN_DISABLE_BPF": None,
-        "MCS_ACCORDIN_STATS_ONLY": None,
-    }
+    return experiment_six.mcs_accordin_env()
 
 
 def ensure_builds(locks: Iterable[str], *, dry_run: bool) -> None:
@@ -316,7 +313,7 @@ def mutexbench_command(
     args: argparse.Namespace,
 ) -> tuple[list[str], dict[str, str | None], bool]:
     if is_legacy_mcs_accordin_lock(lock):
-        lock_kind = "mutex"
+        lock_kind = MCS_ACCORDIN_DIRECT_LOCK_KIND
         env = legacy_mcs_accordin_env()
         needs_sudo = True
         cmd_prefix = []

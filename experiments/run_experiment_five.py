@@ -751,6 +751,8 @@ def per_lock_max_threads_for_settings(
 def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None] | None]:
     if experiment_three.is_native_mutex_lock(lock):
         return [], None
+    if experiment_defaults.is_mcs_accordin_lock(lock):
+        return experiment_three.mcs_accordin_command_prefix()
     if experiment_defaults.is_accordin_lock(lock):
         return experiment_three.accordin_command_prefix(lock)
     if lock == "mcs_extension":
@@ -774,6 +776,10 @@ def build_lock_command(
 ) -> tuple[list[str], dict[str, str | None] | None]:
     if experiment_three.is_native_mutex_lock(lock):
         return command, extra_env
+    if experiment_defaults.is_mcs_accordin_lock(lock):
+        prefix, mcs_accordin_env = experiment_three.mcs_accordin_command_prefix()
+        env = merge_envs(extra_env, mcs_accordin_env)
+        return experiment_three.benchmark_command(lock, [*prefix, *command], env)
     if experiment_defaults.is_accordin_lock(lock):
         prefix, accordin_env = experiment_three.accordin_command_prefix(lock)
         env = merge_envs(extra_env, accordin_env)
@@ -798,6 +804,8 @@ def ensure_lock_helpers(
     experiment_three.ensure_interpose_helpers(locks, build_missing=build_missing, logger=logger)
     if any(experiment_defaults.is_accordin_lock(lock) for lock in locks):
         experiment_three.ensure_accordin_preload(build_missing=build_missing, logger=logger)
+    if any(experiment_defaults.is_mcs_accordin_lock(lock) for lock in locks):
+        experiment_three.ensure_mcs_accordin_preload(build_missing=build_missing, logger=logger)
     if "mcs_extension" in locks:
         experiment_three.ensure_mcs_extension_preload(build_missing=build_missing, logger=logger)
 

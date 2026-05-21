@@ -39,6 +39,16 @@ ACCORDIN_DIRECT_LIB_ENV = "MCS_TAS_ACCORDIN_DIRECT_LIB"
 ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
+MCS_ACCORDIN_PACKAGE = "mcs_accordin"
+MCS_ACCORDIN_LOCK = experiment_defaults.MCS_ACCORDIN_LOCK
+MCS_ACCORDIN_RELEASE_LIB = parsec_common.MCS_ACCORDIN_PRELOAD_LIBRARY
+MCS_ACCORDIN_DIRECT_PACKAGE = "mcs_accordin_direct"
+MCS_ACCORDIN_DIRECT_LOCK_KIND = "mcs_accordin_direct"
+MCS_ACCORDIN_DIRECT_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_accordin_direct.so"
+MCS_ACCORDIN_DIRECT_LIB_ENV = "MCS_ACCORDIN_DIRECT_LIB"
+MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_ACCORDIN_DIRECT_DISABLE_BPF"
+MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_ACCORDIN_DIRECT_STATS_ONLY"
+MCS_ACCORDIN_DIRECT_ENV_PREFIX = "MCS_ACCORDIN_DIRECT_"
 FIXED_MUTEXBENCH_COMBOS = (
     (100, 3000),
     (300, 3000),
@@ -64,7 +74,7 @@ MULTI_LOCK_SWEEP_LOCKS = (
     "cna",
     "gcr",
 )
-SUPPORTED_LOCKS = set(REQUIRED_BASELINE_LOCKS)
+SUPPORTED_LOCKS = set(REQUIRED_BASELINE_LOCKS) | {MCS_ACCORDIN_LOCK}
 LOCK_PRESENCE_ALIASES = {
     "mcs-tas": ("mcs-tas", "mcs_tas", "mcstas"),
     "mcs_extension": ("mcs_extension", "mcs_tse"),
@@ -478,6 +488,19 @@ def ensure_accordin_direct_library(logger: CommandLogger) -> None:  # type: igno
         raise RuntimeError(f"{ACCORDIN_DIRECT_PACKAGE} library was not produced: {ACCORDIN_DIRECT_RELEASE_LIB}")
 
 
+def ensure_mcs_accordin_direct_library(logger: CommandLogger) -> None:  # type: ignore[name-defined]
+    if not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+        logger.run(
+            ["cargo", "build", "-p", MCS_ACCORDIN_DIRECT_PACKAGE, "--release"],
+            log_name=f"build_{MCS_ACCORDIN_DIRECT_PACKAGE}.log",
+            timeout_seconds=0,
+        )
+    if not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+        raise RuntimeError(
+            f"{MCS_ACCORDIN_DIRECT_PACKAGE} library was not produced: {MCS_ACCORDIN_DIRECT_RELEASE_LIB}"
+        )
+
+
 def common_sweep_args(matrix: BaselineMatrix, threads: tuple[int, ...] | None = None) -> list[str]:
     sweep_threads = threads if threads is not None else matrix.threads
     return [
@@ -517,6 +540,24 @@ def accordin_direct_env(lock: str) -> dict[str, str | None]:
     return env
 
 
+def mcs_accordin_direct_env() -> dict[str, str | None]:
+    env: dict[str, str | None] = {
+        "ACCORDIN_CPU_MASK_K": None,
+        "ACCORDIN_DISABLE_ADMISSION": None,
+        "K": None,
+        "MCS_ACCORDIN_DISABLE_BPF": None,
+        "MCS_ACCORDIN_STATS_ONLY": None,
+        MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
+        MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
+        ACCORDIN_DIRECT_LIB_ENV: None,
+    }
+    for key, value in os.environ.items():
+        if key.startswith(MCS_ACCORDIN_DIRECT_ENV_PREFIX):
+            env[key] = value
+    env[MCS_ACCORDIN_DIRECT_LIB_ENV] = str(MCS_ACCORDIN_DIRECT_RELEASE_LIB)
+    return env
+
+
 def accordin_sweep_command(
     root: Path,
     lock: str,
@@ -529,6 +570,23 @@ def accordin_sweep_command(
     lock_dir = root / lock
     raw_path = raw_path or lock_dir / "raw.csv"
     summary_path = summary_path or lock_dir / "summary.csv"
+    if experiment_defaults.is_mcs_accordin_lock(lock):
+        return (
+            [
+                str(SWEEP_SINGLE),
+                *common_sweep_args(matrix, runnable_threads_for_lock(lock, matrix)),
+                "--lock-kind",
+                MCS_ACCORDIN_DIRECT_LOCK_KIND,
+                "--timeslice-extension",
+                "off",
+                "--output-raw",
+                str(raw_path),
+                "--output-summary",
+                str(summary_path),
+            ],
+            mcs_accordin_direct_env(),
+        )
+
     cmd = [
         str(SWEEP_SINGLE),
         *common_sweep_args(matrix, runnable_threads_for_lock(lock, matrix)),
@@ -883,10 +941,13 @@ def run_baseline_supplement(
             dry_run=args.dry_run,
         )
 
-    accordin_locks = tuple(lock for lock in locks if lock in ACCORDIN_LOCKS)
-    if accordin_locks and not args.dry_run:
+    accordin_direct_locks = tuple(lock for lock in locks if lock in ACCORDIN_LOCKS)
+    mcs_accordin_locks = tuple(lock for lock in locks if experiment_defaults.is_mcs_accordin_lock(lock))
+    if accordin_direct_locks and not args.dry_run:
         ensure_accordin_direct_library(logger)
-    for lock in accordin_locks:
+    if mcs_accordin_locks and not args.dry_run:
+        ensure_mcs_accordin_direct_library(logger)
+    for lock in (*accordin_direct_locks, *mcs_accordin_locks):
         if experiment_defaults.accordin_uses_taskset(lock) and args.mcs_accordin_taskset_cpus is None:
             run_dynamic_taskset_accordin_sweeps(
                 logger,

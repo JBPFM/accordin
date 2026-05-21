@@ -123,12 +123,13 @@ BENCHMARK_LABELS = {
     "streamcluster": "PARSEC streamcluster",
 }
 ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin.so"
+MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
 ROOT_REQUIRED_PRELOAD_LOCKS = {
     lock
     for lock in experiment_defaults.ACCORDIN_VARIANT_LOCKS
-}
+} | {experiment_defaults.MCS_ACCORDIN_LOCK}
 LOCK_ALIASES = experiment_defaults.LOCK_ALIASES
 LOCK_ORDER = experiment_defaults.LOCK_ORDER
 RESULT_LOG_PATTERN = re.compile(
@@ -613,6 +614,25 @@ def accordin_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None]
     )
 
 
+def mcs_accordin_preload_env(
+    preload_library: Path = MCS_ACCORDIN_PRELOAD_LIBRARY,
+) -> dict[str, str | None]:
+    return {
+        "LD_PRELOAD": combine_ld_preload(preload_library),
+        "ACCORDIN_DISABLE_ADMISSION": None,
+        "ACCORDIN_CPU_MASK_K": None,
+        "K": None,
+        "MCS_ACCORDIN_DISABLE_BPF": None,
+        "MCS_ACCORDIN_STATS_ONLY": None,
+        "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
+        "MCS_TAS_ACCORDIN_STATS_ONLY": None,
+    }
+
+
+def mcs_accordin_command_prefix() -> tuple[list[str], dict[str, str | None]]:
+    return [], mcs_accordin_preload_env()
+
+
 def parse_csv_ints(value: str) -> tuple[int, ...]:
     items = tuple(int(item.strip()) for item in value.split(",") if item.strip())
     if not items:
@@ -787,7 +807,12 @@ def interpose_helper_error(lock: str) -> str | None:
 def invalid_interpose_helpers(locks: Iterable[str]) -> list[str]:
     invalid: list[str] = []
     for lock in locks:
-        if is_native_mutex_lock(lock) or lock == "mcs_extension" or experiment_defaults.is_accordin_lock(lock):
+        if (
+            is_native_mutex_lock(lock)
+            or lock == "mcs_extension"
+            or experiment_defaults.is_accordin_lock(lock)
+            or experiment_defaults.is_mcs_accordin_lock(lock)
+        ):
             continue
         error = interpose_helper_error(lock)
         if error is not None:
@@ -798,7 +823,12 @@ def invalid_interpose_helpers(locks: Iterable[str]) -> list[str]:
 def invalid_interpose_helper_locks(locks: Iterable[str]) -> tuple[str, ...]:
     invalid: list[str] = []
     for lock in locks:
-        if is_native_mutex_lock(lock) or lock == "mcs_extension" or experiment_defaults.is_accordin_lock(lock):
+        if (
+            is_native_mutex_lock(lock)
+            or lock == "mcs_extension"
+            or experiment_defaults.is_accordin_lock(lock)
+            or experiment_defaults.is_mcs_accordin_lock(lock)
+        ):
             continue
         if interpose_helper_error(lock) is not None:
             invalid.append(lock)
@@ -826,6 +856,29 @@ def ensure_accordin_preload(
     )
     if not ACCORDIN_PRELOAD_LIBRARY.is_file():
         raise RuntimeError(f"LD_PRELOAD helper was not built: {ACCORDIN_PRELOAD_LIBRARY}")
+
+
+def ensure_mcs_accordin_preload(
+    *,
+    build_missing: bool,
+    logger: CommandLogger,
+) -> None:
+    if MCS_ACCORDIN_PRELOAD_LIBRARY.is_file():
+        return
+    if not build_missing:
+        raise RuntimeError(
+            f"LD_PRELOAD helper is missing: {MCS_ACCORDIN_PRELOAD_LIBRARY}. "
+            "Run cargo build -p mcs_accordin --release or rerun with --build-missing."
+        )
+
+    logger.run(
+        ["cargo", "build", "-p", "mcs_accordin", "--release"],
+        log_name="build_mcs_accordin.log",
+        cwd=REPO_ROOT,
+        timeout_seconds=0,
+    )
+    if not MCS_ACCORDIN_PRELOAD_LIBRARY.is_file():
+        raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_ACCORDIN_PRELOAD_LIBRARY}")
 
 
 def ensure_mcs_extension_preload(

@@ -114,6 +114,13 @@ pub fn configured_cpu_count_env_present() -> bool {
     configured_cpu_count_env().is_some()
 }
 
+pub fn controlled_dsq_required_by_env() -> bool {
+    controlled_dsq_required_for_env(
+        std::env::var_os(CPU_MASK_K_ENV).is_some(),
+        std::env::var_os(CPU_MASK_K_SHORT_ENV).is_some(),
+    )
+}
+
 pub fn update_dynamic_cpu_count(
     requested_cpus: usize,
 ) -> Result<Option<DynamicCpuAffinityUpdate>, String> {
@@ -215,6 +222,10 @@ fn configured_cpu_count_env() -> Option<(&'static str, String)> {
         },
         Err(error) => Some((CPU_MASK_K_ENV, error.to_string())),
     }
+}
+
+fn controlled_dsq_required_for_env(long_env_present: bool, short_env_present: bool) -> bool {
+    long_env_present || short_env_present
 }
 
 fn parse_requested_cpu_count(value: &str, env_name: &str) -> Result<usize, String> {
@@ -492,8 +503,8 @@ fn format_cpu_list(cpus: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_active_cpu_bitmap, format_cpu_list, parse_cpu_list, select_numa_available_cpu_nodes,
-        select_numa_cpus, should_apply_userspace_affinity,
+        build_active_cpu_bitmap, controlled_dsq_required_for_env, format_cpu_list, parse_cpu_list,
+        select_numa_available_cpu_nodes, select_numa_cpus, should_apply_userspace_affinity,
     };
 
     #[test]
@@ -583,5 +594,12 @@ mod tests {
     fn userspace_affinity_is_disabled_when_bpf_sink_is_registered() {
         assert!(should_apply_userspace_affinity(false));
         assert!(!should_apply_userspace_affinity(true));
+    }
+
+    #[test]
+    fn controlled_dsq_is_only_needed_for_configured_cpu_masks() {
+        assert!(!controlled_dsq_required_for_env(false, false));
+        assert!(controlled_dsq_required_for_env(true, false));
+        assert!(controlled_dsq_required_for_env(false, true));
     }
 }

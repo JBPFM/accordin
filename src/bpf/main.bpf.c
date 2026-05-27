@@ -10,10 +10,6 @@ UEI_DEFINE(uei);
 #include "maps.bpf.h"
 
 #define INACTIVE_STEAL_SCAN 8U
-#define INACTIVE_ADMIT_SCAN 4U
-#define DEBUG_DEQUEUE_LOCAL 0U
-#define DEBUG_DEQUEUE_STEAL 1U
-#define DEBUG_DEQUEUE_CONTROLLED 2U
 
 static __always_inline bool valid_cpu(s32 cpu) {
   return cpu >= 0 && cpu < MAX_CPUS;
@@ -27,106 +23,11 @@ static __always_inline bool single_lock_enabled(void) {
   return single_lock_mode != 0;
 }
 
-static __always_inline bool admission_debug_enabled(void) {
-  return admission_debug_mode != 0;
-}
-
 static __always_inline struct cpu_inactive_hint *lookup_inactive_hint(__u32 cpu) {
   if (cpu >= MAX_CPUS)
     return 0;
 
   return bpf_map_lookup_elem(&cpu_inactive_hint_map, &cpu);
-}
-
-static __always_inline struct cpu_admission_debug *
-lookup_admission_debug(__u32 cpu) {
-  if (cpu >= MAX_CPUS)
-    return 0;
-
-  return bpf_map_lookup_elem(&cpu_adm_dbg_map, &cpu);
-}
-
-static __always_inline void record_debug_inactive_total(
-    struct cpu_admission_debug *debug, __u32 total) {
-  debug->current_inactive_total = total;
-  if (total > debug->max_inactive_total)
-    debug->max_inactive_total = total;
-}
-
-static __always_inline void record_debug_inactive_enqueue(__u32 cpu,
-                                                          __u32 total) {
-  struct cpu_admission_debug *debug;
-
-  if (!admission_debug_enabled())
-    return;
-
-  debug = lookup_admission_debug(cpu);
-  if (!debug)
-    return;
-
-  __sync_fetch_and_add(&debug->inactive_enqueue, 1);
-  record_debug_inactive_total(debug, total);
-}
-
-static __always_inline void record_debug_inactive_dequeue(__u32 cpu,
-                                                          __u32 total,
-                                                          __u32 dequeue_kind) {
-  struct cpu_admission_debug *debug;
-
-  if (!admission_debug_enabled())
-    return;
-
-  debug = lookup_admission_debug(cpu);
-  if (!debug)
-    return;
-
-  if (dequeue_kind == DEBUG_DEQUEUE_STEAL)
-    __sync_fetch_and_add(&debug->inactive_steal_dequeue, 1);
-  else if (dequeue_kind == DEBUG_DEQUEUE_CONTROLLED)
-    __sync_fetch_and_add(&debug->inactive_controlled_dequeue, 1);
-  else
-    __sync_fetch_and_add(&debug->inactive_local_dequeue, 1);
-
-  record_debug_inactive_total(debug, total);
-}
-
-static __always_inline void record_debug_direct_grant(__u32 cpu) {
-  struct cpu_admission_debug *debug;
-
-  if (!admission_debug_enabled())
-    return;
-
-  debug = lookup_admission_debug(cpu);
-  if (!debug)
-    return;
-
-  __sync_fetch_and_add(&debug->direct_grant, 1);
-}
-
-static __always_inline void record_debug_token_limit_reject(__u32 cpu) {
-  struct cpu_admission_debug *debug;
-
-  if (!admission_debug_enabled())
-    return;
-
-  debug = lookup_admission_debug(cpu);
-  if (!debug)
-    return;
-
-  __sync_fetch_and_add(&debug->token_limit_reject, 1);
-}
-
-static __always_inline void record_debug_owner_busy_reject(__u32 cpu) {
-  struct cpu_admission_debug *debug;
-
-  if (!admission_debug_enabled())
-    return;
-
-  debug = lookup_admission_debug(cpu);
-  if (!debug)
-    return;
-
-  __sync_fetch_and_add(&debug->owner_busy_reject, 1);
 }
 
 static __always_inline bool cpu_is_active(__u32 cpu) {
@@ -172,6 +73,13 @@ static __always_inline bool valid_lock_id(__u32 lock_id) {
   return lock_id != UNMANAGED_LOCK_ID && lock_id < MAX_LOCK_CLASSES;
 }
 
+static __always_inline __u32 lock_id_bit(__u32 lock_id) {
+  if (!valid_lock_id(lock_id))
+    return 0;
+
+  return 1U << lock_id;
+}
+
 static __always_inline __u32 user_admission_lock_id(__u32 user_ctx_word) {
   return (user_ctx_word & ~USER_ADMISSION_FLAG_MASK) >>
          USER_ADMISSION_LOCK_ID_SHIFT;
@@ -184,46 +92,36 @@ static __always_inline __u32 effective_lock_id(__u32 user_ctx_word) {
   return user_admission_lock_id(user_ctx_word);
 }
 
-static __always_inline __u64 inactive_dsq_id(__u32 cpu) {
-  return INACTIVE_DSQ_BASE + cpu;
+static __always_inline __u64 inactive_dsq_id(__u32 lock_id, __u32 cpu) {
+  return INACTIVE_DSQ_BASE + ((__u64)lock_id * MAX_CPUS) + cpu;
 }
 
-static __always_inline void record_inactive_enqueue(__u32 cpu) {
+static __always_inline void record_inactive_enqueue(__u32 lock_id, __u32 cpu) {
   struct cpu_inactive_hint *hint;
-  __u32 total;
+  __u32 bit = lock_id_bit(lock_id);
 
-  if (cpu >= MAX_CPUS)
+  if (!bit || cpu >= MAX_CPUS)
     return;
-
-  __sync_fetch_and_add(&inactive_total, 1);
 
   hint = lookup_inactive_hint(cpu);
   if (!hint)
     return;
 
-  total = __sync_fetch_and_add(&hint->total, 1) + 1;
-  record_debug_inactive_enqueue(cpu, total);
+  __sync_fetch_and_or(&hint->lock_mask, bit);
+  __sync_fetch_and_add(&hint->total, 1);
 }
 
-static __always_inline void record_inactive_dequeue(__u32 cpu,
-                                                    __u32 dequeue_kind) {
+static __always_inline void record_inactive_dequeue(__u32 lock_id, __u32 cpu) {
   struct cpu_inactive_hint *hint;
-  __u32 total;
 
-  if (cpu >= MAX_CPUS)
+  if (!valid_lock_id(lock_id) || cpu >= MAX_CPUS)
     return;
-
-  if (inactive_total)
-    __sync_fetch_and_sub(&inactive_total, 1);
 
   hint = lookup_inactive_hint(cpu);
   if (!hint || !hint->total)
     return;
 
-  total = __sync_fetch_and_sub(&hint->total, 1);
-  if (total)
-    total--;
-  record_debug_inactive_dequeue(cpu, total, dequeue_kind);
+  __sync_fetch_and_sub(&hint->total, 1);
 }
 
 static __always_inline bool active_words_want_cpu(__u64 wanted0, __u64 wanted1,
@@ -274,8 +172,6 @@ static __always_inline void init_task_ctx_if_needed(struct task_scx_ctx *task_ct
   task_ctx->initialized = 1;
   task_ctx->admission_cpu = ADMISSION_CPU_NONE;
   task_ctx->admission_lock_id = UNMANAGED_LOCK_ID;
-  task_ctx->admission_token_uses = 0;
-  task_ctx->admission_token_cooldown = 0;
 }
 
 static __always_inline struct task_scx_ctx *lookup_task_ctx(struct task_struct *p) {
@@ -312,49 +208,100 @@ static __always_inline volatile __u32 *lookup_cpu_owner(__u32 cpu) {
   return &cpu_admission_owner[idx];
 }
 
-static __always_inline bool inactive_waiters_pending(void) {
-  return inactive_total != 0;
-}
-
-static __always_inline bool drain_inactive_round_robin(__u32 cpu) {
-  volatile __u32 *owner = lookup_cpu_owner(cpu);
+static __always_inline bool steal_inactive(__u32 cpu) {
   __u32 nr_cpus = scx_bpf_nr_cpu_ids();
-  __u32 start;
+  __u32 lock_id;
   __u32 i;
-
-  if (!owner || *owner)
-    return false;
-
-  if (!inactive_waiters_pending())
-    return false;
 
   if (nr_cpus > MAX_CPUS)
     nr_cpus = MAX_CPUS;
-  if (!nr_cpus)
+
+  if (nr_cpus <= 1)
     return false;
 
-  start = __sync_fetch_and_add(&inactive_admit_cursor, 1);
-  start %= nr_cpus;
-
 #pragma unroll
-  for (i = 0; i < INACTIVE_ADMIT_SCAN; i++) {
+  for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
     struct cpu_inactive_hint *hint;
-    __u32 victim = start + i;
+    __u32 victim = cpu + i;
 
     if (i >= nr_cpus)
       break;
+
     if (victim >= nr_cpus)
       victim -= nr_cpus;
-    if (!cpu_is_active(victim))
-      continue;
 
     hint = lookup_inactive_hint(victim);
     if (!hint || !hint->total)
       continue;
 
-    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(victim))) {
-      record_inactive_dequeue(
-          victim, victim == cpu ? DEBUG_DEQUEUE_LOCAL : DEBUG_DEQUEUE_STEAL);
+#pragma unroll
+    for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+      volatile __u32 *owner;
+
+      if (!(hint->lock_mask & lock_id_bit(lock_id)))
+        continue;
+
+      owner = lookup_cpu_owner(cpu);
+      if (!owner || *owner)
+        continue;
+
+      if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, victim))) {
+        record_inactive_dequeue(lock_id, victim);
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+static __always_inline bool drain_single_inactive(__u32 cpu) {
+  volatile __u32 *owner;
+
+  owner = lookup_cpu_owner(cpu);
+  if (!owner || *owner)
+    return false;
+
+  if (scx_bpf_dsq_move_to_local(inactive_dsq_id(1, cpu))) {
+    record_inactive_dequeue(1, cpu);
+    return true;
+  }
+
+  return false;
+}
+
+static __always_inline bool steal_single_inactive(__u32 cpu) {
+  __u32 nr_cpus = scx_bpf_nr_cpu_ids();
+  __u32 i;
+
+  if (nr_cpus > MAX_CPUS)
+    nr_cpus = MAX_CPUS;
+
+  if (nr_cpus <= 1)
+    return false;
+
+#pragma unroll
+  for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
+    struct cpu_inactive_hint *hint;
+    __u32 victim = cpu + i;
+    volatile __u32 *owner;
+
+    if (i >= nr_cpus)
+      break;
+
+    if (victim >= nr_cpus)
+      victim -= nr_cpus;
+
+    hint = lookup_inactive_hint(victim);
+    if (!hint || !hint->total)
+      continue;
+
+    owner = lookup_cpu_owner(cpu);
+    if (!owner || *owner)
+      continue;
+
+    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(1, victim))) {
+      record_inactive_dequeue(1, victim);
       return true;
     }
   }
@@ -409,30 +356,6 @@ static __always_inline bool user_explicit_release(__u32 user_ctx_word) {
          !user_in_critical_section(user_ctx_word);
 }
 
-static __always_inline bool admission_token_limit_reached(
-    const struct task_scx_ctx *task_ctx) {
-  return task_ctx->admission_token_cooldown ||
-         task_ctx->admission_token_uses >= ADMISSION_TOKEN_MAX_USES;
-}
-
-static __always_inline void record_admission_token_use(
-    struct task_scx_ctx *task_ctx) {
-  if (!task_ctx->holds_admission)
-    return;
-
-  if (task_ctx->admission_token_uses < ADMISSION_TOKEN_MAX_USES)
-    task_ctx->admission_token_uses++;
-
-  if (task_ctx->admission_token_uses >= ADMISSION_TOKEN_MAX_USES)
-    task_ctx->admission_token_cooldown = 1;
-}
-
-static __always_inline void reset_admission_token_uses(
-    struct task_scx_ctx *task_ctx) {
-  task_ctx->admission_token_uses = 0;
-  task_ctx->admission_token_cooldown = 0;
-}
-
 static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx) {
   task_ctx->holds_admission = 0;
   task_ctx->must_run_on_admission_cpu = 0;
@@ -451,7 +374,6 @@ static __always_inline void release_admission(struct task_struct *p,
   if (owner && *owner == pid)
     *owner = 0;
 
-  record_admission_token_use(task_ctx);
   clear_admission_state(task_ctx);
 
   if (cpu < MAX_CPUS)
@@ -460,8 +382,7 @@ static __always_inline void release_admission(struct task_struct *p,
 
 static __always_inline bool grant_admission(struct task_struct *p,
                                             struct task_scx_ctx *task_ctx,
-                                            __u32 lock_id, __u32 cpu,
-                                            bool enforce_token_limit) {
+                                            __u32 lock_id, __u32 cpu) {
   __u32 pid = p->pid;
   volatile __u32 *owner;
 
@@ -472,19 +393,10 @@ static __always_inline bool grant_admission(struct task_struct *p,
   if (!owner)
     return false;
 
-  if (enforce_token_limit && admission_token_limit_reached(task_ctx) &&
-      inactive_waiters_pending()) {
-    record_debug_token_limit_reject(cpu);
+  if (*owner && *owner != pid)
     return false;
-  }
-
-  if (*owner && *owner != pid) {
-    record_debug_owner_busy_reject(cpu);
-    return false;
-  }
 
   *owner = pid;
-  record_debug_direct_grant(cpu);
   task_ctx->slow_path_seen = 1;
   task_ctx->holds_admission = 1;
   task_ctx->must_run_on_admission_cpu = 0;
@@ -610,7 +522,7 @@ static __always_inline void protect_critical_section(struct task_struct *p,
 
   task_ctx->admission_cpu = cpu;
   if (!task_ctx->holds_admission)
-    grant_admission(p, task_ctx, lock_id, cpu, false);
+    grant_admission(p, task_ctx, lock_id, cpu);
 
   task_ctx->must_run_on_admission_cpu = 1;
 }
@@ -641,7 +553,7 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
   if (!task_ctx->holds_admission && have_user &&
       user_slow_path_pending(user_ctx_word) && valid_lock_id(lock_id) &&
       cpu < MAX_CPUS && task_cpu_allowed(p, cpu))
-    grant_admission(p, task_ctx, lock_id, cpu, true);
+    grant_admission(p, task_ctx, lock_id, cpu);
 
   if (task_ctx->must_run_on_admission_cpu && task_ctx->admission_cpu == cpu)
     task_ctx->must_run_on_admission_cpu = 0;
@@ -776,16 +688,15 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     }
     task_ctx->admission_cpu = cpu;
 
-    if (grant_admission(p, task_ctx, lock_id, cpu, true)) {
+    if (grant_admission(p, task_ctx, lock_id, cpu)) {
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
       return;
     }
 
-    reset_admission_token_uses(task_ctx);
     task_ctx->inactive_wait = 1;
     task_ctx->admission_lock_id = lock_id;
-    record_inactive_enqueue(cpu);
-    scx_bpf_dsq_insert(p, inactive_dsq_id(cpu), SCX_SLICE_DFL, enq_flags);
+    record_inactive_enqueue(lock_id, cpu);
+    scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id, cpu), SCX_SLICE_DFL, enq_flags);
     return;
   }
 
@@ -814,6 +725,33 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
 }
 
+static __always_inline bool drain_local_inactive(__u32 cpu) {
+  struct cpu_inactive_hint *hint = lookup_inactive_hint(cpu);
+  __u32 lock_id;
+
+  if (!hint || !hint->total)
+    return false;
+
+#pragma unroll
+  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+    volatile __u32 *owner;
+
+    if (!(hint->lock_mask & lock_id_bit(lock_id)))
+      continue;
+
+    owner = lookup_cpu_owner(cpu);
+    if (!owner || *owner)
+      continue;
+
+    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, cpu))) {
+      record_inactive_dequeue(lock_id, cpu);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   bool active;
   (void)prev;
@@ -828,21 +766,50 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   if (stats_only_enabled())
     return;
 
-  if (drain_inactive_round_robin((__u32)cpu))
+  if (single_lock_enabled()) {
+    if (drain_single_inactive((__u32)cpu))
+      return;
+
+    if (scx_bpf_dsq_move_to_local(CONTROLLED_DSQ_ID))
+      return;
+
+    steal_single_inactive((__u32)cpu);
+    return;
+  }
+
+  if (drain_local_inactive((__u32)cpu))
     return;
 
   if (scx_bpf_dsq_move_to_local(CONTROLLED_DSQ_ID))
     return;
+
+  steal_inactive((__u32)cpu);
 }
 
 static __always_inline void drain_inactive_to_controlled(__u32 cpu) {
   struct task_struct *p;
+  __u32 lock_id;
+
+#pragma unroll
+  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+    bpf_rcu_read_lock();
+    bpf_for_each(scx_dsq, p, inactive_dsq_id(lock_id, cpu), 0) {
+      if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, CONTROLLED_DSQ_ID, 0))
+        break;
+      record_inactive_dequeue(lock_id, cpu);
+    }
+    bpf_rcu_read_unlock();
+  }
+}
+
+static __always_inline void drain_single_inactive_to_controlled(__u32 cpu) {
+  struct task_struct *p;
 
   bpf_rcu_read_lock();
-  bpf_for_each(scx_dsq, p, inactive_dsq_id(cpu), 0) {
+  bpf_for_each(scx_dsq, p, inactive_dsq_id(1, cpu), 0) {
     if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, CONTROLLED_DSQ_ID, 0))
       break;
-    record_inactive_dequeue(cpu, DEBUG_DEQUEUE_CONTROLLED);
+    record_inactive_dequeue(1, cpu);
   }
   bpf_rcu_read_unlock();
 }
@@ -891,8 +858,12 @@ int accordin_nudge_cpu(struct accordin_cpu_nudge_args *args) {
   if (cpu >= MAX_CPUS)
     return -EINVAL;
 
-  if (!stats_only_enabled() && args->drain_inactive)
-    drain_inactive_to_controlled(cpu);
+  if (!stats_only_enabled() && args->drain_inactive) {
+    if (single_lock_enabled())
+      drain_single_inactive_to_controlled(cpu);
+    else
+      drain_inactive_to_controlled(cpu);
+  }
 
   scx_bpf_kick_cpu(cpu, 0);
   return 0;
@@ -967,6 +938,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   if (ret)
     return ret;
 
+  if (single_lock_enabled()) {
+    for (cpu = 0; cpu < nr_cpus; cpu++) {
+      ret = scx_bpf_create_dsq(inactive_dsq_id(1, cpu), -1);
+      if (ret)
+        return ret;
+    }
+    return 0;
+  }
+
   active_cpus_all = 1;
   active_cpu_word0 = ~0ULL;
   active_cpu_word1 = ~0ULL;
@@ -974,7 +954,25 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   active_cpu_word3 = ~0ULL;
 
   for (cpu = 0; cpu < nr_cpus; cpu++) {
-    ret = scx_bpf_create_dsq(inactive_dsq_id(cpu), -1);
+    ret = scx_bpf_create_dsq(inactive_dsq_id(1, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(2, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(3, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(4, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(5, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(6, cpu), -1);
+    if (ret)
+      return ret;
+    ret = scx_bpf_create_dsq(inactive_dsq_id(7, cpu), -1);
     if (ret)
       return ret;
   }

@@ -19,7 +19,6 @@
 #define USER_ADMISSION_LOCK_ID_SHIFT 3U
 #define MAX_LOCK_CLASSES 8U
 #define UNMANAGED_LOCK_ID 0U
-#define ADMISSION_TOKEN_MAX_USES 1U
 
 struct accordin_active_cpus_args {
   unsigned long long wanted0;
@@ -41,8 +40,6 @@ struct task_scx_ctx {
   unsigned int admission_cpu;
   unsigned int must_run_on_admission_cpu;
   unsigned int inactive_wait;
-  unsigned int admission_token_uses;
-  unsigned int admission_token_cooldown;
   unsigned long long
       user_ctx_ptr; /* cached pointer to user-space admission word */
   unsigned int admission_lock_id; /* 0 = no admission held */
@@ -50,18 +47,7 @@ struct task_scx_ctx {
 
 struct cpu_inactive_hint {
   unsigned int total;
-};
-
-struct cpu_admission_debug {
-  unsigned long long inactive_enqueue;
-  unsigned long long inactive_local_dequeue;
-  unsigned long long inactive_steal_dequeue;
-  unsigned long long inactive_controlled_dequeue;
-  unsigned long long direct_grant;
-  unsigned long long token_limit_reject;
-  unsigned long long owner_busy_reject;
-  unsigned int current_inactive_total;
-  unsigned int max_inactive_total;
+  unsigned int lock_mask;
 };
 
 enum stat_key {

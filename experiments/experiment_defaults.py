@@ -31,6 +31,7 @@ ACCORDIN_SAMPLED_LOCK = "mcs_tas_accordin_sampled"
 ACCORDIN_NO_ADMISSION_LOCK = "mcs_tas_accordin_no_admission"
 ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin_taskset"
 MCS_ACCORDIN_LOCK = "mcs_accordin"
+PTHREAD_SPINLOCK_LOCK = "pthread_spinlock"
 ACCORDIN_VARIANT_LOCKS = (
     ACCORDIN_BASE_LOCK,
     ACCORDIN_SAMPLED_LOCK,
@@ -115,6 +116,7 @@ EXPERIMENT_ONE_FOCUS_LOCKS = (ACCORDIN_BASE_LOCK, "flexguard")
 EXPERIMENT_ONE_SUPPLEMENT_DEFAULT_LOCKS = ("reciprocating", "malthusian")
 
 SINGLE_OVERSUBSCRIBED_LOCKS = (
+    PTHREAD_SPINLOCK_LOCK,
     "mcs",
     "mcs_extension",
     "reciprocating",
@@ -126,6 +128,7 @@ LOCK_LABELS = {
     "stock": "Stock",
     "mutex": "Mutex",
     "pthread": "Mutex",
+    "pthread_spinlock": "Pthread spinlock",
     "mcs": "MCS",
     "mcstp": "MCS-TP",
     "mcs-tas": "MCS-TAS",
@@ -171,6 +174,8 @@ LOCK_ALIASES = {
     "mutex": "mutex",
     "pthread": "mutex",
     "stock": "mutex",
+    "pthread_spinlock": PTHREAD_SPINLOCK_LOCK,
+    "pthread-spinlock": PTHREAD_SPINLOCK_LOCK,
     "cna": "cna",
     "gcr": "gcr",
 }
@@ -188,6 +193,7 @@ EXPERIMENT_TWO_LOCK_ALIASES = {
 LOCK_ORDER = (
     "mutex",
     "stock",
+    "pthread_spinlock",
     "mcs",
     "mcs-tas",
     "mcs_tas",

@@ -57,8 +57,10 @@ BENCHMARK_ACCORDIN_MODE_OVERRIDES = {
     "readrandom": ACCORDIN_MODE_MUTEX_HOOK,
     "fillrandom": ACCORDIN_MODE_DIRECT,
 }
+PTHREAD_SPINLOCK_LOCK = experiment_defaults.PTHREAD_SPINLOCK_LOCK
 LEVELDB_DIRECT_ADAPTER_BENCHMARKS = ("fillrandom",)
 LEVELDB_DIRECT_ADAPTER_LOCKS = (
+    PTHREAD_SPINLOCK_LOCK,
     "mcs",
     "mcstp",
     "mcstas",
@@ -161,9 +163,18 @@ LEVELDB_ACCORDIN_MUTEX_HOOK_ALIAS_TARGETS = {
 LEVELDB_ACCORDIN_MUTEX_HOOK_VARIANT_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
 MINIMAL_LOCKS = LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS
 LEVELDB_BASE_FULL_LOCKS = tuple(
-    lock
-    for lock in experiment_defaults.FULL_LOCKS
-    if lock not in experiment_defaults.ACCORDIN_VARIANT_LOCKS
+    dict.fromkeys(
+        (
+            "mutex",
+            PTHREAD_SPINLOCK_LOCK,
+            *(
+                lock
+                for lock in experiment_defaults.FULL_LOCKS
+                if lock not in experiment_defaults.ACCORDIN_VARIANT_LOCKS
+                and lock != "mutex"
+            ),
+        )
+    )
 )
 FULL_LOCKS = tuple(dict.fromkeys(("mutex", *LEVELDB_BASE_FULL_LOCKS, *LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS)))
 LOCK_PROFILES = {
@@ -172,7 +183,15 @@ LOCK_PROFILES = {
 }
 MUTEX_HOOK_LOCK_PROFILES = {
     "minimal": LEVELDB_ACCORDIN_MUTEX_HOOK_VARIANT_LOCKS,
-    "full": tuple(dict.fromkeys(("mutex", *experiment_defaults.FULL_LOCKS))),
+    "full": tuple(
+        dict.fromkeys(
+            (
+                "mutex",
+                PTHREAD_SPINLOCK_LOCK,
+                *(lock for lock in experiment_defaults.FULL_LOCKS if lock != "mutex"),
+            )
+        )
+    ),
 }
 DEFAULT_LOCKS = LOCK_PROFILES[DEFAULT_LOCK_PROFILE]
 LEVELDB_REBUILD_INPUTS = (
@@ -626,6 +645,8 @@ def is_leveldb_direct_adapter_lock(lock: str) -> bool:
 
 
 def benchmark_uses_leveldb_direct_adapter(benchmark: str, lock: str) -> bool:
+    if lock == PTHREAD_SPINLOCK_LOCK:
+        return True
     return benchmark in LEVELDB_DIRECT_ADAPTER_BENCHMARKS and is_leveldb_direct_adapter_lock(lock)
 
 

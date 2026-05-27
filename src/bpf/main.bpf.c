@@ -35,6 +35,10 @@ static __always_inline bool admission_debug_enabled(void) {
   return admission_debug_mode != 0;
 }
 
+static __always_inline bool global_inactive_dsq_enabled(void) {
+  return global_inactive_dsq_mode != 0;
+}
+
 static __always_inline struct cpu_inactive_hint *lookup_inactive_hint(__u32 cpu) {
   if (cpu >= MAX_CPUS)
     return 0;
@@ -189,6 +193,9 @@ static __always_inline __u32 effective_lock_id(__u32 user_ctx_word) {
 }
 
 static __always_inline __u64 inactive_dsq_id(__u32 cpu) {
+  if (global_inactive_dsq_enabled())
+    return INACTIVE_DSQ_BASE;
+
   return INACTIVE_DSQ_BASE + cpu;
 }
 
@@ -199,7 +206,11 @@ static __always_inline void record_inactive_enqueue(__u32 cpu) {
   if (cpu >= MAX_CPUS)
     return;
 
-  __sync_fetch_and_add(&inactive_total, 1);
+  total = __sync_fetch_and_add(&inactive_total, 1) + 1;
+  if (global_inactive_dsq_enabled()) {
+    record_debug_inactive_enqueue(cpu, total);
+    return;
+  }
 
   hint = lookup_inactive_hint(cpu);
   if (!hint)
@@ -217,8 +228,18 @@ static __always_inline void record_inactive_dequeue(__u32 cpu,
   if (cpu >= MAX_CPUS)
     return;
 
-  if (inactive_total)
-    __sync_fetch_and_sub(&inactive_total, 1);
+  if (inactive_total) {
+    total = __sync_fetch_and_sub(&inactive_total, 1);
+    if (total)
+      total--;
+  } else {
+    total = 0;
+  }
+
+  if (global_inactive_dsq_enabled()) {
+    record_debug_inactive_dequeue(cpu, total, dequeue_kind);
+    return;
+  }
 
   hint = lookup_inactive_hint(cpu);
   if (!hint || !hint->total)
@@ -332,6 +353,14 @@ static __always_inline bool drain_inactive_round_robin(__u32 cpu) {
   owner = lookup_cpu_owner(cpu);
   if (!owner || *owner)
     return false;
+
+  if (global_inactive_dsq_enabled()) {
+    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(0))) {
+      record_inactive_dequeue(cpu, DEBUG_DEQUEUE_STEAL);
+      return true;
+    }
+    return false;
+  }
 
   if (nr_cpus > MAX_CPUS)
     nr_cpus = MAX_CPUS;
@@ -916,6 +945,29 @@ int accordin_nudge_cpu(struct accordin_cpu_nudge_args *args) {
   return 0;
 }
 
+SEC("syscall")
+int accordin_release_current_admission(
+    struct accordin_release_admission_args *args) {
+  struct task_struct *p;
+  struct task_scx_ctx *task_ctx;
+
+  (void)args;
+
+  if (!eager_token_release_mode)
+    return 0;
+
+  p = bpf_get_current_task_btf();
+  if (!p)
+    return -ESRCH;
+
+  task_ctx = lookup_task_ctx(p);
+  if (!task_ctx || !task_ctx->holds_admission)
+    return 0;
+
+  release_admission(p, task_ctx);
+  return 0;
+}
+
 void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
   refresh_running_state(p);
 }
@@ -991,7 +1043,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   active_cpu_word2 = ~0ULL;
   active_cpu_word3 = ~0ULL;
 
-  for (cpu = 0; cpu < nr_cpus; cpu++) {
+  ret = scx_bpf_create_dsq(inactive_dsq_id(0), -1);
+  if (ret)
+    return ret;
+
+  if (global_inactive_dsq_enabled())
+    return 0;
+
+  for (cpu = 1; cpu < nr_cpus; cpu++) {
     ret = scx_bpf_create_dsq(inactive_dsq_id(cpu), -1);
     if (ret)
       return ret;

@@ -75,6 +75,10 @@ macro_rules! define_scheduler_loader {
             previous: ::std::sync::Mutex<Option<[u8; $crate::cpu_affinity::MAX_CPUS]>>,
         }
 
+        struct EagerReleaseProgSink {
+            release_prog_fd: ::std::os::fd::RawFd,
+        }
+
         impl ActiveCpusProgSink {
             fn set_active_cpus(
                 &self,
@@ -172,6 +176,17 @@ macro_rules! define_scheduler_loader {
             }
         }
 
+        impl $crate::admission::EagerReleaseSink for EagerReleaseProgSink {
+            fn release_current(&self) -> ::std::result::Result<(), ::std::string::String> {
+                let args = crate::bpf_intf::accordin_release_admission_args { reserved: 0 };
+                run_bpf_syscall_prog(
+                    self.release_prog_fd,
+                    &args,
+                    "accordin_release_current_admission",
+                )
+            }
+        }
+
         struct SchedulerState {
             _link: Option<::libbpf_rs::Link>,
             _skel: Option<BpfSkel<'static>>,
@@ -198,6 +213,10 @@ macro_rules! define_scheduler_loader {
                 bss.use_controlled_dsq =
                     u32::from($crate::cpu_affinity::controlled_dsq_required_by_env());
                 bss.admission_debug_mode = u32::from(debug_counters);
+                bss.global_inactive_dsq_mode =
+                    u32::from($crate::env::inactive_dsq_global_enabled_by_env());
+                bss.eager_token_release_mode =
+                    u32::from($crate::env::eager_token_release_enabled_by_env());
             }
             let mut skel = ::scx_utils::scx_ops_load!(skel, accordin_ops, uei)?;
 
@@ -212,10 +231,18 @@ macro_rules! define_scheduler_loader {
                 use ::std::os::fd::{AsFd, AsRawFd};
                 skel.progs.accordin_nudge_cpu.as_fd().as_raw_fd()
             };
+            let release_current_admission_prog_fd = {
+                use ::std::os::fd::{AsFd, AsRawFd};
+                skel.progs.accordin_release_current_admission.as_fd().as_raw_fd()
+            };
             $crate::cpu_affinity::set_bpf_sink(Box::new(ActiveCpusProgSink {
                 set_prog_fd: active_cpus_prog_fd,
                 nudge_prog_fd: nudge_cpu_prog_fd,
                 previous: ::std::sync::Mutex::new(Some([0; $crate::cpu_affinity::MAX_CPUS])),
+            }))
+            .map_err(::anyhow::Error::msg)?;
+            $crate::admission::set_eager_release_sink(Box::new(EagerReleaseProgSink {
+                release_prog_fd: release_current_admission_prog_fd,
             }))
             .map_err(::anyhow::Error::msg)?;
             $crate::cpu_affinity::init_from_env(SCHEDULER_NAME);
@@ -291,6 +318,12 @@ macro_rules! define_scheduler_loader {
                             "[{}] admission debug counters enabled by env {}",
                             SCHEDULER_NAME, DEBUG_COUNTERS_ENV
                         );
+                    }
+                    if $crate::env::inactive_dsq_global_enabled_by_env() {
+                        eprintln!("[{}] global inactive DSQ ablation enabled by {}", SCHEDULER_NAME, $crate::env::INACTIVE_DSQ_ENV);
+                    }
+                    if $crate::env::eager_token_release_enabled_by_env() {
+                        eprintln!("[{}] eager token release ablation enabled by {}", SCHEDULER_NAME, $crate::env::EAGER_TOKEN_RELEASE_ENV);
                     }
                     eprintln!("[{}] eBPF scheduler loaded successfully", SCHEDULER_NAME);
                     state

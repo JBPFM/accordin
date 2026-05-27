@@ -34,6 +34,10 @@ struct accordin_cpu_nudge_args {
   unsigned int drain_inactive;
 };
 
+struct accordin_release_admission_args {
+  unsigned int reserved;
+};
+
 struct task_scx_ctx {
   unsigned int slow_path_seen;
   unsigned int initialized;

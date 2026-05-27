@@ -12,6 +12,7 @@ pub const UNMANAGED_LOCK_ID: u32 = 0;
 pub const DISABLE_ADMISSION_ENV: &str = "ACCORDIN_DISABLE_ADMISSION";
 
 static NEXT_LOCK_ID: AtomicU32 = AtomicU32::new(1);
+static EAGER_RELEASE_SINK: OnceLock<Box<dyn EagerReleaseSink>> = OnceLock::new();
 
 thread_local! {
     static USER_ADMISSION_WORD: AtomicU32 = const { AtomicU32::new(0) };
@@ -24,6 +25,16 @@ pub struct LockAdmissionScope {
     outer_managed: bool,
 }
 
+pub trait EagerReleaseSink: Send + Sync {
+    fn release_current(&self) -> Result<(), String>;
+}
+
+pub fn set_eager_release_sink(sink: Box<dyn EagerReleaseSink>) -> Result<(), String> {
+    EAGER_RELEASE_SINK
+        .set(sink)
+        .map_err(|_| "eager release sink already registered".to_string())
+}
+
 pub fn user_word_addr() -> *const u32 {
     USER_ADMISSION_WORD.with(|word| word as *const AtomicU32 as *const u32)
 }
@@ -33,6 +44,24 @@ fn admission_enabled() -> bool {
     static ADMISSION_ENABLED: OnceLock<bool> = OnceLock::new();
 
     *ADMISSION_ENABLED.get_or_init(|| !crate::env::env_flag(DISABLE_ADMISSION_ENV))
+}
+
+#[inline(always)]
+fn eager_release_enabled() -> bool {
+    static EAGER_RELEASE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *EAGER_RELEASE_ENABLED.get_or_init(crate::env::eager_token_release_enabled_by_env)
+}
+
+#[inline(always)]
+fn release_admission_eagerly_if_enabled() {
+    if !eager_release_enabled() {
+        return;
+    }
+
+    if let Some(sink) = EAGER_RELEASE_SINK.get() {
+        let _ = sink.release_current();
+    }
 }
 
 #[inline(always)]
@@ -226,6 +255,9 @@ fn mark_critical_section_exit_with_admission_enabled(enabled: bool) {
         };
         word.store(next, Ordering::Relaxed);
     });
+    if enabled {
+        release_admission_eagerly_if_enabled();
+    }
 }
 
 #[inline(always)]
@@ -246,6 +278,9 @@ fn mark_critical_section_exit_for_lock_with_admission_enabled(lock_id: u32, enab
         };
         word.store(next, Ordering::Relaxed);
     });
+    if enabled {
+        release_admission_eagerly_if_enabled();
+    }
 }
 
 #[inline(always)]

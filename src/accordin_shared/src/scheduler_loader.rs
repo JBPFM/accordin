@@ -195,8 +195,6 @@ macro_rules! define_scheduler_loader {
             if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
                 bss.stats_only_mode = u32::from(stats_only);
                 bss.single_lock_mode = u32::from($single_lock_mode);
-                bss.use_controlled_dsq =
-                    u32::from($crate::cpu_affinity::controlled_dsq_required_by_env());
                 bss.admission_debug_mode = u32::from(debug_counters);
             }
             let mut skel = ::scx_utils::scx_ops_load!(skel, accordin_ops, uei)?;

@@ -48,7 +48,6 @@ struct {
 
 volatile __u32 stats_only_mode = 0;
 volatile __u32 single_lock_mode = 0;
-volatile __u32 use_controlled_dsq = 0;
 volatile __u32 admission_debug_mode = 0;
 volatile __u32 active_cpus_all = 1;
 volatile __u64 active_cpu_word0 = ~0ULL;

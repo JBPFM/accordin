@@ -11,6 +11,3 @@
 	path = third_party/leveldb-1.23
 	url = https://github.com/google/leveldb.git
 	ignore = dirty
-[submodule "third_party/CacheLib"]
-	path = third_party/CacheLib
-	url = https://github.com/facebook/CacheLib.git

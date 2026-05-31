@@ -12,6 +12,7 @@ import statistics
 import subprocess
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -530,11 +531,35 @@ def lock_plot_style(lock: str, color_by_key: dict[str, str]) -> dict[str, str]:
     }
 
 
+BAR_HATCHES = ("", "//", "\\\\", "xx", "..", "++", "--", "oo", "**", "OO")
+
+
 def load_summary_rows(summary_path: Path) -> list[dict[str, str]]:
     if not summary_path.is_file():
         raise RuntimeError(f"{summary_path} does not exist")
     with summary_path.open(newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
+
+
+def summary_decimal(row: dict[str, str], field: str) -> Decimal:
+    value = row.get(field, "")
+    try:
+        return Decimal(value.strip())
+    except (AttributeError, InvalidOperation) as exc:
+        raise ValueError(f"summary row has invalid {field}: {value!r}") from exc
+
+
+def format_plot_number(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    if value == value.to_integral_value():
+        return str(value.quantize(Decimal(1)))
+    text = format(value.normalize(), "f")
+    return text.rstrip("0").rstrip(".") or "0"
+
+
+def summary_workload_key(row: dict[str, str]) -> tuple[Decimal, Decimal]:
+    return summary_decimal(row, "critical_ns"), summary_decimal(row, "outside_ns")
 
 
 def generate_plots(result_root: Path) -> tuple[Path, ...]:
@@ -547,41 +572,67 @@ def generate_plots(result_root: Path) -> tuple[Path, ...]:
     import matplotlib.pyplot as plt
 
     rows = load_summary_rows(result_root / "summary.csv")
-    combos = sorted({(row["critical_ns"], row["outside_ns"]) for row in rows}, key=lambda item: (int(item[0]), int(item[1])))
+    rows_by_workload: dict[tuple[Decimal, Decimal], list[dict[str, str]]] = {}
+    for row in rows:
+        rows_by_workload.setdefault(summary_workload_key(row), []).append(row)
     color_by_key = plot_color_map(row["lock"] for row in rows)
     plot_paths: list[Path] = []
-    for critical_ns, outside_ns in combos:
-        combo_rows = [row for row in rows if row["critical_ns"] == critical_ns and row["outside_ns"] == outside_ns]
+    for critical_value, outside_value in sorted(rows_by_workload):
+        critical_ns = format_plot_number(critical_value)
+        outside_ns = format_plot_number(outside_value)
+        combo_rows = rows_by_workload[(critical_value, outside_value)]
         locks = tuple(dict.fromkeys(row["lock"] for row in combo_rows))
         fig, ax = plt.subplots(figsize=(9.2, 5.3))
-        for lock in locks:
-            lock_rows = sorted(
-                (row for row in combo_rows if row["lock"] == lock),
-                key=lambda row: float(row["cpu_fraction_value"]),
-            )
+        category_keys = sorted(
+            {
+                (
+                    summary_decimal(row, "cpu_fraction_value"),
+                    summary_decimal(row, "taskset_cpu_count"),
+                    row["cpu_fraction"],
+                )
+                for row in combo_rows
+            },
+            key=lambda item: (item[0], item[1], item[2]),
+        )
+        category_index = {key: index for index, key in enumerate(category_keys)}
+        group_width = 0.82
+        bar_width = group_width / max(len(locks), 1)
+        for lock_index, lock in enumerate(locks):
+            lock_rows = [row for row in combo_rows if row["lock"] == lock]
             if not lock_rows:
                 continue
-            xs = [float(row["taskset_cpu_count"]) for row in lock_rows]
+            xs = [
+                category_index[
+                    (
+                        summary_decimal(row, "cpu_fraction_value"),
+                        summary_decimal(row, "taskset_cpu_count"),
+                        row["cpu_fraction"],
+                    )
+                ]
+                + (lock_index - (len(locks) - 1) / 2) * bar_width
+                for row in lock_rows
+            ]
             ys = [float(row["throughput_ops_per_sec"]) / 1_000_000.0 for row in lock_rows]
             label = lock_rows[0].get("lock_label") or lock
             style = lock_plot_style(lock, color_by_key)
-            ax.plot(
+            ax.bar(
                 xs,
                 ys,
-                marker=style["marker"],
+                width=bar_width * 0.92,
                 color=style["color"],
-                linestyle=style["linestyle"],
-                linewidth=1.8,
-                markersize=4.5,
-                markerfacecolor="white",
-                markeredgewidth=1.4,
+                edgecolor="#333333",
+                linewidth=0.45,
+                hatch=BAR_HATCHES[lock_index % len(BAR_HATCHES)],
                 label=label,
             )
+        xtick_labels = [format_plot_number(cpu_count) for _, cpu_count, _ in category_keys]
         ax.set_title(f"Overload Throughput, critical={critical_ns} ns, outside={outside_ns} ns")
         ax.set_xlabel("Taskset logical CPUs")
         ax.set_ylabel("Throughput (M ops/s)")
+        ax.set_xticks(range(len(category_keys)), xtick_labels)
+        ax.set_xlim(-0.5, max(len(category_keys) - 0.5, 0.5))
+        ax.set_axisbelow(True)
         ax.grid(True, axis="y", alpha=0.28)
-        ax.grid(True, axis="x", which="major", alpha=0.16)
         if locks:
             ax.legend(loc="best", fontsize=8, frameon=False)
         fig.tight_layout()

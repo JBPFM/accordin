@@ -191,6 +191,11 @@ RAW_FIELDS = (
     "fill_benchmark",
     "init_wall_seconds",
     "latency_micros_per_op",
+    "benchmark_elapsed_ns",
+    "leveldb_lock_hold_ns_total",
+    "leveldb_lock_hold_samples",
+    "avg_lock_hold_ns",
+    "avg_lock_handoff_ns_estimated",
     "wall_seconds",
     "init_command_log",
     "command_log",
@@ -202,6 +207,11 @@ SUMMARY_FIELDS = (
     "mean_latency_micros_per_op",
     "mean_benchmark_seconds",
     "mean_ops_per_second",
+    "mean_benchmark_elapsed_ns",
+    "mean_leveldb_lock_hold_ns_total",
+    "mean_leveldb_lock_hold_samples",
+    "mean_avg_lock_hold_ns",
+    "mean_avg_lock_handoff_ns_estimated",
     "mean_init_wall_seconds",
     "mean_wall_seconds",
     "runs",
@@ -211,6 +221,15 @@ LATENCY_PATTERN = re.compile(
     re.MULTILINE,
 )
 LEVELDB_PROGRESS_PATTERN = re.compile(r"^\.\.\. (?:finished \d+ ops|crc=0x[0-9a-fA-F]+)\s*$")
+LOCK_TIMING_PATTERN = re.compile(
+    r"^(?P<name>"
+    r"leveldb_lock_benchmark_elapsed_ns|"
+    r"leveldb_lock_hold_ns_total|"
+    r"leveldb_lock_hold_samples|"
+    r"leveldb_lock_avg_hold_ns"
+    r"):\s+(?P<value>\d+(?:\.\d+)?)\s*$",
+    re.MULTILINE,
+)
 BENCHMARK_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 RunKey = tuple[str, str, int, int]
 
@@ -1195,6 +1214,66 @@ def parse_latency(output: str, benchmark: str) -> float:
     raise RuntimeError(f"db_bench output did not contain a latency line for {benchmark}.")
 
 
+def parse_lock_timing_metrics(output: str) -> dict[str, str]:
+    metrics: dict[str, str] = {}
+    for match in LOCK_TIMING_PATTERN.finditer(output):
+        metrics[match.group("name")] = match.group("value")
+    return metrics
+
+
+def lock_timing_fields_from_output(output: str, *, effective_total_ops: int) -> dict[str, str]:
+    metrics = parse_lock_timing_metrics(output)
+    fields = {
+        "benchmark_elapsed_ns": "",
+        "leveldb_lock_hold_ns_total": "",
+        "leveldb_lock_hold_samples": "",
+        "avg_lock_hold_ns": "",
+        "avg_lock_handoff_ns_estimated": "",
+    }
+    if not metrics:
+        return fields
+
+    elapsed = metrics.get("leveldb_lock_benchmark_elapsed_ns")
+    hold_total = metrics.get("leveldb_lock_hold_ns_total")
+    hold_samples = metrics.get("leveldb_lock_hold_samples")
+    avg_hold = metrics.get("leveldb_lock_avg_hold_ns")
+    if elapsed is None or hold_total is None or hold_samples is None:
+        missing = [
+            name
+            for name, value in (
+                ("leveldb_lock_benchmark_elapsed_ns", elapsed),
+                ("leveldb_lock_hold_ns_total", hold_total),
+                ("leveldb_lock_hold_samples", hold_samples),
+            )
+            if value is None
+        ]
+        raise RuntimeError(f"db_bench lock timing output is missing: {', '.join(missing)}")
+
+    elapsed_ns = int(float(elapsed))
+    hold_total_ns = int(float(hold_total))
+    if hold_total_ns > elapsed_ns:
+        raise RuntimeError(
+            "LevelDB lock hold total exceeds benchmark elapsed time: "
+            f"hold_ns_total={hold_total_ns} elapsed_ns={elapsed_ns}"
+        )
+
+    fields["benchmark_elapsed_ns"] = str(elapsed_ns)
+    fields["leveldb_lock_hold_ns_total"] = str(hold_total_ns)
+    fields["leveldb_lock_hold_samples"] = str(int(float(hold_samples)))
+    fields["avg_lock_hold_ns"] = format_float(
+        float(avg_hold) if avg_hold is not None else (
+            hold_total_ns / float(fields["leveldb_lock_hold_samples"])
+            if int(fields["leveldb_lock_hold_samples"]) > 0
+            else 0.0
+        )
+    )
+    if effective_total_ops > 0:
+        fields["avg_lock_handoff_ns_estimated"] = format_float(
+            (elapsed_ns - hold_total_ns) / float(effective_total_ops)
+        )
+    return fields
+
+
 def drop_leveldb_progress_line(line: str) -> str | None:
     if LEVELDB_PROGRESS_PATTERN.fullmatch(line.strip()):
         return None
@@ -1311,6 +1390,10 @@ def run_benchmarks(
                             env=env,
                         )
                         latency = parse_latency(result.output, benchmark)
+                        lock_timing_fields = lock_timing_fields_from_output(
+                            result.output,
+                            effective_total_ops=effective_total_ops,
+                        )
                         rows.append(
                             {
                                 "benchmark": benchmark,
@@ -1330,6 +1413,7 @@ def run_benchmarks(
                                     "" if init_result is None else format_float(init_result.wall_seconds)
                                 ),
                                 "latency_micros_per_op": format_float(latency),
+                                **lock_timing_fields,
                                 "wall_seconds": format_float(result.wall_seconds),
                                 "init_command_log": relative_log(
                                     result_root,
@@ -1433,6 +1517,11 @@ def write_settings(
         "summary_outlier_abs_deviation_pct": SUMMARY_OUTLIER_ABS_DEVIATION_PCT,
         "summary_outlier_baseline": "median",
         "summary_ops_source": "leveldb_internal_micros_per_op",
+        "lock_timing_metrics": {
+            "source": "leveldb_db_mutex_hold_time",
+            "handoff_estimate": "(benchmark_elapsed_ns - leveldb_lock_hold_ns_total) / effective_total_ops",
+            "aggregation": "thread_local_hold_time_flushed_after_measurement",
+        },
         "num": num,
         "total_ops": total_ops,
         "command_timeout_seconds": command_timeout_seconds,
@@ -1485,6 +1574,11 @@ def load_raw_rows(result_root: Path) -> list[dict[str, str]]:
             "db_bench_num",
             "reads_per_thread",
             "effective_total_ops",
+            "benchmark_elapsed_ns",
+            "leveldb_lock_hold_ns_total",
+            "leveldb_lock_hold_samples",
+            "avg_lock_hold_ns",
+            "avg_lock_handoff_ns_estimated",
         }]
         missing = [field for field in required_fields if field not in reader.fieldnames]
         if missing:
@@ -1620,6 +1714,20 @@ def summarize_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
                 "mean_latency_micros_per_op": mean_field(group_rows, "latency_micros_per_op"),
                 "mean_benchmark_seconds": mean_benchmark_seconds(group_rows),
                 "mean_ops_per_second": mean_ops_per_second(group_rows),
+                "mean_benchmark_elapsed_ns": mean_field(group_rows, "benchmark_elapsed_ns"),
+                "mean_leveldb_lock_hold_ns_total": mean_field(
+                    group_rows,
+                    "leveldb_lock_hold_ns_total",
+                ),
+                "mean_leveldb_lock_hold_samples": mean_field(
+                    group_rows,
+                    "leveldb_lock_hold_samples",
+                ),
+                "mean_avg_lock_hold_ns": mean_field(group_rows, "avg_lock_hold_ns"),
+                "mean_avg_lock_handoff_ns_estimated": mean_field(
+                    group_rows,
+                    "avg_lock_handoff_ns_estimated",
+                ),
                 "mean_init_wall_seconds": mean_field(group_rows, "init_wall_seconds"),
                 "mean_wall_seconds": mean_field(group_rows, "wall_seconds"),
                 "runs": str(len(group_rows)),

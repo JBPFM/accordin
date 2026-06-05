@@ -1,23 +1,88 @@
+diff --git a/benchmarks/db_bench.cc b/benchmarks/db_bench.cc
+index 429a61a..d10d852 100644
+--- a/benchmarks/db_bench.cc
++++ b/benchmarks/db_bench.cc
+@@ -485,11 +485,16 @@ class Benchmark {
+   }
+ 
+   ~Benchmark() {
+-    delete db_;
++    Close();
+     delete cache_;
+     delete filter_policy_;
+   }
+ 
++  void Close() {
++    delete db_;
++    db_ = nullptr;
++  }
++
+   void Run() {
+     PrintHeader();
+     Open();
+@@ -634,6 +639,7 @@ class Benchmark {
+     thread->stats.Start();
+     (arg->bm->*(arg->method))(thread);
+     thread->stats.Stop();
++    port::FlushLockTimingThreadStats();
+ 
+     {
+       MutexLock l(&shared->mu);
+@@ -667,11 +673,13 @@ class Benchmark {
+       shared.cv.Wait();
+     }
+ 
++    port::BeginLockTimingMeasurement();
+     shared.start = true;
+     shared.cv.SignalAll();
+     while (shared.num_done < n) {
+       shared.cv.Wait();
+     }
++    port::EndLockTimingMeasurement();
+     shared.mu.Unlock();
+ 
+     for (int i = 1; i < n; i++) {
+@@ -1086,5 +1094,7 @@ int main(int argc, char** argv) {
+ 
+   leveldb::Benchmark benchmark;
+   benchmark.Run();
++  benchmark.Close();
++  leveldb::port::PrintLockTimingProcessStats();
+   return 0;
+ }
 diff --git a/db/db_impl.cc b/db/db_impl.cc
-index 1a4e459..419d33c 100644
+index 1a4e459..df4a82e 100644
 --- a/db/db_impl.cc
 +++ b/db/db_impl.cc
-@@ -147,7 +147,9 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+@@ -147,7 +147,10 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
        background_compaction_scheduled_(false),
        manual_compaction_(nullptr),
        versions_(new VersionSet(dbname_, &options_, table_cache_,
 -                               &internal_comparator_)) {}
 +                               &internal_comparator_)) {
 +  mutex_.UseMcsTasAccordinDirect();
++  mutex_.EnableLockTiming();
 +}
  
  DBImpl::~DBImpl() {
    // Wait for background work to finish.
 diff --git a/port/port_stdcxx.h b/port/port_stdcxx.h
-index 2bda48d..e4af1cf 100644
+index 2bda48d..f452384 100644
 --- a/port/port_stdcxx.h
 +++ b/port/port_stdcxx.h
-@@ -38,30 +38,77 @@
+@@ -29,39 +29,238 @@
+ #include <snappy.h>
+ #endif  // HAVE_SNAPPY
+ 
++#include <atomic>
+ #include <cassert>
++#include <chrono>
+ #include <condition_variable>  // NOLINT
+ #include <cstddef>
++#include <cstdio>
+ #include <cstdint>
+ #include <mutex>  // NOLINT
+ #include <string>
  
  #include "port/thread_annotations.h"
  
@@ -39,6 +104,132 @@ index 2bda48d..e4af1cf 100644
  class CondVar;
  
 -// Thinly wraps std::mutex.
++struct LockTimingThreadStats {
++  uint64_t hold_ns_total = 0;
++  uint64_t hold_samples = 0;
++};
++
++inline uint64_t LockTimingNowNs() {
++  return static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(
++          std::chrono::steady_clock::now().time_since_epoch())
++          .count());
++}
++
++inline std::atomic<bool>& LockTimingMeasurementActive() {
++  static std::atomic<bool> active(false);
++  return active;
++}
++
++inline std::atomic<uint64_t>& LockTimingMeasurementStartNs() {
++  static std::atomic<uint64_t> start_ns(0);
++  return start_ns;
++}
++
++inline std::atomic<uint64_t>& LockTimingMeasurementEndNs() {
++  static std::atomic<uint64_t> end_ns(0);
++  return end_ns;
++}
++
++inline std::atomic<uint64_t>& LockTimingBenchmarkElapsedNs() {
++  static std::atomic<uint64_t> elapsed_ns(0);
++  return elapsed_ns;
++}
++
++inline std::atomic<uint64_t>& LockTimingProcessHoldNsTotal() {
++  static std::atomic<uint64_t> hold_ns_total(0);
++  return hold_ns_total;
++}
++
++inline std::atomic<uint64_t>& LockTimingProcessHoldSamples() {
++  static std::atomic<uint64_t> hold_samples(0);
++  return hold_samples;
++}
++
++inline LockTimingThreadStats& LockTimingCurrentThreadStats() {
++  static thread_local LockTimingThreadStats stats;
++  return stats;
++}
++
++inline void FlushLockTimingThreadStats() {
++  LockTimingThreadStats& stats = LockTimingCurrentThreadStats();
++  if (stats.hold_ns_total != 0) {
++    LockTimingProcessHoldNsTotal().fetch_add(stats.hold_ns_total,
++                                             std::memory_order_relaxed);
++    stats.hold_ns_total = 0;
++  }
++  if (stats.hold_samples != 0) {
++    LockTimingProcessHoldSamples().fetch_add(stats.hold_samples,
++                                             std::memory_order_relaxed);
++    stats.hold_samples = 0;
++  }
++}
++
++inline void BeginLockTimingMeasurement() {
++  FlushLockTimingThreadStats();
++  LockTimingProcessHoldNsTotal().store(0, std::memory_order_relaxed);
++  LockTimingProcessHoldSamples().store(0, std::memory_order_relaxed);
++  LockTimingBenchmarkElapsedNs().store(0, std::memory_order_relaxed);
++  LockTimingMeasurementEndNs().store(0, std::memory_order_release);
++  LockTimingMeasurementStartNs().store(LockTimingNowNs(),
++                                       std::memory_order_release);
++  LockTimingMeasurementActive().store(true, std::memory_order_release);
++}
++
++inline void EndLockTimingMeasurement() {
++  const uint64_t end_ns = LockTimingNowNs();
++  LockTimingMeasurementActive().store(false, std::memory_order_release);
++  LockTimingMeasurementEndNs().store(end_ns, std::memory_order_release);
++  const uint64_t start_ns =
++      LockTimingMeasurementStartNs().load(std::memory_order_acquire);
++  LockTimingBenchmarkElapsedNs().store(
++      start_ns == 0 || end_ns < start_ns ? 0 : end_ns - start_ns,
++      std::memory_order_release);
++  FlushLockTimingThreadStats();
++}
++
++inline void RecordLockTimingHold(uint64_t hold_start_ns) {
++  if (hold_start_ns == 0) {
++    return;
++  }
++  uint64_t hold_end_ns = LockTimingNowNs();
++  if (!LockTimingMeasurementActive().load(std::memory_order_acquire)) {
++    const uint64_t measurement_end_ns =
++        LockTimingMeasurementEndNs().load(std::memory_order_acquire);
++    if (measurement_end_ns != 0 && hold_end_ns > measurement_end_ns) {
++      hold_end_ns = measurement_end_ns;
++    }
++  }
++  if (hold_end_ns <= hold_start_ns) {
++    return;
++  }
++  LockTimingThreadStats& stats = LockTimingCurrentThreadStats();
++  stats.hold_ns_total += hold_end_ns - hold_start_ns;
++  stats.hold_samples += 1;
++}
++
++inline void PrintLockTimingProcessStats() {
++  FlushLockTimingThreadStats();
++  const uint64_t elapsed_ns =
++      LockTimingBenchmarkElapsedNs().load(std::memory_order_acquire);
++  const uint64_t hold_ns_total =
++      LockTimingProcessHoldNsTotal().load(std::memory_order_acquire);
++  const uint64_t hold_samples =
++      LockTimingProcessHoldSamples().load(std::memory_order_acquire);
++  const double avg_hold_ns =
++      hold_samples == 0
++          ? 0.0
++          : static_cast<double>(hold_ns_total) / static_cast<double>(hold_samples);
++  std::fprintf(stdout, "leveldb_lock_benchmark_elapsed_ns: %llu\n",
++               static_cast<unsigned long long>(elapsed_ns));
++  std::fprintf(stdout, "leveldb_lock_hold_ns_total: %llu\n",
++               static_cast<unsigned long long>(hold_ns_total));
++  std::fprintf(stdout, "leveldb_lock_hold_samples: %llu\n",
++               static_cast<unsigned long long>(hold_samples));
++  std::fprintf(stdout, "leveldb_lock_avg_hold_ns: %.2f\n", avg_hold_ns);
++  std::fflush(stdout);
++}
++
 +// Wraps std::mutex, with an opt-in mcs_tas_accordin_direct backend.
  class LOCKABLE Mutex {
   public:
@@ -68,16 +259,21 @@ index 2bda48d..e4af1cf 100644
 +    direct_ = mcs_tas_accordin_direct_mutex_create();
 +  }
 +
++  void EnableLockTiming() { lock_timing_enabled_ = true; }
++
 +  void Lock() EXCLUSIVE_LOCK_FUNCTION() {
 +    if (direct_ != nullptr) {
 +      const int ret = mcs_tas_accordin_direct_mutex_lock(direct_);
 +      assert(ret == 0);
 +      (void)ret;
++      StartLockTimingHold();
 +      return;
 +    }
 +    mu_.lock();
++    StartLockTimingHold();
 +  }
 +  void Unlock() UNLOCK_FUNCTION() {
++    FinishLockTimingHold();
 +    if (direct_ != nullptr) {
 +      const int ret = mcs_tas_accordin_direct_mutex_unlock(direct_);
 +      assert(ret == 0);
@@ -92,8 +288,26 @@ index 2bda48d..e4af1cf 100644
  
   private:
 -  friend class CondVar;
++  void StartLockTimingHold() {
++    lock_timing_hold_start_ns_ =
++        lock_timing_enabled_ &&
++                LockTimingMeasurementActive().load(std::memory_order_acquire)
++            ? LockTimingNowNs()
++            : 0;
++  }
++
++  void FinishLockTimingHold() {
++    const uint64_t hold_start_ns = lock_timing_hold_start_ns_;
++    lock_timing_hold_start_ns_ = 0;
++    if (lock_timing_enabled_) {
++      RecordLockTimingHold(hold_start_ns);
++    }
++  }
++
    std::mutex mu_;
 +  mcs_tas_accordin_direct_mutex* direct_ = nullptr;
++  bool lock_timing_enabled_ = false;
++  uint64_t lock_timing_hold_start_ns_ = 0;
  };
  
 -// Thinly wraps std::condition_variable.
@@ -101,7 +315,7 @@ index 2bda48d..e4af1cf 100644
  class CondVar {
   public:
    explicit CondVar(Mutex* mu) : mu_(mu) { assert(mu != nullptr); }
-@@ -71,7 +118,7 @@ class CondVar {
+@@ -71,7 +270,7 @@ class CondVar {
    CondVar& operator=(const CondVar&) = delete;
  
    void Wait() {
@@ -110,7 +324,7 @@ index 2bda48d..e4af1cf 100644
      cv_.wait(lock);
      lock.release();
    }
-@@ -79,7 +126,7 @@ class CondVar {
+@@ -79,7 +278,7 @@ class CondVar {
    void SignalAll() { cv_.notify_all(); }
  
   private:
@@ -118,4 +332,16 @@ index 2bda48d..e4af1cf 100644
 +  std::condition_variable_any cv_;
    Mutex* const mu_;
  };
+ 
+diff --git a/util/env_posix.cc b/util/env_posix.cc
+index d84cd1e..fb09f96 100644
+--- a/util/env_posix.cc
++++ b/util/env_posix.cc
+@@ -815,6 +815,7 @@ void PosixEnv::BackgroundThreadMain() {
+ 
+     background_work_mutex_.Unlock();
+     background_work_function(background_work_arg);
++    port::FlushLockTimingThreadStats();
+   }
+ }
  

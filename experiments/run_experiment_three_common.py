@@ -461,8 +461,7 @@ def parse_args(
             "Comma-separated lock keys. Overrides --lock-profile. "
             "Use mutex to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "accordin == mcs_tas_accordin_admission_only, accordin_sampled, "
-            "accordin_no_admission, accordin_taskset."
+            "accordin == mcs_tas_accordin_admission_only."
         ),
     )
     parser.add_argument(

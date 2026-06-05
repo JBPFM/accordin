@@ -305,7 +305,6 @@ Default benchmark settings:
   machine-profile={ACTIVE_MACHINE_CONFIG.name} (override with {PROFILE_ENV})
   threads={','.join(str(v) for v in THREADS)}
   single-overload locks={','.join(SINGLE_OVERSUBSCRIBED_LOCK_KEYS)} use threads={','.join(str(v) for v in runnable_threads_for_lock("mcs"))}
-  full profile includes accordin ({ACCORDIN_TASKSET_LOCK}) under taskset CPUs={DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}
 
 Examples:
   python3 experiments/run_experiment_one.py
@@ -384,7 +383,7 @@ Examples:
         default=DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
         metavar="CPU_LIST",
         help=(
-            f"CPU list passed to taskset for the {experiment_defaults.ACCORDIN_TASKSET_LOCK} series. "
+            f"CPU list passed to taskset if the legacy {experiment_defaults.ACCORDIN_TASKSET_LOCK} series is re-enabled. "
             f"Default: {DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}."
         ),
     )
@@ -392,8 +391,8 @@ Examples:
         "--skip-mcs-accordin-taskset",
         action="store_true",
         help=(
-            f"Skip only the taskset accordin ({experiment_defaults.ACCORDIN_TASKSET_LOCK}) "
-            "series. Default minimal/full run includes it."
+            f"Skip only the legacy taskset accordin ({experiment_defaults.ACCORDIN_TASKSET_LOCK}) "
+            "series if it is re-enabled."
         ),
     )
     parser.add_argument(

@@ -244,7 +244,7 @@ def parse_args() -> argparse.Namespace:
         "--mcs-accordin-taskset-cpus",
         default=experiment_defaults.DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
         help=(
-            f"CPU list passed to taskset for {experiment_defaults.ACCORDIN_TASKSET_LOCK}. "
+            f"CPU list passed to taskset if the legacy {experiment_defaults.ACCORDIN_TASKSET_LOCK} series is re-enabled. "
             f"Default: {experiment_defaults.DEFAULT_MCS_ACCORDIN_TASKSET_CPUS}."
         ),
     )

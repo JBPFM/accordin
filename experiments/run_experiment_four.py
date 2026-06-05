@@ -101,23 +101,12 @@ MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK = "mcs_tas_accordin_direct_no_admissio
 MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK = "mcs_tas_accordin_direct_taskset"
 LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS = (
     MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
 )
-LEVELDB_ACCORDIN_DIRECT_SAMPLED_LOCKS = (
-    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
-)
-LEVELDB_ACCORDIN_DIRECT_ADMISSION_DISABLED_LOCKS = (
-    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
-)
-LEVELDB_ACCORDIN_DIRECT_TASKSET_LOCKS = (MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,)
+LEVELDB_ACCORDIN_DIRECT_SAMPLED_LOCKS: tuple[str, ...] = ()
+LEVELDB_ACCORDIN_DIRECT_ADMISSION_DISABLED_LOCKS: tuple[str, ...] = ()
+LEVELDB_ACCORDIN_DIRECT_TASKSET_LOCKS: tuple[str, ...] = ()
 LEVELDB_ACCORDIN_DIRECT_STYLE_LOCKS = {
     MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK: experiment_defaults.ACCORDIN_BASE_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK: experiment_defaults.ACCORDIN_SAMPLED_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK: experiment_defaults.ACCORDIN_NO_ADMISSION_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK: experiment_defaults.ACCORDIN_TASKSET_LOCK,
 }
 LEVELDB_ACCORDIN_DIRECT_ALIAS_TARGETS = {
     experiment_defaults.ACCORDIN_BASE_LOCK: MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
@@ -131,26 +120,9 @@ LEVELDB_ACCORDIN_DIRECT_ALIAS_TARGETS = {
     "accordin_direct": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
     "accordin_direct_admission_only": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
     "accordin-direct": MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
-    experiment_defaults.ACCORDIN_SAMPLED_LOCK: MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
-    "accordin_sampled": MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
-    "accordin_sampling": MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
-    "accordin_direct_sampled": MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
-    "mcs_tas_accordin_direct_sampled": MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK,
-    experiment_defaults.ACCORDIN_NO_ADMISSION_LOCK: MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
-    "accordin_no_admission": MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
-    "accordin_controller_only": MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
-    "accordin_direct_no_admission": MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
-    "mcs_tas_accordin_direct_no_admission": MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK,
-    experiment_defaults.ACCORDIN_TASKSET_LOCK: MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
-    "accordin_taskset": MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
-    "accordin_direct_taskset": MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
-    "mcs_tas_accordin_direct_taskset": MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK,
 }
 LEVELDB_ACCORDIN_DIRECT_TO_MUTEX_HOOK_LOCKS = {
     MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK: experiment_defaults.ACCORDIN_BASE_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK: experiment_defaults.ACCORDIN_SAMPLED_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK: experiment_defaults.ACCORDIN_NO_ADMISSION_LOCK,
-    MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK: experiment_defaults.ACCORDIN_TASKSET_LOCK,
 }
 LEVELDB_ACCORDIN_MUTEX_HOOK_TO_DIRECT_LOCKS = {
     hook_lock: direct_lock
@@ -369,8 +341,8 @@ Examples:
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
             "fillrandom uses LevelDB direct adapters for non-Accordin benchmark locks, "
             "accordin aliases follow --accordin-mode before benchmark-specific "
-            "readrandom/fillrandom remapping; accordin_sampled, accordin_no_admission, "
-            "accordin_taskset select the matching mode variant."
+            "readrandom/fillrandom remapping; only the admission-only Accordin "
+            "variant is supported."
         ),
     )
     parser.add_argument(

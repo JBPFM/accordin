@@ -1074,7 +1074,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mcs-accordin-taskset-cpus",
         default=None,
         help=(
-            f"Override CPU list for {experiment_defaults.ACCORDIN_TASKSET_LOCK}. "
+            f"Override CPU list if the legacy {experiment_defaults.ACCORDIN_TASKSET_LOCK} series is re-enabled. "
             "Default runs only out=3000 ratio combos "
             "(crit=100,300,1000,3000) and computes per-combo taskset size as "
             "round(outside/critical + 1), using first NUMA node CPUs first and spilling to later NUMA nodes."

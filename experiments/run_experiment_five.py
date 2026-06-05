@@ -626,9 +626,7 @@ Examples:
         help=(
             "Comma-separated lock keys. Overrides --lock-profile. Use mutex for no interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "accordin == mcs_tas_accordin_admission_only, accordin_sampled, "
-            "accordin_no_admission. mcs_tas_accordin_taskset is excluded from "
-            "experiment5 profiles; pass it explicitly only for manual profiled static-K runs."
+            "accordin == mcs_tas_accordin_admission_only."
         ),
     )
     parser.add_argument("--threads", default=",".join(str(thread) for thread in DEFAULT_THREADS), metavar="CSV")

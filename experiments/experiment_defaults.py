@@ -34,16 +34,10 @@ MCS_ACCORDIN_LOCK = "mcs_accordin"
 PTHREAD_SPINLOCK_LOCK = "pthread_spinlock"
 ACCORDIN_VARIANT_LOCKS = (
     ACCORDIN_BASE_LOCK,
-    ACCORDIN_SAMPLED_LOCK,
-    ACCORDIN_NO_ADMISSION_LOCK,
-    ACCORDIN_TASKSET_LOCK,
 )
-ACCORDIN_SAMPLED_LOCKS = (
-    ACCORDIN_SAMPLED_LOCK,
-    ACCORDIN_NO_ADMISSION_LOCK,
-)
-ACCORDIN_ADMISSION_DISABLED_LOCKS = (ACCORDIN_NO_ADMISSION_LOCK,)
-ACCORDIN_TASKSET_LOCKS = (ACCORDIN_TASKSET_LOCK,)
+ACCORDIN_SAMPLED_LOCKS: tuple[str, ...] = ()
+ACCORDIN_ADMISSION_DISABLED_LOCKS: tuple[str, ...] = ()
+ACCORDIN_TASKSET_LOCKS: tuple[str, ...] = ()
 
 
 def _cpu_list_count(cpu_list: str) -> int:
@@ -145,9 +139,6 @@ LOCK_LABELS = {
     "mcs_accordin": "MCS Accordin",
     "mcs_tas_accordin": "Accordin",
     "mcs_tas_accordin_admission_only": "Accordin",
-    "mcs_tas_accordin_sampled": "Accordin with budget optimization",
-    "mcs_tas_accordin_no_admission": "Core budget only",
-    "mcs_tas_accordin_taskset": "Profiled static-K Accordin",
 }
 
 LOCK_ALIASES = {
@@ -156,14 +147,6 @@ LOCK_ALIASES = {
     "mcs_tas_accordin": ACCORDIN_ADMISSION_ONLY_LOCK,
     "mcs_tas_accordin_admission_only": ACCORDIN_ADMISSION_ONLY_LOCK,
     "mcs_accordin": MCS_ACCORDIN_LOCK,
-    "accordin_sampled": "mcs_tas_accordin_sampled",
-    "accordin_sampling": "mcs_tas_accordin_sampled",
-    "mcs_tas_accordin_sampled": "mcs_tas_accordin_sampled",
-    "accordin_no_admission": "mcs_tas_accordin_no_admission",
-    "accordin_controller_only": "mcs_tas_accordin_no_admission",
-    "mcs_tas_accordin_no_admission": "mcs_tas_accordin_no_admission",
-    "accordin_taskset": "mcs_tas_accordin_taskset",
-    "mcs_tas_accordin_taskset": "mcs_tas_accordin_taskset",
     "mcs-tas": "mcstas",
     "mcs_tas": "mcstas",
     "mcstas": "mcstas",
@@ -230,9 +213,6 @@ EXPERIMENT_ONE_LOCKS = (
     ExperimentOneLockConfig("MCS-TAS", "mcs-tas"),
     ExperimentOneLockConfig("Reciprocating", "reciprocating", optional=True),
     ExperimentOneLockConfig("Admission only", ACCORDIN_BASE_LOCK, optional=True),
-    ExperimentOneLockConfig("Admission + core budget", ACCORDIN_SAMPLED_LOCK, optional=True),
-    ExperimentOneLockConfig("Core budget only", ACCORDIN_NO_ADMISSION_LOCK, optional=True),
-    ExperimentOneLockConfig("Profiled static-K Accordin", ACCORDIN_TASKSET_LOCK, optional=True),
     ExperimentOneLockConfig("MCS + TSE", "mcs_extension"),
     ExperimentOneLockConfig("Malthusian", "malthusian", optional=True),
     ExperimentOneLockConfig("FlexGuard", "flexguard"),

@@ -1,47 +1,23 @@
 diff --git a/db/db_impl.cc b/db/db_impl.cc
-index 1a4e459..c7698da 100644
+index 1a4e459..419d33c 100644
 --- a/db/db_impl.cc
 +++ b/db/db_impl.cc
-@@ -35,6 +35,8 @@
- #include "util/logging.h"
- #include "util/mutexlock.h"
- 
-+extern "C" int accordin_register_hooked_mutex(void* mutex) __attribute__((weak));
-+
- namespace leveldb {
- 
- const int kNumNonTableCacheFiles = 10;
-@@ -123,6 +125,13 @@ static int TableCacheSize(const Options& sanitized_options) {
-   return sanitized_options.max_open_files - kNumNonTableCacheFiles;
- }
- 
-+static void MaybeRegisterAccordinHookedMutex(port::Mutex* mutex) {
-+  if (!mutex->UsesMcsTasAccordinDirect() &&
-+      accordin_register_hooked_mutex != nullptr) {
-+    accordin_register_hooked_mutex(static_cast<void*>(mutex->NativeHandle()));
-+  }
-+}
-+
- DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
-     : env_(raw_options.env),
-       internal_comparator_(raw_options.comparator),
-@@ -147,7 +156,10 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+@@ -147,7 +147,9 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
        background_compaction_scheduled_(false),
        manual_compaction_(nullptr),
        versions_(new VersionSet(dbname_, &options_, table_cache_,
 -                               &internal_comparator_)) {}
 +                               &internal_comparator_)) {
 +  mutex_.UseMcsTasAccordinDirect();
-+  MaybeRegisterAccordinHookedMutex(&mutex_);
 +}
  
  DBImpl::~DBImpl() {
    // Wait for background work to finish.
 diff --git a/port/port_stdcxx.h b/port/port_stdcxx.h
-index 2bda48d..7c7ca44 100644
+index 2bda48d..e4af1cf 100644
 --- a/port/port_stdcxx.h
 +++ b/port/port_stdcxx.h
-@@ -38,30 +38,93 @@
+@@ -38,30 +38,77 @@
  
  #include "port/thread_annotations.h"
  
@@ -66,18 +42,15 @@ index 2bda48d..7c7ca44 100644
 +// Wraps std::mutex, with an opt-in mcs_tas_accordin_direct backend.
  class LOCKABLE Mutex {
   public:
-+  using NativeHandleType = std::mutex::native_handle_type;
-+
    Mutex() = default;
 -  ~Mutex() = default;
 +  ~Mutex() {
-+    if (mcs_tas_accordin_direct_ != nullptr &&
-+        mcs_tas_accordin_direct_mutex_destroy != nullptr) {
-+      const int ret =
-+          mcs_tas_accordin_direct_mutex_destroy(mcs_tas_accordin_direct_);
-+      assert(ret == 0);
-+      (void)ret;
++    if (direct_ == nullptr) {
++      return;
 +    }
++    const int ret = mcs_tas_accordin_direct_mutex_destroy(direct_);
++    assert(ret == 0);
++    (void)ret;
 +  }
  
    Mutex(const Mutex&) = delete;
@@ -85,29 +58,19 @@ index 2bda48d..7c7ca44 100644
  
 -  void Lock() EXCLUSIVE_LOCK_FUNCTION() { mu_.lock(); }
 -  void Unlock() UNLOCK_FUNCTION() { mu_.unlock(); }
-+  bool UseMcsTasAccordinDirect() {
-+    if (mcs_tas_accordin_direct_ != nullptr) {
-+      return true;
-+    }
-+    if (mcs_tas_accordin_direct_mutex_create == nullptr ||
++  void UseMcsTasAccordinDirect() {
++    if (direct_ != nullptr || mcs_tas_accordin_direct_mutex_create == nullptr ||
 +        mcs_tas_accordin_direct_mutex_destroy == nullptr ||
 +        mcs_tas_accordin_direct_mutex_lock == nullptr ||
 +        mcs_tas_accordin_direct_mutex_unlock == nullptr) {
-+      return false;
++      return;
 +    }
-+
-+    mcs_tas_accordin_direct_ = mcs_tas_accordin_direct_mutex_create();
-+    return mcs_tas_accordin_direct_ != nullptr;
-+  }
-+
-+  bool UsesMcsTasAccordinDirect() const {
-+    return mcs_tas_accordin_direct_ != nullptr;
++    direct_ = mcs_tas_accordin_direct_mutex_create();
 +  }
 +
 +  void Lock() EXCLUSIVE_LOCK_FUNCTION() {
-+    if (mcs_tas_accordin_direct_ != nullptr) {
-+      const int ret =
-+          mcs_tas_accordin_direct_mutex_lock(mcs_tas_accordin_direct_);
++    if (direct_ != nullptr) {
++      const int ret = mcs_tas_accordin_direct_mutex_lock(direct_);
 +      assert(ret == 0);
 +      (void)ret;
 +      return;
@@ -115,9 +78,8 @@ index 2bda48d..7c7ca44 100644
 +    mu_.lock();
 +  }
 +  void Unlock() UNLOCK_FUNCTION() {
-+    if (mcs_tas_accordin_direct_ != nullptr) {
-+      const int ret =
-+          mcs_tas_accordin_direct_mutex_unlock(mcs_tas_accordin_direct_);
++    if (direct_ != nullptr) {
++      const int ret = mcs_tas_accordin_direct_mutex_unlock(direct_);
 +      assert(ret == 0);
 +      (void)ret;
 +      return;
@@ -127,56 +89,33 @@ index 2bda48d..7c7ca44 100644
 +  void lock() EXCLUSIVE_LOCK_FUNCTION() { Lock(); }
 +  void unlock() UNLOCK_FUNCTION() { Unlock(); }
    void AssertHeld() ASSERT_EXCLUSIVE_LOCK() {}
-+  NativeHandleType NativeHandle() { return mu_.native_handle(); }
  
   private:
-   friend class CondVar;
+-  friend class CondVar;
    std::mutex mu_;
-+  mcs_tas_accordin_direct_mutex* mcs_tas_accordin_direct_ = nullptr;
++  mcs_tas_accordin_direct_mutex* direct_ = nullptr;
  };
  
 -// Thinly wraps std::condition_variable.
-+// Wraps condition variables for both std::mutex and direct Mutex backends.
++// Wraps condition variables for std::mutex and direct Mutex backends.
  class CondVar {
   public:
    explicit CondVar(Mutex* mu) : mu_(mu) { assert(mu != nullptr); }
-@@ -71,15 +134,34 @@ class CondVar {
+@@ -71,7 +118,7 @@ class CondVar {
    CondVar& operator=(const CondVar&) = delete;
  
    void Wait() {
 -    std::unique_lock<std::mutex> lock(mu_->mu_, std::adopt_lock);
--    cv_.wait(lock);
--    lock.release();
-+    if (mu_->UsesMcsTasAccordinDirect()) {
-+      std::unique_lock<Mutex> lock(*mu_, std::adopt_lock);
-+      cv_any_.wait(lock);
-+      lock.release();
-+    } else {
-+      std::unique_lock<std::mutex> lock(mu_->mu_, std::adopt_lock);
-+      cv_.wait(lock);
-+      lock.release();
-+    }
-+  }
-+  void Signal() {
-+    if (mu_->UsesMcsTasAccordinDirect()) {
-+      cv_any_.notify_one();
-+    } else {
-+      cv_.notify_one();
-+    }
-+  }
-+  void SignalAll() {
-+    if (mu_->UsesMcsTasAccordinDirect()) {
-+      cv_any_.notify_all();
-+    } else {
-+      cv_.notify_all();
-+    }
++    std::unique_lock<Mutex> lock(*mu_, std::adopt_lock);
+     cv_.wait(lock);
+     lock.release();
    }
--  void Signal() { cv_.notify_one(); }
--  void SignalAll() { cv_.notify_all(); }
+@@ -79,7 +126,7 @@ class CondVar {
+   void SignalAll() { cv_.notify_all(); }
  
   private:
-   std::condition_variable cv_;
-+  std::condition_variable_any cv_any_;
+-  std::condition_variable cv_;
++  std::condition_variable_any cv_;
    Mutex* const mu_;
  };
  

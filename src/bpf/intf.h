@@ -19,6 +19,7 @@
 #define USER_ADMISSION_LOCK_ID_SHIFT 3U
 #define MAX_LOCK_CLASSES 8U
 #define UNMANAGED_LOCK_ID 0U
+#define INACTIVE_PREVIOUS_LOCK_PERCENT_DEFAULT 80U
 
 struct accordin_active_cpus_args {
   unsigned long long wanted0;

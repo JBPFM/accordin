@@ -2,6 +2,7 @@
 #include <scx/common.bpf.h>
 
 #include "intf.h"
+#include "inactive_select.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -208,9 +209,90 @@ static __always_inline volatile __u32 *lookup_cpu_owner(__u32 cpu) {
   return &cpu_admission_owner[idx];
 }
 
+static __always_inline volatile __u32 *lookup_cpu_last_inactive_lock(__u32 cpu) {
+  __u32 idx;
+
+  if (cpu >= MAX_CPUS)
+    return 0;
+
+  idx = cpu & (MAX_CPUS - 1);
+  barrier_var(idx);
+  return &cpu_last_inactive_lock[idx];
+}
+
+static __always_inline void record_inactive_dispatch_lock(__u32 cpu,
+                                                          __u32 lock_id) {
+  volatile __u32 *last_lock;
+
+  if (!valid_lock_id(lock_id))
+    return;
+
+  last_lock = lookup_cpu_last_inactive_lock(cpu);
+  if (last_lock)
+    *last_lock = lock_id;
+}
+
+static __always_inline bool move_inactive_to_local(__u32 dispatch_cpu,
+                                                   __u32 dsq_cpu,
+                                                   __u32 lock_id) {
+  if (!valid_lock_id(lock_id))
+    return false;
+
+  if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, dsq_cpu))) {
+    record_inactive_dequeue(lock_id, dsq_cpu);
+    record_inactive_dispatch_lock(dispatch_cpu, lock_id);
+    return true;
+  }
+
+  return false;
+}
+
+static __always_inline bool move_selected_inactive_to_local(
+    __u32 dispatch_cpu, __u32 dsq_cpu, struct cpu_inactive_hint *hint) {
+  volatile __u32 *last_lock_ptr;
+  __u32 previous_lock_id = UNMANAGED_LOCK_ID;
+  __u32 random = bpf_get_prandom_u32();
+  __u32 random_start = random / INACTIVE_PROBABILITY_SCALE;
+  bool prefer_previous =
+      inactive_prefer_previous_lock(random, inactive_previous_lock_percent);
+  __u32 offset;
+
+  if (!hint)
+    return false;
+
+  last_lock_ptr = lookup_cpu_last_inactive_lock(dispatch_cpu);
+  if (last_lock_ptr)
+    previous_lock_id = *last_lock_ptr;
+
+  if (valid_lock_id(previous_lock_id) && prefer_previous &&
+      (hint->lock_mask & lock_id_bit(previous_lock_id)) &&
+      move_inactive_to_local(dispatch_cpu, dsq_cpu, previous_lock_id))
+    return true;
+
+#pragma unroll
+  for (offset = 0; offset < MAX_LOCK_CLASSES; offset++) {
+    __u32 lock_id =
+        inactive_other_lock_at(previous_lock_id, random_start, offset);
+
+    if (!valid_lock_id(lock_id))
+      break;
+
+    if (!(hint->lock_mask & lock_id_bit(lock_id)))
+      continue;
+
+    if (move_inactive_to_local(dispatch_cpu, dsq_cpu, lock_id))
+      return true;
+  }
+
+  if (valid_lock_id(previous_lock_id) && !prefer_previous &&
+      (hint->lock_mask & lock_id_bit(previous_lock_id)))
+    return move_inactive_to_local(dispatch_cpu, dsq_cpu, previous_lock_id);
+
+  return false;
+}
+
 static __always_inline bool steal_inactive(__u32 cpu) {
   __u32 nr_cpus = scx_bpf_nr_cpu_ids();
-  __u32 lock_id;
   __u32 i;
 
   if (nr_cpus > MAX_CPUS)
@@ -223,6 +305,7 @@ static __always_inline bool steal_inactive(__u32 cpu) {
   for (i = 1; i <= INACTIVE_STEAL_SCAN; i++) {
     struct cpu_inactive_hint *hint;
     __u32 victim = cpu + i;
+    volatile __u32 *owner;
 
     if (i >= nr_cpus)
       break;
@@ -234,22 +317,12 @@ static __always_inline bool steal_inactive(__u32 cpu) {
     if (!hint || !hint->total)
       continue;
 
-#pragma unroll
-    for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
-      volatile __u32 *owner;
+    owner = lookup_cpu_owner(cpu);
+    if (!owner || *owner)
+      continue;
 
-      if (!(hint->lock_mask & lock_id_bit(lock_id)))
-        continue;
-
-      owner = lookup_cpu_owner(cpu);
-      if (!owner || *owner)
-        continue;
-
-      if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, victim))) {
-        record_inactive_dequeue(lock_id, victim);
-        return true;
-      }
-    }
+    if (move_selected_inactive_to_local(cpu, victim, hint))
+      return true;
   }
 
   return false;
@@ -727,29 +800,16 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
 static __always_inline bool drain_local_inactive(__u32 cpu) {
   struct cpu_inactive_hint *hint = lookup_inactive_hint(cpu);
-  __u32 lock_id;
+  volatile __u32 *owner;
 
   if (!hint || !hint->total)
     return false;
 
-#pragma unroll
-  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
-    volatile __u32 *owner;
+  owner = lookup_cpu_owner(cpu);
+  if (!owner || *owner)
+    return false;
 
-    if (!(hint->lock_mask & lock_id_bit(lock_id)))
-      continue;
-
-    owner = lookup_cpu_owner(cpu);
-    if (!owner || *owner)
-      continue;
-
-    if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id, cpu))) {
-      record_inactive_dequeue(lock_id, cpu);
-      return true;
-    }
-  }
-
-  return false;
+  return move_selected_inactive_to_local(cpu, cpu, hint);
 }
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {

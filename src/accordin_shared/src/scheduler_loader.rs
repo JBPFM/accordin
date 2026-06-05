@@ -31,6 +31,8 @@ macro_rules! define_scheduler_loader {
         const DISABLE_BPF_ENV: &str = concat!($env_prefix, "_DISABLE_BPF");
         const STATS_ONLY_ENV: &str = concat!($env_prefix, "_STATS_ONLY");
         const DEBUG_COUNTERS_ENV: &str = concat!($env_prefix, "_DEBUG_COUNTERS");
+        const INACTIVE_PREVIOUS_LOCK_PERCENT_ENV: &str =
+            concat!($env_prefix, "_INACTIVE_PREVIOUS_LOCK_PERCENT");
 
         const _: () = assert!(
             $crate::cpu_affinity::MAX_CPUS == crate::bpf_intf::MAX_CPUS as usize,
@@ -195,6 +197,12 @@ macro_rules! define_scheduler_loader {
             if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
                 bss.stats_only_mode = u32::from(stats_only);
                 bss.single_lock_mode = u32::from($single_lock_mode);
+                bss.inactive_previous_lock_percent = $crate::env::env_u32_clamped(
+                    INACTIVE_PREVIOUS_LOCK_PERCENT_ENV,
+                    crate::bpf_intf::INACTIVE_PREVIOUS_LOCK_PERCENT_DEFAULT,
+                    0,
+                    100,
+                );
             }
             let mut skel = ::scx_utils::scx_ops_load!(skel, accordin_ops, uei)?;
 

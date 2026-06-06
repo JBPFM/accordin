@@ -59,7 +59,7 @@ def _cpu_list_count(cpu_list: str) -> int:
 DEFAULT_ACCORDIN_CONCURRENCY = _cpu_list_count(DEFAULT_MCS_ACCORDIN_TASKSET_CPUS)
 
 BASELINE_LOCKS = (
-    "mutex",
+    PTHREAD_SPINLOCK_LOCK,
     "mcs",
     "mcs_extension",
     "reciprocating",

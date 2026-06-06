@@ -83,6 +83,7 @@ CASES = (
 
 BUILTIN_LOCK_KINDS = {
     "mutex": "mutex",
+    experiment_defaults.PTHREAD_SPINLOCK_LOCK: "pthread_spinlock",
     "mcs": "mcs",
     "mcstas": "mcs-tas",
     "mcs_extension": "mcs-tas-tse",

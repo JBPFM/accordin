@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -36,6 +38,31 @@ impl Node {
 thread_local! {
     static THREAD_NODE: UnsafeCell<Node> = const { UnsafeCell::new(Node::new()) };
     // static WAIT_SAMPLE_COUNTER: Cell<u32> = const { Cell::new(0) };
+    #[cfg(test)]
+    static UNLOCK_YIELD_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn record_unlock_yield_for_test() {
+    UNLOCK_YIELD_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_unlock_yield_count_for_test() {
+    UNLOCK_YIELD_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn unlock_yield_count_for_test() -> u64 {
+    UNLOCK_YIELD_COUNT.with(Cell::get)
+}
+
+#[inline(always)]
+fn yield_after_unlock() {
+    #[cfg(test)]
+    record_unlock_yield_for_test();
+    std::thread::yield_now();
 }
 
 // #[inline(always)]
@@ -173,6 +200,7 @@ impl McsTasLockRaw {
     fn unlock_fast(&self) {
         self.locked.0.store(false, Ordering::Release);
         clear_admission_state();
+        yield_after_unlock();
     }
 }
 
@@ -228,5 +256,17 @@ mod tests {
         assert_eq!(snapshot.admission_cpu, ADMISSION_CPU_NONE);
         assert!(!snapshot.in_critical_section);
         assert!(!snapshot.slow_path_pending);
+    }
+
+    #[test]
+    fn unlock_returns_admission_token_with_one_yield() {
+        clear_admission_state();
+        super::reset_unlock_yield_count_for_test();
+
+        let lock = super::McsTasLockRaw::new();
+        assert!(lock.try_lock_fast());
+        lock.unlock_fast();
+
+        assert_eq!(super::unlock_yield_count_for_test(), 1);
     }
 }

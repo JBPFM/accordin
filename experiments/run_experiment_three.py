@@ -58,15 +58,7 @@ FIXED_MUTEXBENCH_COMBOS = (
 )
 ACCORDIN_TASKSET_RATIO_COMBOS = FIXED_MUTEXBENCH_COMBOS
 
-REQUIRED_BASELINE_LOCKS = tuple(
-    dict.fromkeys(
-        (
-            "mutex",
-            PTHREAD_SPINLOCK_LOCK,
-            *(lock for lock in experiment_defaults.FULL_LOCKS if lock != "mutex"),
-        )
-    )
-)
+REQUIRED_BASELINE_LOCKS = experiment_defaults.FULL_LOCKS
 ACCORDIN_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
 MINIMAL_LOCKS = experiment_defaults.MINIMAL_LOCKS
@@ -79,13 +71,15 @@ MULTI_LOCK_SWEEP_LOCKS = (
     "mutex",
     PTHREAD_SPINLOCK_LOCK,
     "mcs",
+    "mcs-tas",
     "flexguard",
     "reciprocating",
     "cna",
     "gcr",
 )
-SUPPORTED_LOCKS = set(REQUIRED_BASELINE_LOCKS) | {MCS_ACCORDIN_LOCK}
+SUPPORTED_LOCKS = set(REQUIRED_BASELINE_LOCKS) | {"mutex", "mcs-tas"} | {MCS_ACCORDIN_LOCK}
 LOCK_PRESENCE_ALIASES = {
+    "mcstas": ("mcstas", "mcs-tas", "mcs_tas"),
     "mcs-tas": ("mcs-tas", "mcs_tas", "mcstas"),
     "mcs_extension": ("mcs_extension", "mcs_tse"),
     experiment_defaults.ACCORDIN_BASE_LOCK: (

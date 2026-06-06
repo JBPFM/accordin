@@ -33,8 +33,16 @@ MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB = (
 MCS_TAS_ACCORDIN_DIRECT_LIB_ENV = "MCS_TAS_ACCORDIN_DIRECT_LIB"
 MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
+MCS_ACCORDIN_LOCK = experiment_defaults.MCS_ACCORDIN_LOCK
+MCS_ACCORDIN_DIRECT_PACKAGE = "mcs_accordin_direct"
+MCS_ACCORDIN_DIRECT_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_accordin_direct.so"
+MCS_ACCORDIN_DIRECT_LIB_ENV = "MCS_ACCORDIN_DIRECT_LIB"
+MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_ACCORDIN_DIRECT_DISABLE_BPF"
+MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_ACCORDIN_DIRECT_STATS_ONLY"
 
 MCS_TAS_LOCK = "mcstas"
+MCS_EXTENSION_LOCK = "mcs_extension"
+MCSTP_LOCK = "mcstp"
 FLEXGUARD_LOCK = "flexguard"
 ACCORDIN_LOCK = experiment_defaults.ACCORDIN_BASE_LOCK
 DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
@@ -49,13 +57,30 @@ LOCK_KIND_BY_LOCK = {
     "mutex": "mutex",
     experiment_defaults.PTHREAD_SPINLOCK_LOCK: "pthread_spinlock",
     "mcs": "mcs",
-    "mcs_extension": "mcs-tas-tse",
+    MCS_EXTENSION_LOCK: "mutex",
     "reciprocating": "reciprocating",
-    MCS_TAS_LOCK: "mcs-tas",
+    MCS_TAS_LOCK: "mutex",
+    MCSTP_LOCK: "mutex",
     FLEXGUARD_LOCK: "mutex",
     "cna": "mutex",
     "gcr": "mutex",
+    MCS_ACCORDIN_LOCK: "mcs_accordin_direct",
     ACCORDIN_LOCK: "mcs_tas_accordin_direct",
+}
+FLEXGUARD_INTERPOSE_ARTIFACT_LOCKS = {
+    FLEXGUARD_LOCK: "flexguard",
+    MCS_TAS_LOCK: "mcstas",
+    MCS_EXTENSION_LOCK: "mcs",
+    MCSTP_LOCK: "mcstp",
+}
+FLEXGUARD_INTERPOSE_BUILD_TARGETS = {
+    FLEXGUARD_LOCK: "build/interpose_flexguard.sh",
+    MCS_TAS_LOCK: "mcstas",
+    MCS_EXTENSION_LOCK: "mcs",
+    MCSTP_LOCK: "mcstp",
+}
+FLEXGUARD_TIMESLICE_EXTENSIONS = {
+    MCS_EXTENSION_LOCK: "require",
 }
 
 DEFAULT_DURATION_MS = 9_000
@@ -347,6 +372,30 @@ def otherlocks_interpose_library(lock: str) -> Path:
     return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.so"
 
 
+def is_flexguard_interpose_lock(lock: str) -> bool:
+    return lock in FLEXGUARD_INTERPOSE_ARTIFACT_LOCKS
+
+
+def flexguard_interpose_artifact_lock(lock: str) -> str:
+    return FLEXGUARD_INTERPOSE_ARTIFACT_LOCKS[lock]
+
+
+def flexguard_interpose_script(lock: str) -> Path:
+    return FLEXGUARD_DIR / "build" / f"interpose_{flexguard_interpose_artifact_lock(lock)}.sh"
+
+
+def flexguard_interpose_library(lock: str) -> Path:
+    return FLEXGUARD_DIR / "build" / f"interpose_{flexguard_interpose_artifact_lock(lock)}.so"
+
+
+def flexguard_interpose_needs_sudo(lock: str) -> bool:
+    return lock == FLEXGUARD_LOCK
+
+
+def timeslice_extension_for_lock(lock: str) -> str:
+    return FLEXGUARD_TIMESLICE_EXTENSIONS.get(lock, "off")
+
+
 def direct_env() -> dict[str, str | None]:
     env: dict[str, str | None] = {
         "ACCORDIN_DISABLE_ADMISSION": None,
@@ -359,6 +408,25 @@ def direct_env() -> dict[str, str | None]:
         if key.startswith("MCS_TAS_ACCORDIN_DIRECT_"):
             env[key] = value
     env[MCS_TAS_ACCORDIN_DIRECT_LIB_ENV] = str(MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB)
+    return env
+
+
+def mcs_accordin_direct_env() -> dict[str, str | None]:
+    env: dict[str, str | None] = {
+        "ACCORDIN_CPU_MASK_K": None,
+        "ACCORDIN_DISABLE_ADMISSION": None,
+        "K": None,
+        "MCS_ACCORDIN_DISABLE_BPF": None,
+        "MCS_ACCORDIN_STATS_ONLY": None,
+        MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
+        MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
+        MCS_TAS_ACCORDIN_DIRECT_LIB_ENV: None,
+        MCS_ACCORDIN_DIRECT_LIB_ENV: str(MCS_ACCORDIN_DIRECT_RELEASE_LIB),
+    }
+    for key, value in os.environ.items():
+        if key.startswith("MCS_ACCORDIN_DIRECT_"):
+            env[key] = value
+    env[MCS_ACCORDIN_DIRECT_LIB_ENV] = str(MCS_ACCORDIN_DIRECT_RELEASE_LIB)
     return env
 
 
@@ -409,15 +477,20 @@ def build_command(lock: str, threads: int, args: RunArgs) -> list[str]:
         "--seed",
         str(args.seed),
         "--timeslice-extension",
-        "off",
+        timeslice_extension_for_lock(lock),
         "--lock-kind",
         LOCK_KIND_BY_LOCK[lock],
     ]
 
 
 def effective_command(lock: str, base_cmd: list[str], args: RunArgs) -> list[str]:
-    if lock == FLEXGUARD_LOCK:
-        return env_command([str(FLEXGUARD_INTERPOSE_SCRIPT), *base_cmd], {}, needs_sudo=True, sudo_mode=args.sudo_mode)
+    if is_flexguard_interpose_lock(lock):
+        return env_command(
+            [str(flexguard_interpose_script(lock)), *base_cmd],
+            {},
+            needs_sudo=flexguard_interpose_needs_sudo(lock),
+            sudo_mode=args.sudo_mode,
+        )
     if experiment_defaults.is_otherlocks_interpose_lock(lock):
         return env_command(
             [str(otherlocks_interpose_script(lock)), *base_cmd],
@@ -425,6 +498,8 @@ def effective_command(lock: str, base_cmd: list[str], args: RunArgs) -> list[str
             needs_sudo=False,
             sudo_mode=args.sudo_mode,
         )
+    if lock == MCS_ACCORDIN_LOCK:
+        return env_command(base_cmd, mcs_accordin_direct_env(), needs_sudo=True, sudo_mode=args.sudo_mode)
     if lock == ACCORDIN_LOCK:
         return env_command(base_cmd, direct_env(), needs_sudo=True, sudo_mode=args.sudo_mode)
     return env_command(base_cmd, {}, needs_sudo=False, sudo_mode=args.sudo_mode)
@@ -499,6 +574,7 @@ def write_settings(root: Path, args: RunArgs) -> None:
         "command_timeout_seconds": args.command_timeout_seconds,
         "multilockbench_binary": str(MULTILOCKBENCH_BINARY),
         "flexguard_interpose_script": str(FLEXGUARD_INTERPOSE_SCRIPT),
+        "mcs_accordin_direct_library": str(MCS_ACCORDIN_DIRECT_RELEASE_LIB),
         "mcs_tas_accordin_direct_library": str(MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB),
     }
     (root / "settings.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
@@ -582,12 +658,12 @@ def build_multilockbench(logger: CommandLogger | None) -> None:
     logger.run(cmd, log_name="build_multilockbench.log", cwd=REPO_ROOT, timeout_seconds=0)
 
 
-def build_flexguard_interpose(logger: CommandLogger | None) -> None:
-    cmd = ["make", "-C", str(FLEXGUARD_DIR), "build/interpose_flexguard.sh"]
+def build_flexguard_interpose(lock: str, logger: CommandLogger | None) -> None:
+    cmd = ["make", "-C", str(FLEXGUARD_DIR), FLEXGUARD_INTERPOSE_BUILD_TARGETS[lock]]
     if logger is None:
         print(shlex_join(cmd))
         return
-    logger.run(cmd, log_name="build_flexguard_interpose.log", cwd=REPO_ROOT, timeout_seconds=0)
+    logger.run(cmd, log_name=f"build_flexguard_{safe_name(lock)}.log", cwd=REPO_ROOT, timeout_seconds=0)
 
 
 def build_otherlocks_interpose(lock: str, logger: CommandLogger | None) -> None:
@@ -602,12 +678,15 @@ def ensure_inputs(locks: tuple[str, ...], *, build_missing: bool, logger: Comman
     if logger is None:
         if not MULTILOCKBENCH_BINARY.is_file() or not os.access(MULTILOCKBENCH_BINARY, os.X_OK):
             build_multilockbench(logger)
-        if build_missing and FLEXGUARD_LOCK in locks and (
-            not FLEXGUARD_INTERPOSE_SCRIPT.is_file()
-            or not os.access(FLEXGUARD_INTERPOSE_SCRIPT, os.X_OK)
-            or not FLEXGUARD_INTERPOSE_LIBRARY.is_file()
-        ):
-            build_flexguard_interpose(logger)
+        for lock in sorted(lock for lock in locks if is_flexguard_interpose_lock(lock)):
+            script = flexguard_interpose_script(lock)
+            library = flexguard_interpose_library(lock)
+            if build_missing and (
+                not script.is_file()
+                or not os.access(script, os.X_OK)
+                or not library.is_file()
+            ):
+                build_flexguard_interpose(lock, logger)
         for lock in sorted(lock for lock in locks if experiment_defaults.is_otherlocks_interpose_lock(lock)):
             if build_missing and (
                 not otherlocks_interpose_script(lock).is_file()
@@ -617,6 +696,8 @@ def ensure_inputs(locks: tuple[str, ...], *, build_missing: bool, logger: Comman
                 build_otherlocks_interpose(lock, logger)
         if build_missing and ACCORDIN_LOCK in locks and not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
             print(shlex_join(["cargo", "build", "-p", MCS_TAS_ACCORDIN_DIRECT_PACKAGE, "--release"]))
+        if build_missing and MCS_ACCORDIN_LOCK in locks and not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+            print(shlex_join(["cargo", "build", "-p", MCS_ACCORDIN_DIRECT_PACKAGE, "--release"]))
         return
 
     if not MULTILOCKBENCH_BINARY.is_file() or not os.access(MULTILOCKBENCH_BINARY, os.X_OK):
@@ -625,18 +706,14 @@ def ensure_inputs(locks: tuple[str, ...], *, build_missing: bool, logger: Comman
         raise RuntimeError(f"multilockbench is missing or not executable: {MULTILOCKBENCH_BINARY}")
 
     missing: list[str] = []
-    if FLEXGUARD_LOCK in locks and (
-        not FLEXGUARD_INTERPOSE_SCRIPT.is_file() or not os.access(FLEXGUARD_INTERPOSE_SCRIPT, os.X_OK)
-        or not FLEXGUARD_INTERPOSE_LIBRARY.is_file()
-    ):
-        if build_missing:
-            build_flexguard_interpose(logger)
-        if (
-            not FLEXGUARD_INTERPOSE_SCRIPT.is_file()
-            or not os.access(FLEXGUARD_INTERPOSE_SCRIPT, os.X_OK)
-            or not FLEXGUARD_INTERPOSE_LIBRARY.is_file()
-        ):
-            missing.append(f"flexguard interpose artifacts are missing: {FLEXGUARD_INTERPOSE_SCRIPT}, {FLEXGUARD_INTERPOSE_LIBRARY}")
+    for lock in sorted(lock for lock in locks if is_flexguard_interpose_lock(lock)):
+        script = flexguard_interpose_script(lock)
+        library = flexguard_interpose_library(lock)
+        if not script.is_file() or not os.access(script, os.X_OK) or not library.is_file():
+            if build_missing:
+                build_flexguard_interpose(lock, logger)
+            if not script.is_file() or not os.access(script, os.X_OK) or not library.is_file():
+                missing.append(f"{lock} interpose artifacts are missing: {script}, {library}")
     for lock in sorted(lock for lock in locks if experiment_defaults.is_otherlocks_interpose_lock(lock)):
         script = otherlocks_interpose_script(lock)
         library = otherlocks_interpose_library(lock)
@@ -659,6 +736,20 @@ def ensure_inputs(locks: tuple[str, ...], *, build_missing: bool, logger: Comman
                 )
         if not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
             missing.append(f"mcs_tas_accordin_direct library is missing: {MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB}")
+    if MCS_ACCORDIN_LOCK in locks and not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+        if build_missing:
+            build_cmd = ["cargo", "build", "-p", MCS_ACCORDIN_DIRECT_PACKAGE, "--release"]
+            if logger is None:
+                print(shlex_join(build_cmd))
+            else:
+                logger.run(
+                    build_cmd,
+                    log_name=f"build_{MCS_ACCORDIN_DIRECT_PACKAGE}.log",
+                    cwd=REPO_ROOT,
+                    timeout_seconds=0,
+                )
+        if not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+            missing.append(f"mcs_accordin_direct library is missing: {MCS_ACCORDIN_DIRECT_RELEASE_LIB}")
     if missing:
         raise RuntimeError("Required inputs are missing: " + "; ".join(missing))
 

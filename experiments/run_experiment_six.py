@@ -84,13 +84,19 @@ BUILTIN_LOCK_KINDS = {
     "mutex": "mutex",
     experiment_defaults.PTHREAD_SPINLOCK_LOCK: "pthread_spinlock",
     "mcs": "mcs",
-    "mcstas": "mcs-tas",
-    "mcs_extension": "mcs-tas-tse",
     "reciprocating": "reciprocating",
 }
-FLEXGUARD_INTERPOSE_LOCKS = {"flexguard", "mcstp", "malthusian"}
+FLEXGUARD_INTERPOSE_LOCKS = {"flexguard", "mcstas", "mcs_extension", "mcstp", "malthusian"}
+FLEXGUARD_INTERPOSE_ARTIFACT_LOCKS = {
+    "mcs_extension": "mcs",
+}
+FLEXGUARD_TIMESLICE_EXTENSIONS = {
+    "mcs_extension": "require",
+}
 FLEXGUARD_INTERPOSE_BUILD_SPECS = {
     "flexguard": FlexguardInterposeBuildSpec(make_target="build/interpose_flexguard.sh"),
+    "mcstas": FlexguardInterposeBuildSpec(make_target="mcstas"),
+    "mcs_extension": FlexguardInterposeBuildSpec(make_target="mcs"),
     "mcstp": FlexguardInterposeBuildSpec(
         make_vars=("LOCK_VERSION=MCSTP", "ADD_PADDING=1", "USE_REAL_PTHREAD=1"),
         clean_first=True,
@@ -304,16 +310,24 @@ def is_otherlocks_interpose_lock(lock: str) -> bool:
     return experiment_defaults.is_otherlocks_interpose_lock(lock)
 
 
+def flexguard_interpose_artifact_lock(lock: str) -> str:
+    return FLEXGUARD_INTERPOSE_ARTIFACT_LOCKS.get(lock, lock)
+
+
 def flexguard_interpose_script(lock: str) -> Path:
-    return FLEXGUARD_DIR / "build" / f"interpose_{lock}.sh"
+    return FLEXGUARD_DIR / "build" / f"interpose_{flexguard_interpose_artifact_lock(lock)}.sh"
 
 
 def flexguard_interpose_library(lock: str) -> Path:
-    return FLEXGUARD_DIR / "build" / f"interpose_{lock}.so"
+    return FLEXGUARD_DIR / "build" / f"interpose_{flexguard_interpose_artifact_lock(lock)}.so"
 
 
 def flexguard_interpose_needs_sudo(lock: str) -> bool:
     return lock.startswith("flexguard")
+
+
+def flexguard_timeslice_extension(lock: str) -> str:
+    return FLEXGUARD_TIMESLICE_EXTENSIONS.get(lock, "off")
 
 
 def otherlocks_interpose_script(lock: str) -> Path:
@@ -357,11 +371,13 @@ def mutexbench_command(case: TwoLockCase, lock: str, threads: int, args: argpars
         needs_sudo = flexguard_interpose_needs_sudo(lock) if is_flexguard_interpose_lock(lock) else False
         script = flexguard_interpose_script(lock) if is_flexguard_interpose_lock(lock) else otherlocks_interpose_script(lock)
         cmd_prefix = [str(script)]
+        timeslice_extension = flexguard_timeslice_extension(lock) if is_flexguard_interpose_lock(lock) else "off"
     else:
         lock_kind = BUILTIN_LOCK_KINDS.get(lock, ACCORDIN_DIRECT_LOCK_KIND)
         env = accordin_env(lock) if is_accordin_direct_lock(lock) else {}
         needs_sudo = is_accordin_direct_lock(lock)
         cmd_prefix = []
+        timeslice_extension = "off"
     cmd = [
         *cmd_prefix,
         str(MUTEX_BENCH),
@@ -384,7 +400,7 @@ def mutexbench_command(case: TwoLockCase, lock: str, threads: int, args: argpars
         "--lock-kind",
         lock_kind,
         "--timeslice-extension",
-        "off",
+        timeslice_extension,
     ]
     if experiment_defaults.accordin_uses_taskset(lock):
         cmd = ["taskset", "-c", args.mcs_accordin_taskset_cpus, *cmd]

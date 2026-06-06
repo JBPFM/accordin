@@ -27,7 +27,6 @@ MACHINE_CORE_COUNT = MACHINE_PHYSICAL_CORES
 DEFAULT_THREADS = DEFAULT_THREAD_COUNTS
 ACCORDIN_ADMISSION_ONLY_LOCK = "mcs_tas_accordin_admission_only"
 ACCORDIN_BASE_LOCK = ACCORDIN_ADMISSION_ONLY_LOCK
-ACCORDIN_SAMPLED_LOCK = "mcs_tas_accordin_sampled"
 ACCORDIN_NO_ADMISSION_LOCK = "mcs_tas_accordin_no_admission"
 ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin_taskset"
 MCS_ACCORDIN_LOCK = "mcs_accordin"
@@ -35,7 +34,6 @@ PTHREAD_SPINLOCK_LOCK = "pthread_spinlock"
 ACCORDIN_VARIANT_LOCKS = (
     ACCORDIN_BASE_LOCK,
 )
-ACCORDIN_SAMPLED_LOCKS: tuple[str, ...] = ()
 ACCORDIN_ADMISSION_DISABLED_LOCKS: tuple[str, ...] = ()
 ACCORDIN_TASKSET_LOCKS: tuple[str, ...] = ()
 
@@ -191,7 +189,6 @@ LOCK_ORDER = (
     "malthusian",
     "mcs_tas_accordin_admission_only",
     "mcs_tas_accordin",
-    "mcs_tas_accordin_sampled",
     "mcs_tas_accordin_no_admission",
     "mcs_tas_accordin_taskset",
     "mcs_accordin",
@@ -305,10 +302,6 @@ def is_accordin_lock(lock: str) -> bool:
 
 def is_mcs_accordin_lock(lock: str) -> bool:
     return lock == MCS_ACCORDIN_LOCK
-
-
-def accordin_uses_sampling(lock: str) -> bool:
-    return lock in ACCORDIN_SAMPLED_LOCKS
 
 
 def accordin_disables_admission(lock: str) -> bool:

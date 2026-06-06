@@ -100,13 +100,11 @@ MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_ACCORDIN_DIRECT_STATS_ONLY"
 MCS_TAS_ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
 MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
-MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK = "mcs_tas_accordin_direct_sampled"
 MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK = "mcs_tas_accordin_direct_no_admission"
 MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK = "mcs_tas_accordin_direct_taskset"
 LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS = (
     MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
 )
-LEVELDB_ACCORDIN_DIRECT_SAMPLED_LOCKS: tuple[str, ...] = ()
 LEVELDB_ACCORDIN_DIRECT_ADMISSION_DISABLED_LOCKS: tuple[str, ...] = ()
 LEVELDB_ACCORDIN_DIRECT_TASKSET_LOCKS: tuple[str, ...] = ()
 LEVELDB_ACCORDIN_DIRECT_STYLE_LOCKS = {
@@ -709,10 +707,6 @@ def leveldb_direct_flexguard_library_path(lock: str) -> Path:
     return leveldb_direct_adapter_library_path(lock)
 
 
-def leveldb_direct_accordin_uses_sampling(lock: str) -> bool:
-    return lock in LEVELDB_ACCORDIN_DIRECT_SAMPLED_LOCKS
-
-
 def leveldb_direct_accordin_disables_admission(lock: str) -> bool:
     return lock in LEVELDB_ACCORDIN_DIRECT_ADMISSION_DISABLED_LOCKS
 
@@ -735,16 +729,12 @@ def mcs_tas_accordin_direct_preload_env(
     env.update(
         {
             ACCORDIN_HOOK_SCOPE_ENV: None,
-            "ACCORDIN_CPU_MASK_K": None,
             "ACCORDIN_DISABLE_ADMISSION": None,
-            "K": None,
             "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
             MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
             MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
         }
     )
-    if leveldb_direct_accordin_uses_sampling(lock):
-        env["K"] = str(experiment_defaults.DEFAULT_ACCORDIN_CONCURRENCY)
     if leveldb_direct_accordin_disables_admission(lock):
         env["ACCORDIN_DISABLE_ADMISSION"] = "1"
         env[MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV] = "1"
@@ -763,9 +753,7 @@ def mcs_accordin_direct_preload_env(
     env.update(
         {
             ACCORDIN_HOOK_SCOPE_ENV: None,
-            "ACCORDIN_CPU_MASK_K": None,
             "ACCORDIN_DISABLE_ADMISSION": None,
-            "K": None,
             "MCS_ACCORDIN_DISABLE_BPF": None,
             "MCS_ACCORDIN_STATS_ONLY": None,
             MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
@@ -783,12 +771,10 @@ def default_result_root() -> Path:
 def lock_label(lock: str) -> str:
     if lock == MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK:
         return "Admission only"
-    if lock == MCS_TAS_ACCORDIN_DIRECT_SAMPLED_LOCK:
-        return "Admission + core budget"
     if lock == MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK:
         return "Core budget only"
     if lock == MCS_TAS_ACCORDIN_DIRECT_TASKSET_LOCK:
-        return "Profiled static-K Accordin"
+        return "Taskset Accordin"
     return experiment_defaults.lock_label(lock)
 
 

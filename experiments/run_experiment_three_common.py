@@ -570,14 +570,9 @@ def accordin_preload_env(
     env: dict[str, str | None] = {
         "LD_PRELOAD": combine_ld_preload(preload_library),
         "ACCORDIN_DISABLE_ADMISSION": None,
-        "ACCORDIN_CPU_MASK_K": None,
         "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
         "MCS_TAS_ACCORDIN_STATS_ONLY": None,
     }
-    if experiment_defaults.accordin_uses_sampling(lock):
-        env["K"] = str(experiment_defaults.DEFAULT_ACCORDIN_CONCURRENCY)
-    else:
-        env["K"] = None
     if experiment_defaults.accordin_disables_admission(lock):
         env["ACCORDIN_DISABLE_ADMISSION"] = "1"
         env["MCS_TAS_ACCORDIN_STATS_ONLY"] = "1"
@@ -619,8 +614,6 @@ def mcs_accordin_preload_env(
     return {
         "LD_PRELOAD": combine_ld_preload(preload_library),
         "ACCORDIN_DISABLE_ADMISSION": None,
-        "ACCORDIN_CPU_MASK_K": None,
-        "K": None,
         "MCS_ACCORDIN_DISABLE_BPF": None,
         "MCS_ACCORDIN_STATS_ONLY": None,
         "MCS_TAS_ACCORDIN_DISABLE_BPF": None,

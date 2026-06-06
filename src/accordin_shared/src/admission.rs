@@ -4,10 +4,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const IN_CRITICAL_SECTION: u32 = 1 << 0;
 const SLOW_PATH_PENDING: u32 = 1 << 1;
-const SLOW_PATH_SEEN: u32 = 1 << 2;
-pub const USER_ADMISSION_FLAG_MASK: u32 = 0x7;
-pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 3;
-pub const MAX_LOCK_CLASSES: u32 = 8;
+pub const USER_ADMISSION_FLAG_MASK: u32 = 0x3;
+pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 2;
+pub const MAX_LOCK_CLASSES: u32 = 16;
 pub const UNMANAGED_LOCK_ID: u32 = 0;
 pub const DISABLE_ADMISSION_ENV: &str = "ACCORDIN_DISABLE_ADMISSION";
 
@@ -129,9 +128,9 @@ fn mark_slow_path_pending_with_admission_enabled(enabled: bool) -> bool {
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
-            value | SLOW_PATH_PENDING | SLOW_PATH_SEEN
+            value | SLOW_PATH_PENDING
         } else {
-            (value | SLOW_PATH_SEEN) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
+            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -147,11 +146,11 @@ fn mark_slow_path_pending_for_lock_with_admission_enabled(lock_id: u32, enabled:
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
-            word_with_lock_id(lock_id, flags(value) | SLOW_PATH_PENDING | SLOW_PATH_SEEN)
+            word_with_lock_id(lock_id, flags(value) | SLOW_PATH_PENDING)
         } else {
             word_with_lock_id(
                 lock_id,
-                (flags(value) | SLOW_PATH_SEEN) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
+                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
             )
         };
         word.store(next, Ordering::Relaxed);
@@ -176,7 +175,7 @@ fn mark_critical_section_entered_with_admission_enabled(enabled: bool) {
         let next = if enabled {
             (value | IN_CRITICAL_SECTION) & !SLOW_PATH_PENDING
         } else {
-            (value | SLOW_PATH_SEEN) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
+            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -198,7 +197,7 @@ fn mark_critical_section_entered_for_lock_with_admission_enabled(lock_id: u32, e
         } else {
             word_with_lock_id(
                 lock_id,
-                (flags(value) | SLOW_PATH_SEEN) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
+                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
             )
         };
         word.store(next, Ordering::Relaxed);
@@ -222,7 +221,7 @@ fn mark_critical_section_exit_with_admission_enabled(enabled: bool) {
         let next = if enabled {
             value & !IN_CRITICAL_SECTION
         } else {
-            (value | SLOW_PATH_SEEN) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
+            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -241,7 +240,7 @@ fn mark_critical_section_exit_for_lock_with_admission_enabled(lock_id: u32, enab
         } else {
             word_with_lock_id(
                 lock_id,
-                (flags(value) | SLOW_PATH_SEEN) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
+                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
             )
         };
         word.store(next, Ordering::Relaxed);
@@ -259,10 +258,7 @@ pub fn reset_state() {
 pub fn reset_transient_state() {
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
-        word.store(
-            lock_id_bits(value) | (value & SLOW_PATH_SEEN),
-            Ordering::Relaxed,
-        );
+        word.store(lock_id_bits(value), Ordering::Relaxed);
     });
 }
 
@@ -284,9 +280,9 @@ pub fn reset_lock_id_allocator_for_test() {
 #[cfg(test)]
 mod tests {
     use super::{
-        IN_CRITICAL_SECTION, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, SLOW_PATH_SEEN,
-        UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_id, begin_lock_scope,
-        finish_lock_scope, mark_critical_section_entered, mark_critical_section_entered_for_scope,
+        IN_CRITICAL_SECTION, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, UNMANAGED_LOCK_ID,
+        USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_id, begin_lock_scope, finish_lock_scope,
+        mark_critical_section_entered, mark_critical_section_entered_for_scope,
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
@@ -303,27 +299,24 @@ mod tests {
         reset_state();
 
         mark_slow_path_pending();
-        assert_eq!(word_for_test(), SLOW_PATH_PENDING | SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), SLOW_PATH_PENDING);
 
         mark_critical_section_entered();
-        assert_eq!(word_for_test(), IN_CRITICAL_SECTION | SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), IN_CRITICAL_SECTION);
 
         mark_slow_path_pending();
-        assert_eq!(
-            word_for_test(),
-            IN_CRITICAL_SECTION | SLOW_PATH_PENDING | SLOW_PATH_SEEN
-        );
+        assert_eq!(word_for_test(), IN_CRITICAL_SECTION | SLOW_PATH_PENDING);
 
         mark_critical_section_exit();
-        assert_eq!(word_for_test(), SLOW_PATH_PENDING | SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), SLOW_PATH_PENDING);
 
         mark_critical_section_entered();
         mark_critical_section_exit();
-        assert_eq!(word_for_test(), SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), 0);
     }
 
     #[test]
-    fn measurement_reset_preserves_slow_path_history() {
+    fn measurement_reset_clears_transient_state() {
         reset_state();
 
         mark_slow_path_pending();
@@ -331,24 +324,24 @@ mod tests {
 
         reset_transient_state();
 
-        assert_eq!(word_for_test(), SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), 0);
 
         reset_state();
         assert_eq!(word_for_test(), 0);
     }
 
     #[test]
-    fn disabled_admission_marks_controlled_thread_without_admission_bits() {
+    fn disabled_admission_does_not_set_admission_bits() {
         reset_state();
 
         mark_slow_path_pending_with_admission_enabled(false);
-        assert_eq!(word_for_test(), SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), 0);
 
         mark_critical_section_entered_with_admission_enabled(false);
-        assert_eq!(word_for_test(), SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), 0);
 
         mark_critical_section_exit_with_admission_enabled(false);
-        assert_eq!(word_for_test(), SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), 0);
     }
 
     #[test]
@@ -356,12 +349,12 @@ mod tests {
         reset_state();
 
         assert!(mark_slow_path_pending_with_admission_enabled(true));
-        assert_eq!(word_for_test(), SLOW_PATH_PENDING | SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), SLOW_PATH_PENDING);
 
         reset_state();
 
         assert!(!mark_slow_path_pending_with_admission_enabled(false));
-        assert_eq!(word_for_test(), SLOW_PATH_SEEN);
+        assert_eq!(word_for_test(), 0);
     }
 
     #[test]
@@ -371,19 +364,13 @@ mod tests {
 
         let scope = begin_lock_scope(3);
         assert!(mark_slow_path_pending_for_scope(scope));
-        assert_eq!(
-            word_for_test(),
-            word_for(3, SLOW_PATH_PENDING | SLOW_PATH_SEEN)
-        );
+        assert_eq!(word_for_test(), word_for(3, SLOW_PATH_PENDING));
 
         mark_critical_section_entered_for_scope(scope);
-        assert_eq!(
-            word_for_test(),
-            word_for(3, IN_CRITICAL_SECTION | SLOW_PATH_SEEN)
-        );
+        assert_eq!(word_for_test(), word_for(3, IN_CRITICAL_SECTION));
 
         finish_lock_scope(3);
-        assert_eq!(word_for_test(), word_for(3, SLOW_PATH_SEEN));
+        assert_eq!(word_for_test(), word_for(3, 0));
 
         reset_state();
         assert_eq!(word_for_test(), 0);
@@ -410,33 +397,25 @@ mod tests {
         let outer = begin_lock_scope(2);
         assert!(mark_slow_path_pending_for_scope(outer));
         mark_critical_section_entered_for_scope(outer);
-        assert_eq!(
-            word_for_test(),
-            word_for(2, IN_CRITICAL_SECTION | SLOW_PATH_SEEN)
-        );
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
 
         let inner = begin_lock_scope(3);
         assert!(!mark_slow_path_pending_for_scope(inner));
         mark_critical_section_entered_for_scope(inner);
-        assert_eq!(
-            word_for_test(),
-            word_for(2, IN_CRITICAL_SECTION | SLOW_PATH_SEEN)
-        );
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
 
         finish_lock_scope(3);
-        assert_eq!(
-            word_for_test(),
-            word_for(2, IN_CRITICAL_SECTION | SLOW_PATH_SEEN)
-        );
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
 
         finish_lock_scope(2);
-        assert_eq!(word_for_test(), word_for(2, SLOW_PATH_SEEN));
+        assert_eq!(word_for_test(), word_for(2, 0));
     }
 
     #[test]
     fn lock_id_allocator_exhausts_at_configured_class_limit() {
         reset_lock_id_allocator_for_test();
 
+        assert_eq!(MAX_LOCK_CLASSES, 16);
         for expected in 1..MAX_LOCK_CLASSES {
             assert_eq!(allocate_lock_id(), expected);
         }

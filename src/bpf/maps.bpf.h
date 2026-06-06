@@ -27,13 +27,6 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, MAX_CPUS);
-  __type(key, __u32);
-  __type(value, struct cpu_inactive_hint);
-} cpu_inactive_hint_map SEC(".maps");
-
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, STAT_NR);
   __type(key, __u32);
   __type(value, __u64);
@@ -41,11 +34,6 @@ struct {
 
 volatile __u32 stats_only_mode = 0;
 volatile __u32 single_lock_mode = 0;
-volatile __u32 active_cpus_all = 1;
-volatile __u64 active_cpu_word0 = ~0ULL;
-volatile __u64 active_cpu_word1 = ~0ULL;
-volatile __u64 active_cpu_word2 = ~0ULL;
-volatile __u64 active_cpu_word3 = ~0ULL;
 volatile __u32 cpu_admission_owner[MAX_CPUS];
 volatile __u32 cpu_last_inactive_lock[MAX_CPUS];
 volatile __u32 inactive_previous_lock_percent;

@@ -531,9 +531,7 @@ def common_sweep_args(matrix: BaselineMatrix, threads: tuple[int, ...] | None = 
 
 def accordin_direct_env(lock: str) -> dict[str, str | None]:
     env: dict[str, str | None] = {
-        "ACCORDIN_CPU_MASK_K": None,
         "ACCORDIN_DISABLE_ADMISSION": None,
-        "K": None,
         "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
         ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
         ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
@@ -542,8 +540,6 @@ def accordin_direct_env(lock: str) -> dict[str, str | None]:
         if key.startswith(ACCORDIN_DIRECT_ENV_PREFIX):
             env[key] = value
     env[ACCORDIN_DIRECT_LIB_ENV] = str(ACCORDIN_DIRECT_RELEASE_LIB)
-    if experiment_defaults.accordin_uses_sampling(lock):
-        env["K"] = str(experiment_defaults.DEFAULT_ACCORDIN_CONCURRENCY)
     if experiment_defaults.accordin_disables_admission(lock):
         env["ACCORDIN_DISABLE_ADMISSION"] = "1"
         env[ACCORDIN_DIRECT_STATS_ONLY_ENV] = "1"
@@ -552,9 +548,7 @@ def accordin_direct_env(lock: str) -> dict[str, str | None]:
 
 def mcs_accordin_direct_env() -> dict[str, str | None]:
     env: dict[str, str | None] = {
-        "ACCORDIN_CPU_MASK_K": None,
         "ACCORDIN_DISABLE_ADMISSION": None,
-        "K": None,
         "MCS_ACCORDIN_DISABLE_BPF": None,
         "MCS_ACCORDIN_STATS_ONLY": None,
         MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,

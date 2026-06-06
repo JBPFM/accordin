@@ -349,9 +349,7 @@ def otherlocks_interpose_library(lock: str) -> Path:
 
 def direct_env() -> dict[str, str | None]:
     env: dict[str, str | None] = {
-        "ACCORDIN_CPU_MASK_K": None,
         "ACCORDIN_DISABLE_ADMISSION": None,
-        "K": None,
         "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
         MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
         MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,

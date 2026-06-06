@@ -21,7 +21,6 @@ import run_experiment_three as experiment_three
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MUTEXBENCH_DIR = REPO_ROOT / "bench" / "mutexbench"
 MUTEX_BENCH = MUTEXBENCH_DIR / "mutex_bench"
-SAMPLE_BPF = MUTEXBENCH_DIR / "scripts" / "sample_accordin_bpf.py"
 FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
 OTHERLOCKS_DIR = REPO_ROOT / "bench" / "otherlocks"
 OTHERLOCKS_BUILD_DIR = OTHERLOCKS_DIR / "build"
@@ -150,14 +149,10 @@ RAW_FIELDS = (
     "group_b_normalized_efficiency",
     "group_b_normalized_slowdown",
     "fairness_jain",
-    "selected_k_min",
-    "selected_k_max",
-    "selected_k_mean",
-    "selected_k_samples_path",
     "command_log",
 )
 
-SUMMARY_FIELDS = tuple(field for field in RAW_FIELDS if field not in {"repeat", "selected_k_samples_path", "command_log"})
+SUMMARY_FIELDS = tuple(field for field in RAW_FIELDS if field not in {"repeat", "command_log"})
 SUMMARY_NUMERIC_FIELDS = tuple(
     field
     for field in SUMMARY_FIELDS
@@ -238,9 +233,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=4)
     parser.add_argument("--sudo-mode", choices=("all", "auto", "none"), default="auto")
     parser.add_argument("--command-timeout-seconds", type=int, default=DEFAULT_COMMAND_TIMEOUT_SECONDS)
-    parser.add_argument("--sample-bpf", dest="sample_bpf", action="store_true", default=True)
-    parser.add_argument("--no-sample-bpf", dest="sample_bpf", action="store_false")
-    parser.add_argument("--sample-bpf-interval-us", type=int, default=500)
     parser.add_argument(
         "--mcs-accordin-taskset-cpus",
         default=experiment_defaults.DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
@@ -259,8 +251,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--repeats must be > 0")
     if args.command_timeout_seconds <= 0:
         parser.error("--command-timeout-seconds must be > 0")
-    if args.sample_bpf_interval_us <= 0:
-        parser.error("--sample-bpf-interval-us must be > 0")
 
     args.thread_counts = parse_csv_ints(args.threads, "--threads")
     try:
@@ -296,10 +286,6 @@ def env_command(cmd: Sequence[str], env: dict[str, str | None], *, needs_sudo: b
 
 def lock_label(lock: str) -> str:
     return experiment_defaults.lock_label(lock)
-
-
-def is_sampled_lock(lock: str) -> bool:
-    return lock == experiment_defaults.ACCORDIN_SAMPLED_LOCK
 
 
 def is_accordin_direct_lock(lock: str) -> bool:
@@ -340,9 +326,7 @@ def otherlocks_interpose_library(lock: str) -> Path:
 
 def accordin_env(lock: str) -> dict[str, str | None]:
     env: dict[str, str | None] = {
-        "ACCORDIN_CPU_MASK_K": None,
         "ACCORDIN_DISABLE_ADMISSION": None,
-        "K": None,
         "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
         ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
         ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
@@ -351,8 +335,6 @@ def accordin_env(lock: str) -> dict[str, str | None]:
         if key.startswith(ACCORDIN_DIRECT_ENV_PREFIX):
             env[key] = value
     env[ACCORDIN_DIRECT_LIB_ENV] = str(ACCORDIN_DIRECT_RELEASE_LIB)
-    if experiment_defaults.accordin_uses_sampling(lock):
-        env["K"] = str(experiment_defaults.DEFAULT_ACCORDIN_CONCURRENCY)
     if experiment_defaults.accordin_disables_admission(lock):
         env["ACCORDIN_DISABLE_ADMISSION"] = "1"
         env[ACCORDIN_DIRECT_STATS_ONLY_ENV] = "1"
@@ -512,69 +494,6 @@ def parse_metrics(text: str) -> dict[str, str]:
     return metrics
 
 
-def wait_for_sched_ext_enabled(timeout_s: float = 8.0) -> bool:
-    state_path = Path("/sys/kernel/sched_ext/state")
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            if state_path.read_text(encoding="utf-8").strip() == "enabled":
-                return True
-        except OSError:
-            pass
-        time.sleep(0.05)
-    return False
-
-
-def sampler_command(output_path: Path, args: argparse.Namespace) -> list[str]:
-    duration_s = (args.warmup_duration_ms + args.duration_ms) / 1000.0 + 0.250
-    cmd = [
-        "python3",
-        str(SAMPLE_BPF),
-        "--layout",
-        "auto",
-        "--duration-s",
-        f"{duration_s:.3f}",
-        "--interval-us",
-        str(args.sample_bpf_interval_us),
-        "--include-agg",
-        "--include-slots",
-        "--slot-limit",
-        "64",
-        "--output",
-        str(output_path),
-    ]
-    if os.geteuid() != 0:
-        return ["sudo", "-n", "--", *cmd]
-    return cmd
-
-
-def selected_k_summary(path: Path) -> tuple[str, str, str]:
-    if not path.is_file() or path.stat().st_size == 0:
-        return "", "", ""
-    values: list[int] = []
-    with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            raw = row.get("ssc_active_count", "")
-            if raw:
-                values.append(int(raw))
-    if not values:
-        return "", "", ""
-    return str(min(values)), str(max(values)), f"{statistics.mean(values):.6f}"
-
-
-def csv_has_data_row(path: Path) -> bool:
-    if not path.is_file() or path.stat().st_size == 0:
-        return False
-    with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        try:
-            next(reader)
-        except StopIteration:
-            return False
-        return any(row for row in reader)
-
-
 def run_one(
     case: TwoLockCase,
     lock: str,
@@ -586,74 +505,19 @@ def run_one(
     cmd, env, needs_sudo = mutexbench_command(case, lock, threads, args)
     run_cmd = env_command(cmd, env, needs_sudo=needs_sudo, sudo_mode=args.sudo_mode)
     log_path = logs_dir / f"{case.name}_{lock}_t{threads}_r{repeat}.log"
-    sample_path = logs_dir / f"{case.name}_{lock}_t{threads}_r{repeat}.bpf_samples.csv"
-    selected_k_path = sample_path if args.sample_bpf and is_sampled_lock(lock) else None
 
     start_ns = time.time_ns()
-    if selected_k_path is None:
-        completed = subprocess.run(
-            run_cmd,
-            check=False,
-            cwd=REPO_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=args.command_timeout_seconds,
-        )
-        output = completed.stdout
-        status = completed.returncode
-    else:
-        proc = subprocess.Popen(
-            run_cmd,
-            cwd=REPO_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        sampler_proc: subprocess.Popen[str] | None = None
-        sampler_stopped_by_harness = False
-        sampler_stderr = sample_path.with_suffix(".bpf_samples.stderr")
-        if wait_for_sched_ext_enabled():
-            with sampler_stderr.open("w", encoding="utf-8") as err:
-                sampler_proc = subprocess.Popen(
-                    sampler_command(sample_path, args),
-                    cwd=REPO_ROOT,
-                    text=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=err,
-                )
-        else:
-            proc.terminate()
-            output, _ = proc.communicate(timeout=2.0)
-            raise RuntimeError(
-                f"timed out waiting for sched_ext before BPF sampling for case={case.name} lock={lock} threads={threads} repeat={repeat}"
-            )
-        try:
-            output, _ = proc.communicate(timeout=args.command_timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            proc.kill()
-            output, _ = proc.communicate()
-            raise RuntimeError(
-                f"benchmark timed out for case={case.name} lock={lock} threads={threads} repeat={repeat}"
-            ) from exc
-        status = proc.returncode
-        if sampler_proc is not None:
-            try:
-                sampler_proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                sampler_proc.terminate()
-                sampler_stopped_by_harness = True
-                try:
-                    sampler_proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    sampler_proc.kill()
-                    sampler_stopped_by_harness = True
-                    sampler_proc.wait()
-            sampler_has_rows = csv_has_data_row(sample_path)
-            if sampler_proc.returncode != 0 and not (sampler_stopped_by_harness and sampler_has_rows):
-                raise RuntimeError(f"BPF sampler failed for case={case.name} lock={lock} threads={threads} repeat={repeat}; see {sampler_stderr}")
-            if not sampler_has_rows:
-                raise RuntimeError(f"BPF sampler failed for case={case.name} lock={lock} threads={threads} repeat={repeat}; see {sampler_stderr}")
+    completed = subprocess.run(
+        run_cmd,
+        check=False,
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=args.command_timeout_seconds,
+    )
+    output = completed.stdout
+    status = completed.returncode
     end_ns = time.time_ns()
     bench_wall_seconds = (end_ns - start_ns) / 1_000_000_000.0
 
@@ -665,7 +529,6 @@ def run_one(
         raise RuntimeError(f"benchmark failed for case={case.name} lock={lock} threads={threads} repeat={repeat}; see {log_path}")
 
     metrics = parse_metrics(output)
-    k_min, k_max, k_mean = selected_k_summary(selected_k_path) if selected_k_path is not None else ("", "", "")
     row = {
         "case": case.name,
         "lock": lock,
@@ -679,10 +542,6 @@ def run_one(
         "group_b_outside_ns": str(case.group_b_outside_ns),
         "repeat": str(repeat),
         "bench_wall_seconds": f"{bench_wall_seconds:.6f}",
-        "selected_k_min": k_min,
-        "selected_k_max": k_max,
-        "selected_k_mean": k_mean,
-        "selected_k_samples_path": str(selected_k_path) if selected_k_path is not None else "",
         "command_log": str(log_path),
     }
     for field in RAW_FIELDS:
@@ -708,7 +567,7 @@ def run_one(
 def write_settings(root: Path, args: argparse.Namespace) -> None:
     settings = {
         "experiment": "experiment6_two_lock_mutexbench",
-        "description": "Two independent locks, two half-sized worker groups, shared process-level sampled-K when enabled.",
+        "description": "Two independent locks with two half-sized worker groups.",
         "output_root": str(root),
         "lock_profile": args.lock_profile,
         "lock_profile_source": args.lock_profile_source,
@@ -717,8 +576,6 @@ def write_settings(root: Path, args: argparse.Namespace) -> None:
         "duration_ms": args.duration_ms,
         "warmup_duration_ms": args.warmup_duration_ms,
         "repeats": args.repeats,
-        "sample_bpf": args.sample_bpf,
-        "sample_bpf_interval_us": args.sample_bpf_interval_us,
         "mcs_accordin_taskset_cpus": args.mcs_accordin_taskset_cpus,
         "cases": [case.__dict__ for case in CASES],
     }
@@ -923,10 +780,7 @@ def dry_run(args: argparse.Namespace) -> None:
             for threads in args.thread_counts:
                 cmd, env, needs_sudo = mutexbench_command(case, lock, threads, args)
                 run_cmd = env_command(cmd, env, needs_sudo=needs_sudo, sudo_mode=args.sudo_mode)
-                sample_note = " selected_k_samples_path=<none>"
-                if args.sample_bpf and is_sampled_lock(lock):
-                    sample_note = " selected_k_samples_path=<logs>/<case>_<lock>_t<threads>_r<repeat>.bpf_samples.csv"
-                print(f"case={case.name} lock={lock} threads={threads} repeat=1 {shlex_join(run_cmd)}{sample_note}")
+                print(f"case={case.name} lock={lock} threads={threads} repeat=1 {shlex_join(run_cmd)}")
 
 
 def run_experiment(args: argparse.Namespace) -> Path:

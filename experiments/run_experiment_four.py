@@ -54,11 +54,11 @@ ACCORDIN_MODE_MUTEX_HOOK = "mutex_hook"
 ACCORDIN_MODES = (ACCORDIN_MODE_DIRECT, ACCORDIN_MODE_MUTEX_HOOK)
 DEFAULT_ACCORDIN_MODE = ACCORDIN_MODE_DIRECT
 BENCHMARK_ACCORDIN_MODE_OVERRIDES = {
-    "readrandom": ACCORDIN_MODE_MUTEX_HOOK,
+    "readrandom": ACCORDIN_MODE_DIRECT,
     "fillrandom": ACCORDIN_MODE_DIRECT,
 }
 PTHREAD_SPINLOCK_LOCK = experiment_defaults.PTHREAD_SPINLOCK_LOCK
-LEVELDB_DIRECT_ADAPTER_BENCHMARKS = ("fillrandom",)
+LEVELDB_DIRECT_ADAPTER_BENCHMARKS = ("readrandom", "fillrandom")
 LEVELDB_DIRECT_ADAPTER_LOCKS = (
     PTHREAD_SPINLOCK_LOCK,
     "mcs",
@@ -345,8 +345,8 @@ Examples:
             f"{ACCORDIN_MODE_DIRECT} uses libmcs_tas_accordin_direct.so; "
             f"explicit mcs_accordin uses libmcs_accordin_direct.so; "
             f"{ACCORDIN_MODE_MUTEX_HOOK} uses libmcs_tas_accordin.so for all pthread mutex hooks. "
-            "readrandom is forced to mutex_hook and fillrandom is forced to accordin_direct; "
-            "fillrandom also uses LevelDB direct adapters for non-Accordin benchmark locks; "
+            "readrandom and fillrandom are forced to accordin_direct; "
+            "readrandom and fillrandom also use LevelDB direct adapters for non-Accordin benchmark locks; "
             f"other benchmarks use this mode. Default: {DEFAULT_ACCORDIN_MODE}."
         ),
     )
@@ -358,9 +358,9 @@ Examples:
             "Comma-separated lock keys. Overrides --lock-profile. "
             "Use mutex to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
-            "fillrandom uses LevelDB direct adapters for non-Accordin benchmark locks, "
+            "readrandom/fillrandom use LevelDB direct adapters for non-Accordin benchmark locks, "
             "accordin aliases follow --accordin-mode before benchmark-specific "
-            "readrandom/fillrandom remapping; only the admission-only Accordin "
+            "readrandom/fillrandom direct remapping; only the admission-only Accordin "
             "variant is supported."
         ),
     )
@@ -561,6 +561,47 @@ def validate_benchmark_names(benchmarks: tuple[str, ...]) -> tuple[str, ...]:
     if invalid:
         raise ValueError(f"Unsupported benchmark names: {', '.join(invalid)}")
     return benchmarks
+
+
+def lock_uses_direct_leveldb_path(benchmark: str, lock: str) -> bool:
+    lock = canonical_leveldb_lock(lock)
+    return (
+        experiment_three.is_native_mutex_lock(lock)
+        or experiment_defaults.is_mcs_accordin_lock(lock)
+        or is_leveldb_direct_accordin_lock(lock)
+        or benchmark_uses_leveldb_direct_adapter(benchmark, lock)
+    )
+
+
+def validate_benchmark_lock_compatibility(
+    benchmarks: tuple[str, ...],
+    locks: tuple[str, ...],
+) -> None:
+    unsupported = tuple(
+        dict.fromkeys(
+            lock
+            for benchmark in benchmarks
+            if benchmark == "readrandom"
+            for lock in locks
+            if not lock_uses_direct_leveldb_path(benchmark, lock)
+        )
+    )
+    if unsupported:
+        supported = tuple(
+            dict.fromkeys(
+                (
+                    "mutex",
+                    *LEVELDB_DIRECT_ADAPTER_LOCKS,
+                    *LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS,
+                    experiment_defaults.MCS_ACCORDIN_LOCK,
+                )
+            )
+        )
+        raise ValueError(
+            "Locks do not support direct readrandom: "
+            f"{', '.join(unsupported)}. "
+            f"Supported direct readrandom locks: {', '.join(supported)}."
+        )
 
 
 def parse_init_existing_benchmarks(value: str) -> tuple[str, ...]:
@@ -1890,6 +1931,13 @@ def main() -> int:
             print_outputs(result_root, raw_path, summary_path, plot_paths)
             return 0
 
+        effective_locks = effective_locks_for_benchmarks(
+            benchmarks,
+            locks,
+            accordin_mode=args.accordin_mode,
+        )
+        validate_benchmark_lock_compatibility(benchmarks, effective_locks)
+
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         experiment_three.ensure_output_root(result_root, args.force)
         logger = experiment_three.CommandLogger(
@@ -1899,11 +1947,6 @@ def main() -> int:
             output_filter=drop_leveldb_progress_line,
         )
 
-        effective_locks = effective_locks_for_benchmarks(
-            benchmarks,
-            locks,
-            accordin_mode=args.accordin_mode,
-        )
         ensure_lock_helpers(
             effective_locks,
             benchmarks=benchmarks,

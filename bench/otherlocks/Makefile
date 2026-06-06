@@ -13,9 +13,10 @@ LDLIBS ?= -ldl -pthread
 
 COMMON_SOURCES := otherlocks_pthread_interpose.c
 GCR_SOURCES := $(COMMON_SOURCES) gcr_mcs.c
+GCR_LEVELDB_DIRECT_SOURCES := leveldb_direct_gcr_adapter.c gcr_mcs.c
 CNA_SOURCES := $(COMMON_SOURCES)
 
-.PHONY: all clean test
+.PHONY: all clean test leveldb_direct_gcr
 
 all: $(BUILD_DIR)/interpose_gcr.sh $(BUILD_DIR)/interpose_cna.sh
 test: $(BUILD_DIR)/gcr_mcs_empty_active_wakeup_test
@@ -26,6 +27,11 @@ $(BUILD_DIR):
 
 $(BUILD_DIR)/interpose_gcr.so: $(GCR_SOURCES) gcr_mcs.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DOTHERLOCK_KIND_GCR $(GCR_SOURCES) -shared -o $@ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD_DIR)/leveldb_direct_gcr.so: $(GCR_LEVELDB_DIRECT_SOURCES) gcr_mcs.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(GCR_LEVELDB_DIRECT_SOURCES) -shared -o $@ $(LDFLAGS) -pthread
+
+leveldb_direct_gcr: $(BUILD_DIR)/leveldb_direct_gcr.so
 
 $(BUILD_DIR)/gcr_mcs_empty_active_wakeup_test: tests/gcr_mcs_empty_active_wakeup_test.c gcr_mcs.c gcr_mcs.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gcr_mcs_empty_active_wakeup_test.c gcr_mcs.c -o $@ $(LDFLAGS) -pthread

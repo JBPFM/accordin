@@ -23,6 +23,8 @@ import run_experiment_three as experiment_three
 REPO_ROOT = experiment_three.REPO_ROOT
 FLEXGUARD_DIR = experiment_three.FLEXGUARD_DIR
 FLEXGUARD_BUILD_DIR = experiment_three.FLEXGUARD_BUILD_DIR
+OTHERLOCKS_DIR = experiment_three.OTHERLOCKS_DIR
+OTHERLOCKS_BUILD_DIR = experiment_three.OTHERLOCKS_BUILD_DIR
 LEVELDB_VERSION = "1.23"
 DEFAULT_LEVELDB_DIR = REPO_ROOT / "third_party" / f"leveldb-{LEVELDB_VERSION}"
 DEFAULT_DB_BENCH = DEFAULT_LEVELDB_DIR / "build" / "db_bench"
@@ -68,7 +70,9 @@ LEVELDB_DIRECT_ADAPTER_LOCKS = (
     "flexguard",
     "malthusian",
     "reciprocating",
+    "gcr",
 )
+OTHERLOCKS_LEVELDB_DIRECT_ADAPTER_LOCKS = ("gcr",)
 LEVELDB_DIRECT_ADAPTER_ROOT_LOCKS = ("flexguard",)
 LEVELDB_DIRECT_ADAPTER_BUILD_TARGETS = {
     lock: f"build/leveldb_direct_{lock}.so"
@@ -686,7 +690,15 @@ def leveldb_direct_adapter_library_path(lock: str) -> Path:
     if not is_leveldb_direct_adapter_lock(lock):
         supported = ", ".join(LEVELDB_DIRECT_ADAPTER_LOCKS)
         raise ValueError(f"Unsupported LevelDB direct adapter lock: {lock}. Supported locks: {supported}.")
+    if lock in OTHERLOCKS_LEVELDB_DIRECT_ADAPTER_LOCKS:
+        return OTHERLOCKS_BUILD_DIR / f"leveldb_direct_{lock}.so"
     return FLEXGUARD_BUILD_DIR / f"leveldb_direct_{lock}.so"
+
+
+def leveldb_direct_adapter_build_cwd(lock: str) -> Path:
+    if lock in OTHERLOCKS_LEVELDB_DIRECT_ADAPTER_LOCKS:
+        return OTHERLOCKS_DIR
+    return FLEXGUARD_DIR
 
 
 def is_leveldb_direct_flexguard_lock(lock: str) -> bool:
@@ -1055,7 +1067,7 @@ def ensure_leveldb_direct_adapter_helpers(
         logger.run(
             ["make", LEVELDB_DIRECT_ADAPTER_BUILD_TARGETS[lock]],
             log_name=f"build_leveldb_direct_{safe_name(lock)}.log",
-            cwd=FLEXGUARD_DIR,
+            cwd=leveldb_direct_adapter_build_cwd(lock),
             timeout_seconds=0,
         )
         if not leveldb_direct_adapter_library_path(lock).is_file():

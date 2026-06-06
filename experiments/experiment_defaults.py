@@ -61,6 +61,7 @@ DEFAULT_ACCORDIN_CONCURRENCY = _cpu_list_count(DEFAULT_MCS_ACCORDIN_TASKSET_CPUS
 BASELINE_LOCKS = (
     PTHREAD_SPINLOCK_LOCK,
     "mcs",
+    "mcstas",
     "mcs_extension",
     "reciprocating",
     "flexguard",
@@ -72,7 +73,10 @@ FULL_LOCKS = (
     *BASELINE_LOCKS,
     *ACCORDIN_VARIANT_LOCKS,
 )
-MINIMAL_LOCKS = ACCORDIN_VARIANT_LOCKS
+MINIMAL_LOCKS = (
+    *ACCORDIN_VARIANT_LOCKS,
+    MCS_ACCORDIN_LOCK,
+)
 LOCK_PROFILES = {
     "minimal": MINIMAL_LOCKS,
     "full": FULL_LOCKS,
@@ -150,6 +154,9 @@ LOCK_ALIASES = {
     "mcs-tas": "mcstas",
     "mcs_tas": "mcstas",
     "mcstas": "mcstas",
+    "mcs-tp": "mcstp",
+    "mcs_tp": "mcstp",
+    "mcstp": "mcstp",
     "mcs_extension": "mcs_extension",
     "mcs-extension": "mcs_extension",
     "mcs-tse": "mcs_extension",

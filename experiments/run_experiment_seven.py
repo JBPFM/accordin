@@ -331,11 +331,17 @@ def mutexbench_command(
             else experiment_six.otherlocks_interpose_script(lock)
         )
         cmd_prefix = [str(script)]
+        timeslice_extension = (
+            experiment_six.flexguard_timeslice_extension(lock)
+            if experiment_six.is_flexguard_interpose_lock(lock)
+            else "off"
+        )
     else:
         lock_kind = experiment_six.BUILTIN_LOCK_KINDS.get(lock, experiment_six.ACCORDIN_DIRECT_LOCK_KIND)
         env = experiment_six.accordin_env(lock) if experiment_six.is_accordin_direct_lock(lock) else {}
         needs_sudo = experiment_six.is_accordin_direct_lock(lock)
         cmd_prefix = []
+        timeslice_extension = "off"
 
     cmd = [
         *cmd_prefix,
@@ -353,7 +359,7 @@ def mutexbench_command(
         "--lock-kind",
         lock_kind,
         "--timeslice-extension",
-        "off",
+        timeslice_extension,
     ]
     if experiment_defaults.accordin_uses_taskset(lock):
         cmd = ["taskset", "-c", args.mcs_accordin_taskset_cpus, *cmd]

@@ -13,10 +13,6 @@ static __always_inline bool valid_cpu(s32 cpu) {
   return cpu >= 0 && cpu < MAX_CPUS;
 }
 
-static __always_inline __u64 inactive_dsq_id(__u32 cpu) {
-  return INACTIVE_DSQ_BASE + cpu;
-}
-
 static __always_inline void init_task_ctx_if_needed(struct task_scx_ctx *task_ctx) {
   if (task_ctx->initialized)
     return;
@@ -267,7 +263,7 @@ void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
     }
 
     task_ctx->inactive_wait = 1;
-    scx_bpf_dsq_insert(p, inactive_dsq_id(cpu), SCX_SLICE_DFL, enq_flags);
+    scx_bpf_dsq_insert(p, INACTIVE_DSQ_ID, SCX_SLICE_DFL, enq_flags);
     return;
   }
 
@@ -282,7 +278,7 @@ void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev) {
 
   if (valid_cpu(cpu)) {
     owner = lookup_cpu_owner((__u32)cpu);
-    if (owner && !*owner && scx_bpf_dsq_move_to_local(inactive_dsq_id((__u32)cpu)))
+    if (owner && !*owner && scx_bpf_dsq_move_to_local(INACTIVE_DSQ_ID))
       return;
   }
 
@@ -340,24 +336,13 @@ void BPF_STRUCT_OPS(lb_simple_exit_task, struct task_struct *p,
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) {
-  __u32 cpu;
-  __u32 nr_cpus = scx_bpf_nr_cpu_ids();
   s32 ret;
-
-  if (nr_cpus > MAX_CPUS)
-    nr_cpus = MAX_CPUS;
 
   ret = scx_bpf_create_dsq(READY_DSQ_ID, -1);
   if (ret)
     return ret;
 
-  for (cpu = 0; cpu < nr_cpus; cpu++) {
-    ret = scx_bpf_create_dsq(inactive_dsq_id(cpu), -1);
-    if (ret)
-      return ret;
-  }
-
-  return 0;
+  return scx_bpf_create_dsq(INACTIVE_DSQ_ID, -1);
 }
 
 void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei) {

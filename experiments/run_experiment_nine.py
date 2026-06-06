@@ -13,86 +13,105 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import experiment_defaults
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MUTEXBENCH_DIR = REPO_ROOT / "bench" / "mutexbench"
+MULTILOCKBENCH_BINARY = MUTEXBENCH_DIR / "multilockbench"
 FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
-FLEXGUARD_BUILD_DIR = FLEXGUARD_DIR / "build"
-MAKE_ALL_SCRIPT = FLEXGUARD_DIR / "scripts" / "make_all.sh"
-DIRECT_LOCK = "mcs_tas_accordin_direct"
-DIRECT_BUCKETS_BINARY = FLEXGUARD_BUILD_DIR / "direct_buckets_bench"
+FLEXGUARD_INTERPOSE_SCRIPT = FLEXGUARD_DIR / "build" / "interpose_flexguard.sh"
+FLEXGUARD_INTERPOSE_LIBRARY = FLEXGUARD_DIR / "build" / "interpose_flexguard.so"
+OTHERLOCKS_DIR = REPO_ROOT / "bench" / "otherlocks"
+OTHERLOCKS_BUILD_DIR = OTHERLOCKS_DIR / "build"
 MCS_TAS_ACCORDIN_DIRECT_PACKAGE = "mcs_tas_accordin_direct"
-MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB = REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
+MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB = (
+    REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
+)
 MCS_TAS_ACCORDIN_DIRECT_LIB_ENV = "MCS_TAS_ACCORDIN_DIRECT_LIB"
 MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
-DIRECT_ALIASES = {
-    DIRECT_LOCK,
-    "mcs-tas-accordin-direct",
-    "accordin_direct",
-    "accordin-direct",
+
+MCS_TAS_LOCK = "mcstas"
+FLEXGUARD_LOCK = "flexguard"
+ACCORDIN_LOCK = experiment_defaults.ACCORDIN_BASE_LOCK
+DEFAULT_LOCK_PROFILE = experiment_defaults.DEFAULT_LOCK_PROFILE
+DEFAULT_LOCKS = experiment_defaults.DEFAULT_LOCKS
+EXPERIMENT9_LOCK_ALIASES = {
+    "mcs_tas_accordin_direct": ACCORDIN_LOCK,
+    "mcs-tas-accordin-direct": ACCORDIN_LOCK,
+    "accordin_direct": ACCORDIN_LOCK,
+    "accordin-direct": ACCORDIN_LOCK,
+}
+LOCK_KIND_BY_LOCK = {
+    "mutex": "mutex",
+    experiment_defaults.PTHREAD_SPINLOCK_LOCK: "pthread_spinlock",
+    "mcs": "mcs",
+    "mcs_extension": "mcs-tas-tse",
+    "reciprocating": "reciprocating",
+    MCS_TAS_LOCK: "mcs-tas",
+    FLEXGUARD_LOCK: "mutex",
+    "cna": "mutex",
+    "gcr": "mutex",
+    ACCORDIN_LOCK: "mcs_tas_accordin_direct",
 }
 
-DEFAULT_DURATION_MS = 10_000
-DEFAULT_BUCKETS = 100
-DEFAULT_MAX_VALUE = 100_000
-DEFAULT_OFFSET_CHANGES = 40
-DEFAULT_NON_CRITICAL_CYCLES = 0
+DEFAULT_DURATION_MS = 9_000
+DEFAULT_WARMUP_DURATION_MS = 1_000
+DEFAULT_LOCK_COUNT = 64
+DEFAULT_ZIPF_ALPHA = 1.2
+DEFAULT_CRITICAL_NS = 300
+DEFAULT_OUTSIDE_NS = 3_000
+DEFAULT_SEED = 1
+DEFAULT_TIMING_SAMPLE_STRIDE = 8
 DEFAULT_REPEATS = experiment_defaults.DEFAULT_REPEATS
 DEFAULT_THREADS = experiment_defaults.DEFAULT_THREADS
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 21_600
-
-LOCK_PROFILES = {
-    "minimal": ("flexguard", "mcs", DIRECT_LOCK),
-    "full": ("mutex", "mcs", "mcstas", "reciprocating", "flexguard", DIRECT_LOCK),
-}
-DEFAULT_LOCK_PROFILE = "minimal"
 
 RAW_FIELDS = (
     "lock",
     "lock_label",
     "threads",
     "duration_ms",
-    "buckets",
-    "max_value",
-    "offset_changes",
-    "non_critical_cycles",
-    "pin_threads",
+    "warmup_duration_ms",
+    "lock_count",
+    "zipf_alpha",
+    "critical_ns",
+    "outside_ns",
+    "seed",
     "repeat",
-    "throughput_cs_per_sec",
-    "critical_path_throughput_cs_per_sec",
-    "mean_thread_throughput_cs_per_sec",
-    "min_thread_throughput_cs_per_sec",
-    "max_thread_throughput_cs_per_sec",
-    "thread_iterations_total",
-    "pauses",
+    "throughput_ops_per_sec",
     "elapsed_seconds",
+    "total_operations",
+    "avg_lock_hold_ns",
+    "avg_wait_ns_estimated",
+    "lock_hold_samples",
+    "hotspot_lock",
+    "hotspot_lock_operations",
+    "hotspot_lock_operation_pct",
+    "per_thread_operations",
+    "per_lock_operations",
     "wall_seconds",
     "command_log",
 )
-SUMMARY_FIELDS = tuple(field for field in RAW_FIELDS if field not in {"repeat", "command_log"}) + ("runs",)
-SUMMARY_NUMERIC_FIELDS = tuple(
+SUMMARY_FIELDS = tuple(
     field
-    for field in SUMMARY_FIELDS
-    if field
-    not in {
-        "lock",
-        "lock_label",
-        "pin_threads",
-        "runs",
-    }
-)
-
-THROUGHPUT_RE = re.compile(r"^#Throughput:\s*(?P<value>[\d.]+)\s*CS/s")
-LOCAL_RE = re.compile(
-    r"^#Local result for Thread\s+(?P<thread>\d+):\s*"
-    r"(?P<throughput>[\d.]+)\s*CS/s\s*\((?P<iterations>\d+)\s+iterations\)"
-)
-PAUSES_RE = re.compile(r"^Pauses:\s*(?P<value>\d+)")
-DIRECT_RESULT_RE = re.compile(r"^RESULT\s+(?P<items>.+)$")
+    for field in RAW_FIELDS
+    if field not in {"repeat", "command_log", "per_thread_operations", "per_lock_operations"}
+) + ("runs",)
+SUMMARY_NUMERIC_FIELDS = {
+    "throughput_ops_per_sec",
+    "elapsed_seconds",
+    "total_operations",
+    "avg_lock_hold_ns",
+    "avg_wait_ns_estimated",
+    "lock_hold_samples",
+    "hotspot_lock_operations",
+    "hotspot_lock_operation_pct",
+    "wall_seconds",
+}
 
 
 @dataclass(frozen=True)
@@ -101,13 +120,15 @@ class RunArgs:
     lock_keys: tuple[str, ...]
     threads: tuple[int, ...]
     duration_ms: int
-    buckets: int
-    max_value: int
-    offset_changes: int
-    non_critical_cycles: int
-    pin_threads: bool
+    warmup_duration_ms: int
+    lock_count: int
+    zipf_alpha: float
+    critical_ns: int
+    outside_ns: int
+    seed: int
     repeats: int
     command_timeout_seconds: int
+    timing_sample_stride: int = DEFAULT_TIMING_SAMPLE_STRIDE
     sudo_mode: str = "auto"
     build_missing: bool = False
     skip_plots: bool = False
@@ -234,7 +255,7 @@ def shlex_join(cmd: Sequence[str]) -> str:
 
 def default_output_root() -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return REPO_ROOT / "experiments" / "results" / f"experiment9_buckets_{timestamp}"
+    return REPO_ROOT / "experiments" / "results" / f"experiment9_multilockbench_{timestamp}"
 
 
 def positive_int(value: str) -> int:
@@ -247,6 +268,13 @@ def positive_int(value: str) -> int:
 def non_negative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
+def non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0.0:
         raise argparse.ArgumentTypeError("value must be >= 0")
     return parsed
 
@@ -274,36 +302,28 @@ def parse_csv_strings(text: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in text.split(",") if item.strip())
 
 
-def lock_profile_names() -> tuple[str, ...]:
-    return tuple(LOCK_PROFILES)
-
-
-def lock_profile_locks(profile: str) -> tuple[str, ...]:
-    try:
-        return LOCK_PROFILES[profile]
-    except KeyError as exc:
-        supported = ", ".join(lock_profile_names())
-        raise ValueError(f"Unsupported lock profile: {profile}. Supported profiles: {supported}") from exc
-
-
 def normalize_lock(raw: str) -> str:
     normalized = raw.strip().lower()
-    if normalized in DIRECT_ALIASES:
-        return DIRECT_LOCK
-    return experiment_defaults.normalize_lock(normalized)
+    lock = EXPERIMENT9_LOCK_ALIASES.get(normalized, normalized)
+    if lock not in LOCK_KIND_BY_LOCK:
+        lock = experiment_defaults.normalize_lock(lock)
+        lock = EXPERIMENT9_LOCK_ALIASES.get(lock, lock)
+    if lock not in LOCK_KIND_BY_LOCK:
+        supported = ", ".join(sorted(set(LOCK_KIND_BY_LOCK) | set(EXPERIMENT9_LOCK_ALIASES)))
+        raise argparse.ArgumentTypeError(
+            f"Unsupported experiment9 lock {raw!r}. Supported locks: {supported}"
+        )
+    return lock
 
 
 def parse_locks(text: str | None, profile: str) -> tuple[str, ...]:
-    raw_locks = lock_profile_locks(profile) if text is None else parse_csv_strings(text)
+    try:
+        raw_locks = experiment_defaults.lock_profile_locks(profile) if text is None else parse_csv_strings(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
     locks: list[str] = []
-    supported = set(lock for values in LOCK_PROFILES.values() for lock in values) | set(experiment_defaults.LOCK_LABELS)
-    supported |= {DIRECT_LOCK, *DIRECT_ALIASES}
     for raw in raw_locks:
         lock = normalize_lock(raw)
-        if lock not in supported:
-            raise argparse.ArgumentTypeError(
-                f"Unsupported experiment9 lock {raw!r}. Supported locks: {', '.join(sorted(supported))}"
-            )
         if lock not in locks:
             locks.append(lock)
     if not locks:
@@ -312,23 +332,19 @@ def parse_locks(text: str | None, profile: str) -> tuple[str, ...]:
 
 
 def lock_label(lock: str) -> str:
-    if lock == DIRECT_LOCK:
-        return "MCS-TAS Accordin direct"
     return experiment_defaults.lock_label(lock)
 
 
-def ordinary_bucket_binary(lock: str) -> Path:
-    return FLEXGUARD_BUILD_DIR / f"buckets_{lock}"
+def lock_sort_key(lock: str) -> tuple[int, str]:
+    return experiment_defaults.lock_sort_key(lock)
 
 
-def is_direct_lock(lock: str) -> bool:
-    return lock == DIRECT_LOCK
+def otherlocks_interpose_script(lock: str) -> Path:
+    return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.sh"
 
 
-def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:
-    if is_direct_lock(lock):
-        return threads
-    return experiment_defaults.runnable_threads_for_lock(lock, threads)
+def otherlocks_interpose_library(lock: str) -> Path:
+    return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.so"
 
 
 def direct_env() -> dict[str, str | None]:
@@ -374,115 +390,84 @@ def env_command(
 
 
 def build_command(lock: str, threads: int, args: RunArgs) -> list[str]:
-    if is_direct_lock(lock):
-        return [
-            str(DIRECT_BUCKETS_BINARY),
-            "--lib",
-            str(MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB),
-            "--label",
-            lock,
-            "--threads",
-            str(threads),
-            "--duration-ms",
-            str(args.duration_ms),
-            "--buckets",
-            str(args.buckets),
-            "--max-value",
-            str(args.max_value),
-            "--offset-changes",
-            str(args.offset_changes),
-        ]
-    cmd = [
-        str(ordinary_bucket_binary(lock)),
-        "--duration",
-        str(args.duration_ms),
-        "--num-threads",
+    return [
+        str(MULTILOCKBENCH_BINARY),
+        "--threads",
         str(threads),
-        "--buckets",
-        str(args.buckets),
-        "--max-value",
-        str(args.max_value),
-        "--offset-changes",
-        str(args.offset_changes),
-        "--non-critical-cycles",
-        str(args.non_critical_cycles),
+        "--locks",
+        str(args.lock_count),
+        "--zipf-alpha",
+        f"{args.zipf_alpha:g}",
+        "--duration-ms",
+        str(args.duration_ms),
+        "--warmup-duration-ms",
+        str(args.warmup_duration_ms),
+        "--critical-ns",
+        str(args.critical_ns),
+        "--outside-ns",
+        str(args.outside_ns),
+        "--timing-sample-stride",
+        str(args.timing_sample_stride),
+        "--seed",
+        str(args.seed),
+        "--timeslice-extension",
+        "off",
+        "--lock-kind",
+        LOCK_KIND_BY_LOCK[lock],
     ]
-    if args.pin_threads:
-        cmd.extend(["--pin-threads", "1"])
-    return cmd
 
 
 def effective_command(lock: str, base_cmd: list[str], args: RunArgs) -> list[str]:
-    if is_direct_lock(lock):
+    if lock == FLEXGUARD_LOCK:
+        return env_command([str(FLEXGUARD_INTERPOSE_SCRIPT), *base_cmd], {}, needs_sudo=True, sudo_mode=args.sudo_mode)
+    if experiment_defaults.is_otherlocks_interpose_lock(lock):
+        return env_command(
+            [str(otherlocks_interpose_script(lock)), *base_cmd],
+            {},
+            needs_sudo=False,
+            sudo_mode=args.sudo_mode,
+        )
+    if lock == ACCORDIN_LOCK:
         return env_command(base_cmd, direct_env(), needs_sudo=True, sudo_mode=args.sudo_mode)
-    needs_sudo = lock.startswith("flexguard")
-    return env_command(base_cmd, {}, needs_sudo=needs_sudo, sudo_mode=args.sudo_mode)
+    return env_command(base_cmd, {}, needs_sudo=False, sudo_mode=args.sudo_mode)
 
 
-def parse_direct_result(line: str) -> dict[str, str]:
-    match = DIRECT_RESULT_RE.match(line)
-    if match is None:
-        raise ValueError("missing direct RESULT line")
-    pairs: dict[str, str] = {}
-    for item in match.group("items").split():
-        if "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        pairs[key] = value
-    required = {
-        "total_ops",
-        "elapsed_seconds",
-        "wall_throughput_ops_per_sec",
-        "critical_path_cs_per_sec",
-    }
-    missing = sorted(required - set(pairs))
-    if missing:
-        raise ValueError(f"direct RESULT line missing fields: {', '.join(missing)}")
-    return {
-        "throughput_cs_per_sec": format_float(float(pairs["wall_throughput_ops_per_sec"])),
-        "critical_path_throughput_cs_per_sec": format_float(float(pairs["critical_path_cs_per_sec"])),
-        "mean_thread_throughput_cs_per_sec": "",
-        "min_thread_throughput_cs_per_sec": "",
-        "max_thread_throughput_cs_per_sec": "",
-        "thread_iterations_total": str(int(pairs["total_ops"])),
-        "pauses": "",
-        "elapsed_seconds": format_float(float(pairs["elapsed_seconds"])),
-    }
-
-
-def parse_benchmark_output(lock: str, output: str) -> dict[str, str]:
-    if is_direct_lock(lock):
-        for line in output.splitlines():
-            if DIRECT_RESULT_RE.match(line):
-                return parse_direct_result(line)
-        raise ValueError("direct benchmark output did not contain RESULT line")
-
-    throughput: float | None = None
-    local_values: list[float] = []
-    total_iterations = 0
-    pauses = 0
+def parse_benchmark_output(output: str) -> dict[str, str]:
+    values: dict[str, str] = {}
     for line in output.splitlines():
-        if match := THROUGHPUT_RE.match(line):
-            throughput = float(match.group("value"))
+        if ": " not in line:
             continue
-        if match := LOCAL_RE.match(line):
-            local_values.append(float(match.group("throughput")))
-            total_iterations += int(match.group("iterations"))
-            continue
-        if match := PAUSES_RE.match(line):
-            pauses += int(match.group("value"))
-    if throughput is None:
-        raise ValueError("ordinary buckets output did not contain #Throughput")
+        key, value = line.split(": ", 1)
+        values[key.strip()] = value.strip()
+    required = {
+        "throughput_ops_per_sec",
+        "elapsed_seconds",
+        "total_operations",
+        "avg_lock_hold_ns",
+        "avg_wait_ns_estimated",
+        "lock_hold_samples",
+        "hotspot_lock",
+        "hotspot_lock_operations",
+        "hotspot_lock_operation_pct",
+        "per_thread_operations",
+        "per_lock_operations",
+    }
+    missing = sorted(required - set(values))
+    if missing:
+        raise ValueError(f"multilockbench output missing fields: {', '.join(missing)}")
 
     return {
-        "throughput_cs_per_sec": format_float(throughput),
-        "critical_path_throughput_cs_per_sec": "",
-        "mean_thread_throughput_cs_per_sec": format_float(statistics.mean(local_values)) if local_values else "",
-        "min_thread_throughput_cs_per_sec": format_float(min(local_values)) if local_values else "",
-        "max_thread_throughput_cs_per_sec": format_float(max(local_values)) if local_values else "",
-        "thread_iterations_total": str(total_iterations) if local_values else "",
-        "pauses": str(pauses) if pauses else "",
-        "elapsed_seconds": "",
+        "throughput_ops_per_sec": values["throughput_ops_per_sec"],
+        "elapsed_seconds": values["elapsed_seconds"],
+        "total_operations": values["total_operations"],
+        "avg_lock_hold_ns": values["avg_lock_hold_ns"],
+        "avg_wait_ns_estimated": values["avg_wait_ns_estimated"],
+        "lock_hold_samples": values["lock_hold_samples"],
+        "hotspot_lock": values["hotspot_lock"],
+        "hotspot_lock_operations": values["hotspot_lock_operations"],
+        "hotspot_lock_operation_pct": values["hotspot_lock_operation_pct"],
+        "per_thread_operations": values["per_thread_operations"].replace(",", ";"),
+        "per_lock_operations": values["per_lock_operations"].replace(",", ";"),
     }
 
 
@@ -492,8 +477,8 @@ def format_float(value: float) -> str:
 
 def write_settings(root: Path, args: RunArgs) -> None:
     settings = {
-        "experiment": "experiment9_buckets",
-        "description": "FlexGuard buckets hash-table benchmark runner.",
+        "experiment": "experiment9_multilockbench",
+        "description": "Zipfian hotspot multilockbench runner; only thread count is swept by default.",
         "output_root": str(root),
         "machine_profile": experiment_defaults.ACTIVE_MACHINE_CONFIG.name,
         "machine_config_physical_cores": experiment_defaults.MACHINE_CORE_COUNT,
@@ -501,37 +486,37 @@ def write_settings(root: Path, args: RunArgs) -> None:
         "lock_profile_source": args.lock_profile_source,
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in args.lock_keys],
         "threads": list(args.threads),
-        "runnable_threads_by_lock": {
-            lock: list(runnable_threads_for_lock(lock, args.threads))
-            for lock in args.lock_keys
-        },
+        "sweep_dimensions": ["threads"],
         "duration_ms": args.duration_ms,
-        "buckets": args.buckets,
-        "max_value": args.max_value,
-        "offset_changes": args.offset_changes,
-        "non_critical_cycles": args.non_critical_cycles,
-        "pin_threads": args.pin_threads,
+        "warmup_duration_ms": args.warmup_duration_ms,
+        "lock_count": args.lock_count,
+        "zipf_alpha": args.zipf_alpha,
+        "critical_ns": args.critical_ns,
+        "outside_ns": args.outside_ns,
+        "seed": args.seed,
+        "timing_sample_stride": args.timing_sample_stride,
         "repeats": args.repeats,
         "build_missing": args.build_missing,
         "sudo_mode": args.sudo_mode,
         "command_timeout_seconds": args.command_timeout_seconds,
-        "flexguard_dir": str(FLEXGUARD_DIR),
-        "direct_buckets_binary": str(DIRECT_BUCKETS_BINARY),
+        "multilockbench_binary": str(MULTILOCKBENCH_BINARY),
+        "flexguard_interpose_script": str(FLEXGUARD_INTERPOSE_SCRIPT),
         "mcs_tas_accordin_direct_library": str(MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB),
     }
     (root / "settings.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
 
 
-def summary_key(row: dict[str, str]) -> tuple[str, str, str, str, str, str, str, str]:
+def summary_key(row: dict[str, str]) -> tuple[str, str, str, str, str, str, str, str, str]:
     return (
         row["lock"],
         row["threads"],
         row["duration_ms"],
-        row["buckets"],
-        row["max_value"],
-        row["offset_changes"],
-        row["non_critical_cycles"],
-        row["pin_threads"],
+        row["warmup_duration_ms"],
+        row["lock_count"],
+        row["zipf_alpha"],
+        row["critical_ns"],
+        row["outside_ns"],
+        row["seed"],
     )
 
 
@@ -540,14 +525,14 @@ def write_summary(raw_path: Path, summary_path: Path) -> None:
         return
     with raw_path.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    groups: dict[tuple[str, str, str, str, str, str, str, str], list[dict[str, str]]] = {}
+    groups: dict[tuple[str, str, str, str, str, str, str, str, str], list[dict[str, str]]] = {}
     for row in rows:
         groups.setdefault(summary_key(row), []).append(row)
 
     with summary_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS, lineterminator="\n")
         writer.writeheader()
-        for key in sorted(groups, key=lambda item: (experiment_defaults.lock_sort_key(item[0]), int(item[1]))):
+        for key in sorted(groups, key=lambda item: (lock_sort_key(item[0]), int(item[1]))):
             group_rows = groups[key]
             first = group_rows[0]
             out: dict[str, str] = {
@@ -555,19 +540,19 @@ def write_summary(raw_path: Path, summary_path: Path) -> None:
                 "lock_label": first["lock_label"],
                 "threads": first["threads"],
                 "duration_ms": first["duration_ms"],
-                "buckets": first["buckets"],
-                "max_value": first["max_value"],
-                "offset_changes": first["offset_changes"],
-                "non_critical_cycles": first["non_critical_cycles"],
-                "pin_threads": first["pin_threads"],
+                "warmup_duration_ms": first["warmup_duration_ms"],
+                "lock_count": first["lock_count"],
+                "zipf_alpha": first["zipf_alpha"],
+                "critical_ns": first["critical_ns"],
+                "outside_ns": first["outside_ns"],
+                "seed": first["seed"],
+                "hotspot_lock": first["hotspot_lock"],
                 "runs": str(len(group_rows)),
             }
             for field in SUMMARY_NUMERIC_FIELDS:
-                if field in out:
-                    continue
                 values = [float(row[field]) for row in group_rows if row.get(field)]
                 out[field] = format_float(statistics.mean(values)) if values else ""
-            writer.writerow(out)
+            writer.writerow({field: out.get(field, "") for field in SUMMARY_FIELDS})
 
 
 def load_existing_keys(raw_path: Path) -> set[tuple[str, int, int]]:
@@ -591,69 +576,115 @@ def prepare_output_root(root: Path, *, force: bool, resume: bool) -> None:
             path.unlink()
 
 
-def missing_inputs(locks: Iterable[str]) -> list[str]:
-    missing: list[str] = []
-    for lock in locks:
-        if is_direct_lock(lock):
-            if not DIRECT_BUCKETS_BINARY.is_file() or not os.access(DIRECT_BUCKETS_BINARY, os.X_OK):
-                missing.append(f"direct buckets helper is missing or not executable: {DIRECT_BUCKETS_BINARY}")
-            if not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
-                missing.append(f"mcs_tas_accordin_direct library is missing: {MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB}")
-            continue
-        binary = ordinary_bucket_binary(lock)
-        if not binary.is_file() or not os.access(binary, os.X_OK):
-            missing.append(f"{lock} buckets executable is missing or not executable: {binary}")
-    return missing
+def build_multilockbench(logger: CommandLogger | None) -> None:
+    cmd = ["make", "-C", str(MUTEXBENCH_DIR), "multilockbench"]
+    if logger is None:
+        print(shlex_join(cmd))
+        return
+    logger.run(cmd, log_name="build_multilockbench.log", cwd=REPO_ROOT, timeout_seconds=0)
+
+
+def build_flexguard_interpose(logger: CommandLogger | None) -> None:
+    cmd = ["make", "-C", str(FLEXGUARD_DIR), "build/interpose_flexguard.sh"]
+    if logger is None:
+        print(shlex_join(cmd))
+        return
+    logger.run(cmd, log_name="build_flexguard_interpose.log", cwd=REPO_ROOT, timeout_seconds=0)
+
+
+def build_otherlocks_interpose(lock: str, logger: CommandLogger | None) -> None:
+    cmd = ["make", "-C", str(OTHERLOCKS_DIR), f"build/interpose_{lock}.sh"]
+    if logger is None:
+        print(shlex_join(cmd))
+        return
+    logger.run(cmd, log_name=f"build_otherlocks_{safe_name(lock)}.log", cwd=REPO_ROOT, timeout_seconds=0)
 
 
 def ensure_inputs(locks: tuple[str, ...], *, build_missing: bool, logger: CommandLogger | None) -> None:
-    missing = missing_inputs(locks)
-    if not missing:
+    if logger is None:
+        if not MULTILOCKBENCH_BINARY.is_file() or not os.access(MULTILOCKBENCH_BINARY, os.X_OK):
+            build_multilockbench(logger)
+        if build_missing and FLEXGUARD_LOCK in locks and (
+            not FLEXGUARD_INTERPOSE_SCRIPT.is_file()
+            or not os.access(FLEXGUARD_INTERPOSE_SCRIPT, os.X_OK)
+            or not FLEXGUARD_INTERPOSE_LIBRARY.is_file()
+        ):
+            build_flexguard_interpose(logger)
+        for lock in sorted(lock for lock in locks if experiment_defaults.is_otherlocks_interpose_lock(lock)):
+            if build_missing and (
+                not otherlocks_interpose_script(lock).is_file()
+                or not os.access(otherlocks_interpose_script(lock), os.X_OK)
+                or not otherlocks_interpose_library(lock).is_file()
+            ):
+                build_otherlocks_interpose(lock, logger)
+        if build_missing and ACCORDIN_LOCK in locks and not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+            print(shlex_join(["cargo", "build", "-p", MCS_TAS_ACCORDIN_DIRECT_PACKAGE, "--release"]))
         return
-    if not build_missing:
+
+    if not MULTILOCKBENCH_BINARY.is_file() or not os.access(MULTILOCKBENCH_BINARY, os.X_OK):
+        build_multilockbench(logger)
+    if not MULTILOCKBENCH_BINARY.is_file() or not os.access(MULTILOCKBENCH_BINARY, os.X_OK):
+        raise RuntimeError(f"multilockbench is missing or not executable: {MULTILOCKBENCH_BINARY}")
+
+    missing: list[str] = []
+    if FLEXGUARD_LOCK in locks and (
+        not FLEXGUARD_INTERPOSE_SCRIPT.is_file() or not os.access(FLEXGUARD_INTERPOSE_SCRIPT, os.X_OK)
+        or not FLEXGUARD_INTERPOSE_LIBRARY.is_file()
+    ):
+        if build_missing:
+            build_flexguard_interpose(logger)
+        if (
+            not FLEXGUARD_INTERPOSE_SCRIPT.is_file()
+            or not os.access(FLEXGUARD_INTERPOSE_SCRIPT, os.X_OK)
+            or not FLEXGUARD_INTERPOSE_LIBRARY.is_file()
+        ):
+            missing.append(f"flexguard interpose artifacts are missing: {FLEXGUARD_INTERPOSE_SCRIPT}, {FLEXGUARD_INTERPOSE_LIBRARY}")
+    for lock in sorted(lock for lock in locks if experiment_defaults.is_otherlocks_interpose_lock(lock)):
+        script = otherlocks_interpose_script(lock)
+        library = otherlocks_interpose_library(lock)
+        if not script.is_file() or not os.access(script, os.X_OK) or not library.is_file():
+            if build_missing:
+                build_otherlocks_interpose(lock, logger)
+            if not script.is_file() or not os.access(script, os.X_OK) or not library.is_file():
+                missing.append(f"{lock} interpose artifacts are missing: {script}, {library}")
+    if ACCORDIN_LOCK in locks and not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+        if build_missing:
+            build_cmd = ["cargo", "build", "-p", MCS_TAS_ACCORDIN_DIRECT_PACKAGE, "--release"]
+            if logger is None:
+                print(shlex_join(build_cmd))
+            else:
+                logger.run(
+                    build_cmd,
+                    log_name=f"build_{MCS_TAS_ACCORDIN_DIRECT_PACKAGE}.log",
+                    cwd=REPO_ROOT,
+                    timeout_seconds=0,
+                )
+        if not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
+            missing.append(f"mcs_tas_accordin_direct library is missing: {MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB}")
+    if missing:
         raise RuntimeError("Required inputs are missing: " + "; ".join(missing))
 
-    ordinary_missing = [lock for lock in locks if not is_direct_lock(lock) and not ordinary_bucket_binary(lock).is_file()]
-    direct_lib_missing = any(is_direct_lock(lock) for lock in locks) and not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file()
 
-    if ordinary_missing:
-        if logger is None:
-            print(shlex_join(["bash", str(MAKE_ALL_SCRIPT)]))
-        else:
-            logger.run(
-                ["bash", str(MAKE_ALL_SCRIPT)],
-                log_name="build_flexguard_buckets.log",
-                cwd=FLEXGUARD_DIR,
-                timeout_seconds=0,
-            )
-    if direct_lib_missing:
-        build_cmd = ["cargo", "build", "-p", MCS_TAS_ACCORDIN_DIRECT_PACKAGE, "--release"]
-        if logger is None:
-            print(shlex_join(build_cmd))
-        else:
-            logger.run(
-                build_cmd,
-                log_name=f"build_{MCS_TAS_ACCORDIN_DIRECT_PACKAGE}.log",
-                cwd=REPO_ROOT,
-                timeout_seconds=0,
-            )
-
-    missing_after_build = missing_inputs(locks)
-    if missing_after_build:
-        raise RuntimeError("Required inputs are still missing: " + "; ".join(missing_after_build))
-
-
-def row_for_run(lock: str, threads: int, repeat: int, args: RunArgs, metrics: dict[str, str], wall_seconds: float, log_path: Path) -> dict[str, str]:
+def row_for_run(
+    lock: str,
+    threads: int,
+    repeat: int,
+    args: RunArgs,
+    metrics: dict[str, str],
+    wall_seconds: float,
+    log_path: Path,
+) -> dict[str, str]:
     row = {
         "lock": lock,
         "lock_label": lock_label(lock),
         "threads": str(threads),
         "duration_ms": str(args.duration_ms),
-        "buckets": str(args.buckets),
-        "max_value": str(args.max_value),
-        "offset_changes": str(args.offset_changes),
-        "non_critical_cycles": str(args.non_critical_cycles),
-        "pin_threads": "1" if args.pin_threads else "0",
+        "warmup_duration_ms": str(args.warmup_duration_ms),
+        "lock_count": str(args.lock_count),
+        "zipf_alpha": format_float(args.zipf_alpha),
+        "critical_ns": str(args.critical_ns),
+        "outside_ns": str(args.outside_ns),
+        "seed": str(args.seed),
         "repeat": str(repeat),
         "wall_seconds": format_float(wall_seconds),
         "command_log": str(log_path.relative_to(args.output_root)),
@@ -680,7 +711,7 @@ def run_experiment(args: RunArgs) -> Path:
         if write_header:
             writer.writeheader()
         for lock in args.lock_keys:
-            for threads in runnable_threads_for_lock(lock, args.threads):
+            for threads in args.threads:
                 for repeat in range(1, args.repeats + 1):
                     key = (lock, threads, repeat)
                     if key in existing:
@@ -688,10 +719,10 @@ def run_experiment(args: RunArgs) -> Path:
                         continue
                     base_cmd = build_command(lock, threads, args)
                     run_cmd = effective_command(lock, base_cmd, args)
-                    log_name = f"buckets_{safe_name(lock)}_{threads:03d}_r{repeat}.log"
+                    log_name = f"multilockbench_{safe_name(lock)}_{threads:03d}_r{repeat}.log"
                     try:
                         result = logger.run(run_cmd, log_name=log_name, cwd=REPO_ROOT, timeout_seconds=args.command_timeout_seconds)
-                        metrics = parse_benchmark_output(lock, result.output)
+                        metrics = parse_benchmark_output(result.output)
                     except CommandError as exc:
                         print(f"Failed lock={lock} threads={threads} repeat={repeat}: {exc.log_path}")
                         continue
@@ -736,13 +767,13 @@ def generate_plots(result_root: Path) -> tuple[Path, ...]:
     for lock in locks:
         lock_rows = sorted([row for row in rows if row["lock"] == lock], key=lambda row: int(row["threads"]))
         xs = [int(row["threads"]) for row in lock_rows]
-        ys = [float(row["throughput_cs_per_sec"]) / 1_000_000.0 for row in lock_rows if row["throughput_cs_per_sec"]]
+        ys = [float(row["throughput_ops_per_sec"]) / 1_000_000.0 for row in lock_rows if row["throughput_ops_per_sec"]]
         if len(xs) != len(ys):
             continue
         ax.plot(xs, ys, marker="o", label=lock_rows[0]["lock_label"] or lock)
     ax.set_xlabel("Threads")
-    ax.set_ylabel("Throughput (M CS/s)")
-    ax.set_title("Experiment 9 Buckets Throughput")
+    ax.set_ylabel("Throughput (M ops/s)")
+    ax.set_title("Experiment 9 Multilockbench Throughput")
     ax.grid(True, alpha=0.35)
     ax.legend()
     output = plot_dir / "throughput_vs_threads.png"
@@ -756,7 +787,7 @@ def dry_run(args: RunArgs) -> None:
     print(f"Output root: {args.output_root}")
     ensure_inputs(args.lock_keys, build_missing=args.build_missing, logger=None)
     for lock in args.lock_keys:
-        for threads in runnable_threads_for_lock(lock, args.threads):
+        for threads in args.threads:
             for repeat in range(1, args.repeats + 1):
                 base_cmd = build_command(lock, threads, args)
                 print(f"lock={lock} threads={threads} repeat={repeat}: {shlex_join(effective_command(lock, base_cmd, args))}")
@@ -764,12 +795,12 @@ def dry_run(args: RunArgs) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> RunArgs:
     parser = argparse.ArgumentParser(
-        description="Run Experiment 9: FlexGuard buckets hash-table benchmark.",
+        description="Run Experiment 9: Zipfian multilockbench thread-count sweep.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  python3 experiments/run_experiment_nine.py --locks flexguard,mcs,mcs_tas_accordin_direct --threads 64 --repeats 1
-  python3 experiments/run_experiment_nine.py --plot-only experiments/results/experiment9_buckets_manual
+  python3 experiments/run_experiment_nine.py --threads 16,32,64 --repeats 1
+  python3 experiments/run_experiment_nine.py --plot-only experiments/results/experiment9_multilockbench_manual
 """,
     )
     parser.add_argument("--output-root", type=Path, default=None)
@@ -779,22 +810,27 @@ Examples:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--build-missing", action="store_true")
-    parser.add_argument("--lock-profile", choices=lock_profile_names(), default=DEFAULT_LOCK_PROFILE)
+    parser.add_argument(
+        "--lock-profile",
+        choices=experiment_defaults.lock_profile_names(),
+        default=DEFAULT_LOCK_PROFILE,
+        help="Named lock set used when --locks is omitted. Default comes from experiment_defaults.py.",
+    )
     parser.add_argument("--locks", help="Comma-separated lock list. Default comes from --lock-profile.")
     parser.add_argument("--threads", default=",".join(str(thread) for thread in DEFAULT_THREADS))
     parser.add_argument("--duration-ms", type=positive_int, default=DEFAULT_DURATION_MS)
-    parser.add_argument("--buckets", type=positive_int, default=DEFAULT_BUCKETS)
-    parser.add_argument("--max-value", type=positive_int, default=DEFAULT_MAX_VALUE)
-    parser.add_argument("--offset-changes", type=positive_int, default=DEFAULT_OFFSET_CHANGES)
-    parser.add_argument("--non-critical-cycles", type=non_negative_int, default=DEFAULT_NON_CRITICAL_CYCLES)
-    parser.add_argument("--pin-threads", action="store_true")
+    parser.add_argument("--warmup-duration-ms", type=non_negative_int, default=DEFAULT_WARMUP_DURATION_MS)
+    parser.add_argument("--lock-count", type=positive_int, default=DEFAULT_LOCK_COUNT)
+    parser.add_argument("--zipf-alpha", type=non_negative_float, default=DEFAULT_ZIPF_ALPHA)
+    parser.add_argument("--critical-ns", type=non_negative_int, default=DEFAULT_CRITICAL_NS)
+    parser.add_argument("--outside-ns", type=non_negative_int, default=DEFAULT_OUTSIDE_NS)
+    parser.add_argument("--seed", type=non_negative_int, default=DEFAULT_SEED)
+    parser.add_argument("--timing-sample-stride", type=positive_int, default=DEFAULT_TIMING_SAMPLE_STRIDE)
     parser.add_argument("--repeats", type=positive_int, default=DEFAULT_REPEATS)
     parser.add_argument("--sudo-mode", choices=("all", "auto", "none"), default="auto")
     parser.add_argument("--command-timeout-seconds", type=positive_int, default=DEFAULT_COMMAND_TIMEOUT_SECONDS)
     parsed = parser.parse_args(argv)
 
-    if parsed.max_value <= parsed.buckets:
-        parser.error("--max-value must be greater than --buckets")
     try:
         lock_keys = parse_locks(parsed.locks, parsed.lock_profile)
         threads = parse_csv_positive_ints(parsed.threads, "--threads")
@@ -805,11 +841,13 @@ Examples:
         lock_keys=lock_keys,
         threads=threads,
         duration_ms=parsed.duration_ms,
-        buckets=parsed.buckets,
-        max_value=parsed.max_value,
-        offset_changes=parsed.offset_changes,
-        non_critical_cycles=parsed.non_critical_cycles,
-        pin_threads=parsed.pin_threads,
+        warmup_duration_ms=parsed.warmup_duration_ms,
+        lock_count=parsed.lock_count,
+        zipf_alpha=parsed.zipf_alpha,
+        critical_ns=parsed.critical_ns,
+        outside_ns=parsed.outside_ns,
+        seed=parsed.seed,
+        timing_sample_stride=parsed.timing_sample_stride,
         repeats=parsed.repeats,
         command_timeout_seconds=parsed.command_timeout_seconds,
         sudo_mode=parsed.sudo_mode,

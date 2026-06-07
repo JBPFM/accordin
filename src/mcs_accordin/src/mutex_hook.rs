@@ -23,6 +23,7 @@ impl MutexHookBackend for McsBackend {
 
     fn unlock(state: &Self::LockState) {
         LockBackend::unlock(state);
+        std::thread::yield_now();
     }
 }
 

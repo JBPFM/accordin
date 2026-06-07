@@ -36,6 +36,7 @@ volatile __u32 stats_only_mode = 0;
 volatile __u32 single_lock_mode = 0;
 volatile __u32 cpu_admission_owner[MAX_CPUS];
 volatile __u32 cpu_last_inactive_lock[MAX_CPUS];
+volatile __u32 cpu_inactive_dispatch_count[MAX_CPUS];
 volatile __u32 inactive_previous_lock_percent;
 volatile __u64 dbg_acct_calls = 0;
 volatile __u64 dbg_acct_read_ok = 0;

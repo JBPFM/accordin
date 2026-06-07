@@ -300,6 +300,7 @@ def mutexbench_command(
         env = experiment_six.mcs_accordin_env()
         needs_sudo = True
         cmd_prefix: list[str] = []
+        timeslice_extension = "off"
     elif experiment_six.is_flexguard_interpose_lock(lock) or experiment_six.is_otherlocks_interpose_lock(lock):
         lock_kind = "mutex"
         env = {}

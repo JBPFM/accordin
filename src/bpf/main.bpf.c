@@ -110,6 +110,38 @@ static __always_inline volatile __u32 *lookup_cpu_last_inactive_lock(__u32 cpu) 
   return &cpu_last_inactive_lock[idx];
 }
 
+static __always_inline volatile __u32 *
+lookup_cpu_inactive_dispatch_count(__u32 cpu) {
+  __u32 idx;
+
+  if (cpu >= MAX_CPUS)
+    return 0;
+
+  idx = cpu & (MAX_CPUS - 1);
+  barrier_var(idx);
+  return &cpu_inactive_dispatch_count[idx];
+}
+
+static __always_inline bool inactive_dispatch_budget_available(__u32 cpu) {
+  volatile __u32 *count = lookup_cpu_inactive_dispatch_count(cpu);
+
+  return !count || *count < INACTIVE_DISPATCH_BURST;
+}
+
+static __always_inline void record_inactive_dispatch(__u32 cpu) {
+  volatile __u32 *count = lookup_cpu_inactive_dispatch_count(cpu);
+
+  if (count && *count < INACTIVE_DISPATCH_BURST)
+    *count += 1;
+}
+
+static __always_inline void reset_inactive_dispatch_budget(__u32 cpu) {
+  volatile __u32 *count = lookup_cpu_inactive_dispatch_count(cpu);
+
+  if (count)
+    *count = 0;
+}
+
 static __always_inline void record_inactive_dispatch_lock(__u32 cpu,
                                                           __u32 lock_id) {
   volatile __u32 *last_lock;
@@ -178,6 +210,15 @@ static __always_inline bool drain_inactive(__u32 cpu) {
     return false;
 
   return move_selected_inactive_to_local(cpu);
+}
+
+static __always_inline bool drain_inactive_counted(__u32 cpu) {
+  if (drain_inactive(cpu)) {
+    record_inactive_dispatch(cpu);
+    return true;
+  }
+
+  return false;
 }
 
 static __always_inline bool refresh_user_ctx_ptr(struct task_struct *p,
@@ -359,15 +400,6 @@ static __always_inline bool task_in_critical_section(
   return false;
 }
 
-static __always_inline void mark_controlled_enqueue_after_inactive_wait(
-    struct task_scx_ctx *task_ctx, bool runnable) {
-  if (!runnable || !task_ctx->inactive_wait)
-    return;
-
-  task_ctx->inactive_wait = 0;
-  task_ctx->enqueue_to_controlled = 1;
-}
-
 static __always_inline void protect_critical_section(struct task_struct *p,
                                                      struct task_scx_ctx *task_ctx,
                                                      __u32 lock_id) {
@@ -427,7 +459,6 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   bool is_idle = false;
   bool have_user = false;
   bool wants_slow_path = false;
-  bool controlled_enqueue_pending = false;
   s32 cpu;
 
   if (stats_only_enabled()) {
@@ -448,7 +479,6 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   task_ctx = get_task_ctx(p);
   if (task_ctx) {
     have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
-    controlled_enqueue_pending = task_ctx->enqueue_to_controlled != 0;
     clear_invalid_admission_cpu(p, task_ctx);
   }
 
@@ -482,7 +512,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
     task_ctx->admission_cpu = (__u32)cpu;
 
   if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu) &&
-      !wants_slow_path && !controlled_enqueue_pending)
+      !wants_slow_path)
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
   return cpu;
@@ -511,7 +541,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
   task_ctx = get_task_ctx(p);
   if (!task_ctx) {
-    scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+    scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
     return;
   }
 
@@ -531,16 +561,10 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     return;
   }
 
-  if (task_ctx->enqueue_to_controlled) {
-    task_ctx->enqueue_to_controlled = 0;
-    scx_bpf_dsq_insert(p, CONTROLLED_DSQ_ID, SCX_SLICE_DFL, enq_flags);
-    return;
-  }
-
   if (slow_path_requested(task_ctx, have_user, user_ctx_word)) {
     cpu = requested_cpu(p, task_ctx, -1);
     if (cpu >= MAX_CPUS) {
-      scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+      scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
       return;
     }
     task_ctx->admission_cpu = cpu;
@@ -550,8 +574,6 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       return;
     }
 
-    task_ctx->inactive_wait = 1;
-    task_ctx->enqueue_to_controlled = 0;
     scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
     return;
   }
@@ -565,7 +587,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     }
   }
 
-  scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+  scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
 }
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
@@ -574,13 +596,21 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   if (!valid_cpu(cpu))
     return;
 
-  if (stats_only_enabled())
+  if (stats_only_enabled()) {
+    scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL);
+    return;
+  }
+
+  if (inactive_dispatch_budget_available((__u32)cpu) &&
+      drain_inactive_counted((__u32)cpu))
     return;
 
-  if (drain_inactive((__u32)cpu))
+  if (scx_bpf_dsq_move_to_local(NORMAL_DSQ_ID)) {
+    reset_inactive_dispatch_budget((__u32)cpu);
     return;
+  }
 
-  scx_bpf_dsq_move_to_local(CONTROLLED_DSQ_ID);
+  drain_inactive_counted((__u32)cpu);
 }
 
 void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
@@ -610,7 +640,6 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
 
   if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
-    mark_controlled_enqueue_after_inactive_wait(task_ctx, runnable);
     return;
   }
 
@@ -619,10 +648,8 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
     return;
   }
 
-  if (!task_ctx->holds_admission) {
-    mark_controlled_enqueue_after_inactive_wait(task_ctx, runnable);
+  if (!task_ctx->holds_admission)
     return;
-  }
 
   task_ctx->must_run_on_admission_cpu = 1;
 }
@@ -646,7 +673,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   __u32 lock_id;
   s32 ret;
 
-  ret = scx_bpf_create_dsq(CONTROLLED_DSQ_ID, -1);
+  ret = scx_bpf_create_dsq(NORMAL_DSQ_ID, -1);
   if (ret)
     return ret;
 

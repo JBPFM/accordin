@@ -6,7 +6,7 @@
 #define __kptr
 #endif
 
-#define CONTROLLED_DSQ_ID 0x100ULL
+#define NORMAL_DSQ_ID 0x100ULL
 #define SSC_DSQ_ID 0x5CCULL
 #define INACTIVE_DSQ_BASE 0x10000ULL
 #define MAX_TASKS 65536U
@@ -19,14 +19,13 @@
 #define MAX_LOCK_CLASSES 16U
 #define UNMANAGED_LOCK_ID 0U
 #define INACTIVE_PREVIOUS_LOCK_PERCENT_DEFAULT 80U
+#define INACTIVE_DISPATCH_BURST 256U
 
 struct task_scx_ctx {
   unsigned int initialized;
   unsigned int holds_admission;
   unsigned int admission_cpu;
   unsigned int must_run_on_admission_cpu;
-  unsigned int inactive_wait;
-  unsigned int enqueue_to_controlled;
   unsigned long long
       user_ctx_ptr; /* cached pointer to user-space admission word */
 };

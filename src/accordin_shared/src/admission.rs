@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 const IN_CRITICAL_SECTION: u32 = 1 << 0;
 const SLOW_PATH_PENDING: u32 = 1 << 1;
@@ -12,6 +12,8 @@ pub const UNMANAGED_LOCK_ID: u32 = 0;
 pub const DISABLE_ADMISSION_ENV: &str = "ACCORDIN_DISABLE_ADMISSION";
 
 static NEXT_LOCK_ID: AtomicU32 = AtomicU32::new(1);
+static INACTIVE_ENQUEUE_SEQ_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
+static INACTIVE_EMPTY_SEQ_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 
 thread_local! {
     static USER_ADMISSION_WORD: AtomicU32 = const { AtomicU32::new(0) };
@@ -76,6 +78,34 @@ pub fn allocate_lock_id() -> u32 {
     }
 }
 
+#[doc(hidden)]
+pub fn set_inactive_queue_seq_ptrs(enqueue_seq: *mut u32, empty_seq: *mut u32) {
+    INACTIVE_ENQUEUE_SEQ_PTR.store(enqueue_seq, Ordering::Release);
+    INACTIVE_EMPTY_SEQ_PTR.store(empty_seq, Ordering::Release);
+}
+
+#[inline(always)]
+fn inactive_queue_idle() -> Option<bool> {
+    let enqueue_seq = INACTIVE_ENQUEUE_SEQ_PTR.load(Ordering::Acquire);
+    let empty_seq = INACTIVE_EMPTY_SEQ_PTR.load(Ordering::Acquire);
+    if enqueue_seq.is_null() || empty_seq.is_null() {
+        return None;
+    }
+
+    let enqueue_seq = unsafe { enqueue_seq.read_volatile() };
+    let empty_seq = unsafe { empty_seq.read_volatile() };
+    Some(enqueue_seq == empty_seq)
+}
+
+#[inline(always)]
+fn slow_path_yield_required(token_consumed: bool) -> bool {
+    if token_consumed && inactive_queue_idle().is_some_and(|idle| idle) {
+        return false;
+    }
+
+    true
+}
+
 #[inline(always)]
 pub fn begin_lock_scope(lock_id: u32) -> LockAdmissionScope {
     THREAD_HELD_DEPTH.with(|depth| {
@@ -94,6 +124,24 @@ pub fn mark_slow_path_pending_for_scope(scope: LockAdmissionScope) -> bool {
         mark_slow_path_pending_for_lock(scope.lock_id)
     } else {
         false
+    }
+}
+
+#[inline(always)]
+pub fn prepare_slow_path_admission() {
+    let consumed = token_consumed();
+    if mark_slow_path_pending() && slow_path_yield_required(consumed) {
+        std::thread::yield_now();
+        clear_token_consumed();
+    }
+}
+
+#[inline(always)]
+pub fn prepare_slow_path_admission_for_scope(scope: LockAdmissionScope) {
+    let consumed = token_consumed_for_scope(scope);
+    if mark_slow_path_pending_for_scope(scope) && slow_path_yield_required(consumed) {
+        std::thread::yield_now();
+        clear_token_consumed_for_scope(scope);
     }
 }
 
@@ -343,6 +391,8 @@ pub fn reset_lock_id_allocator_for_test() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::{
         IN_CRITICAL_SECTION, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, TOKEN_CONSUMED,
         UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_id, begin_lock_scope,
@@ -352,11 +402,44 @@ mod tests {
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
         reset_lock_id_allocator_for_test, reset_state, reset_thread_depth_for_test,
-        reset_transient_state, token_consumed_for_scope, word_for_test,
+        reset_transient_state, set_inactive_queue_seq_ptrs, slow_path_yield_required,
+        token_consumed_for_scope, word_for_test,
     };
+
+    static INACTIVE_QUEUE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static mut TEST_INACTIVE_ENQUEUE_SEQ: u32 = 0;
+    static mut TEST_INACTIVE_EMPTY_SEQ: u32 = 0;
+
+    struct InactiveQueueStateTestGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for InactiveQueueStateTestGuard {
+        fn drop(&mut self) {
+            set_inactive_queue_seq_ptrs(std::ptr::null_mut(), std::ptr::null_mut());
+        }
+    }
 
     fn word_for(lock_id: u32, flags: u32) -> u32 {
         (lock_id << USER_ADMISSION_LOCK_ID_SHIFT) | flags
+    }
+
+    fn install_inactive_queue_state(
+        enqueue_seq: u32,
+        empty_seq: u32,
+    ) -> InactiveQueueStateTestGuard {
+        let guard = INACTIVE_QUEUE_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe {
+            TEST_INACTIVE_ENQUEUE_SEQ = enqueue_seq;
+            TEST_INACTIVE_EMPTY_SEQ = empty_seq;
+        }
+        set_inactive_queue_seq_ptrs(
+            &raw mut TEST_INACTIVE_ENQUEUE_SEQ,
+            &raw mut TEST_INACTIVE_EMPTY_SEQ,
+        );
+        InactiveQueueStateTestGuard { _guard: guard }
     }
 
     #[test]
@@ -500,6 +583,27 @@ mod tests {
         assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
 
         reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn slow_path_without_consumed_token_still_yields_to_request_admission() {
+        let _queue_state = install_inactive_queue_state(7, 7);
+
+        assert!(slow_path_yield_required(false));
+    }
+
+    #[test]
+    fn consumed_token_reuse_skips_yield_when_inactive_queue_is_idle() {
+        let _queue_state = install_inactive_queue_state(7, 7);
+
+        assert!(!slow_path_yield_required(true));
+    }
+
+    #[test]
+    fn consumed_token_reuse_yields_when_inactive_queue_has_pending_work() {
+        let _queue_state = install_inactive_queue_state(8, 7);
+
+        assert!(slow_path_yield_required(true));
     }
 
     #[test]

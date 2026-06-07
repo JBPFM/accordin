@@ -42,6 +42,7 @@ volatile __u32 inactive_enqueue_seq;
 volatile __u32 inactive_empty_seq;
 volatile __u32 normal_enqueue_seq;
 volatile __u32 normal_empty_seq;
+volatile __u32 registered_thread_count;
 volatile __u64 dbg_acct_calls = 0;
 volatile __u64 dbg_acct_read_ok = 0;
 

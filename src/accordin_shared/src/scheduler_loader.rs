@@ -59,6 +59,7 @@ macro_rules! define_scheduler_loader {
             if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
                 bss.stats_only_mode = u32::from(stats_only);
                 bss.single_lock_mode = u32::from($single_lock_mode);
+                bss.registered_thread_count = 0;
                 bss.inactive_previous_lock_percent = $crate::env::env_u32_clamped(
                     INACTIVE_PREVIOUS_LOCK_PERCENT_ENV,
                     crate::bpf_intf::INACTIVE_PREVIOUS_LOCK_PERCENT_DEFAULT,
@@ -70,6 +71,11 @@ macro_rules! define_scheduler_loader {
 
             let thread_ctx_map = ::libbpf_rs::MapHandle::try_from(&skel.maps.thread_ctx_addr_map)?;
             $crate::mutex_hook::set_thread_ctx_map(thread_ctx_map);
+            if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
+                $crate::mutex_hook::set_registered_thread_count_ptr(
+                    &mut bss.registered_thread_count as *mut u32,
+                );
+            }
 
             let link = ::scx_utils::scx_ops_attach!(skel, accordin_ops)?;
 
@@ -82,6 +88,7 @@ macro_rules! define_scheduler_loader {
 
         impl Drop for SchedulerState {
             fn drop(&mut self) {
+                $crate::mutex_hook::set_registered_thread_count_ptr(::std::ptr::null_mut());
                 let _ = self._link.take();
                 let _ = self._skel.take();
                 ::log::info!("{SCHEDULER_NAME} scheduler stopped");

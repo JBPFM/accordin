@@ -22,6 +22,10 @@ static __always_inline bool single_lock_enabled(void) {
   return single_lock_mode != 0;
 }
 
+static __always_inline bool registered_threads_active(void) {
+  return registered_thread_count != 0;
+}
+
 static __always_inline bool inactive_dispatch_needed(void) {
   return inactive_empty_seq != inactive_enqueue_seq;
 }
@@ -373,6 +377,24 @@ static __always_inline __u32 pick_task_cpu(struct task_struct *p,
   return 0;
 }
 
+static __always_inline s32 select_cpu_without_admission(struct task_struct *p,
+                                                        s32 prev_cpu,
+                                                        u64 wake_flags) {
+  bool is_idle = false;
+  s32 cpu;
+
+  cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+  if (!valid_cpu(cpu) || !task_cpumask_allows(p, (__u32)cpu)) {
+    is_idle = false;
+    cpu = pick_task_cpu(p, prev_cpu);
+  }
+
+  if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu))
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+
+  return cpu;
+}
+
 static __always_inline void enqueue_normal_dsq(struct task_struct *p,
                                                __u64 enq_flags) {
   scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
@@ -499,6 +521,9 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
   if (stats_only_enabled())
     return;
 
+  if (!registered_threads_active())
+    return;
+
   task_ctx = get_task_ctx(p);
   if (!task_ctx)
     return;
@@ -542,6 +567,10 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
     return cpu;
+  }
+
+  if (!registered_threads_active()) {
+    return select_cpu_without_admission(p, prev_cpu, wake_flags);
   }
 
   task_ctx = get_task_ctx(p);
@@ -604,6 +633,14 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     }
 
     scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+    return;
+  }
+
+  if (!registered_threads_active()) {
+    if (enqueue_normal_local_fast(p, enq_flags))
+      return;
+
+    enqueue_normal_dsq(p, enq_flags);
     return;
   }
 
@@ -746,6 +783,9 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   __u32 user_ctx_word = 0;
   __u32 lock_id = UNMANAGED_LOCK_ID;
   bool have_user = false;
+
+  if (!registered_threads_active())
+    return;
 
   task_ctx = lookup_task_ctx(p);
   if (!task_ctx)

@@ -13,7 +13,8 @@ macro_rules! define_mcs_lock {
         use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
         use $crate::admission::{
-            mark_critical_section_entered, mark_critical_section_exit, mark_slow_path_pending,
+            clear_token_consumed, mark_critical_section_entered, mark_critical_section_exit,
+            mark_slow_path_pending,
         };
         use $crate::arch::{CacheAligned, pause};
         use $crate::lock_backend::LockBackend;
@@ -141,6 +142,7 @@ macro_rules! define_mcs_lock {
             fn ensure_slow_path_admission(&self) {
                 mark_slow_path_pending();
                 std::thread::yield_now();
+                clear_token_consumed();
             }
 
             #[cfg_attr(feature = "perf-symbols", inline(never))]

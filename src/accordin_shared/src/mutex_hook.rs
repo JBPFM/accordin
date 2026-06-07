@@ -259,28 +259,35 @@ macro_rules! export_mutex_hooks {
 
             #[inline(always)]
             fn lock_with_stats(lock: &<Backend as MutexHookBackend>::LockState, lock_id: u32) {
-                if Backend::try_lock(lock) {
-                    if Backend::USES_ADMISSION_SCOPE {
-                        record_lock_acquired_for_lock(lock_id);
-                    } else {
-                        record_lock_acquired();
-                    }
-                    return;
-                }
-                let wait_start = record_wait_start();
                 if Backend::USES_ADMISSION_SCOPE {
                     let scope = $crate::admission::begin_lock_scope(lock_id);
+                    if !$crate::admission::token_consumed_for_scope(scope)
+                        && Backend::try_lock(lock)
+                    {
+                        record_lock_acquired_for_scope(scope);
+                        return;
+                    }
+
+                    let wait_start = record_wait_start();
                     if $crate::admission::mark_slow_path_pending_for_scope(scope) {
                         std::thread::yield_now();
+                        $crate::admission::clear_token_consumed_for_scope(scope);
                     }
                     Backend::lock(lock);
                     record_wait_end(wait_start);
                     record_lock_acquired_for_scope(scope);
-                } else {
-                    Backend::lock(lock);
-                    record_wait_end(wait_start);
-                    record_lock_acquired();
+                    return;
                 }
+
+                if Backend::try_lock(lock) {
+                    record_lock_acquired();
+                    return;
+                }
+
+                let wait_start = record_wait_start();
+                Backend::lock(lock);
+                record_wait_end(wait_start);
+                record_lock_acquired();
             }
 
             #[inline(always)]

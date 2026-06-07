@@ -258,6 +258,10 @@ static __always_inline bool user_in_critical_section(__u32 user_ctx_word) {
   return user_ctx_word & USER_ADMISSION_IN_CRITICAL_SECTION;
 }
 
+static __always_inline bool user_token_consumed(__u32 user_ctx_word) {
+  return user_ctx_word & USER_ADMISSION_TOKEN_CONSUMED;
+}
+
 static __always_inline bool user_explicit_release(__u32 user_ctx_word) {
   return !user_slow_path_pending(user_ctx_word) &&
          !user_in_critical_section(user_ctx_word);
@@ -266,6 +270,7 @@ static __always_inline bool user_explicit_release(__u32 user_ctx_word) {
 static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx) {
   task_ctx->holds_admission = 0;
   task_ctx->must_run_on_admission_cpu = 0;
+  task_ctx->force_inactive_wait = 0;
   task_ctx->admission_cpu = ADMISSION_CPU_NONE;
 }
 
@@ -304,6 +309,7 @@ static __always_inline bool grant_admission(struct task_struct *p,
   *owner = pid;
   task_ctx->holds_admission = 1;
   task_ctx->must_run_on_admission_cpu = 0;
+  task_ctx->force_inactive_wait = 0;
   task_ctx->admission_cpu = cpu;
   return true;
 }
@@ -384,6 +390,12 @@ static __always_inline bool slow_path_requested(
   return false;
 }
 
+static __always_inline bool consumed_token_reuse_requested(
+    const struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
+  return task_ctx->holds_admission && have_user &&
+         user_slow_path_pending(user_ctx_word) && user_token_consumed(user_ctx_word);
+}
+
 static __always_inline bool should_release_from_user(
     const struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
   if (!task_ctx->holds_admission || !have_user)
@@ -398,6 +410,25 @@ static __always_inline bool task_in_critical_section(
     return user_in_critical_section(user_ctx_word);
 
   return false;
+}
+
+static __always_inline bool enqueue_force_inactive(struct task_struct *p,
+                                                   struct task_scx_ctx *task_ctx,
+                                                   __u32 lock_id, __u32 cpu,
+                                                   __u64 enq_flags) {
+  if (!valid_lock_id(lock_id))
+    return false;
+
+  if (cpu >= MAX_CPUS || !task_cpu_allowed(p, cpu)) {
+    scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+    return true;
+  }
+
+  task_ctx->admission_cpu = cpu;
+  task_ctx->must_run_on_admission_cpu = 0;
+  task_ctx->force_inactive_wait = 0;
+  scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
+  return true;
 }
 
 static __always_inline void protect_critical_section(struct task_struct *p,
@@ -551,8 +582,22 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
   clear_invalid_admission_cpu(p, task_ctx);
 
+  if (consumed_token_reuse_requested(task_ctx, have_user, user_ctx_word)) {
+    cpu = requested_cpu(p, task_ctx, -1);
+    release_admission(p, task_ctx);
+    enqueue_force_inactive(p, task_ctx, lock_id, cpu, enq_flags);
+    return;
+  }
+
   if (should_release_from_user(task_ctx, have_user, user_ctx_word))
     release_admission(p, task_ctx);
+
+  if (task_ctx->force_inactive_wait && have_user &&
+      user_slow_path_pending(user_ctx_word)) {
+    cpu = requested_cpu(p, task_ctx, -1);
+    enqueue_force_inactive(p, task_ctx, lock_id, cpu, enq_flags);
+    return;
+  }
 
   if (task_ctx->admission_cpu < MAX_CPUS &&
       (task_ctx->holds_admission || task_ctx->must_run_on_admission_cpu)) {
@@ -640,6 +685,12 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
 
   if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
+    return;
+  }
+
+  if (consumed_token_reuse_requested(task_ctx, have_user, user_ctx_word)) {
+    release_admission(p, task_ctx);
+    task_ctx->force_inactive_wait = 1;
     return;
   }
 

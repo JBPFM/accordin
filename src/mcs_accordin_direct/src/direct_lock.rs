@@ -42,7 +42,7 @@ fn ensure_registered() {
 
 #[inline(always)]
 fn lock_with_stats(lock: &crate::mcs::McsLockRaw) {
-    if lock.try_lock() {
+    if !accordin_shared::admission::token_consumed() && lock.try_lock() {
         accordin_shared::lock_stats::record_lock_acquired();
         return;
     }

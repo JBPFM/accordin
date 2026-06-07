@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const IN_CRITICAL_SECTION: u32 = 1 << 0;
 const SLOW_PATH_PENDING: u32 = 1 << 1;
-pub const USER_ADMISSION_FLAG_MASK: u32 = 0x3;
-pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 2;
+const TOKEN_CONSUMED: u32 = 1 << 2;
+pub const USER_ADMISSION_FLAG_MASK: u32 = 0x7;
+pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 3;
 pub const MAX_LOCK_CLASSES: u32 = 16;
 pub const UNMANAGED_LOCK_ID: u32 = 0;
 pub const DISABLE_ADMISSION_ENV: &str = "ACCORDIN_DISABLE_ADMISSION";
@@ -47,6 +48,11 @@ fn flags(value: u32) -> u32 {
 #[inline(always)]
 fn lock_id_bits(value: u32) -> u32 {
     value & !USER_ADMISSION_FLAG_MASK
+}
+
+#[inline(always)]
+fn user_lock_id_for_value(value: u32) -> u32 {
+    lock_id_bits(value) >> USER_ADMISSION_LOCK_ID_SHIFT
 }
 
 #[inline(always)]
@@ -92,6 +98,18 @@ pub fn mark_slow_path_pending_for_scope(scope: LockAdmissionScope) -> bool {
 }
 
 #[inline(always)]
+pub fn token_consumed_for_scope(scope: LockAdmissionScope) -> bool {
+    scope.outer_managed && token_consumed_for_lock(scope.lock_id)
+}
+
+#[inline(always)]
+pub fn clear_token_consumed_for_scope(scope: LockAdmissionScope) {
+    if scope.outer_managed {
+        clear_token_consumed_for_lock(scope.lock_id);
+    }
+}
+
+#[inline(always)]
 pub fn mark_critical_section_entered_for_scope(scope: LockAdmissionScope) {
     if scope.outer_managed {
         mark_critical_section_entered_for_lock(scope.lock_id);
@@ -124,13 +142,33 @@ pub fn mark_slow_path_pending_for_lock(lock_id: u32) -> bool {
 }
 
 #[inline(always)]
+pub fn token_consumed() -> bool {
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        flags(value) & TOKEN_CONSUMED != 0
+    })
+}
+
+#[inline(always)]
+fn token_consumed_for_lock(lock_id: u32) -> bool {
+    if !managed_lock_id(lock_id) {
+        return false;
+    }
+
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        user_lock_id_for_value(value) == lock_id && flags(value) & TOKEN_CONSUMED != 0
+    })
+}
+
+#[inline(always)]
 fn mark_slow_path_pending_with_admission_enabled(enabled: bool) -> bool {
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
             value | SLOW_PATH_PENDING
         } else {
-            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
+            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -150,7 +188,7 @@ fn mark_slow_path_pending_for_lock_with_admission_enabled(lock_id: u32, enabled:
         } else {
             word_with_lock_id(
                 lock_id,
-                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
+                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED),
             )
         };
         word.store(next, Ordering::Relaxed);
@@ -173,9 +211,9 @@ fn mark_critical_section_entered_with_admission_enabled(enabled: bool) {
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
-            (value | IN_CRITICAL_SECTION) & !SLOW_PATH_PENDING
+            (value | IN_CRITICAL_SECTION) & !(SLOW_PATH_PENDING | TOKEN_CONSUMED)
         } else {
-            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
+            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -192,12 +230,12 @@ fn mark_critical_section_entered_for_lock_with_admission_enabled(lock_id: u32, e
         let next = if enabled {
             word_with_lock_id(
                 lock_id,
-                (flags(value) | IN_CRITICAL_SECTION) & !SLOW_PATH_PENDING,
+                (flags(value) | IN_CRITICAL_SECTION) & !(SLOW_PATH_PENDING | TOKEN_CONSUMED),
             )
         } else {
             word_with_lock_id(
                 lock_id,
-                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
+                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED),
             )
         };
         word.store(next, Ordering::Relaxed);
@@ -219,9 +257,9 @@ fn mark_critical_section_exit_with_admission_enabled(enabled: bool) {
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
-            value & !IN_CRITICAL_SECTION
+            (value | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION
         } else {
-            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION)
+            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -236,14 +274,40 @@ fn mark_critical_section_exit_for_lock_with_admission_enabled(lock_id: u32, enab
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
-            word_with_lock_id(lock_id, flags(value) & !IN_CRITICAL_SECTION)
+            word_with_lock_id(
+                lock_id,
+                (flags(value) | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION,
+            )
         } else {
             word_with_lock_id(
                 lock_id,
-                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION),
+                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED),
             )
         };
         word.store(next, Ordering::Relaxed);
+    });
+}
+
+#[inline(always)]
+pub fn clear_token_consumed() {
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        word.store(value & !TOKEN_CONSUMED, Ordering::Relaxed);
+    });
+}
+
+#[inline(always)]
+fn clear_token_consumed_for_lock(lock_id: u32) {
+    if !managed_lock_id(lock_id) {
+        return;
+    }
+
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        word.store(
+            word_with_lock_id(lock_id, flags(value) & !TOKEN_CONSUMED),
+            Ordering::Relaxed,
+        );
     });
 }
 
@@ -280,14 +344,15 @@ pub fn reset_lock_id_allocator_for_test() {
 #[cfg(test)]
 mod tests {
     use super::{
-        IN_CRITICAL_SECTION, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, UNMANAGED_LOCK_ID,
-        USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_id, begin_lock_scope, finish_lock_scope,
-        mark_critical_section_entered, mark_critical_section_entered_for_scope,
+        IN_CRITICAL_SECTION, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, TOKEN_CONSUMED,
+        UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_id, begin_lock_scope,
+        clear_token_consumed_for_scope, finish_lock_scope, mark_critical_section_entered,
+        mark_critical_section_entered_for_scope,
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
         reset_lock_id_allocator_for_test, reset_state, reset_thread_depth_for_test,
-        reset_transient_state, word_for_test,
+        reset_transient_state, token_consumed_for_scope, word_for_test,
     };
 
     fn word_for(lock_id: u32, flags: u32) -> u32 {
@@ -308,11 +373,11 @@ mod tests {
         assert_eq!(word_for_test(), IN_CRITICAL_SECTION | SLOW_PATH_PENDING);
 
         mark_critical_section_exit();
-        assert_eq!(word_for_test(), SLOW_PATH_PENDING);
+        assert_eq!(word_for_test(), SLOW_PATH_PENDING | TOKEN_CONSUMED);
 
         mark_critical_section_entered();
         mark_critical_section_exit();
-        assert_eq!(word_for_test(), 0);
+        assert_eq!(word_for_test(), TOKEN_CONSUMED);
     }
 
     #[test]
@@ -370,7 +435,7 @@ mod tests {
         assert_eq!(word_for_test(), word_for(3, IN_CRITICAL_SECTION));
 
         finish_lock_scope(3);
-        assert_eq!(word_for_test(), word_for(3, 0));
+        assert_eq!(word_for_test(), word_for(3, TOKEN_CONSUMED));
 
         reset_state();
         assert_eq!(word_for_test(), 0);
@@ -408,7 +473,33 @@ mod tests {
         assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
 
         finish_lock_scope(2);
-        assert_eq!(word_for_test(), word_for(2, 0));
+        assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
+    }
+
+    #[test]
+    fn next_slow_path_after_consuming_token_exposes_consumed_flag_until_yield() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let first = begin_lock_scope(4);
+        assert!(mark_slow_path_pending_for_scope(first));
+        mark_critical_section_entered_for_scope(first);
+        finish_lock_scope(4);
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
+
+        let second = begin_lock_scope(4);
+        assert!(token_consumed_for_scope(second));
+        assert!(mark_slow_path_pending_for_scope(second));
+        assert_eq!(
+            word_for_test(),
+            word_for(4, TOKEN_CONSUMED | SLOW_PATH_PENDING)
+        );
+
+        clear_token_consumed_for_scope(second);
+        assert!(!token_consumed_for_scope(second));
+        assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
+
+        reset_thread_depth_for_test();
     }
 
     #[test]

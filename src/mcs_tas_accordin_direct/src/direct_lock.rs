@@ -45,15 +45,17 @@ fn ensure_registered() {
 
 #[inline(always)]
 fn lock_with_stats(lock: &<DirectBackend as MutexHookBackend>::LockState, lock_id: u32) {
-    if DirectBackend::try_lock(lock) {
-        accordin_shared::lock_stats::record_lock_acquired_for_lock(lock_id);
+    let scope = accordin_shared::admission::begin_lock_scope(lock_id);
+    if !accordin_shared::admission::token_consumed_for_scope(scope) && DirectBackend::try_lock(lock)
+    {
+        accordin_shared::lock_stats::record_lock_acquired_for_scope(scope);
         return;
     }
 
     let wait_start = accordin_shared::lock_stats::record_wait_start();
-    let scope = accordin_shared::admission::begin_lock_scope(lock_id);
     if accordin_shared::admission::mark_slow_path_pending_for_scope(scope) {
         std::thread::yield_now();
+        accordin_shared::admission::clear_token_consumed_for_scope(scope);
     }
     DirectBackend::lock(lock);
     accordin_shared::lock_stats::record_wait_end(wait_start);

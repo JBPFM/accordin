@@ -317,6 +317,7 @@ def mutexbench_command(
         env = legacy_mcs_accordin_env()
         needs_sudo = True
         cmd_prefix = []
+        timeslice_extension = "off"
     elif experiment_six.is_flexguard_interpose_lock(lock) or experiment_six.is_otherlocks_interpose_lock(lock):
         lock_kind = "mutex"
         env: dict[str, str | None] = {}

@@ -365,6 +365,7 @@ def mutexbench_command(case: TwoLockCase, lock: str, threads: int, args: argpars
         env = mcs_accordin_env()
         needs_sudo = True
         cmd_prefix = []
+        timeslice_extension = "off"
     elif is_flexguard_interpose_lock(lock) or is_otherlocks_interpose_lock(lock):
         lock_kind = "mutex"
         env: dict[str, str | None] = {}

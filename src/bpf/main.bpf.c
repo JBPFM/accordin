@@ -22,6 +22,34 @@ static __always_inline bool single_lock_enabled(void) {
   return single_lock_mode != 0;
 }
 
+static __always_inline bool inactive_dispatch_needed(void) {
+  return inactive_empty_seq != inactive_enqueue_seq;
+}
+
+static __always_inline bool inactive_dispatch_needed_for(__u32 inactive_seq) {
+  return inactive_empty_seq != inactive_seq;
+}
+
+static __always_inline void record_inactive_enqueue(void) {
+  inactive_enqueue_seq += 1;
+}
+
+static __always_inline void record_inactive_scan_empty(__u32 inactive_seq) {
+  inactive_empty_seq = inactive_seq;
+}
+
+static __always_inline bool normal_dispatch_needed_for(__u32 normal_seq) {
+  return normal_empty_seq != normal_seq;
+}
+
+static __always_inline void record_normal_enqueue(void) {
+  normal_enqueue_seq += 1;
+}
+
+static __always_inline void record_normal_scan_empty(__u32 normal_seq) {
+  normal_empty_seq = normal_seq;
+}
+
 static __always_inline bool task_cpumask_allows(struct task_struct *p,
                                                 __u32 cpu) {
   if (cpu >= MAX_CPUS)
@@ -128,6 +156,12 @@ static __always_inline bool inactive_dispatch_budget_available(__u32 cpu) {
   return !count || *count < INACTIVE_DISPATCH_BURST;
 }
 
+static __always_inline bool inactive_dispatch_cpu_available(__u32 cpu) {
+  volatile __u32 *owner = lookup_cpu_owner(cpu);
+
+  return owner && !*owner;
+}
+
 static __always_inline void record_inactive_dispatch(__u32 cpu) {
   volatile __u32 *count = lookup_cpu_inactive_dispatch_count(cpu);
 
@@ -198,25 +232,6 @@ static __always_inline bool move_selected_inactive_to_local(__u32 dispatch_cpu) 
 
   if (valid_lock_id(previous_lock_id) && !prefer_previous)
     return move_inactive_to_local(dispatch_cpu, previous_lock_id);
-
-  return false;
-}
-
-static __always_inline bool drain_inactive(__u32 cpu) {
-  volatile __u32 *owner;
-
-  owner = lookup_cpu_owner(cpu);
-  if (!owner || *owner)
-    return false;
-
-  return move_selected_inactive_to_local(cpu);
-}
-
-static __always_inline bool drain_inactive_counted(__u32 cpu) {
-  if (drain_inactive(cpu)) {
-    record_inactive_dispatch(cpu);
-    return true;
-  }
 
   return false;
 }
@@ -358,6 +373,27 @@ static __always_inline __u32 pick_task_cpu(struct task_struct *p,
   return 0;
 }
 
+static __always_inline void enqueue_normal_dsq(struct task_struct *p,
+                                               __u64 enq_flags) {
+  scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+  record_normal_enqueue();
+}
+
+static __always_inline bool enqueue_normal_local_fast(struct task_struct *p,
+                                                      __u64 enq_flags) {
+  __u32 cpu;
+
+  if (inactive_dispatch_needed())
+    return false;
+
+  cpu = pick_task_cpu(p, -1);
+  if (!valid_cpu(cpu) || !task_cpumask_allows(p, cpu))
+    return false;
+
+  scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
+  return true;
+}
+
 static __always_inline __u32 requested_cpu(struct task_struct *p,
                                            struct task_scx_ctx *task_ctx,
                                            s32 fallback_cpu) {
@@ -420,7 +456,7 @@ static __always_inline bool enqueue_force_inactive(struct task_struct *p,
     return false;
 
   if (cpu >= MAX_CPUS || !task_cpu_allowed(p, cpu)) {
-    scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+    enqueue_normal_dsq(p, enq_flags);
     return true;
   }
 
@@ -428,6 +464,7 @@ static __always_inline bool enqueue_force_inactive(struct task_struct *p,
   task_ctx->must_run_on_admission_cpu = 0;
   task_ctx->force_inactive_wait = 0;
   scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
+  record_inactive_enqueue();
   return true;
 }
 
@@ -572,7 +609,10 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
   task_ctx = get_task_ctx(p);
   if (!task_ctx) {
-    scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+    if (enqueue_normal_local_fast(p, enq_flags))
+      return;
+
+    enqueue_normal_dsq(p, enq_flags);
     return;
   }
 
@@ -609,7 +649,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   if (slow_path_requested(task_ctx, have_user, user_ctx_word)) {
     cpu = requested_cpu(p, task_ctx, -1);
     if (cpu >= MAX_CPUS) {
-      scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+      enqueue_normal_dsq(p, enq_flags);
       return;
     }
     task_ctx->admission_cpu = cpu;
@@ -620,8 +660,12 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     }
 
     scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
+    record_inactive_enqueue();
     return;
   }
+
+  if (enqueue_normal_local_fast(p, enq_flags))
+    return;
 
   if (p->nr_cpus_allowed == 1) {
     cpu = pick_task_cpu(p, -1);
@@ -632,10 +676,14 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     }
   }
 
-  scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+  enqueue_normal_dsq(p, enq_flags);
 }
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
+  __u32 inactive_seq;
+  __u32 normal_seq;
+  bool inactive_cpu_available;
+
   (void)prev;
 
   if (!valid_cpu(cpu))
@@ -646,16 +694,43 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
     return;
   }
 
-  if (inactive_dispatch_budget_available((__u32)cpu) &&
-      drain_inactive_counted((__u32)cpu))
-    return;
-
-  if (scx_bpf_dsq_move_to_local(NORMAL_DSQ_ID)) {
-    reset_inactive_dispatch_budget((__u32)cpu);
+  inactive_seq = inactive_enqueue_seq;
+  normal_seq = normal_enqueue_seq;
+  if (!inactive_dispatch_needed_for(inactive_seq)) {
+    if (normal_dispatch_needed_for(normal_seq) &&
+        !scx_bpf_dsq_move_to_local(NORMAL_DSQ_ID))
+      record_normal_scan_empty(normal_seq);
     return;
   }
 
-  drain_inactive_counted((__u32)cpu);
+  inactive_cpu_available = inactive_dispatch_cpu_available((__u32)cpu);
+  if (inactive_cpu_available &&
+      inactive_dispatch_budget_available((__u32)cpu)) {
+    if (move_selected_inactive_to_local((__u32)cpu)) {
+      record_inactive_dispatch((__u32)cpu);
+      return;
+    }
+
+    record_inactive_scan_empty(inactive_seq);
+  }
+
+  if (normal_dispatch_needed_for(normal_seq)) {
+    if (scx_bpf_dsq_move_to_local(NORMAL_DSQ_ID)) {
+      reset_inactive_dispatch_budget((__u32)cpu);
+      return;
+    }
+
+    record_normal_scan_empty(normal_seq);
+  }
+
+  if (inactive_cpu_available) {
+    if (move_selected_inactive_to_local((__u32)cpu)) {
+      record_inactive_dispatch((__u32)cpu);
+      return;
+    }
+
+    record_inactive_scan_empty(inactive_seq);
+  }
 }
 
 void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {

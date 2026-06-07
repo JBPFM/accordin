@@ -359,6 +359,15 @@ static __always_inline bool task_in_critical_section(
   return false;
 }
 
+static __always_inline void mark_controlled_enqueue_after_inactive_wait(
+    struct task_scx_ctx *task_ctx, bool runnable) {
+  if (!runnable || !task_ctx->inactive_wait)
+    return;
+
+  task_ctx->inactive_wait = 0;
+  task_ctx->enqueue_to_controlled = 1;
+}
+
 static __always_inline void protect_critical_section(struct task_struct *p,
                                                      struct task_scx_ctx *task_ctx,
                                                      __u32 lock_id) {
@@ -418,6 +427,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   bool is_idle = false;
   bool have_user = false;
   bool wants_slow_path = false;
+  bool controlled_enqueue_pending = false;
   s32 cpu;
 
   if (stats_only_enabled()) {
@@ -436,11 +446,11 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   }
 
   task_ctx = get_task_ctx(p);
-  if (task_ctx)
+  if (task_ctx) {
     have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
-
-  if (task_ctx)
+    controlled_enqueue_pending = task_ctx->enqueue_to_controlled != 0;
     clear_invalid_admission_cpu(p, task_ctx);
+  }
 
   if (task_ctx && task_ctx->admission_cpu < MAX_CPUS &&
       (task_ctx->holds_admission || task_ctx->must_run_on_admission_cpu))
@@ -472,7 +482,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
     task_ctx->admission_cpu = (__u32)cpu;
 
   if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu) &&
-      !wants_slow_path)
+      !wants_slow_path && !controlled_enqueue_pending)
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
   return cpu;
@@ -521,6 +531,12 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     return;
   }
 
+  if (task_ctx->enqueue_to_controlled) {
+    task_ctx->enqueue_to_controlled = 0;
+    scx_bpf_dsq_insert(p, CONTROLLED_DSQ_ID, SCX_SLICE_DFL, enq_flags);
+    return;
+  }
+
   if (slow_path_requested(task_ctx, have_user, user_ctx_word)) {
     cpu = requested_cpu(p, task_ctx, -1);
     if (cpu >= MAX_CPUS) {
@@ -534,6 +550,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       return;
     }
 
+    task_ctx->inactive_wait = 1;
+    task_ctx->enqueue_to_controlled = 0;
     scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
     return;
   }
@@ -559,7 +577,10 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   if (stats_only_enabled())
     return;
 
-  drain_inactive((__u32)cpu);
+  if (drain_inactive((__u32)cpu))
+    return;
+
+  scx_bpf_dsq_move_to_local(CONTROLLED_DSQ_ID);
 }
 
 void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
@@ -589,6 +610,7 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
 
   if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
+    mark_controlled_enqueue_after_inactive_wait(task_ctx, runnable);
     return;
   }
 
@@ -597,8 +619,10 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
     return;
   }
 
-  if (!task_ctx->holds_admission)
+  if (!task_ctx->holds_admission) {
+    mark_controlled_enqueue_after_inactive_wait(task_ctx, runnable);
     return;
+  }
 
   task_ctx->must_run_on_admission_cpu = 1;
 }
@@ -621,6 +645,10 @@ void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
 s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   __u32 lock_id;
   s32 ret;
+
+  ret = scx_bpf_create_dsq(CONTROLLED_DSQ_ID, -1);
+  if (ret)
+    return ret;
 
 #pragma unroll
   for (lock_id = 0; lock_id < MAX_LOCK_CLASSES; lock_id++) {

@@ -190,6 +190,11 @@ pub fn mark_slow_path_pending_for_lock(lock_id: u32) -> bool {
 }
 
 #[inline(always)]
+pub fn mark_cond_reacquire_pending_for_lock(lock_id: u32) -> bool {
+    mark_cond_reacquire_pending_for_lock_with_admission_enabled(lock_id, admission_enabled())
+}
+
+#[inline(always)]
 pub fn token_consumed() -> bool {
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
@@ -233,6 +238,33 @@ fn mark_slow_path_pending_for_lock_with_admission_enabled(lock_id: u32, enabled:
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
             word_with_lock_id(lock_id, flags(value) | SLOW_PATH_PENDING)
+        } else {
+            word_with_lock_id(
+                lock_id,
+                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED),
+            )
+        };
+        word.store(next, Ordering::Relaxed);
+    });
+    enabled
+}
+
+#[inline(always)]
+fn mark_cond_reacquire_pending_for_lock_with_admission_enabled(
+    lock_id: u32,
+    enabled: bool,
+) -> bool {
+    if !managed_lock_id(lock_id) {
+        return false;
+    }
+
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        let next = if enabled {
+            word_with_lock_id(
+                lock_id,
+                (flags(value) | SLOW_PATH_PENDING | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION,
+            )
         } else {
             word_with_lock_id(
                 lock_id,
@@ -396,8 +428,8 @@ mod tests {
     use super::{
         IN_CRITICAL_SECTION, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, TOKEN_CONSUMED,
         UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_id, begin_lock_scope,
-        clear_token_consumed_for_scope, finish_lock_scope, mark_critical_section_entered,
-        mark_critical_section_entered_for_scope,
+        clear_token_consumed_for_scope, finish_lock_scope, mark_cond_reacquire_pending_for_lock,
+        mark_critical_section_entered, mark_critical_section_entered_for_scope,
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
@@ -583,6 +615,18 @@ mod tests {
         assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
 
         reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn cond_reacquire_hint_marks_slow_path_and_consumed_token_for_lock() {
+        reset_state();
+
+        mark_cond_reacquire_pending_for_lock(4);
+
+        assert_eq!(
+            word_for_test(),
+            word_for(4, SLOW_PATH_PENDING | TOKEN_CONSUMED)
+        );
     }
 
     #[test]

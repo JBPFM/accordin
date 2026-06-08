@@ -1,0 +1,142 @@
+BEGIN
+{
+  @completed = 0;
+  @offcpu_completed = 0;
+  @later_handoffs = 0;
+  @later_switch_sum = 0;
+}
+
+uprobe:__BIN__:trace_mcs_worker_start /pid == __PID__/
+{
+  @known[tid] = 1;
+  @worker[tid] = arg0;
+  @oncpu[tid] = 1;
+  @last_switch_in_ns[tid] = nsecs;
+}
+
+uprobe:__BIN__:trace_mcs_worker_end /pid == __PID__/
+{
+  delete(@known[tid]);
+  delete(@worker[tid]);
+  delete(@waiting[tid]);
+  delete(@seq[tid]);
+  delete(@oncpu[tid]);
+  delete(@last_switch_in_ns[tid]);
+}
+
+uprobe:__BIN__:trace_mcs_wait_begin /pid == __PID__/
+{
+  @known[tid] = 1;
+  @oncpu[tid] = 1;
+  @last_switch_in_ns[tid] = nsecs;
+  @waiting[tid] = 1;
+  @seq[tid] = arg2;
+}
+
+uprobe:__BIN__:trace_mcs_wait_end /pid == __PID__/
+{
+  @known[tid] = 1;
+  @oncpu[tid] = 1;
+  @last_switch_in_ns[tid] = nsecs;
+  @waiting[tid] = 0;
+  @seq[tid] = arg2;
+}
+
+uprobe:__BIN__:trace_mcs_release /pid == __PID__/
+{
+  @known[tid] = 1;
+  @oncpu[tid] = 1;
+  @last_switch_in_ns[tid] = nsecs;
+  @active = 1;
+  @sample_id = arg1;
+  @release_ns = nsecs;
+  @owner_tid = tid;
+  @successor_tid = arg2;
+  @successor_seq = arg3;
+  @successor_oncpu = @oncpu[arg2];
+  @active_successor[arg2] = 1;
+  @later_waiter_switches = 0;
+}
+
+tracepoint:sched:sched_switch /@active/
+{
+  $prev = (uint64)args->prev_pid;
+  $next = (uint64)args->next_pid;
+
+  if (@known[$prev]) {
+    @oncpu[$prev] = 0;
+  }
+  if (@known[$next]) {
+    @oncpu[$next] = 1;
+    @last_switch_in_ns[$next] = nsecs;
+  }
+
+  if (@known[$next] && !@active_successor[$next] && @waiting[$next] &&
+      @seq[$next] > @successor_seq) {
+    @later_waiter_switches = @later_waiter_switches + 1;
+  }
+}
+
+uprobe:__BIN__:trace_mcs_acquire /pid == __PID__ && @active && arg3 == @sample_id/
+{
+  $acquire_ns = nsecs;
+  $handoff_gap_ns = $acquire_ns - @release_ns;
+  $handoff_gap_us = $handoff_gap_ns / 1000;
+  $dispatch_delay_ns = (uint64)0;
+
+  if (@successor_oncpu == 0 && @last_switch_in_ns[tid] > @release_ns) {
+    $dispatch_delay_ns = @last_switch_in_ns[tid] - @release_ns;
+  }
+  $dispatch_delay_us = $dispatch_delay_ns / (uint64)1000;
+
+  @completed = @completed + 1;
+  @handoff_gap_us[$handoff_gap_us] = @handoff_gap_us[$handoff_gap_us] + 1;
+  @dispatch_us[$dispatch_delay_us] = @dispatch_us[$dispatch_delay_us] + 1;
+
+  if (@successor_oncpu == 0) {
+    @offcpu_completed = @offcpu_completed + 1;
+    @offcpu_dispatch_us[$dispatch_delay_us] =
+        @offcpu_dispatch_us[$dispatch_delay_us] + 1;
+  }
+
+  if (@later_waiter_switches > 0) {
+    @later_handoffs = @later_handoffs + 1;
+  }
+  @later_switch_sum = @later_switch_sum + @later_waiter_switches;
+
+  @active = 0;
+  delete(@active_successor[(uint64)tid]);
+}
+
+END
+{
+  printf("summary,sampled_handoffs,%llu\n", @completed);
+  printf("summary,successor_offcpu_count,%llu\n", @offcpu_completed);
+  printf("summary,later_waiter_handoff_count,%llu\n", @later_handoffs);
+  printf("summary,later_waiter_switch_sum,%llu\n", @later_switch_sum);
+  print(@handoff_gap_us);
+  print(@dispatch_us);
+  print(@offcpu_dispatch_us);
+  clear(@known);
+  clear(@worker);
+  clear(@waiting);
+  clear(@seq);
+  clear(@oncpu);
+  clear(@last_switch_in_ns);
+  clear(@active_successor);
+  clear(@handoff_gap_us);
+  clear(@dispatch_us);
+  clear(@offcpu_dispatch_us);
+  clear(@active);
+  clear(@completed);
+  clear(@offcpu_completed);
+  clear(@later_handoffs);
+  clear(@later_switch_sum);
+  clear(@later_waiter_switches);
+  clear(@sample_id);
+  clear(@release_ns);
+  clear(@owner_tid);
+  clear(@successor_tid);
+  clear(@successor_seq);
+  clear(@successor_oncpu);
+}

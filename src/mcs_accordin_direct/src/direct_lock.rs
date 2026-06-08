@@ -8,6 +8,7 @@ use accordin_shared::lock_backend::LockBackend;
 #[repr(C)]
 pub struct mcs_accordin_direct_mutex {
     lock: crate::mcs::McsLockRaw,
+    lock_id: u32,
 }
 
 struct ThreadCtxGuard;
@@ -41,22 +42,28 @@ fn ensure_registered() {
 }
 
 #[inline(always)]
-fn lock_with_stats(lock: &crate::mcs::McsLockRaw) {
-    if !accordin_shared::admission::token_consumed() && lock.try_lock() {
-        accordin_shared::lock_stats::record_lock_acquired();
+fn lock_with_stats(lock: &crate::mcs::McsLockRaw, lock_id: u32) {
+    let scope = accordin_shared::admission::begin_lock_scope(lock_id);
+    if !accordin_shared::admission::token_consumed_for_scope(scope) && lock.try_lock() {
+        accordin_shared::lock_stats::record_lock_acquired_for_scope(scope);
         return;
     }
 
     let wait_start = accordin_shared::lock_stats::record_wait_start();
+    if accordin_shared::admission::mark_slow_path_pending_for_scope(scope) {
+        std::thread::yield_now();
+        accordin_shared::admission::clear_token_consumed_for_scope(scope);
+    }
     lock.lock();
     accordin_shared::lock_stats::record_wait_end(wait_start);
-    accordin_shared::lock_stats::record_lock_acquired();
+    accordin_shared::lock_stats::record_lock_acquired_for_scope(scope);
 }
 
 #[inline(always)]
-fn unlock_with_stats(lock: &crate::mcs::McsLockRaw) {
+fn unlock_with_stats(lock: &crate::mcs::McsLockRaw, lock_id: u32) {
     let hold_end = accordin_shared::lock_stats::record_hold_end_sample();
     lock.unlock();
+    accordin_shared::admission::finish_lock_scope(lock_id);
     accordin_shared::lock_stats::record_post_unlock(hold_end);
 }
 
@@ -74,6 +81,7 @@ unsafe fn mutex_ref<'a>(
 pub extern "C" fn mcs_accordin_direct_mutex_create() -> *mut mcs_accordin_direct_mutex {
     Box::into_raw(Box::new(mcs_accordin_direct_mutex {
         lock: crate::mcs::McsLockRaw::new(),
+        lock_id: accordin_shared::admission::allocate_lock_id(),
     }))
 }
 
@@ -99,7 +107,7 @@ pub unsafe extern "C" fn mcs_accordin_direct_mutex_lock(
     };
 
     ensure_registered();
-    lock_with_stats(&mutex.lock);
+    lock_with_stats(&mutex.lock, mutex.lock_id);
     0
 }
 
@@ -114,7 +122,7 @@ pub unsafe extern "C" fn mcs_accordin_direct_mutex_trylock(
 
     ensure_registered();
     if mutex.lock.try_lock() {
-        accordin_shared::lock_stats::record_lock_acquired();
+        accordin_shared::lock_stats::record_lock_acquired_for_lock(mutex.lock_id);
         0
     } else {
         libc::EBUSY
@@ -130,7 +138,7 @@ pub unsafe extern "C" fn mcs_accordin_direct_mutex_unlock(
         Err(ret) => return ret,
     };
 
-    unlock_with_stats(&mutex.lock);
+    unlock_with_stats(&mutex.lock, mutex.lock_id);
     0
 }
 
@@ -190,6 +198,41 @@ mod tests {
             assert_eq!(mcs_accordin_direct_mutex_unlock(mutex), 0);
             assert_eq!(mcs_accordin_direct_mutex_destroy(mutex), 0);
         }
+    }
+
+    #[test]
+    fn direct_mutexes_encode_distinct_managed_lock_ids() {
+        accordin_shared::admission::reset_thread_depth_for_test();
+        accordin_shared::admission::reset_state();
+
+        let first = mcs_accordin_direct_mutex_create();
+        let second = mcs_accordin_direct_mutex_create();
+        assert!(!first.is_null());
+        assert!(!second.is_null());
+
+        unsafe {
+            assert_eq!(mcs_accordin_direct_mutex_lock(first), 0);
+            let first_lock_id = accordin_shared::admission::word_for_test()
+                >> accordin_shared::admission::USER_ADMISSION_LOCK_ID_SHIFT;
+            assert_ne!(first_lock_id, accordin_shared::admission::UNMANAGED_LOCK_ID);
+            assert_eq!(mcs_accordin_direct_mutex_unlock(first), 0);
+
+            assert_eq!(mcs_accordin_direct_mutex_lock(second), 0);
+            let second_lock_id = accordin_shared::admission::word_for_test()
+                >> accordin_shared::admission::USER_ADMISSION_LOCK_ID_SHIFT;
+            assert_ne!(
+                second_lock_id,
+                accordin_shared::admission::UNMANAGED_LOCK_ID
+            );
+            assert_ne!(first_lock_id, second_lock_id);
+            assert_eq!(mcs_accordin_direct_mutex_unlock(second), 0);
+
+            assert_eq!(mcs_accordin_direct_mutex_destroy(first), 0);
+            assert_eq!(mcs_accordin_direct_mutex_destroy(second), 0);
+        }
+
+        accordin_shared::admission::reset_thread_depth_for_test();
+        accordin_shared::admission::reset_state();
     }
 
     #[test]

@@ -14,5 +14,4 @@ mod mcs;
 accordin_shared::define_scheduler_loader!(
     scheduler_name = "mcs_accordin_direct",
     env_prefix = "MCS_ACCORDIN_DIRECT",
-    single_lock_mode = true,
 );

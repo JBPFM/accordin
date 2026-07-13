@@ -237,7 +237,12 @@ fn mark_slow_path_pending_for_lock_with_admission_enabled(lock_id: u32, enabled:
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
-            word_with_lock_id(lock_id, flags(value) | SLOW_PATH_PENDING)
+            let preserved_flags = if user_lock_id_for_value(value) == lock_id {
+                flags(value) & TOKEN_CONSUMED
+            } else {
+                0
+            };
+            word_with_lock_id(lock_id, preserved_flags | SLOW_PATH_PENDING)
         } else {
             word_with_lock_id(
                 lock_id,
@@ -613,6 +618,26 @@ mod tests {
         clear_token_consumed_for_scope(second);
         assert!(!token_consumed_for_scope(second));
         assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn slow_path_for_different_lock_drops_consumed_token() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let first = begin_lock_scope(4);
+        assert!(mark_slow_path_pending_for_scope(first));
+        mark_critical_section_entered_for_scope(first);
+        finish_lock_scope(4);
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
+
+        let second = begin_lock_scope(5);
+        assert!(!token_consumed_for_scope(second));
+        assert!(mark_slow_path_pending_for_scope(second));
+
+        assert_eq!(word_for_test(), word_for(5, SLOW_PATH_PENDING));
 
         reset_thread_depth_for_test();
     }

@@ -47,7 +47,7 @@ macro_rules! define_scheduler_loader {
         fn init_scheduler(
             debug: bool,
             stats_only: bool,
-            _debug_counters: bool,
+            debug_counters: bool,
         ) -> ::anyhow::Result<SchedulerState> {
             let mut skel_builder = BpfSkelBuilder::default();
             skel_builder.obj_builder.debug(debug);
@@ -59,6 +59,7 @@ macro_rules! define_scheduler_loader {
             if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
                 bss.stats_only_mode = u32::from(stats_only);
                 bss.single_lock_mode = u32::from($single_lock_mode);
+                bss.debug_counters_mode = u32::from(debug_counters);
                 bss.registered_thread_count = 0;
                 bss.inactive_previous_lock_percent = $crate::env::env_u32_clamped(
                     INACTIVE_PREVIOUS_LOCK_PERCENT_ENV,
@@ -139,14 +140,8 @@ macro_rules! define_scheduler_loader {
                         eprintln!("[{}] single-lock BPF mode enabled", SCHEDULER_NAME);
                     }
                     if debug_counters {
-                        ::log::info!(
-                            "{SCHEDULER_NAME} debug-counter env {} requested but ignored by minimal BPF controller",
-                            DEBUG_COUNTERS_ENV
-                        );
-                        eprintln!(
-                            "[{}] debug-counter env {} requested but ignored by minimal BPF controller",
-                            SCHEDULER_NAME, DEBUG_COUNTERS_ENV
-                        );
+                        ::log::info!("{SCHEDULER_NAME} BPF debug counters enabled");
+                        eprintln!("[{}] BPF debug counters enabled", SCHEDULER_NAME);
                     }
                     eprintln!("[{}] eBPF scheduler loaded successfully", SCHEDULER_NAME);
                     state

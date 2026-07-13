@@ -4,6 +4,8 @@ accordin_shared::define_mcs_lock!(4);
 mod tests {
     use std::cell::UnsafeCell;
     use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::{McsLockRaw, Node};
     use crate::lock_backend::LockBackend;
@@ -59,6 +61,39 @@ mod tests {
         }
 
         assert_eq!(unsafe { *shared.value.get() }, 40_000);
+    }
+
+    #[test]
+    fn raw_lock_slow_path_does_not_write_admission_word() {
+        crate::admission::reset_state();
+        crate::admission::reset_thread_depth_for_test();
+
+        let lock = Arc::new(McsLockRaw::new());
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let holder_lock = Arc::clone(&lock);
+        let holder = std::thread::spawn(move || {
+            holder_lock.lock();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            holder_lock.unlock();
+        });
+
+        locked_rx.recv().unwrap();
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            release_tx.send(()).unwrap();
+        });
+
+        lock.lock();
+        assert_eq!(crate::admission::word_for_test(), 0);
+        lock.unlock();
+        assert_eq!(crate::admission::word_for_test(), 0);
+
+        release.join().unwrap();
+        holder.join().unwrap();
     }
 
     #[test]

@@ -34,6 +34,7 @@ struct {
 
 volatile __u32 stats_only_mode = 0;
 volatile __u32 single_lock_mode = 0;
+volatile __u32 debug_counters_mode = 0;
 volatile __u32 cpu_admission_owner[MAX_CPUS];
 volatile __u32 cpu_last_inactive_lock[MAX_CPUS];
 volatile __u32 cpu_inactive_dispatch_count[MAX_CPUS];
@@ -43,6 +44,16 @@ volatile __u32 inactive_empty_seq;
 volatile __u32 normal_enqueue_seq;
 volatile __u32 normal_empty_seq;
 volatile __u32 registered_thread_count;
+volatile __u64 dispatch_calls;
+volatile __u64 dispatch_normal_skip_seq;
+volatile __u64 dispatch_normal_attempts;
+volatile __u64 dispatch_normal_success;
+volatile __u64 dispatch_normal_empty;
+volatile __u64 dispatch_inactive_unavailable;
+volatile __u64 dispatch_inactive_budget_blocked;
+volatile __u64 dispatch_inactive_attempts;
+volatile __u64 dispatch_inactive_success;
+volatile __u64 dispatch_inactive_empty;
 volatile __u64 dbg_acct_calls = 0;
 volatile __u64 dbg_acct_read_ok = 0;
 

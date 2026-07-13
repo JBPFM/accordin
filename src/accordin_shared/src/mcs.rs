@@ -1,6 +1,6 @@
 /// Emits an MCS lock implementation with a fixed-capacity per-thread node pool.
 ///
-/// The macro expects `crate::admission`, `crate::arch::{CacheAligned, pause}`, and
+/// The macro expects `crate::arch::{CacheAligned, pause}` and
 /// `crate::lock_backend::LockBackend` to be in scope.
 ///
 /// # Parameters
@@ -12,10 +12,6 @@ macro_rules! define_mcs_lock {
         use std::ptr;
         use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-        use $crate::admission::{
-            clear_token_consumed, mark_critical_section_entered, mark_critical_section_exit,
-            mark_slow_path_pending,
-        };
         use $crate::arch::{CacheAligned, pause};
         use $crate::lock_backend::LockBackend;
 
@@ -138,18 +134,9 @@ macro_rules! define_mcs_lock {
                 });
             }
 
-            #[inline(always)]
-            fn ensure_slow_path_admission(&self) {
-                mark_slow_path_pending();
-                std::thread::yield_now();
-                clear_token_consumed();
-            }
-
             #[cfg_attr(feature = "perf-symbols", inline(never))]
             #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
             fn lock_queue(&self) {
-                self.ensure_slow_path_admission();
-
                 let my_node = self.acquire_thread_node(true);
                 let pred = self.tail.0.swap(my_node, Ordering::AcqRel);
                 if !pred.is_null() {
@@ -160,8 +147,6 @@ macro_rules! define_mcs_lock {
                         }
                     }
                 }
-
-                mark_critical_section_entered();
             }
 
             #[cfg_attr(feature = "perf-symbols", inline(never))]
@@ -202,7 +187,6 @@ macro_rules! define_mcs_lock {
                         )
                         .is_ok()
                     {
-                        mark_critical_section_exit();
                         self.release_thread_node(my_node);
                         return;
                     }
@@ -218,7 +202,6 @@ macro_rules! define_mcs_lock {
                 unsafe {
                     (*succ).locked.store(false, Ordering::Release);
                 }
-                mark_critical_section_exit();
                 self.release_thread_node(my_node);
             }
         }

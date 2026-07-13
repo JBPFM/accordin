@@ -19,8 +19,16 @@
 #define USER_ADMISSION_LOCK_ID_SHIFT 3U
 #define MAX_LOCK_CLASSES 16U
 #define UNMANAGED_LOCK_ID 0U
-#define INACTIVE_PREVIOUS_LOCK_PERCENT_DEFAULT 80U
+#define INACTIVE_PREVIOUS_LOCK_PERCENT_DEFAULT 0U
 #define INACTIVE_DISPATCH_BURST 256U
+
+#define ENQ_PATH_UNKNOWN 0U
+#define ENQ_PATH_NORMAL_DSQ 1U
+#define ENQ_PATH_NORMAL_LOCAL_FAST 2U
+#define ENQ_PATH_ADMISSION_LOCAL 3U
+#define ENQ_PATH_SLOW_GRANTED_LOCAL 4U
+#define ENQ_PATH_SLOW_INACTIVE 5U
+#define ENQ_PATH_FORCE_INACTIVE 6U
 
 struct task_scx_ctx {
   unsigned int initialized;
@@ -28,6 +36,11 @@ struct task_scx_ctx {
   unsigned int admission_cpu;
   unsigned int must_run_on_admission_cpu;
   unsigned int force_inactive_wait;
+  unsigned int last_enqueue_path;
+  unsigned int last_enqueue_lock_id;
+  unsigned int last_enqueue_cpu;
+  unsigned int last_user_ctx_word;
+  unsigned long long last_enqueue_dsq;
   unsigned long long
       user_ctx_ptr; /* cached pointer to user-space admission word */
 };

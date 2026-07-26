@@ -1,27 +1,19 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::env;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::admission;
+use crate::admission::{self, CLASS_COUNT, UNMANAGED_LOCK_ID};
 use crate::arch::{
-    wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns, wait_time_total_to_ns,
+    CacheAligned, wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns,
+    wait_time_total_to_ns,
 };
 use crate::cpu_affinity;
-use crate::mutex_hook;
+use crate::width_control;
 
 const SAMPLE_STRIDE_ENV: &str = "ACCORDIN_SAMPLE_STRIDE";
-const DYNAMIC_CPU_WINDOW_NS_ENV: &str = "ACCORDIN_DYNAMIC_CPU_WINDOW_NS";
 
 const DEFAULT_SAMPLE_STRIDE: u64 = 8;
-const DEFAULT_DYNAMIC_CPU_WINDOW_NS: u64 = 10_000_000;
-const DYNAMIC_CPU_CRITICAL_EWMA_ALPHA: f64 = 0.5;
-const DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA: f64 = 0.1;
-const DYNAMIC_CPU_MAX_TARGET_MULTIPLIER: usize = 8;
-const DYNAMIC_CPU_LOW_LOAD_BYPASS_MIN_FLOOR: usize = 8;
-const DYNAMIC_CPU_LOW_LOAD_BYPASS_MULTIPLIER: usize = 2;
-const DYNAMIC_CPU_MULTICORE_CRITICAL_PENALTY_NS: f64 = 50.0;
-const DYNAMIC_CPU_CROSS_NUMA_CRITICAL_PENALTY_NS: f64 = 200.0;
 
 /// Per-thread lock statistics storage used by print_process_stats.
 #[repr(C)]
@@ -70,8 +62,8 @@ struct ThreadStatsAux {
     outside_unlock_sample: u64,
     outside_wait_start_sample: u64,
     outside_wait_total: u64,
-    dynamic_sample_pending: bool,
-    dynamic_pending_outside_ns: u64,
+    class_sample_armed: bool,
+    class_hold_start_sample: u64,
 }
 
 impl ThreadStatsAux {
@@ -96,8 +88,8 @@ impl ThreadStatsAux {
             outside_unlock_sample: 0,
             outside_wait_start_sample: 0,
             outside_wait_total: 0,
-            dynamic_sample_pending: false,
-            dynamic_pending_outside_ns: 0,
+            class_sample_armed: false,
+            class_hold_start_sample: 0,
         }
     }
 }
@@ -105,16 +97,38 @@ impl ThreadStatsAux {
 #[derive(Default)]
 struct WindowControlState {
     last_dynamic_cpu_count: Option<usize>,
-    target_cpu_floor: Option<usize>,
-    target_cpu_limit: Option<usize>,
-    critical_ewma_ns: Option<f64>,
-    outside_ewma_ns: Option<f64>,
-    frozen: bool,
+}
+
+/// Per-class critical-section and non-critical-section accumulators consumed by
+/// the width controller. Each class occupies its own cache line to avoid false
+/// sharing between classes updated by different threads.
+#[repr(C)]
+struct ClassStats {
+    cs_sum_ns: AtomicU64,
+    cs_count: AtomicU64,
+    ncs_sum_ns: AtomicU64,
+    ncs_count: AtomicU64,
+    acquires: AtomicU64,
+}
+
+impl ClassStats {
+    const fn new() -> Self {
+        Self {
+            cs_sum_ns: AtomicU64::new(0),
+            cs_count: AtomicU64::new(0),
+            ncs_sum_ns: AtomicU64::new(0),
+            ncs_count: AtomicU64::new(0),
+            acquires: AtomicU64::new(0),
+        }
+    }
 }
 
 thread_local! {
     static THREAD_CTX: UnsafeCell<LockSchedThreadCtx> = const { UnsafeCell::new(LockSchedThreadCtx::new()) };
     static THREAD_AUX: UnsafeCell<ThreadStatsAux> = const { UnsafeCell::new(ThreadStatsAux::new()) };
+    static THREAD_LAST_UNLOCK: [Cell<u64>; CLASS_COUNT] =
+        const { [const { Cell::new(0) }; CLASS_COUNT] };
+    static THREAD_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 static PROCESS_THREAD_ELAPSED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -124,11 +138,8 @@ static PROCESS_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROCESS_OUTSIDE_GAP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PROCESS_OUTSIDE_GAP_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
-static PROCESS_CS_SUM_NS: AtomicU64 = AtomicU64::new(0);
-static PROCESS_CS_COUNT: AtomicU64 = AtomicU64::new(0);
-static PROCESS_NCS_SUM_NS: AtomicU64 = AtomicU64::new(0);
-static PROCESS_NCS_COUNT: AtomicU64 = AtomicU64::new(0);
-static DYNAMIC_CPU_LAST_TICK_NS: AtomicU64 = AtomicU64::new(0);
+static CLASS_STATS: [CacheAligned<ClassStats>; CLASS_COUNT] =
+    [const { CacheAligned(ClassStats::new()) }; CLASS_COUNT];
 
 /// Returns a pointer to the current thread's stats context.
 pub fn thread_ctx() -> *mut LockSchedThreadCtx {
@@ -138,6 +149,152 @@ pub fn thread_ctx() -> *mut LockSchedThreadCtx {
 #[inline(always)]
 fn thread_aux() -> *mut ThreadStatsAux {
     THREAD_AUX.with(|aux| aux.get())
+}
+
+/// Enters a lock scope for outermost attribution and reports whether this is the
+/// outermost scope (the thread held nothing). Mirrors the depth guard used by
+/// `admission::finish_lock_scope`.
+#[inline(always)]
+fn enter_lock_scope_depth() -> bool {
+    THREAD_LOCK_DEPTH.with(|depth| {
+        let held = depth.get();
+        depth.set(held.saturating_add(1));
+        held == 0
+    })
+}
+
+/// Exits a lock scope and reports whether it was the outermost one.
+#[inline(always)]
+fn exit_lock_scope_depth() -> bool {
+    THREAD_LOCK_DEPTH.with(|depth| {
+        let held = depth.get();
+        if held == 0 {
+            return false;
+        }
+        depth.set(held - 1);
+        held == 1
+    })
+}
+
+#[cfg(test)]
+fn last_unlock_sample(class: u32) -> u64 {
+    if class == UNMANAGED_LOCK_ID {
+        return 0;
+    }
+    THREAD_LAST_UNLOCK.with(|slots| slots.get(class as usize).map_or(0, Cell::get))
+}
+
+/// Stores the class's unlock timestamp and returns the one it replaced, so the
+/// attribution path reaches thread-local storage once instead of twice.
+#[inline(always)]
+fn replace_last_unlock_sample(class: u32, sample: u64) -> u64 {
+    if class == UNMANAGED_LOCK_ID {
+        return 0;
+    }
+    THREAD_LAST_UNLOCK.with(|slots| {
+        slots
+            .get(class as usize)
+            .map_or(0, |slot| slot.replace(sample))
+    })
+}
+
+/// Non-critical-section gap between a class's previous unlock and its next
+/// acquire, in raw timing units. `None` when the class has no prior unlock.
+#[inline(always)]
+fn last_unlock_gap_sample(previous_unlock: u64, acquire_sample: u64) -> Option<u64> {
+    (previous_unlock != 0).then(|| acquire_sample.saturating_sub(previous_unlock))
+}
+
+#[inline(always)]
+fn class_stats(class: u32) -> Option<&'static ClassStats> {
+    if class == UNMANAGED_LOCK_ID {
+        return None;
+    }
+    CLASS_STATS.get(class as usize).map(|aligned| &aligned.0)
+}
+
+/// Accumulates one per-class sample. The critical section is always present; the
+/// non-critical section is contributed only when a prior unlock of the class was
+/// observed. Index 0 (unmanaged) is dropped. Reports whether it was accounted.
+#[inline(always)]
+fn record_class_sample(class: u32, critical_ns: u64, outside_ns: Option<u64>) -> bool {
+    let Some(stats) = class_stats(class) else {
+        return false;
+    };
+    stats.cs_sum_ns.fetch_add(critical_ns, Ordering::Relaxed);
+    stats.cs_count.fetch_add(1, Ordering::Relaxed);
+    stats.acquires.fetch_add(1, Ordering::Relaxed);
+    if let Some(outside_ns) = outside_ns {
+        stats.ncs_sum_ns.fetch_add(outside_ns, Ordering::Relaxed);
+        stats.ncs_count.fetch_add(1, Ordering::Relaxed);
+    }
+    true
+}
+
+/// Monotonic count of samples attributed to a class. Drives the controller's
+/// full-window gate and survives `take_class_sample_averages`.
+pub fn class_acquires(class: u32) -> u64 {
+    class_stats(class).map_or(0, |stats| stats.acquires.load(Ordering::Relaxed))
+}
+
+/// Swaps out and averages one class's critical and non-critical accumulators.
+/// The monotonic `acquires` counter is preserved for exit reporting. Consumed by
+/// the width controller.
+pub fn take_class_sample_averages(class: u32) -> Option<(f64, f64)> {
+    let stats = class_stats(class)?;
+    let cs_count = stats.cs_count.swap(0, Ordering::Relaxed);
+    let ncs_count = stats.ncs_count.swap(0, Ordering::Relaxed);
+    let cs_sum_ns = stats.cs_sum_ns.swap(0, Ordering::Relaxed);
+    let ncs_sum_ns = stats.ncs_sum_ns.swap(0, Ordering::Relaxed);
+    class_sample_averages(cs_sum_ns, cs_count, ncs_sum_ns, ncs_count)
+}
+
+fn class_sample_averages(
+    cs_sum_ns: u64,
+    cs_count: u64,
+    ncs_sum_ns: u64,
+    ncs_count: u64,
+) -> Option<(f64, f64)> {
+    if cs_count == 0 || ncs_count == 0 {
+        return None;
+    }
+
+    Some((
+        cs_sum_ns as f64 / cs_count as f64,
+        ncs_sum_ns as f64 / ncs_count as f64,
+    ))
+}
+
+/// Attributes the outermost critical section and its per-lock non-critical
+/// section to `class`, then refreshes the class's last-unlock timestamp so the
+/// next acquire can measure its gap. Reports whether a sample was recorded.
+/// Only invoked on outermost unlocks.
+///
+/// The non-critical section must exclude queueing, otherwise the
+/// `1 + ncs / cs` model measures the very contention it is meant to size:
+/// `wait_sample` is the time this acquire spent waiting for the lock and is
+/// removed from the gap. Time spent under other locks stays in the gap and
+/// biases the estimate high, which the occupancy feedback and the CPU budget
+/// then trim.
+#[inline(always)]
+fn attribute_outermost_class_sample(
+    aux: &mut ThreadStatsAux,
+    class: u32,
+    unlock_sample: u64,
+    wait_sample: u64,
+) -> bool {
+    let previous_unlock = replace_last_unlock_sample(class, unlock_sample);
+    if !aux.class_sample_armed {
+        return false;
+    }
+
+    let critical_ns = wait_time_elapsed_ns_between(aux.class_hold_start_sample, unlock_sample);
+    let outside_ns = last_unlock_gap_sample(previous_unlock, aux.class_hold_start_sample)
+        .map(|gap| wait_time_total_to_ns(gap.saturating_sub(wait_sample)));
+    let recorded = record_class_sample(class, critical_ns, outside_ns);
+    aux.class_sample_armed = false;
+    aux.class_hold_start_sample = 0;
+    recorded
 }
 
 fn first_env_string(key: &str) -> Option<String> {
@@ -157,17 +314,14 @@ fn parse_sample_stride(value: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_SAMPLE_STRIDE)
 }
 
-fn parse_dynamic_cpu_window_ns(value: Option<&str>) -> u64 {
-    value
-        .and_then(parse_positive_u64)
-        .unwrap_or(DEFAULT_DYNAMIC_CPU_WINDOW_NS)
-}
-
+/// Per-class sampling exists to feed the width controller, so the controller's
+/// master switch is its only source: with the feature off nothing is measured
+/// and no tick runs.
 #[inline(always)]
 fn sampling_enabled() -> bool {
     static SAMPLING_ENABLED: OnceLock<bool> = OnceLock::new();
 
-    *SAMPLING_ENABLED.get_or_init(cpu_affinity::configured_cpu_count_env_present)
+    *SAMPLING_ENABLED.get_or_init(width_control::enabled)
 }
 
 #[inline(always)]
@@ -176,15 +330,6 @@ fn sample_stride() -> u64 {
 
     *SAMPLE_STRIDE
         .get_or_init(|| parse_sample_stride(first_env_string(SAMPLE_STRIDE_ENV).as_deref()))
-}
-
-#[inline(always)]
-fn dynamic_cpu_window_ns() -> u64 {
-    static DYNAMIC_CPU_WINDOW_NS: OnceLock<u64> = OnceLock::new();
-
-    *DYNAMIC_CPU_WINDOW_NS.get_or_init(|| {
-        parse_dynamic_cpu_window_ns(first_env_string(DYNAMIC_CPU_WINDOW_NS_ENV).as_deref())
-    })
 }
 
 fn dynamic_cpu_control_state() -> &'static Mutex<WindowControlState> {
@@ -224,11 +369,6 @@ fn decide_operation_sampling_with_enabled(aux: &mut ThreadStatsAux, enabled: boo
 fn finish_operation_sampling(aux: &mut ThreadStatsAux) {
     aux.op_sample_decided = false;
     aux.op_sampled = false;
-}
-
-#[inline(always)]
-fn begin_outside_gap_sample(aux: &mut ThreadStatsAux) -> bool {
-    begin_outside_gap_sample_with_enabled(aux, sampling_enabled())
 }
 
 #[inline(always)]
@@ -293,6 +433,12 @@ fn reset_thread_measurement_state(ctx: &mut LockSchedThreadCtx, aux: &mut Thread
     ctx.hold_ns_total = 0;
     ctx.hold_start_ns = 0;
     ctx.lock_count = 0;
+    THREAD_LOCK_DEPTH.with(|depth| depth.set(0));
+    THREAD_LAST_UNLOCK.with(|slots| {
+        for slot in slots.iter() {
+            slot.set(0);
+        }
+    });
     admission::reset_transient_state();
 }
 
@@ -378,10 +524,55 @@ pub fn print_process_stats(label: &str) {
 
     if let Some(cpu_count) = cpu_affinity::current_dynamic_cpu_count() {
         println!("dynamic_cpu_affinity_cpus: {cpu_count}");
-        println!("dynamic_cpu_window_ns: {}", dynamic_cpu_window_ns());
-        println!("dynamic_cpu_critical_ewma_alpha: {DYNAMIC_CPU_CRITICAL_EWMA_ALPHA:.2}");
-        println!("dynamic_cpu_outside_ewma_alpha: {DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA:.2}");
     }
+
+    for (class, aligned) in CLASS_STATS.iter().enumerate().skip(1) {
+        let stats = &aligned.0;
+        let acquires = stats.acquires.load(Ordering::Relaxed);
+        if acquires == 0 {
+            continue;
+        }
+        let cs_count = stats.cs_count.load(Ordering::Relaxed);
+        let ncs_count = stats.ncs_count.load(Ordering::Relaxed);
+        let cs_sum_ns = stats.cs_sum_ns.load(Ordering::Relaxed);
+        let ncs_sum_ns = stats.ncs_sum_ns.load(Ordering::Relaxed);
+        let avg_cs_ns = if cs_count != 0 {
+            cs_sum_ns as f64 / cs_count as f64
+        } else {
+            0.0
+        };
+        let avg_ncs_ns = if ncs_count != 0 {
+            ncs_sum_ns as f64 / ncs_count as f64
+        } else {
+            0.0
+        };
+        // The controller drains the accumulators every tick, so avg_cs_ns and
+        // avg_ncs_ns cover only the residual window; its EWMAs carry the signal
+        // the widths were decided from.
+        let mut line = format!(
+            "class_stats: id={class} avg_cs_ns={avg_cs_ns:.2} avg_ncs_ns={avg_ncs_ns:.2} acquires={acquires}"
+        );
+        if let Some(report) = width_control::class_report(class as u32) {
+            let history = report
+                .history
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            line.push_str(&format!(
+                " width={} published_width={} seed={} width_changes={} ewma_cs_ns={:.2} ewma_ncs_ns={:.2} width_history={history}",
+                report.width,
+                report.published,
+                report.seed,
+                report.changes,
+                report.cs_ewma_ns,
+                report.ncs_ewma_ns,
+            ));
+        }
+        println!("{line}");
+    }
+
+    admission::dump_dependency_diagnostics();
 }
 
 #[inline(always)]
@@ -444,9 +635,12 @@ pub fn record_lock_acquired_for_scope(scope: admission::LockAdmissionScope) {
 
 #[inline(always)]
 fn record_lock_acquired_stats() {
+    let enabled = sampling_enabled();
+    let outermost = enabled && enter_lock_scope_depth();
+
     unsafe {
         let aux = &mut *thread_aux();
-        decide_operation_sampling(aux);
+        decide_operation_sampling_with_enabled(aux, enabled);
         if !aux.op_sampled {
             return;
         }
@@ -457,6 +651,13 @@ fn record_lock_acquired_stats() {
         let aux = &mut *thread_aux();
         ensure_thread_start_sample(aux, hold_start);
         aux.hold_start_sample = hold_start;
+
+        // Attribute the critical section and its per-lock non-critical section to
+        // the outermost scope only; nested inner acquisitions fold into it.
+        if outermost {
+            aux.class_hold_start_sample = hold_start;
+            aux.class_sample_armed = true;
+        }
 
         if aux.outside_sample_pending {
             let wait_total = if aux.wait_start_sample != 0 {
@@ -474,8 +675,6 @@ fn record_lock_acquired_stats() {
             let outside_total = outside_gap.saturating_sub(wait_total);
             aux.outside_gap_total += outside_total;
             aux.outside_gap_samples += 1;
-            aux.dynamic_sample_pending = true;
-            aux.dynamic_pending_outside_ns = wait_time_total_to_ns(outside_total);
 
             finish_outside_gap_sample(aux);
         }
@@ -492,10 +691,14 @@ pub fn record_hold_end_sample() -> u64 {
     wait_time_start()
 }
 
+/// Closes out one unlock. Takes the raw lock id rather than its class so the
+/// merge lookup happens only on the outermost unlock that actually attributes a
+/// sample, and so no lock backend has to remember to map the id itself.
 #[inline(always)]
-pub fn record_post_unlock(hold_end: u64) {
-    let dynamic_control_enabled = sampling_enabled();
-    let mut dynamic_control_now_ns = None;
+pub fn record_post_unlock(hold_end: u64, lock_id: u32) {
+    let enabled = sampling_enabled();
+    let outermost = enabled && exit_lock_scope_depth();
+    let mut tick_sample = 0;
 
     unsafe {
         let aux = &mut *thread_aux();
@@ -532,23 +735,12 @@ pub fn record_post_unlock(hold_end: u64) {
             aux.hold_sample_count += 1;
         }
 
-        if aux.dynamic_sample_pending {
-            if hold_end != 0 && aux.hold_start_sample != 0 {
-                record_dynamic_control_sample(
-                    wait_time_elapsed_ns_between(aux.hold_start_sample, hold_end),
-                    aux.dynamic_pending_outside_ns,
-                );
-            }
-            aux.dynamic_sample_pending = false;
-            aux.dynamic_pending_outside_ns = 0;
-        }
-
         aux.hold_start_sample = 0;
         finish_operation_sampling(aux);
 
-        let begin_next_sample = !aux.outside_sample_pending && begin_outside_gap_sample(aux);
-        let post_unlock_sample = if begin_next_sample || (dynamic_control_enabled && hold_end == 0)
-        {
+        let begin_next_sample =
+            !aux.outside_sample_pending && begin_outside_gap_sample_with_enabled(aux, enabled);
+        let post_unlock_sample = if begin_next_sample || (enabled && hold_end == 0) {
             wait_time_start()
         } else {
             hold_end
@@ -561,322 +753,22 @@ pub fn record_post_unlock(hold_end: u64) {
             aux.outside_wait_total = 0;
         }
 
-        if dynamic_control_enabled && post_unlock_sample != 0 {
-            dynamic_control_now_ns = Some(wait_time_to_ns(post_unlock_sample));
-        }
-    }
-
-    if let Some(now_ns) = dynamic_control_now_ns {
-        maybe_run_dynamic_cpu_control(now_ns);
-    }
-}
-
-#[inline(always)]
-fn record_dynamic_control_sample(critical_ns: u64, outside_ns: u64) {
-    PROCESS_CS_SUM_NS.fetch_add(critical_ns, Ordering::Relaxed);
-    PROCESS_NCS_SUM_NS.fetch_add(outside_ns, Ordering::Relaxed);
-    PROCESS_CS_COUNT.fetch_add(1, Ordering::Relaxed);
-    PROCESS_NCS_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
-fn maybe_run_dynamic_cpu_control(now_ns: u64) {
-    let window_ns = dynamic_cpu_window_ns();
-    let mut last_tick = DYNAMIC_CPU_LAST_TICK_NS.load(Ordering::Relaxed);
-
-    loop {
-        if last_tick == 0 {
-            match DYNAMIC_CPU_LAST_TICK_NS.compare_exchange(
-                0,
-                now_ns,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => {
-                    last_tick = actual;
-                    continue;
-                }
-            }
-        }
-
-        if now_ns.saturating_sub(last_tick) < window_ns {
-            return;
-        }
-
-        match DYNAMIC_CPU_LAST_TICK_NS.compare_exchange(
-            last_tick,
-            now_ns,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(actual) => last_tick = actual,
-        }
-    }
-
-    run_dynamic_cpu_control_tick();
-}
-
-fn run_dynamic_cpu_control_tick() {
-    let Some((critical_avg_ns, outside_avg_ns)) = take_dynamic_sample_averages() else {
-        return;
-    };
-
-    let mut control = dynamic_cpu_control_state()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if control.frozen {
-        return;
-    }
-
-    let current_cpu_count = control
-        .last_dynamic_cpu_count
-        .or_else(cpu_affinity::current_dynamic_cpu_count);
-    let target_cpu_floor = dynamic_cpu_target_floor(&mut control, current_cpu_count);
-    if let Some(low_load_target) = dynamic_cpu_low_load_bypass_target(
-        target_cpu_floor,
-        mutex_hook::registered_thread_count(),
-        cpu_affinity::current_available_cpu_count(),
-    ) {
-        control.critical_ewma_ns = None;
-        control.outside_ewma_ns = None;
-        apply_dynamic_cpu_count_update(&mut control, low_load_target);
-        return;
-    }
-
-    let target_cpu_limit = dynamic_cpu_target_limit(&mut control, current_cpu_count);
-    let Some(smoothed_target) = dynamic_cpu_target_from_penalized_components(
-        &mut control,
-        critical_avg_ns,
-        outside_avg_ns,
-        target_cpu_limit,
-        current_cpu_count,
-        cpu_affinity::current_first_numa_available_cpu_count(),
-    ) else {
-        return;
-    };
-    let bounded_target =
-        dynamic_cpu_target_bounded(smoothed_target, target_cpu_floor, target_cpu_limit);
-    let rounded_target = dynamic_cpu_count_from_target(bounded_target);
-
-    if dynamic_cpu_count_within_dead_zone(current_cpu_count, rounded_target) {
-        control.last_dynamic_cpu_count = current_cpu_count;
-        return;
-    }
-
-    apply_dynamic_cpu_count_update(&mut control, rounded_target);
-}
-
-fn apply_dynamic_cpu_count_update(control: &mut WindowControlState, requested_target: usize) {
-    match cpu_affinity::update_dynamic_cpu_count(requested_target) {
-        Ok(Some(update)) => {
-            control.last_dynamic_cpu_count = Some(update.applied_cpus);
-            if update.changed {
-                eprintln!(
-                    "[lock_stats] dynamic CPU affinity set to {} CPUs (requested {})",
-                    update.applied_cpus, update.requested_cpus
-                );
-            }
-        }
-        Ok(None) => {}
-        Err(error) => log_dynamic_cpu_affinity_error(&error),
-    }
-}
-
-fn take_dynamic_sample_averages() -> Option<(f64, f64)> {
-    let critical_count = PROCESS_CS_COUNT.swap(0, Ordering::Relaxed);
-    let outside_count = PROCESS_NCS_COUNT.swap(0, Ordering::Relaxed);
-    let critical_sum = PROCESS_CS_SUM_NS.swap(0, Ordering::Relaxed);
-    let outside_sum = PROCESS_NCS_SUM_NS.swap(0, Ordering::Relaxed);
-
-    dynamic_sample_averages(critical_sum, critical_count, outside_sum, outside_count)
-}
-
-fn dynamic_sample_averages(
-    critical_sum_ns: u64,
-    critical_count: u64,
-    outside_sum_ns: u64,
-    outside_count: u64,
-) -> Option<(f64, f64)> {
-    if critical_count == 0 || outside_count == 0 {
-        return None;
-    }
-
-    Some((
-        critical_sum_ns as f64 / critical_count as f64,
-        outside_sum_ns as f64 / outside_count as f64,
-    ))
-}
-
-fn dynamic_cpu_target_from_sample_averages(critical_ns: f64, outside_ns: f64) -> Option<f64> {
-    let valid_estimate =
-        critical_ns.is_finite() && outside_ns.is_finite() && critical_ns > 0.0 && outside_ns >= 0.0;
-    if !valid_estimate {
-        return None;
-    }
-
-    let target = 1.0 + outside_ns / critical_ns;
-    if !target.is_finite() {
-        return None;
-    }
-
-    Some(target)
-}
-
-fn dynamic_cpu_target_from_smoothed_components(
-    control: &mut WindowControlState,
-    critical_ns: f64,
-    outside_ns: f64,
-    target_cpu_limit: Option<usize>,
-) -> Option<f64> {
-    let valid_sample =
-        critical_ns.is_finite() && outside_ns.is_finite() && critical_ns > 0.0 && outside_ns >= 0.0;
-    if !valid_sample {
-        return None;
-    }
-
-    let target_cpu_limit = target_cpu_limit.map(|limit| limit.max(1) as f64);
-    let max_outside_to_critical_ratio = target_cpu_limit.map(|limit| (limit - 1.0).max(0.0));
-    let outside_ns = max_outside_to_critical_ratio
-        .map(|ratio| outside_ns.min(critical_ns * ratio))
-        .unwrap_or(outside_ns);
-
-    let critical_ewma_ns = next_ewma(
-        control.critical_ewma_ns,
-        critical_ns,
-        DYNAMIC_CPU_CRITICAL_EWMA_ALPHA,
-    );
-    let outside_ewma_ns = next_ewma(
-        control.outside_ewma_ns,
-        outside_ns,
-        DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA,
-    );
-    let outside_ewma_ns = max_outside_to_critical_ratio
-        .map(|ratio| outside_ewma_ns.min(critical_ewma_ns * ratio))
-        .unwrap_or(outside_ewma_ns);
-    let target = dynamic_cpu_target_from_sample_averages(critical_ewma_ns, outside_ewma_ns)?;
-    let target = target_cpu_limit
-        .map(|limit| target.min(limit))
-        .unwrap_or(target);
-
-    control.critical_ewma_ns = Some(critical_ewma_ns);
-    control.outside_ewma_ns = Some(outside_ewma_ns);
-    Some(target)
-}
-
-fn dynamic_cpu_target_from_penalized_components(
-    control: &mut WindowControlState,
-    critical_ns: f64,
-    outside_ns: f64,
-    target_cpu_limit: Option<usize>,
-    current_cpu_count: Option<usize>,
-    first_numa_available_cpu_count: Option<usize>,
-) -> Option<f64> {
-    let critical_ns = critical_ns
-        + dynamic_cpu_critical_penalty_ns(current_cpu_count, first_numa_available_cpu_count);
-    dynamic_cpu_target_from_smoothed_components(control, critical_ns, outside_ns, target_cpu_limit)
-}
-
-fn dynamic_cpu_critical_penalty_ns(
-    current_cpu_count: Option<usize>,
-    first_numa_available_cpu_count: Option<usize>,
-) -> f64 {
-    let Some(current_cpu_count) = current_cpu_count else {
-        return 0.0;
-    };
-    if current_cpu_count <= 1 {
-        return 0.0;
-    }
-
-    match first_numa_available_cpu_count {
-        Some(first_numa_available_cpu_count)
-            if first_numa_available_cpu_count > 0
-                && current_cpu_count > first_numa_available_cpu_count =>
+        if outermost
+            && attribute_outermost_class_sample(
+                aux,
+                admission::class_of(lock_id),
+                post_unlock_sample,
+                wait_total,
+            )
         {
-            DYNAMIC_CPU_CROSS_NUMA_CRITICAL_PENALTY_NS
+            tick_sample = post_unlock_sample;
         }
-        _ => DYNAMIC_CPU_MULTICORE_CRITICAL_PENALTY_NS,
-    }
-}
-
-fn dynamic_cpu_target_limit(
-    control: &mut WindowControlState,
-    current_cpu_count: Option<usize>,
-) -> Option<usize> {
-    if control.target_cpu_limit.is_none() {
-        control.target_cpu_limit = current_cpu_count.map(|count| {
-            count
-                .max(1)
-                .saturating_mul(DYNAMIC_CPU_MAX_TARGET_MULTIPLIER)
-        });
-    }
-    control.target_cpu_limit
-}
-
-fn dynamic_cpu_target_floor(
-    control: &mut WindowControlState,
-    current_cpu_count: Option<usize>,
-) -> Option<usize> {
-    if control.target_cpu_floor.is_none() {
-        control.target_cpu_floor = current_cpu_count.map(|count| count.max(1));
-    }
-    control.target_cpu_floor
-}
-
-fn dynamic_cpu_target_bounded(
-    target: f64,
-    target_cpu_floor: Option<usize>,
-    target_cpu_limit: Option<usize>,
-) -> f64 {
-    let target = target_cpu_floor
-        .map(|floor| target.max(floor.max(1) as f64))
-        .unwrap_or(target);
-    target_cpu_limit
-        .map(|limit| target.min(limit.max(1) as f64))
-        .unwrap_or(target)
-}
-
-fn dynamic_cpu_low_load_bypass_target(
-    target_cpu_floor: Option<usize>,
-    registered_thread_count: usize,
-    available_cpu_count: Option<usize>,
-) -> Option<usize> {
-    let floor = target_cpu_floor?;
-    let available_cpu_count = available_cpu_count?;
-    if floor < DYNAMIC_CPU_LOW_LOAD_BYPASS_MIN_FLOOR
-        || registered_thread_count == 0
-        || available_cpu_count <= floor
-    {
-        return None;
     }
 
-    let bypass_limit = floor.saturating_mul(DYNAMIC_CPU_LOW_LOAD_BYPASS_MULTIPLIER);
-    (registered_thread_count <= bypass_limit).then_some(available_cpu_count)
-}
-
-fn next_ewma(previous: Option<f64>, value: f64, alpha: f64) -> f64 {
-    match previous {
-        Some(previous) => alpha * value + (1.0 - alpha) * previous,
-        None => value,
-    }
-}
-
-fn dynamic_cpu_count_from_target(target: f64) -> usize {
-    target.round().clamp(1.0, usize::MAX as f64) as usize
-}
-
-fn dynamic_cpu_count_within_dead_zone(
-    current_cpu_count: Option<usize>,
-    candidate_cpu_count: usize,
-) -> bool {
-    current_cpu_count.is_some_and(|current| current.abs_diff(candidate_cpu_count) <= 1)
-}
-
-fn log_dynamic_cpu_affinity_error(error: &str) {
-    static DYNAMIC_AFFINITY_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
-
-    if !DYNAMIC_AFFINITY_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
-        eprintln!("[lock_stats] dynamic CPU affinity update failed: {error}");
+    // The controller rides the class-sampling path: a tick only ever fires on
+    // an unlock that just contributed fresh per-class evidence.
+    if tick_sample != 0 {
+        width_control::maybe_run_tick(tick_sample);
     }
 }
 
@@ -899,7 +791,6 @@ pub fn dynamic_cpu_affinity_freeze() {
     let mut control = dynamic_cpu_control_state()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    control.frozen = true;
     if control.last_dynamic_cpu_count.is_none() {
         control.last_dynamic_cpu_count = cpu_affinity::current_dynamic_cpu_count();
     }
@@ -922,19 +813,41 @@ pub fn dynamic_cpu_affinity_begin_measurement_for_thread() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
+    use crate::arch::wait_time_total_to_ns;
+
     use super::{
-        DEFAULT_SAMPLE_STRIDE, DYNAMIC_CPU_CRITICAL_EWMA_ALPHA, DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA,
-        ThreadStatsAux, WindowControlState, advance_periodic_sample,
-        begin_outside_gap_sample_with_enabled, decide_operation_sampling_with_enabled,
-        dynamic_cpu_count_from_target, dynamic_cpu_count_within_dead_zone,
-        dynamic_cpu_critical_penalty_ns, dynamic_cpu_low_load_bypass_target,
-        dynamic_cpu_target_bounded, dynamic_cpu_target_floor,
-        dynamic_cpu_target_from_penalized_components, dynamic_cpu_target_from_sample_averages,
-        dynamic_cpu_target_from_smoothed_components, dynamic_cpu_target_limit,
-        dynamic_sample_averages, finish_outside_gap_sample, next_ewma, parse_dynamic_cpu_window_ns,
-        parse_sample_stride, record_lock_acquired, record_post_unlock,
-        refresh_thread_elapsed_for_aux,
+        DEFAULT_SAMPLE_STRIDE, THREAD_LAST_UNLOCK, THREAD_LOCK_DEPTH, ThreadStatsAux,
+        advance_periodic_sample, attribute_outermost_class_sample,
+        begin_outside_gap_sample_with_enabled, class_sample_averages, class_stats,
+        decide_operation_sampling_with_enabled, enter_lock_scope_depth, exit_lock_scope_depth,
+        finish_outside_gap_sample, last_unlock_gap_sample, last_unlock_sample, parse_sample_stride,
+        record_class_sample, record_lock_acquired, record_post_unlock,
+        refresh_thread_elapsed_for_aux, replace_last_unlock_sample, take_class_sample_averages,
     };
+
+    fn reset_class_stats(class: u32) {
+        if let Some(stats) = class_stats(class) {
+            stats.cs_sum_ns.store(0, Ordering::Relaxed);
+            stats.cs_count.store(0, Ordering::Relaxed);
+            stats.ncs_sum_ns.store(0, Ordering::Relaxed);
+            stats.ncs_count.store(0, Ordering::Relaxed);
+            stats.acquires.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn reset_last_unlock() {
+        THREAD_LAST_UNLOCK.with(|slots| {
+            for slot in slots.iter() {
+                slot.set(0);
+            }
+        });
+    }
+
+    fn reset_lock_scope_depth() {
+        THREAD_LOCK_DEPTH.with(|depth| depth.set(0));
+    }
 
     #[test]
     fn refresh_thread_elapsed_tracks_raw_wait_time_units() {
@@ -982,13 +895,6 @@ mod tests {
     fn parse_sample_stride_accepts_positive_values() {
         assert_eq!(parse_sample_stride(Some("4")), 4);
         assert_eq!(parse_sample_stride(Some(" 16 ")), 16);
-    }
-
-    #[test]
-    fn parse_dynamic_window_uses_default_for_missing_or_invalid_values() {
-        assert_eq!(parse_dynamic_cpu_window_ns(None), 10_000_000);
-        assert_eq!(parse_dynamic_cpu_window_ns(Some("0")), 10_000_000);
-        assert_eq!(parse_dynamic_cpu_window_ns(Some("abc")), 10_000_000);
     }
 
     #[test]
@@ -1063,7 +969,7 @@ mod tests {
             };
         }
 
-        record_post_unlock(260);
+        record_post_unlock(260, 0);
 
         unsafe {
             assert_eq!((*aux).thread_elapsed_total, 160);
@@ -1095,7 +1001,7 @@ mod tests {
             };
         }
 
-        record_post_unlock(0);
+        record_post_unlock(0, 0);
 
         unsafe {
             assert_eq!((*aux).lock_count, 1);
@@ -1117,198 +1023,163 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_sample_averages_require_both_counts() {
+    fn class_sample_averages_require_both_counts() {
+        assert_eq!(class_sample_averages(300, 3, 600, 3), Some((100.0, 200.0)));
+        assert_eq!(class_sample_averages(300, 0, 600, 3), None);
+        assert_eq!(class_sample_averages(300, 3, 600, 0), None);
+    }
+
+    #[test]
+    fn class_samples_accumulate_independently() {
+        reset_class_stats(1);
+        reset_class_stats(2);
+
+        record_class_sample(1, 100, Some(400));
+        record_class_sample(1, 300, Some(600));
+        record_class_sample(2, 50, Some(50));
+
+        assert_eq!(take_class_sample_averages(1), Some((200.0, 500.0)));
+        assert_eq!(take_class_sample_averages(2), Some((50.0, 50.0)));
+    }
+
+    #[test]
+    fn unmanaged_class_sample_is_dropped() {
+        record_class_sample(0, 100, Some(200));
+
+        assert!(class_stats(0).is_none());
+        assert_eq!(take_class_sample_averages(0), None);
+    }
+
+    #[test]
+    fn class_sample_records_cs_always_and_ncs_only_when_present() {
+        reset_class_stats(3);
+
+        record_class_sample(3, 200, Some(300));
+        record_class_sample(3, 250, None);
+
+        let stats = class_stats(3).expect("managed class");
+        assert_eq!(stats.acquires.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.cs_count.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.cs_sum_ns.load(Ordering::Relaxed), 450);
+        assert_eq!(stats.ncs_count.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.ncs_sum_ns.load(Ordering::Relaxed), 300);
+    }
+
+    #[test]
+    fn take_class_sample_averages_resets_sums_and_keeps_acquires() {
+        reset_class_stats(4);
+
+        record_class_sample(4, 100, Some(200));
+        record_class_sample(4, 200, Some(400));
+
+        assert_eq!(take_class_sample_averages(4), Some((150.0, 300.0)));
+        // Second read observes reset sums and counts.
+        assert_eq!(take_class_sample_averages(4), None);
+
+        let stats = class_stats(4).expect("managed class");
+        assert_eq!(stats.cs_sum_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.cs_count.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.ncs_sum_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.ncs_count.load(Ordering::Relaxed), 0);
+        // acquires is monotonic for exit reporting and survives the swap.
+        assert_eq!(stats.acquires.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn nested_lock_scope_depth_reports_outermost_once() {
+        reset_lock_scope_depth();
+
+        assert!(enter_lock_scope_depth(), "outer acquire is outermost");
+        assert!(!enter_lock_scope_depth(), "inner acquire is not outermost");
+        assert!(!exit_lock_scope_depth(), "inner unlock is not outermost");
+        assert!(exit_lock_scope_depth(), "outer unlock is outermost");
+        assert!(!exit_lock_scope_depth(), "underflow stays non-outermost");
+    }
+
+    #[test]
+    fn per_lock_ncs_gap_is_none_without_prior_unlock() {
+        assert_eq!(last_unlock_gap_sample(0, 500), None);
+        assert_eq!(last_unlock_gap_sample(100, 500), Some(400));
+        // Saturating: an out-of-order acquire never reports a negative gap.
+        assert_eq!(last_unlock_gap_sample(600, 500), Some(0));
+    }
+
+    #[test]
+    fn per_lock_ncs_uses_prior_unlock_of_same_class_only() {
+        reset_last_unlock();
+
+        // Two uses of class 5 with an interleaved use of class 6.
+        replace_last_unlock_sample(5, 1_000);
+        replace_last_unlock_sample(6, 5_000);
+
+        // Class 5 re-acquire at 1_300: gap 300, unaffected by class 6.
+        let gap_five = last_unlock_gap_sample(last_unlock_sample(5), 1_300);
+        assert_eq!(gap_five, Some(300));
+
+        // Class 6 re-acquire at 5_500: its own gap of 500.
+        let gap_six = last_unlock_gap_sample(last_unlock_sample(6), 5_500);
+        assert_eq!(gap_six, Some(500));
+
+        // Unmanaged slot is never stored.
+        replace_last_unlock_sample(0, 123);
+        assert_eq!(last_unlock_sample(0), 0);
+    }
+
+    #[test]
+    fn per_lock_ncs_contributes_single_sample_equal_to_injected_gap() {
+        reset_last_unlock();
+        reset_class_stats(7);
+
+        // Prior unlock of class 7 at 2_000; interleaved class 8 must not corrupt it.
+        replace_last_unlock_sample(7, 2_000);
+        replace_last_unlock_sample(8, 9_000);
+
+        let gap = last_unlock_gap_sample(last_unlock_sample(7), 2_450)
+            .expect("prior unlock yields a gap");
+        assert_eq!(gap, 450);
+        record_class_sample(7, 111, Some(gap));
+
+        let stats = class_stats(7).expect("managed class");
+        assert_eq!(stats.ncs_count.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.ncs_sum_ns.load(Ordering::Relaxed), 450);
+    }
+
+    #[test]
+    fn per_lock_ncs_excludes_time_spent_waiting_for_the_lock() {
+        reset_last_unlock();
+        reset_class_stats(11);
+
+        let mut aux = ThreadStatsAux {
+            class_sample_armed: true,
+            class_hold_start_sample: 3_000,
+            ..ThreadStatsAux::new()
+        };
+        replace_last_unlock_sample(11, 1_000);
+
+        // A gap of 2_000 with 1_500 of it spent queueing leaves 500 of think time.
+        assert!(attribute_outermost_class_sample(&mut aux, 11, 3_400, 1_500));
+
+        let stats = class_stats(11).expect("managed class");
+        assert_eq!(stats.ncs_count.load(Ordering::Relaxed), 1);
         assert_eq!(
-            dynamic_sample_averages(300, 3, 600, 3),
-            Some((100.0, 200.0))
+            stats.ncs_sum_ns.load(Ordering::Relaxed),
+            wait_time_total_to_ns(500)
         );
-        assert_eq!(dynamic_sample_averages(300, 0, 600, 3), None);
-        assert_eq!(dynamic_sample_averages(300, 3, 600, 0), None);
+        assert_eq!(last_unlock_sample(11), 3_400);
     }
 
     #[test]
-    fn dynamic_cpu_target_uses_wait_ratio_formula() {
-        assert_eq!(
-            dynamic_cpu_target_from_sample_averages(100.0, 0.0),
-            Some(1.0)
-        );
-        assert_eq!(
-            dynamic_cpu_target_from_sample_averages(100.0, 100.0),
-            Some(2.0)
-        );
-        assert_eq!(
-            dynamic_cpu_target_from_sample_averages(100.0, 1_000.0),
-            Some(11.0)
-        );
-        assert_eq!(dynamic_cpu_target_from_sample_averages(0.0, 100.0), None);
-    }
+    fn class_stats_slots_do_not_alias_across_classes() {
+        reset_class_stats(9);
+        reset_class_stats(10);
 
-    #[test]
-    fn ewma_uses_supplied_alpha() {
-        assert_eq!(next_ewma(None, 5.0, 0.2), 5.0);
-        assert_eq!(next_ewma(Some(5.0), 15.0, 0.2), 0.2 * 15.0 + 0.8 * 5.0);
-        assert_eq!(next_ewma(Some(5.0), 15.0, 0.5), 0.5 * 15.0 + 0.5 * 5.0);
-    }
+        record_class_sample(9, 10, Some(20));
 
-    #[test]
-    fn dynamic_cpu_target_uses_component_ewmas() {
-        let mut control = WindowControlState::default();
+        let other = class_stats(10).expect("managed class");
+        assert_eq!(other.acquires.load(Ordering::Relaxed), 0);
+        assert_eq!(other.cs_sum_ns.load(Ordering::Relaxed), 0);
 
-        assert_eq!(
-            dynamic_cpu_target_from_smoothed_components(&mut control, 100.0, 100.0, None),
-            Some(2.0)
-        );
-        assert_eq!(control.critical_ewma_ns, Some(100.0));
-        assert_eq!(control.outside_ewma_ns, Some(100.0));
-
-        let target = dynamic_cpu_target_from_smoothed_components(&mut control, 300.0, 900.0, None)
-            .expect("valid component samples should produce a target");
-        let expected_critical = DYNAMIC_CPU_CRITICAL_EWMA_ALPHA * 300.0
-            + (1.0 - DYNAMIC_CPU_CRITICAL_EWMA_ALPHA) * 100.0;
-        let expected_outside =
-            DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA * 900.0 + (1.0 - DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA) * 100.0;
-
-        assert_eq!(control.critical_ewma_ns, Some(expected_critical));
-        assert_eq!(control.outside_ewma_ns, Some(expected_outside));
-        assert!(
-            (target - (1.0 + expected_outside / expected_critical)).abs() < f64::EPSILON,
-            "target should be derived from smoothed components"
-        );
-    }
-
-    #[test]
-    fn dynamic_cpu_component_ewma_clamps_outlier_targets() {
-        let mut control = WindowControlState::default();
-
-        assert_eq!(
-            dynamic_cpu_target_from_smoothed_components(&mut control, 300.0, 3_000.0, Some(16)),
-            Some(11.0)
-        );
-
-        let target =
-            dynamic_cpu_target_from_smoothed_components(&mut control, 1.0, 10_000_000.0, Some(16))
-                .expect("clamped component samples should produce a target");
-
-        assert!(target <= 16.0);
-        assert!(
-            control.outside_ewma_ns.unwrap() <= control.critical_ewma_ns.unwrap() * 15.0,
-            "stored outside EWMA should not keep an unbounded outlier"
-        );
-    }
-
-    #[test]
-    fn dynamic_cpu_critical_penalty_is_tiered_by_current_concurrency() {
-        assert_eq!(dynamic_cpu_critical_penalty_ns(None, Some(4)), 0.0);
-        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(1), Some(4)), 0.0);
-        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(2), Some(4)), 50.0);
-        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(4), Some(4)), 50.0);
-        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(5), Some(4)), 200.0);
-        assert_eq!(dynamic_cpu_critical_penalty_ns(Some(5), None), 50.0);
-    }
-
-    #[test]
-    fn dynamic_cpu_target_uses_penalized_critical_average_before_ewma() {
-        let mut control = WindowControlState::default();
-
-        let target = dynamic_cpu_target_from_penalized_components(
-            &mut control,
-            100.0,
-            1_000.0,
-            None,
-            Some(4),
-            Some(4),
-        )
-        .expect("valid penalized component samples should produce a target");
-
-        assert_eq!(control.critical_ewma_ns, Some(150.0));
-        assert_eq!(control.outside_ewma_ns, Some(1_000.0));
-        assert_eq!(target, 1.0 + 1_000.0 / 150.0);
-    }
-
-    #[test]
-    fn dynamic_cpu_target_uses_cross_numa_penalty_as_total_penalty() {
-        let mut control = WindowControlState::default();
-
-        let target = dynamic_cpu_target_from_penalized_components(
-            &mut control,
-            100.0,
-            1_000.0,
-            None,
-            Some(5),
-            Some(4),
-        )
-        .expect("valid cross-NUMA component samples should produce a target");
-
-        assert_eq!(control.critical_ewma_ns, Some(300.0));
-        assert_eq!(control.outside_ewma_ns, Some(1_000.0));
-        assert_eq!(target, 1.0 + 1_000.0 / 300.0);
-    }
-
-    #[test]
-    fn dynamic_cpu_target_limit_is_based_on_initial_cpu_count() {
-        let mut control = WindowControlState::default();
-
-        assert_eq!(dynamic_cpu_target_limit(&mut control, Some(2)), Some(16));
-        assert_eq!(dynamic_cpu_target_limit(&mut control, Some(32)), Some(16));
-    }
-
-    #[test]
-    fn dynamic_cpu_target_floor_is_based_on_initial_cpu_count() {
-        let mut control = WindowControlState::default();
-
-        assert_eq!(dynamic_cpu_target_floor(&mut control, Some(11)), Some(11));
-        assert_eq!(dynamic_cpu_target_floor(&mut control, Some(4)), Some(11));
-    }
-
-    #[test]
-    fn dynamic_cpu_target_bounds_keep_floor_and_limit() {
-        assert_eq!(dynamic_cpu_target_bounded(1.0, Some(11), Some(88)), 11.0);
-        assert_eq!(dynamic_cpu_target_bounded(12.0, Some(11), Some(88)), 12.0);
-        assert_eq!(dynamic_cpu_target_bounded(128.0, Some(11), Some(88)), 88.0);
-    }
-
-    #[test]
-    fn dynamic_cpu_low_load_bypass_uses_available_cpus_for_taskset_sized_floor() {
-        assert_eq!(
-            dynamic_cpu_low_load_bypass_target(Some(11), 16, Some(96)),
-            Some(96)
-        );
-        assert_eq!(
-            dynamic_cpu_low_load_bypass_target(Some(11), 23, Some(96)),
-            None
-        );
-    }
-
-    #[test]
-    fn dynamic_cpu_low_load_bypass_keeps_small_k_strict() {
-        assert_eq!(
-            dynamic_cpu_low_load_bypass_target(Some(2), 4, Some(96)),
-            None
-        );
-        assert_eq!(
-            dynamic_cpu_low_load_bypass_target(Some(11), 0, Some(96)),
-            None
-        );
-        assert_eq!(
-            dynamic_cpu_low_load_bypass_target(Some(11), 16, Some(11)),
-            None
-        );
-    }
-
-    #[test]
-    fn dynamic_cpu_dead_zone_allows_one_cpu_of_slack() {
-        assert!(dynamic_cpu_count_within_dead_zone(Some(8), 7));
-        assert!(dynamic_cpu_count_within_dead_zone(Some(8), 8));
-        assert!(dynamic_cpu_count_within_dead_zone(Some(8), 9));
-        assert!(!dynamic_cpu_count_within_dead_zone(Some(8), 6));
-        assert!(!dynamic_cpu_count_within_dead_zone(Some(8), 10));
-        assert!(!dynamic_cpu_count_within_dead_zone(None, 8));
-    }
-
-    #[test]
-    fn dynamic_cpu_count_rounds_formula_target() {
-        assert_eq!(dynamic_cpu_count_from_target(1.0), 1);
-        assert_eq!(dynamic_cpu_count_from_target(1.49), 1);
-        assert_eq!(dynamic_cpu_count_from_target(1.50), 2);
+        let touched = class_stats(9).expect("managed class");
+        assert_eq!(touched.acquires.load(Ordering::Relaxed), 1);
     }
 }

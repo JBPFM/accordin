@@ -325,7 +325,7 @@ macro_rules! export_mutex_hooks {
                 if Backend::USES_ADMISSION_SCOPE {
                     $crate::admission::finish_lock_scope(lock_id);
                 }
-                record_post_unlock(hold_end);
+                record_post_unlock(hold_end, lock_id);
             }
 
             const SENTINEL: usize = 1;
@@ -564,7 +564,7 @@ macro_rules! export_mutex_hooks {
                     let state = Box::new(HookState {
                         lock: Backend::create_state(),
                         lock_id: if Backend::USES_ADMISSION_SCOPE {
-                            $crate::admission::allocate_lock_id()
+                            $crate::admission::allocate_lock_class()
                         } else {
                             $crate::admission::UNMANAGED_LOCK_ID
                         },
@@ -648,7 +648,7 @@ macro_rules! export_mutex_hooks {
                     let state = Box::new(HookState {
                         lock: Backend::create_state(),
                         lock_id: if Backend::USES_ADMISSION_SCOPE {
-                            $crate::admission::allocate_lock_id()
+                            $crate::admission::allocate_lock_class()
                         } else {
                             $crate::admission::UNMANAGED_LOCK_ID
                         },

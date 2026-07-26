@@ -13,6 +13,21 @@ pub fn env_flag(name: &str) -> bool {
     }
 }
 
+/// Like `env_flag`, but for a variable that is on unless explicitly turned off.
+/// `env_flag` cannot express this: it reports "unset" and "0" alike as false.
+pub fn env_flag_default_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim();
+            !(value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
+}
+
 pub fn env_u32_clamped(name: &str, default: u32, min: u32, max: u32) -> u32 {
     let Ok(value) = std::env::var(name) else {
         return default;

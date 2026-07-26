@@ -67,6 +67,10 @@ macro_rules! define_scheduler_loader {
                     0,
                     100,
                 );
+                bss.width_control_enabled = u32::from($crate::width_control::enabled());
+                if let Some(class_widths) = $crate::width_control::fixed_class_widths() {
+                    bss.class_width = class_widths;
+                }
             }
             let mut skel = ::scx_utils::scx_ops_load!(skel, accordin_ops, uei)?;
 
@@ -75,6 +79,12 @@ macro_rules! define_scheduler_loader {
             if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
                 $crate::mutex_hook::set_registered_thread_count_ptr(
                     &mut bss.registered_thread_count as *mut u32,
+                );
+                $crate::width_control::set_class_state_ptrs(
+                    bss.class_width.as_mut_ptr(),
+                    bss.class_active.as_mut_ptr(),
+                    bss.class_active_peak.as_mut_ptr(),
+                    bss.class_inactive_depth.as_mut_ptr(),
                 );
             }
 
@@ -90,6 +100,7 @@ macro_rules! define_scheduler_loader {
         impl Drop for SchedulerState {
             fn drop(&mut self) {
                 $crate::mutex_hook::set_registered_thread_count_ptr(::std::ptr::null_mut());
+                $crate::width_control::clear_class_state_ptrs();
                 let _ = self._link.take();
                 let _ = self._skel.take();
                 ::log::info!("{SCHEDULER_NAME} scheduler stopped");

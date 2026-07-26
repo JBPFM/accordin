@@ -1,23 +1,59 @@
 use std::cell::Cell;
+use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
 
 const IN_CRITICAL_SECTION: u32 = 1 << 0;
 const SLOW_PATH_PENDING: u32 = 1 << 1;
 const TOKEN_CONSUMED: u32 = 1 << 2;
+/// Everything an admission-disabled word update clears: the flags that describe
+/// one in-flight acquisition rather than the lock's identity.
+const TRANSIENT_FLAGS: u32 = SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED;
 pub const USER_ADMISSION_FLAG_MASK: u32 = 0x7;
 pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 3;
 pub const MAX_LOCK_CLASSES: u32 = 16;
 pub const UNMANAGED_LOCK_ID: u32 = 0;
 pub const DISABLE_ADMISSION_ENV: &str = "ACCORDIN_DISABLE_ADMISSION";
+const WIDTH_MERGE_ENV: &str = "ACCORDIN_WIDTH_MERGE";
+const DUMP_DEPENDENCY_ENV: &str = "ACCORDIN_DUMP_DEPENDENCY";
+const WIDTH_OVERFLOW_POLICY_ENV: &str = "ACCORDIN_WIDTH_OVERFLOW_POLICY";
+
+/// Number of lock classes, i.e. the length of every per-class array on both
+/// sides of the BPF boundary. Index 0 is the unmanaged sentinel.
+pub const CLASS_COUNT: usize = MAX_LOCK_CLASSES as usize;
 
 static NEXT_LOCK_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_OVERFLOW_INDEX: AtomicU32 = AtomicU32::new(0);
 static INACTIVE_ENQUEUE_SEQ_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 static INACTIVE_EMPTY_SEQ_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
+
+static LOCK_CLASS_PARENT: [AtomicU8; CLASS_COUNT] = identity_lock_classes();
+static LOCK_CLASS_MERGE_LOCK: Mutex<()> = Mutex::new(());
+static CLASSES_DIRTY: AtomicBool = AtomicBool::new(false);
+static TRANSITION_COUNTS: [[AtomicU32; CLASS_COUNT]; CLASS_COUNT] =
+    [const { [const { AtomicU32::new(0) }; CLASS_COUNT] }; CLASS_COUNT];
 
 thread_local! {
     static USER_ADMISSION_WORD: AtomicU32 = const { AtomicU32::new(0) };
     static THREAD_HELD_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static THREAD_OUTER_LOCK_ID: Cell<u32> = const { Cell::new(UNMANAGED_LOCK_ID) };
+    static THREAD_PREV_OUTERMOST_CLASS: Cell<u32> = const { Cell::new(UNMANAGED_LOCK_ID) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static MERGE_FORCED: Cell<bool> = const { Cell::new(false) };
+    static DUMP_FORCED: Cell<bool> = const { Cell::new(false) };
+    static LOCK_CLASS_POLICY_FORCED: Cell<Option<LockClassPolicy>> = const { Cell::new(None) };
+}
+
+/// What a lock created past the class limit receives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockClassPolicy {
+    /// An id shared with an earlier lock, exactly as a merged lock has.
+    Fold,
+    /// No id, so the lock stays outside admission control.
+    Unmanaged,
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +78,225 @@ fn managed_lock_id(lock_id: u32) -> bool {
     lock_id != UNMANAGED_LOCK_ID && lock_id < MAX_LOCK_CLASSES
 }
 
+const fn identity_lock_classes() -> [AtomicU8; CLASS_COUNT] {
+    let mut parents = [const { AtomicU8::new(0) }; CLASS_COUNT];
+    let mut id = 0;
+    while id < CLASS_COUNT {
+        parents[id] = AtomicU8::new(id as u8);
+        id += 1;
+    }
+    parents
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn merge_forced() -> bool {
+    MERGE_FORCED.with(|forced| forced.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn merge_forced() -> bool {
+    false
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn dump_forced() -> bool {
+    DUMP_FORCED.with(|forced| forced.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn dump_forced() -> bool {
+    false
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn forced_lock_class_policy() -> Option<LockClassPolicy> {
+    LOCK_CLASS_POLICY_FORCED.with(|policy| policy.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn forced_lock_class_policy() -> Option<LockClassPolicy> {
+    None
+}
+
+/// Anything other than `unmanaged` keeps the `fold` default, so a typo in the
+/// environment does not silently drop locks out of admission control.
+fn parse_lock_class_policy(value: Option<&str>) -> LockClassPolicy {
+    match value.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("unmanaged") => LockClassPolicy::Unmanaged,
+        _ => LockClassPolicy::Fold,
+    }
+}
+
+/// The overflow policy is a width-control policy: with the feature off there is
+/// no width to share, so allocation stops at the class limit as it does without
+/// any of this machinery.
+fn lock_class_policy() -> LockClassPolicy {
+    if let Some(forced) = forced_lock_class_policy() {
+        return forced;
+    }
+
+    static POLICY: OnceLock<LockClassPolicy> = OnceLock::new();
+
+    *POLICY.get_or_init(|| {
+        if !crate::width_control::enabled() {
+            return LockClassPolicy::Unmanaged;
+        }
+
+        parse_lock_class_policy(std::env::var(WIDTH_OVERFLOW_POLICY_ENV).ok().as_deref())
+    })
+}
+
+#[inline(always)]
+fn merge_enabled() -> bool {
+    if merge_forced() {
+        return true;
+    }
+
+    static MERGE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *MERGE_ENABLED.get_or_init(|| {
+        crate::width_control::enabled() && crate::env::env_flag_default_on(WIDTH_MERGE_ENV)
+    })
+}
+
+#[inline(always)]
+fn dump_dependency_enabled() -> bool {
+    if dump_forced() {
+        return true;
+    }
+
+    static DUMP_DEPENDENCY: OnceLock<bool> = OnceLock::new();
+
+    *DUMP_DEPENDENCY.get_or_init(|| crate::env::env_flag(DUMP_DEPENDENCY_ENV))
+}
+
+/// Walks parent pointers to the component root. A merge only ever points a root
+/// at a strictly smaller id and never re-parents an entry afterwards, so the
+/// walk is strictly decreasing and terminates even if a merge lands mid-walk.
+#[inline(always)]
+fn find_root(lock_id: u32) -> u32 {
+    let mut root = lock_id;
+    loop {
+        let parent = LOCK_CLASS_PARENT[root as usize].load(Ordering::Relaxed) as u32;
+        if parent == root {
+            return root;
+        }
+        root = parent;
+    }
+}
+
+fn union_lock_classes(a: u32, b: u32) {
+    if !managed_lock_id(a) || !managed_lock_id(b) {
+        return;
+    }
+
+    let _guard = LOCK_CLASS_MERGE_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let root_a = find_root(a);
+    let root_b = find_root(b);
+    if root_a == root_b {
+        return;
+    }
+
+    let (min_root, max_root) = if root_a < root_b {
+        (root_a, root_b)
+    } else {
+        (root_b, root_a)
+    };
+    LOCK_CLASS_PARENT[max_root as usize].store(min_root as u8, Ordering::Relaxed);
+    CLASSES_DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// Scheduling class of a lock: the smallest lock id of its merged component.
+///
+/// This is the id published in the admission word, so BPF reads a merged
+/// component as one identity: one shared inactive DSQ and one shared width,
+/// with no mapping table of its own. A thread that still carries the id from
+/// before a merge is harmless — that id is a valid class whose DSQ drains
+/// normally, and the admission counters balance because BPF decrements the
+/// class it recorded at grant time.
+#[inline(always)]
+pub fn class_of(lock_id: u32) -> u32 {
+    if !managed_lock_id(lock_id) || !merge_enabled() {
+        return lock_id;
+    }
+
+    find_root(lock_id)
+}
+
+/// Reports (and clears) whether classes were merged since the last call.
+pub fn take_classes_dirty() -> bool {
+    CLASSES_DIRTY.swap(false, Ordering::Relaxed)
+}
+
+#[inline(always)]
+fn record_nesting_edge(inner: u32) {
+    if !merge_enabled() {
+        return;
+    }
+
+    let outer = THREAD_OUTER_LOCK_ID.with(|outer| outer.get());
+    if outer == inner || !managed_lock_id(outer) {
+        return;
+    }
+
+    // Lock-free reads first: only a genuinely new edge takes the merge mutex.
+    if find_root(outer) == find_root(inner) {
+        return;
+    }
+
+    union_lock_classes(outer, inner);
+}
+
+/// Counts sequential handoffs between outermost classes. Diagnostics only: a
+/// transition is not a nesting edge and never merges classes.
+#[inline(always)]
+fn record_outermost_transition(lock_id: u32) {
+    if !dump_dependency_enabled() {
+        return;
+    }
+
+    let next = class_of(lock_id);
+    if !managed_lock_id(next) {
+        return;
+    }
+
+    let prev = THREAD_PREV_OUTERMOST_CLASS.with(|prev| prev.replace(next));
+    if managed_lock_id(prev) {
+        TRANSITION_COUNTS[prev as usize][next as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn dump_dependency_diagnostics() {
+    if !dump_dependency_enabled() {
+        return;
+    }
+
+    for lock_id in 1..MAX_LOCK_CLASSES {
+        let class = find_root(lock_id);
+        if class != lock_id {
+            eprintln!("dependency_merge: lock={lock_id} class={class}");
+        }
+    }
+
+    for (prev, row) in TRANSITION_COUNTS.iter().enumerate().skip(1) {
+        for (next, cell) in row.iter().enumerate().skip(1) {
+            let count = cell.load(Ordering::Relaxed);
+            if count != 0 {
+                eprintln!("dependency_transition: from={prev} to={next} count={count}");
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn flags(value: u32) -> u32 {
     value & USER_ADMISSION_FLAG_MASK
@@ -62,7 +317,9 @@ fn word_with_lock_id(lock_id: u32, flags: u32) -> u32 {
     (lock_id << USER_ADMISSION_LOCK_ID_SHIFT) | (flags & USER_ADMISSION_FLAG_MASK)
 }
 
-pub fn allocate_lock_id() -> u32 {
+/// Hands out one id per lock while ids last, then reports every further lock as
+/// unmanaged.
+fn allocate_lock_id() -> u32 {
     loop {
         let current = NEXT_LOCK_ID.load(Ordering::Relaxed);
         if current >= MAX_LOCK_CLASSES {
@@ -76,6 +333,34 @@ pub fn allocate_lock_id() -> u32 {
             return current;
         }
     }
+}
+
+/// Scheduling class a lock is created with. The first `MAX_LOCK_CLASSES - 1`
+/// locks each get an id to themselves; from there the overflow policy decides
+/// whether the lock shares a class or drops out of admission control.
+///
+/// The id is drawn once, at creation, and the lock carries it unchanged for its
+/// whole life: nothing here maps a lock back to an id, so no later allocation
+/// can renumber a lock that already exists.
+pub fn allocate_lock_class() -> u32 {
+    let lock_id = allocate_lock_id();
+    if lock_id != UNMANAGED_LOCK_ID {
+        return lock_id;
+    }
+
+    match lock_class_policy() {
+        LockClassPolicy::Fold => fold_overflow_lock_id(),
+        LockClassPolicy::Unmanaged => UNMANAGED_LOCK_ID,
+    }
+}
+
+/// Deals overflowing locks round-robin over the managed ids. Folding reuses the
+/// merge mechanism rather than adding one: the lock shares its id, and with it
+/// one inactive DSQ and one width, with an earlier lock, so `class_of` and
+/// everything downstream of it treat the two as the single class they are.
+fn fold_overflow_lock_id() -> u32 {
+    let overflow_index = NEXT_OVERFLOW_INDEX.fetch_add(1, Ordering::Relaxed);
+    1 + overflow_index % (MAX_LOCK_CLASSES - 1)
 }
 
 #[doc(hidden)]
@@ -111,9 +396,18 @@ pub fn begin_lock_scope(lock_id: u32) -> LockAdmissionScope {
     THREAD_HELD_DEPTH.with(|depth| {
         let held = depth.get();
         depth.set(held.saturating_add(1));
+
+        let managed = managed_lock_id(lock_id);
+        if held == 0 {
+            THREAD_OUTER_LOCK_ID.with(|outer| outer.set(lock_id));
+            record_outermost_transition(lock_id);
+        } else if managed {
+            record_nesting_edge(lock_id);
+        }
+
         LockAdmissionScope {
             lock_id,
-            outer_managed: held == 0 && managed_lock_id(lock_id),
+            outer_managed: held == 0 && managed,
         }
     })
 }
@@ -172,8 +466,11 @@ pub fn finish_lock_scope(lock_id: u32) {
             return;
         }
 
-        if held == 1 && managed_lock_id(lock_id) {
-            mark_critical_section_exit_for_lock(lock_id);
+        if held == 1 {
+            if managed_lock_id(lock_id) {
+                mark_critical_section_exit_for_lock(lock_id);
+            }
+            THREAD_OUTER_LOCK_ID.with(|outer| outer.set(UNMANAGED_LOCK_ID));
         }
         depth.set(held - 1);
     });
@@ -208,9 +505,10 @@ fn token_consumed_for_lock(lock_id: u32) -> bool {
         return false;
     }
 
+    let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
-        user_lock_id_for_value(value) == lock_id && flags(value) & TOKEN_CONSUMED != 0
+        user_lock_id_for_value(value) == class && flags(value) & TOKEN_CONSUMED != 0
     })
 }
 
@@ -221,7 +519,7 @@ fn mark_slow_path_pending_with_admission_enabled(enabled: bool) -> bool {
         let next = if enabled {
             value | SLOW_PATH_PENDING
         } else {
-            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED)
+            value & !TRANSIENT_FLAGS
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -234,20 +532,18 @@ fn mark_slow_path_pending_for_lock_with_admission_enabled(lock_id: u32, enabled:
         return false;
     }
 
+    let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
-            let preserved_flags = if user_lock_id_for_value(value) == lock_id {
+            let preserved_flags = if user_lock_id_for_value(value) == class {
                 flags(value) & TOKEN_CONSUMED
             } else {
                 0
             };
-            word_with_lock_id(lock_id, preserved_flags | SLOW_PATH_PENDING)
+            word_with_lock_id(class, preserved_flags | SLOW_PATH_PENDING)
         } else {
-            word_with_lock_id(
-                lock_id,
-                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED),
-            )
+            word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -263,18 +559,16 @@ fn mark_cond_reacquire_pending_for_lock_with_admission_enabled(
         return false;
     }
 
+    let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
             word_with_lock_id(
-                lock_id,
+                class,
                 (flags(value) | SLOW_PATH_PENDING | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION,
             )
         } else {
-            word_with_lock_id(
-                lock_id,
-                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED),
-            )
+            word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -298,7 +592,7 @@ fn mark_critical_section_entered_with_admission_enabled(enabled: bool) {
         let next = if enabled {
             (value | IN_CRITICAL_SECTION) & !(SLOW_PATH_PENDING | TOKEN_CONSUMED)
         } else {
-            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED)
+            value & !TRANSIENT_FLAGS
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -310,18 +604,16 @@ fn mark_critical_section_entered_for_lock_with_admission_enabled(lock_id: u32, e
         return;
     }
 
+    let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
             word_with_lock_id(
-                lock_id,
+                class,
                 (flags(value) | IN_CRITICAL_SECTION) & !(SLOW_PATH_PENDING | TOKEN_CONSUMED),
             )
         } else {
-            word_with_lock_id(
-                lock_id,
-                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED),
-            )
+            word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -344,7 +636,7 @@ fn mark_critical_section_exit_with_admission_enabled(enabled: bool) {
         let next = if enabled {
             (value | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION
         } else {
-            value & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED)
+            value & !TRANSIENT_FLAGS
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -356,18 +648,16 @@ fn mark_critical_section_exit_for_lock_with_admission_enabled(lock_id: u32, enab
         return;
     }
 
+    let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
             word_with_lock_id(
-                lock_id,
+                class,
                 (flags(value) | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION,
             )
         } else {
-            word_with_lock_id(
-                lock_id,
-                flags(value) & !(SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED),
-            )
+            word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -387,10 +677,11 @@ fn clear_token_consumed_for_lock(lock_id: u32) {
         return;
     }
 
+    let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         word.store(
-            word_with_lock_id(lock_id, flags(value) & !TOKEN_CONSUMED),
+            word_with_lock_id(class, flags(value) & !TOKEN_CONSUMED),
             Ordering::Relaxed,
         );
     });
@@ -419,11 +710,53 @@ pub fn word_for_test() -> u32 {
 #[doc(hidden)]
 pub fn reset_thread_depth_for_test() {
     THREAD_HELD_DEPTH.with(|depth| depth.set(0));
+    THREAD_OUTER_LOCK_ID.with(|outer| outer.set(UNMANAGED_LOCK_ID));
 }
 
 #[doc(hidden)]
 pub fn reset_lock_id_allocator_for_test() {
     NEXT_LOCK_ID.store(1, Ordering::Relaxed);
+    NEXT_OVERFLOW_INDEX.store(0, Ordering::Relaxed);
+}
+
+/// Merging and dump gating are forced per thread so that a test never changes
+/// what concurrently running tests observe.
+#[cfg(test)]
+fn force_merge_for_test(forced: bool) {
+    MERGE_FORCED.with(|merge| merge.set(forced));
+}
+
+#[cfg(test)]
+fn force_dump_for_test(forced: bool) {
+    DUMP_FORCED.with(|dump| dump.set(forced));
+}
+
+#[cfg(test)]
+fn force_lock_class_policy_for_test(forced: Option<LockClassPolicy>) {
+    LOCK_CLASS_POLICY_FORCED.with(|policy| policy.set(forced));
+}
+
+#[cfg(test)]
+fn reset_union_find_for_tests() {
+    for (lock_id, parent) in LOCK_CLASS_PARENT.iter().enumerate() {
+        parent.store(lock_id as u8, Ordering::Relaxed);
+    }
+    CLASSES_DIRTY.store(false, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn reset_transitions_for_tests() {
+    for row in TRANSITION_COUNTS.iter() {
+        for cell in row.iter() {
+            cell.store(0, Ordering::Relaxed);
+        }
+    }
+    THREAD_PREV_OUTERMOST_CLASS.with(|prev| prev.set(UNMANAGED_LOCK_ID));
+}
+
+#[cfg(test)]
+fn transition_count_for_test(prev: u32, next: u32) -> u32 {
+    TRANSITION_COUNTS[prev as usize][next as usize].load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -431,19 +764,25 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     use super::{
-        IN_CRITICAL_SECTION, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, TOKEN_CONSUMED,
-        UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_id, begin_lock_scope,
-        clear_token_consumed_for_scope, finish_lock_scope, mark_cond_reacquire_pending_for_lock,
+        IN_CRITICAL_SECTION, LockClassPolicy, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, TOKEN_CONSUMED,
+        UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_class, allocate_lock_id,
+        begin_lock_scope, class_of, clear_token_consumed_for_scope, finish_lock_scope,
+        force_dump_for_test, force_lock_class_policy_for_test, force_merge_for_test,
+        lock_class_policy, managed_lock_id, mark_cond_reacquire_pending_for_lock,
         mark_critical_section_entered, mark_critical_section_entered_for_scope,
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
-        reset_lock_id_allocator_for_test, reset_state, reset_thread_depth_for_test,
-        reset_transient_state, set_inactive_queue_seq_ptrs, slow_path_yield_required,
-        token_consumed_for_scope, word_for_test,
+        parse_lock_class_policy, reset_lock_id_allocator_for_test, reset_state,
+        reset_thread_depth_for_test, reset_transient_state, reset_transitions_for_tests,
+        reset_union_find_for_tests, set_inactive_queue_seq_ptrs, slow_path_yield_required,
+        take_classes_dirty, token_consumed_for_scope, transition_count_for_test,
+        union_lock_classes, word_for_test,
     };
 
     static INACTIVE_QUEUE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static DEPENDENCY_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static ALLOCATOR_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static mut TEST_INACTIVE_ENQUEUE_SEQ: u32 = 0;
     static mut TEST_INACTIVE_EMPTY_SEQ: u32 = 0;
 
@@ -455,6 +794,66 @@ mod tests {
         fn drop(&mut self) {
             set_inactive_queue_seq_ptrs(std::ptr::null_mut(), std::ptr::null_mut());
         }
+    }
+
+    struct DependencyStateTestGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for DependencyStateTestGuard {
+        fn drop(&mut self) {
+            force_merge_for_test(false);
+            force_dump_for_test(false);
+            reset_union_find_for_tests();
+            reset_transitions_for_tests();
+            reset_thread_depth_for_test();
+        }
+    }
+
+    struct AllocatorStateTestGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for AllocatorStateTestGuard {
+        fn drop(&mut self) {
+            force_lock_class_policy_for_test(None);
+            reset_lock_id_allocator_for_test();
+        }
+    }
+
+    /// Serializes the tests that draw from the process-wide id allocator and
+    /// starts them from a known state. The policy is forced on this thread
+    /// only, so tests running in parallel still see the configured one.
+    fn isolate_allocator_state(policy: Option<LockClassPolicy>) -> AllocatorStateTestGuard {
+        let guard = ALLOCATOR_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_lock_id_allocator_for_test();
+        force_lock_class_policy_for_test(policy);
+        AllocatorStateTestGuard { _guard: guard }
+    }
+
+    fn allocate_lock_classes(count: usize) -> Vec<u32> {
+        (0..count).map(|_| allocate_lock_class()).collect()
+    }
+
+    fn classes_of(lock_ids: &[u32]) -> Vec<u32> {
+        lock_ids.iter().map(|lock_id| class_of(*lock_id)).collect()
+    }
+
+    /// Serializes the tests that mutate the process-wide union-find and
+    /// transition matrix, and starts them from a known state. Merging is forced
+    /// on this thread only, so tests running in parallel still see it off.
+    fn isolate_dependency_state() -> DependencyStateTestGuard {
+        let guard = DEPENDENCY_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_union_find_for_tests();
+        reset_transitions_for_tests();
+        reset_thread_depth_for_test();
+        force_merge_for_test(true);
+        force_dump_for_test(false);
+        DependencyStateTestGuard { _guard: guard }
     }
 
     fn word_for(lock_id: u32, flags: u32) -> u32 {
@@ -677,7 +1076,7 @@ mod tests {
 
     #[test]
     fn lock_id_allocator_exhausts_at_configured_class_limit() {
-        reset_lock_id_allocator_for_test();
+        let _allocator = isolate_allocator_state(None);
 
         assert_eq!(MAX_LOCK_CLASSES, 16);
         for expected in 1..MAX_LOCK_CLASSES {
@@ -686,5 +1085,292 @@ mod tests {
 
         assert_eq!(allocate_lock_id(), UNMANAGED_LOCK_ID);
         assert_eq!(allocate_lock_id(), UNMANAGED_LOCK_ID);
+    }
+
+    #[test]
+    fn overflow_policy_folds_unless_the_environment_asks_otherwise() {
+        assert_eq!(parse_lock_class_policy(None), LockClassPolicy::Fold);
+        assert_eq!(parse_lock_class_policy(Some("fold")), LockClassPolicy::Fold);
+        assert_eq!(
+            parse_lock_class_policy(Some(" UNMANAGED ")),
+            LockClassPolicy::Unmanaged
+        );
+        // An unrecognized value keeps the default rather than dropping locks.
+        assert_eq!(
+            parse_lock_class_policy(Some("no-such-policy")),
+            LockClassPolicy::Fold
+        );
+    }
+
+    #[test]
+    fn allocation_stops_at_the_class_limit_while_width_control_is_off() {
+        let _allocator = isolate_allocator_state(None);
+
+        // With no override the policy comes from the environment, and width
+        // control is off in the test process.
+        assert_eq!(lock_class_policy(), LockClassPolicy::Unmanaged);
+
+        for expected in 1..MAX_LOCK_CLASSES {
+            assert_eq!(allocate_lock_class(), expected);
+        }
+
+        assert_eq!(allocate_lock_class(), UNMANAGED_LOCK_ID);
+        assert_eq!(allocate_lock_class(), UNMANAGED_LOCK_ID);
+    }
+
+    #[test]
+    fn unmanaged_policy_leaves_overflowing_locks_outside_admission() {
+        let _allocator = isolate_allocator_state(Some(LockClassPolicy::Unmanaged));
+
+        let managed: Vec<u32> = (1..MAX_LOCK_CLASSES).collect();
+        let ids = allocate_lock_classes(managed.len() + 4);
+
+        assert_eq!(&ids[..managed.len()], &managed[..]);
+        assert!(
+            ids[managed.len()..]
+                .iter()
+                .all(|id| *id == UNMANAGED_LOCK_ID)
+        );
+    }
+
+    #[test]
+    fn fold_policy_deals_overflowing_locks_round_robin_over_the_managed_ids() {
+        let _allocator = isolate_allocator_state(Some(LockClassPolicy::Fold));
+
+        let managed: Vec<u32> = (1..MAX_LOCK_CLASSES).collect();
+        let ids = allocate_lock_classes(3 * managed.len());
+
+        assert_eq!(&ids[..managed.len()], &managed[..]);
+        // The first locks past the limit fold onto the lowest ids in order.
+        assert_eq!(&ids[managed.len()..managed.len() + 5], &[1, 2, 3, 4, 5]);
+        // A full round of overflow lands on every managed id exactly once.
+        assert_eq!(&ids[managed.len()..2 * managed.len()], &managed[..]);
+        assert_eq!(&ids[2 * managed.len()..], &managed[..]);
+    }
+
+    #[test]
+    fn fold_mapping_repeats_identically_from_a_fresh_allocator() {
+        let _allocator = isolate_allocator_state(Some(LockClassPolicy::Fold));
+
+        let first = allocate_lock_classes(40);
+        reset_lock_id_allocator_for_test();
+        let second = allocate_lock_classes(40);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn an_allocated_lock_class_does_not_move_as_more_locks_appear() {
+        let _allocator = isolate_allocator_state(Some(LockClassPolicy::Fold));
+
+        let early = allocate_lock_classes(MAX_LOCK_CLASSES as usize + 3);
+        let early_classes = classes_of(&early);
+
+        allocate_lock_classes(40);
+
+        assert_eq!(classes_of(&early), early_classes);
+        assert!(early.iter().all(|lock_id| managed_lock_id(*lock_id)));
+    }
+
+    #[test]
+    fn folded_locks_resolve_through_the_class_of_the_id_they_share() {
+        let _dependency = isolate_dependency_state();
+        let _allocator = isolate_allocator_state(Some(LockClassPolicy::Fold));
+
+        let managed: Vec<u32> = (1..MAX_LOCK_CLASSES).collect();
+        let ids = allocate_lock_classes(managed.len() + 4);
+        let folded_onto_three = ids[managed.len() + 2];
+        let folded_onto_four = ids[managed.len() + 3];
+        assert_eq!(folded_onto_three, 3);
+        assert_eq!(folded_onto_four, 4);
+
+        // A folded lock is one of its class, so a merge of that class carries
+        // it along with the lock it folded onto.
+        union_lock_classes(4, 3);
+
+        for lock_id in [3, 4, folded_onto_three, folded_onto_four] {
+            assert_eq!(class_of(lock_id), 3, "lock {lock_id}");
+        }
+
+        // Later overflow does not disturb the classes already resolved.
+        allocate_lock_classes(managed.len());
+        for lock_id in [3, 4, folded_onto_three, folded_onto_four] {
+            assert_eq!(class_of(lock_id), 3, "lock {lock_id}");
+        }
+    }
+
+    #[test]
+    fn merged_component_is_named_by_its_smallest_lock_id() {
+        let _state = isolate_dependency_state();
+
+        union_lock_classes(5, 2);
+        assert_eq!(class_of(5), 2);
+        assert_eq!(class_of(2), 2);
+
+        union_lock_classes(11, 7);
+        assert_eq!(class_of(7), 7);
+        assert_eq!(class_of(11), 7);
+    }
+
+    #[test]
+    fn merges_are_sticky_and_reported_once_as_dirty() {
+        let _state = isolate_dependency_state();
+
+        assert!(!take_classes_dirty());
+
+        union_lock_classes(2, 3);
+        assert!(take_classes_dirty());
+        assert!(!take_classes_dirty());
+
+        union_lock_classes(3, 5);
+        assert!(take_classes_dirty());
+        assert_eq!(class_of(2), 2);
+        assert_eq!(class_of(3), 2);
+        assert_eq!(class_of(5), 2);
+
+        union_lock_classes(5, 2);
+        assert!(!take_classes_dirty());
+        assert_eq!(class_of(5), 2);
+    }
+
+    #[test]
+    fn find_converges_through_chained_parent_pointers() {
+        let _state = isolate_dependency_state();
+
+        union_lock_classes(15, 14);
+        union_lock_classes(14, 12);
+        union_lock_classes(12, 3);
+
+        for lock_id in [3, 12, 14, 15] {
+            assert_eq!(class_of(lock_id), 3, "lock {lock_id}");
+        }
+    }
+
+    #[test]
+    fn class_of_is_identity_for_unmanaged_and_out_of_range_ids() {
+        let _state = isolate_dependency_state();
+
+        assert_eq!(class_of(UNMANAGED_LOCK_ID), UNMANAGED_LOCK_ID);
+        assert_eq!(class_of(MAX_LOCK_CLASSES), MAX_LOCK_CLASSES);
+        assert_eq!(class_of(99), 99);
+    }
+
+    #[test]
+    fn class_of_is_identity_while_merging_is_disabled() {
+        let _state = isolate_dependency_state();
+
+        union_lock_classes(2, 3);
+        assert_eq!(class_of(3), 2);
+
+        force_merge_for_test(false);
+        assert_eq!(class_of(3), 3);
+
+        force_merge_for_test(true);
+        assert_eq!(class_of(3), 2);
+    }
+
+    #[test]
+    fn only_nested_acquires_of_distinct_managed_locks_merge_classes() {
+        let _state = isolate_dependency_state();
+
+        begin_lock_scope(2);
+        begin_lock_scope(3);
+        finish_lock_scope(3);
+        finish_lock_scope(2);
+        assert_eq!(class_of(3), 2);
+        assert_eq!(class_of(2), 2);
+
+        begin_lock_scope(6);
+        finish_lock_scope(6);
+        begin_lock_scope(7);
+        finish_lock_scope(7);
+        assert_eq!(class_of(6), 6);
+        assert_eq!(class_of(7), 7);
+
+        begin_lock_scope(UNMANAGED_LOCK_ID);
+        begin_lock_scope(9);
+        finish_lock_scope(9);
+        finish_lock_scope(UNMANAGED_LOCK_ID);
+        assert_eq!(class_of(9), 9);
+
+        begin_lock_scope(10);
+        begin_lock_scope(UNMANAGED_LOCK_ID);
+        finish_lock_scope(UNMANAGED_LOCK_ID);
+        finish_lock_scope(10);
+        assert_eq!(class_of(10), 10);
+    }
+
+    #[test]
+    fn admission_word_publishes_the_class_of_a_merged_lock() {
+        let _state = isolate_dependency_state();
+        reset_state();
+
+        union_lock_classes(9, 4);
+        assert_eq!(class_of(9), 4);
+
+        let scope = begin_lock_scope(9);
+        assert!(mark_slow_path_pending_for_scope(scope));
+        assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
+
+        mark_critical_section_entered_for_scope(scope);
+        assert_eq!(word_for_test(), word_for(4, IN_CRITICAL_SECTION));
+
+        finish_lock_scope(9);
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
+
+        // The consumed token belongs to the class, so the sibling lock of the
+        // same component reuses it instead of dropping it.
+        let sibling = begin_lock_scope(4);
+        assert!(token_consumed_for_scope(sibling));
+        finish_lock_scope(4);
+
+        reset_state();
+    }
+
+    #[test]
+    fn nested_reacquire_of_the_same_lock_creates_no_edge() {
+        let _state = isolate_dependency_state();
+
+        begin_lock_scope(4);
+        begin_lock_scope(4);
+        finish_lock_scope(4);
+        finish_lock_scope(4);
+
+        assert_eq!(class_of(4), 4);
+        assert!(!take_classes_dirty());
+    }
+
+    #[test]
+    fn transition_counts_follow_outermost_class_handoffs() {
+        let _state = isolate_dependency_state();
+        force_dump_for_test(true);
+
+        begin_lock_scope(2);
+        finish_lock_scope(2);
+        begin_lock_scope(3);
+        finish_lock_scope(3);
+        begin_lock_scope(2);
+        finish_lock_scope(2);
+
+        assert_eq!(transition_count_for_test(2, 3), 1);
+        assert_eq!(transition_count_for_test(3, 2), 1);
+        assert_eq!(transition_count_for_test(2, 2), 0);
+
+        begin_lock_scope(5);
+        begin_lock_scope(6);
+        finish_lock_scope(6);
+        finish_lock_scope(5);
+
+        assert_eq!(transition_count_for_test(2, 5), 1);
+        assert_eq!(transition_count_for_test(5, 6), 0);
+
+        // Lock 6 was merged into class 5 by the nesting above, so its next
+        // outermost acquire is counted against the class, not the lock.
+        begin_lock_scope(6);
+        finish_lock_scope(6);
+
+        assert_eq!(class_of(6), 5);
+        assert_eq!(transition_count_for_test(5, 5), 1);
+        assert_eq!(transition_count_for_test(5, 6), 0);
     }
 }

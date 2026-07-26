@@ -64,7 +64,7 @@ fn unlock_with_stats(lock: &crate::mcs::McsLockRaw, lock_id: u32) {
     let hold_end = accordin_shared::lock_stats::record_hold_end_sample();
     lock.unlock();
     accordin_shared::admission::finish_lock_scope(lock_id);
-    accordin_shared::lock_stats::record_post_unlock(hold_end);
+    accordin_shared::lock_stats::record_post_unlock(hold_end, lock_id);
 }
 
 unsafe fn mutex_ref<'a>(
@@ -81,7 +81,7 @@ unsafe fn mutex_ref<'a>(
 pub extern "C" fn mcs_accordin_direct_mutex_create() -> *mut mcs_accordin_direct_mutex {
     Box::into_raw(Box::new(mcs_accordin_direct_mutex {
         lock: crate::mcs::McsLockRaw::new(),
-        lock_id: accordin_shared::admission::allocate_lock_id(),
+        lock_id: accordin_shared::admission::allocate_lock_class(),
     }))
 }
 

@@ -38,6 +38,12 @@ volatile __u32 debug_counters_mode = 0;
 volatile __u32 cpu_admission_owner[MAX_CPUS];
 volatile __u32 cpu_last_inactive_lock[MAX_CPUS];
 volatile __u32 cpu_inactive_dispatch_count[MAX_CPUS];
+volatile __u32 width_control_enabled;
+volatile __u32 class_width[MAX_LOCK_CLASSES]; /* 0 = unlimited */
+volatile __s32 class_active[MAX_LOCK_CLASSES];
+volatile __u32 class_active_peak[MAX_LOCK_CLASSES];
+volatile __u32 class_inactive_depth[MAX_LOCK_CLASSES];
+volatile __u64 class_active_underflow_events;
 volatile __u32 inactive_previous_lock_percent;
 volatile __u32 inactive_enqueue_seq;
 volatile __u32 inactive_empty_seq;

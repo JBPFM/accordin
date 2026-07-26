@@ -67,7 +67,7 @@ fn unlock_with_stats(lock: &<DirectBackend as MutexHookBackend>::LockState, lock
     let hold_end = accordin_shared::lock_stats::record_hold_end_sample();
     DirectBackend::unlock(lock);
     accordin_shared::admission::finish_lock_scope(lock_id);
-    accordin_shared::lock_stats::record_post_unlock(hold_end);
+    accordin_shared::lock_stats::record_post_unlock(hold_end, lock_id);
 }
 
 unsafe fn mutex_ref<'a>(
@@ -84,7 +84,7 @@ unsafe fn mutex_ref<'a>(
 pub extern "C" fn mcs_tas_accordin_direct_mutex_create() -> *mut mcs_tas_accordin_direct_mutex {
     Box::into_raw(Box::new(mcs_tas_accordin_direct_mutex {
         lock: DirectBackend::create_state(),
-        lock_id: accordin_shared::admission::allocate_lock_id(),
+        lock_id: accordin_shared::admission::allocate_lock_class(),
     }))
 }
 

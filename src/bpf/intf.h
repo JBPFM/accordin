@@ -33,6 +33,7 @@
 struct task_scx_ctx {
   unsigned int initialized;
   unsigned int holds_admission;
+  unsigned int admitted_class;
   unsigned int admission_cpu;
   unsigned int must_run_on_admission_cpu;
   unsigned int force_inactive_wait;

@@ -200,54 +200,6 @@ static __always_inline void record_inactive_dispatch_lock(__u32 cpu,
     *last_lock = lock_id;
 }
 
-static __always_inline bool move_inactive_to_local(__u32 dispatch_cpu,
-                                                   __u32 lock_id) {
-  if (!valid_lock_id(lock_id))
-    return false;
-
-  if (scx_bpf_dsq_move_to_local(inactive_dsq_id(lock_id))) {
-    record_inactive_dispatch_lock(dispatch_cpu, lock_id);
-    return true;
-  }
-
-  return false;
-}
-
-static __always_inline bool move_selected_inactive_to_local(__u32 dispatch_cpu) {
-  volatile __u32 *last_lock_ptr;
-  __u32 previous_lock_id = UNMANAGED_LOCK_ID;
-  __u32 random = bpf_get_prandom_u32();
-  __u32 random_start = random / INACTIVE_PROBABILITY_SCALE;
-  bool prefer_previous =
-      inactive_prefer_previous_lock(random, inactive_previous_lock_percent);
-  __u32 offset;
-
-  last_lock_ptr = lookup_cpu_last_inactive_lock(dispatch_cpu);
-  if (last_lock_ptr)
-    previous_lock_id = *last_lock_ptr;
-
-  if (valid_lock_id(previous_lock_id) && prefer_previous &&
-      move_inactive_to_local(dispatch_cpu, previous_lock_id))
-    return true;
-
-#pragma unroll
-  for (offset = 0; offset < MAX_LOCK_CLASSES; offset++) {
-    __u32 lock_id =
-        inactive_other_lock_at(previous_lock_id, random_start, offset);
-
-    if (!valid_lock_id(lock_id))
-      break;
-
-    if (move_inactive_to_local(dispatch_cpu, lock_id))
-      return true;
-  }
-
-  if (valid_lock_id(previous_lock_id) && !prefer_previous)
-    return move_inactive_to_local(dispatch_cpu, previous_lock_id);
-
-  return false;
-}
-
 static __always_inline void
 record_enqueue_state(struct task_scx_ctx *task_ctx, __u64 dsq_id,
                      __u32 lock_id, __u32 path, __u32 cpu,
@@ -308,8 +260,276 @@ static __always_inline bool user_explicit_release(__u32 user_ctx_word) {
          !user_in_critical_section(user_ctx_word);
 }
 
+/* Bounds a per-class array access for the verifier. barrier_var comes before
+ * the bound so the compiler cannot fold the check away when a caller proved
+ * lock_id < MAX_LOCK_CLASSES on a different register. */
+#define DEFINE_CLASS_SLOT_LOOKUP(fn, type, array)                              \
+  static __always_inline volatile type *fn(__u32 lock_id) {                    \
+    __u32 idx = lock_id;                                                       \
+                                                                               \
+    barrier_var(idx);                                                          \
+    if (idx >= MAX_LOCK_CLASSES)                                               \
+      return 0;                                                                \
+                                                                               \
+    return &array[idx];                                                        \
+  }
+
+DEFINE_CLASS_SLOT_LOOKUP(lookup_class_active, __s32, class_active)
+DEFINE_CLASS_SLOT_LOOKUP(lookup_class_active_peak, __u32, class_active_peak)
+DEFINE_CLASS_SLOT_LOOKUP(lookup_class_width, __u32, class_width)
+DEFINE_CLASS_SLOT_LOOKUP(lookup_class_inactive_depth, __u32,
+                         class_inactive_depth)
+
+static __always_inline void account_admission_grant(__u32 lock_id) {
+  volatile __s32 *active = lookup_class_active(lock_id);
+  volatile __u32 *peak;
+  __s32 new_active;
+
+  if (!active)
+    return;
+
+  /* Atomic: grant and release race across CPUs for the same class. */
+  new_active = __sync_fetch_and_add(active, 1) + 1;
+
+  /* Peak is advisory (controller reads-and-clears); a plain store is fine. */
+  peak = lookup_class_active_peak(lock_id);
+  if (peak && new_active > 0 && (__u32)new_active > *peak)
+    *peak = (__u32)new_active;
+}
+
+static __always_inline void account_admission_release(__u32 lock_id) {
+  volatile __s32 *active = lookup_class_active(lock_id);
+  __s32 old;
+
+  if (!active)
+    return;
+
+  /* Atomic decrement; balanced accounting keeps old >= 1, so the floor
+   * fixup and underflow diagnostic fire only on genuine imbalance. */
+  old = __sync_fetch_and_add(active, -1);
+  if (old <= 0) {
+    __sync_fetch_and_add(active, 1);
+    __sync_fetch_and_add(&class_active_underflow_events, 1);
+  }
+}
+
+/* The inactive-depth counters exist only for width control, so each one owns
+ * its feature gate rather than relying on every call site to repeat it. */
+static __always_inline void account_inactive_depth_enqueue(__u32 lock_id) {
+  volatile __u32 *depth;
+
+  if (!width_control_enabled)
+    return;
+
+  depth = lookup_class_inactive_depth(lock_id);
+  if (!depth)
+    return;
+
+  __sync_fetch_and_add(depth, 1);
+}
+
+static __always_inline void account_inactive_depth_release(__u32 lock_id) {
+  volatile __u32 *depth;
+  __u32 old;
+
+  if (!width_control_enabled)
+    return;
+
+  depth = lookup_class_inactive_depth(lock_id);
+  if (!depth)
+    return;
+
+  old = __sync_fetch_and_add(depth, -1);
+  if (old == 0)
+    __sync_fetch_and_add(depth, 1);
+}
+
+static __always_inline void reset_inactive_depth(__u32 lock_id) {
+  volatile __u32 *depth;
+
+  if (!width_control_enabled)
+    return;
+
+  depth = lookup_class_inactive_depth(lock_id);
+  if (depth)
+    *depth = 0;
+}
+
+/* Sole expression of the width rule: a class may take another CPU while fewer
+ * tasks hold its admission than its published width. Unlimited (width 0), an
+ * unmanaged id, and the feature being off all mean "no cap". */
+static __always_inline bool class_dispatch_eligible(__u32 lock_id) {
+  volatile __u32 *width;
+  volatile __s32 *active;
+  __u32 w;
+
+  if (!width_control_enabled || !valid_lock_id(lock_id))
+    return true;
+
+  width = lookup_class_width(lock_id);
+  active = lookup_class_active(lock_id);
+  if (!width || !active)
+    return true;
+
+  w = *width;
+  if (w == 0)
+    return true;
+
+  return *active < (__s32)w;
+}
+
+/* Stand-in deficit for an unlimited class, large enough to outrank any real
+ * width so an uncapped class with waiters is always preferred. */
+#define INACTIVE_DEFICIT_UNLIMITED (1 << 24)
+
+static __always_inline __u32 select_inactive_deficit_class(void) {
+  __u32 best_lock = UNMANAGED_LOCK_ID;
+  __s32 best_deficit = 0;
+  __u32 lock_id;
+
+#pragma unroll
+  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+    volatile __u32 *depth = lookup_class_inactive_depth(lock_id);
+    volatile __u32 *width;
+    volatile __s32 *active;
+    __u32 w;
+    __s32 in_flight;
+    __s32 deficit;
+
+    /* Most classes are idle, so settle the cheap test before deriving the
+     * width and active slots for the ones that are not. */
+    if (!depth || *depth == 0)
+      continue;
+
+    width = lookup_class_width(lock_id);
+    active = lookup_class_active(lock_id);
+    if (!width || !active)
+      continue;
+
+    w = *width;
+    in_flight = *active;
+    if (w != 0 && in_flight >= (__s32)w)
+      continue;
+
+    deficit = (w == 0) ? INACTIVE_DEFICIT_UNLIMITED : ((__s32)w - in_flight);
+    if (best_lock == UNMANAGED_LOCK_ID || deficit > best_deficit) {
+      best_deficit = deficit;
+      best_lock = lock_id;
+    }
+  }
+
+  return best_lock;
+}
+
+/* Dispatch drain outcome. BLOCKED means a nonempty class DSQ was skipped only
+ * for width-ineligibility; the caller must not record the inactive scan as
+ * empty, or parked waiters stay stranded until the next enqueue bumps the seq. */
+enum inactive_move_outcome {
+  INACTIVE_MOVE_EMPTY = 0,
+  INACTIVE_MOVE_MOVED = 1,
+  INACTIVE_MOVE_BLOCKED = 2,
+};
+
+/* A class DSQ that still holds tasks was not skipped because it ran dry, so its
+ * outcome is BLOCKED rather than EMPTY. Only EMPTY may arm the scan-empty
+ * sequence gate, which is global and would otherwise suppress dispatch on the
+ * CPUs that can still run those tasks. */
+static __always_inline enum inactive_move_outcome
+inactive_move_missed(__u64 dsq_id) {
+  return scx_bpf_dsq_nr_queued(dsq_id) > 0 ? INACTIVE_MOVE_BLOCKED
+                                           : INACTIVE_MOVE_EMPTY;
+}
+
+static __always_inline enum inactive_move_outcome
+move_inactive_to_local(__u32 dispatch_cpu, __u32 lock_id) {
+  __u64 dsq_id;
+
+  if (!valid_lock_id(lock_id))
+    return INACTIVE_MOVE_EMPTY;
+
+  dsq_id = inactive_dsq_id(lock_id);
+
+  if (!class_dispatch_eligible(lock_id))
+    return inactive_move_missed(dsq_id);
+
+  if (scx_bpf_dsq_move_to_local(dsq_id)) {
+    record_inactive_dispatch_lock(dispatch_cpu, lock_id);
+    account_inactive_depth_release(lock_id);
+    return INACTIVE_MOVE_MOVED;
+  }
+
+  /* A failed move means either an empty queue or tasks whose cpumask excludes
+   * this CPU; only the empty case may clear the class's tracked depth. */
+  if (scx_bpf_dsq_nr_queued(dsq_id) > 0)
+    return INACTIVE_MOVE_BLOCKED;
+
+  reset_inactive_depth(lock_id);
+  return INACTIVE_MOVE_EMPTY;
+}
+
+/* Attempts one class and reports whether it moved, latching BLOCKED into the
+ * caller's flag. Every candidate in a scan goes through here so the tri-state
+ * contract is honoured once instead of at each attempt. */
+static __always_inline bool try_move_inactive(__u32 dispatch_cpu, __u32 lock_id,
+                                              bool *blocked) {
+  enum inactive_move_outcome outcome =
+      move_inactive_to_local(dispatch_cpu, lock_id);
+
+  if (outcome == INACTIVE_MOVE_BLOCKED)
+    *blocked = true;
+
+  return outcome == INACTIVE_MOVE_MOVED;
+}
+
+static __always_inline enum inactive_move_outcome
+move_selected_inactive_to_local(__u32 dispatch_cpu) {
+  volatile __u32 *last_lock_ptr;
+  __u32 previous_lock_id = UNMANAGED_LOCK_ID;
+  __u32 random = bpf_get_prandom_u32();
+  __u32 random_start = random / INACTIVE_PROBABILITY_SCALE;
+  bool prefer_previous =
+      inactive_prefer_previous_lock(random, inactive_previous_lock_percent);
+  bool blocked = false;
+  __u32 offset;
+
+  last_lock_ptr = lookup_cpu_last_inactive_lock(dispatch_cpu);
+  if (last_lock_ptr)
+    previous_lock_id = *last_lock_ptr;
+
+  if (valid_lock_id(previous_lock_id) && prefer_previous &&
+      try_move_inactive(dispatch_cpu, previous_lock_id, &blocked))
+    return INACTIVE_MOVE_MOVED;
+
+  if (width_control_enabled) {
+    __u32 best = select_inactive_deficit_class();
+
+    if (valid_lock_id(best) &&
+        try_move_inactive(dispatch_cpu, best, &blocked))
+      return INACTIVE_MOVE_MOVED;
+  }
+
+#pragma unroll
+  for (offset = 0; offset < MAX_LOCK_CLASSES; offset++) {
+    __u32 lock_id =
+        inactive_other_lock_at(previous_lock_id, random_start, offset);
+
+    if (!valid_lock_id(lock_id))
+      break;
+
+    if (try_move_inactive(dispatch_cpu, lock_id, &blocked))
+      return INACTIVE_MOVE_MOVED;
+  }
+
+  if (valid_lock_id(previous_lock_id) && !prefer_previous &&
+      try_move_inactive(dispatch_cpu, previous_lock_id, &blocked))
+    return INACTIVE_MOVE_MOVED;
+
+  return blocked ? INACTIVE_MOVE_BLOCKED : INACTIVE_MOVE_EMPTY;
+}
+
 static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx) {
   task_ctx->holds_admission = 0;
+  task_ctx->admitted_class = 0;
   task_ctx->must_run_on_admission_cpu = 0;
   task_ctx->force_inactive_wait = 0;
   task_ctx->admission_cpu = ADMISSION_CPU_NONE;
@@ -319,11 +539,16 @@ static __always_inline void release_admission(struct task_struct *p,
                                               struct task_scx_ctx *task_ctx) {
   __u32 cpu = task_ctx->admission_cpu;
   __u32 pid = p->pid;
+  bool was_held = task_ctx->holds_admission;
+  __u32 admitted_class = task_ctx->admitted_class;
   volatile __u32 *owner;
 
   owner = lookup_cpu_owner(cpu);
   if (owner && *owner == pid)
     *owner = 0;
+
+  if (was_held)
+    account_admission_release(admitted_class);
 
   clear_admission_state(task_ctx);
 
@@ -335,6 +560,7 @@ static __always_inline bool grant_admission(struct task_struct *p,
                                             struct task_scx_ctx *task_ctx,
                                             __u32 lock_id, __u32 cpu) {
   __u32 pid = p->pid;
+  bool was_held = task_ctx->holds_admission;
   volatile __u32 *owner;
 
   if (!valid_lock_id(lock_id))
@@ -352,6 +578,10 @@ static __always_inline bool grant_admission(struct task_struct *p,
   task_ctx->must_run_on_admission_cpu = 0;
   task_ctx->force_inactive_wait = 0;
   task_ctx->admission_cpu = cpu;
+  if (!was_held) {
+    task_ctx->admitted_class = lock_id;
+    account_admission_grant(lock_id);
+  }
   return true;
 }
 
@@ -531,6 +761,8 @@ static __always_inline bool enqueue_force_inactive(struct task_struct *p,
                        ENQ_PATH_FORCE_INACTIVE, cpu, user_ctx_word);
   scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
   record_inactive_enqueue();
+  if (width_control_enabled)
+    account_inactive_depth_enqueue(lock_id);
   return true;
 }
 
@@ -582,8 +814,12 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
 
   if (!task_ctx->holds_admission && have_user &&
       user_slow_path_pending(user_ctx_word) && valid_lock_id(lock_id) &&
-      cpu < MAX_CPUS && task_cpu_allowed(p, cpu))
-    grant_admission(p, task_ctx, lock_id, cpu);
+      cpu < MAX_CPUS && task_cpu_allowed(p, cpu)) {
+    if (class_dispatch_eligible(lock_id))
+      grant_admission(p, task_ctx, lock_id, cpu);
+    else
+      task_ctx->force_inactive_wait = 1;
+  }
 
   if (task_ctx->must_run_on_admission_cpu && task_ctx->admission_cpu == cpu)
     task_ctx->must_run_on_admission_cpu = 0;
@@ -742,7 +978,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     }
     task_ctx->admission_cpu = cpu;
 
-    if (grant_admission(p, task_ctx, lock_id, cpu)) {
+    if (class_dispatch_eligible(lock_id) &&
+        grant_admission(p, task_ctx, lock_id, cpu)) {
       record_enqueue_state(task_ctx, SCX_DSQ_LOCAL_ON | cpu, lock_id,
                            ENQ_PATH_SLOW_GRANTED_LOCAL, cpu, user_ctx_word);
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
@@ -753,6 +990,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
                          ENQ_PATH_SLOW_INACTIVE, cpu, user_ctx_word);
     scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
     record_inactive_enqueue();
+    if (width_control_enabled)
+      account_inactive_depth_enqueue(lock_id);
     return;
   }
 
@@ -772,6 +1011,31 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   }
 
   enqueue_normal_dsq_recorded(p, task_ctx, enq_flags, lock_id, user_ctx_word);
+}
+
+/* One drain attempt against the inactive queues. Reports whether a task moved;
+ * a BLOCKED scan deliberately leaves the scan-empty sequence gate unarmed. */
+static __always_inline bool try_dispatch_inactive(__u32 cpu, __u32 inactive_seq,
+                                                  bool debug_counters) {
+  enum inactive_move_outcome outcome;
+
+  if (debug_counters)
+    dispatch_inactive_attempts += 1;
+
+  outcome = move_selected_inactive_to_local(cpu);
+  if (outcome == INACTIVE_MOVE_MOVED) {
+    record_inactive_dispatch(cpu);
+    if (debug_counters)
+      dispatch_inactive_success += 1;
+    return true;
+  }
+
+  if (debug_counters)
+    dispatch_inactive_empty += 1;
+  if (outcome != INACTIVE_MOVE_BLOCKED)
+    record_inactive_scan_empty(inactive_seq);
+
+  return false;
 }
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
@@ -804,12 +1068,17 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
       reset_inactive_dispatch_budget((__u32)cpu);
       if (debug_counters)
         dispatch_normal_success += 1;
-      return;
+      /* Returning unconditionally lets a steady normal stream starve the
+       * inactive queues on exactly the CPUs able to drain them; the CPUs that
+       * do reach the scan may be excluded by the waiters' cpumask. */
+      if (!inactive_dispatch_needed_for(inactive_seq))
+        return;
+    } else {
+      if (debug_counters)
+        dispatch_normal_empty += 1;
+      if (scx_bpf_dsq_nr_queued(NORMAL_DSQ_ID) == 0)
+        record_normal_scan_empty(normal_seq);
     }
-
-    if (debug_counters)
-      dispatch_normal_empty += 1;
-    record_normal_scan_empty(normal_seq);
   } else if (debug_counters) {
     dispatch_normal_skip_seq += 1;
   }
@@ -825,35 +1094,13 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
       dispatch_inactive_budget_blocked += 1;
   }
 
-  if (inactive_cpu_available && inactive_dispatch_budget_available((__u32)cpu)) {
-    if (debug_counters)
-      dispatch_inactive_attempts += 1;
-    if (move_selected_inactive_to_local((__u32)cpu)) {
-      record_inactive_dispatch((__u32)cpu);
-      if (debug_counters)
-        dispatch_inactive_success += 1;
-      return;
-    }
+  if (inactive_cpu_available && inactive_dispatch_budget_available((__u32)cpu) &&
+      try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters))
+    return;
 
-    if (debug_counters)
-      dispatch_inactive_empty += 1;
-    record_inactive_scan_empty(inactive_seq);
-  }
-
-  if (inactive_cpu_available) {
-    if (debug_counters)
-      dispatch_inactive_attempts += 1;
-    if (move_selected_inactive_to_local((__u32)cpu)) {
-      record_inactive_dispatch((__u32)cpu);
-      if (debug_counters)
-        dispatch_inactive_success += 1;
-      return;
-    }
-
-    if (debug_counters)
-      dispatch_inactive_empty += 1;
-    record_inactive_scan_empty(inactive_seq);
-  }
+  if (inactive_cpu_available &&
+      try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters))
+    return;
 }
 
 void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
@@ -917,6 +1164,8 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
       debug_counters_mode, registered_thread_count, normal_enqueue_seq,
       normal_empty_seq, scx_bpf_dsq_nr_queued(NORMAL_DSQ_ID),
       inactive_enqueue_seq, inactive_empty_seq);
+  scx_bpf_dump("accordin_width width_ctl=%u underflow=%llu\n",
+               width_control_enabled, class_active_underflow_events);
   if (debug_counters_enabled())
     scx_bpf_dump(
         "accordin_dispatch calls=%llu normal_skip_seq=%llu normal_attempts=%llu "
@@ -933,10 +1182,18 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
   for (lock_id = 0; lock_id < MAX_LOCK_CLASSES; lock_id++) {
     __u64 dsq_id = inactive_dsq_id(lock_id);
     s32 queued = scx_bpf_dsq_nr_queued(dsq_id);
+    __u32 width = class_width[lock_id];
+    s32 active = class_active[lock_id];
+    __u32 peak = class_active_peak[lock_id];
+    __u32 depth = class_inactive_depth[lock_id];
 
     if (queued)
       scx_bpf_dump("accordin_inactive_q lock=%u dsq=0x%llx queued=%d\n",
                    lock_id, dsq_id, queued);
+    if (width || active || peak || depth)
+      scx_bpf_dump(
+          "accordin_class lock=%u width=%u active=%d peak=%u depth=%u\n",
+          lock_id, width, active, peak, depth);
   }
 }
 

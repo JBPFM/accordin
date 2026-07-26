@@ -667,6 +667,7 @@ def accordin_preload_env(
 ) -> dict[str, str | None]:
     env = experiment_three.accordin_preload_env(preload_library, lock=lock)
     env[ACCORDIN_HOOK_SCOPE_ENV] = ACCORDIN_LEVELDB_HOOK_SCOPE
+    env.update(experiment_defaults.accordin_width_env())
     return env
 
 
@@ -735,6 +736,7 @@ def mcs_tas_accordin_direct_preload_env(
             MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
         }
     )
+    env.update(experiment_defaults.accordin_width_env())
     if leveldb_direct_accordin_disables_admission(lock):
         env["ACCORDIN_DISABLE_ADMISSION"] = "1"
         env[MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV] = "1"
@@ -760,6 +762,7 @@ def mcs_accordin_direct_preload_env(
             MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
         }
     )
+    env.update(experiment_defaults.accordin_width_env())
     return env
 
 
@@ -1573,6 +1576,7 @@ def write_settings(
         "init_existing_benchmarks": list(init_existing_benchmarks),
         "accordin_hook_scope_env": ACCORDIN_HOOK_SCOPE_ENV,
         "accordin_hook_scope": ACCORDIN_LEVELDB_HOOK_SCOPE if uses_mutex_hook_accordin else None,
+        "accordin_width_env": experiment_defaults.accordin_width_env(),
         "leveldb_accordin_direct_variants": list(LEVELDB_ACCORDIN_DIRECT_VARIANT_LOCKS),
         "leveldb_accordin_mutex_hook_variants": list(LEVELDB_ACCORDIN_MUTEX_HOOK_VARIANT_LOCKS),
         "leveldb_direct_adapter_benchmarks": list(LEVELDB_DIRECT_ADAPTER_BENCHMARKS),

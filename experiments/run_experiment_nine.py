@@ -407,6 +407,7 @@ def direct_env() -> dict[str, str | None]:
     for key, value in os.environ.items():
         if key.startswith("MCS_TAS_ACCORDIN_DIRECT_"):
             env[key] = value
+    env.update(experiment_defaults.accordin_width_env())
     env[MCS_TAS_ACCORDIN_DIRECT_LIB_ENV] = str(MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB)
     return env
 
@@ -426,6 +427,7 @@ def mcs_accordin_direct_env() -> dict[str, str | None]:
     for key, value in os.environ.items():
         if key.startswith("MCS_ACCORDIN_DIRECT_"):
             env[key] = value
+    env.update(experiment_defaults.accordin_width_env())
     env[MCS_ACCORDIN_DIRECT_LIB_ENV] = str(MCS_ACCORDIN_DIRECT_RELEASE_LIB)
     return env
 
@@ -569,6 +571,7 @@ def write_settings(root: Path, args: RunArgs) -> None:
         "seed": args.seed,
         "timing_sample_stride": args.timing_sample_stride,
         "repeats": args.repeats,
+        "accordin_width_env": experiment_defaults.accordin_width_env(),
         "build_missing": args.build_missing,
         "sudo_mode": args.sudo_mode,
         "command_timeout_seconds": args.command_timeout_seconds,

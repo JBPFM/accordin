@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 try:
     from machine_config import (
@@ -36,6 +37,22 @@ ACCORDIN_VARIANT_LOCKS = (
 )
 ACCORDIN_ADMISSION_DISABLED_LOCKS: tuple[str, ...] = ()
 ACCORDIN_TASKSET_LOCKS: tuple[str, ...] = ()
+
+# Per-class width-control knobs read by accordin_shared. Benchmark drivers run Accordin
+# locks through sudo, which drops the ambient environment, so these have to be restated
+# inside the constructed `env` command instead of being inherited.
+ACCORDIN_WIDTH_ENV_KEYS = (
+    "ACCORDIN_WIDTH_CONTROL",
+    "ACCORDIN_FIXED_WIDTH",
+    "ACCORDIN_WIDTH_CLASS_MAP",
+    "ACCORDIN_WIDTH_MERGE",
+    "ACCORDIN_WIDTH_OVERFLOW_POLICY",
+    "ACCORDIN_WIDTH_HOLDOFF_WINDOWS",
+    "ACCORDIN_WIDTH_DEADZONE",
+    "ACCORDIN_WIDTH_MAX",
+    "ACCORDIN_WIDTH_MIN",
+    "ACCORDIN_DUMP_DEPENDENCY",
+)
 
 
 def _cpu_list_count(cpu_list: str) -> int:
@@ -301,6 +318,11 @@ def lock_sort_key(lock: str) -> tuple[int, str]:
     if lock in LOCK_ORDER:
         return (LOCK_ORDER.index(lock), lock)
     return (len(LOCK_ORDER), lock)
+
+
+def accordin_width_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    source = os.environ if environ is None else environ
+    return {key: source[key] for key in ACCORDIN_WIDTH_ENV_KEYS if key in source}
 
 
 def is_accordin_lock(lock: str) -> bool:

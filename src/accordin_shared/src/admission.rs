@@ -714,19 +714,23 @@ fn mark_critical_section_exit_for_lock_with_admission_enabled(lock_id: u32, enab
     });
 }
 
-/// Out-of-order unlock: the exit word is published only while the admission
-/// word still describes the class of `lock_id`, testing and storing in one word
-/// access.
+/// Out-of-order unlock: the exit word is published only for the lock that owns
+/// the admission word, which is the outermost one this thread entered.
+///
+/// Ownership is decided on lock identity rather than on the class in the word,
+/// because a merge makes an inner lock share the outer lock's class: comparing
+/// classes would accept an ordinary nested release as if it were the outer
+/// one and drop `IN_CRITICAL_SECTION` while the outer lock is still held.
 #[inline(always)]
 fn mark_critical_section_exit_for_owned_lock(lock_id: u32) {
+    if THREAD_OUTER_LOCK_ID.with(|outer| outer.get()) != lock_id {
+        return;
+    }
+
     let enabled = admission_enabled();
     let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
-        if user_lock_id_for_value(value) != class {
-            return;
-        }
-
         word.store(exit_word(class, value, enabled), Ordering::Relaxed);
     });
 }
@@ -1061,6 +1065,55 @@ mod tests {
         assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
 
         finish_lock_scope(2);
+        assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
+    }
+
+    /// Nesting merges the inner lock into the outer lock's class, so the class
+    /// the word carries stops distinguishing the two. Releasing the inner lock
+    /// must still leave the outer critical section published: dropping
+    /// `IN_CRITICAL_SECTION` here lets the scheduler reclaim the admission slot
+    /// while the outer lock is held.
+    #[test]
+    fn a_merged_inner_unlock_keeps_the_outer_critical_section_published() {
+        let _guard = isolate_dependency_state();
+        reset_state();
+
+        let outer = begin_lock_scope(2);
+        assert!(mark_slow_path_pending_for_scope(outer));
+        mark_critical_section_entered_for_scope(outer);
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
+
+        let inner = begin_lock_scope(3);
+        assert_eq!(class_of(3), 2, "nesting merges the inner lock");
+        assert!(!mark_slow_path_pending_for_scope(inner));
+        mark_critical_section_entered_for_scope(inner);
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
+
+        finish_lock_scope(3);
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
+
+        finish_lock_scope(2);
+        assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
+    }
+
+    /// The out-of-order release the owned-lock branch exists for still has to
+    /// work once the two locks share a class.
+    #[test]
+    fn a_merged_out_of_order_unlock_still_publishes_the_outer_exit_word() {
+        let _guard = isolate_dependency_state();
+        reset_state();
+
+        let outer = begin_lock_scope(2);
+        mark_critical_section_entered_for_scope(outer);
+
+        let inner = begin_lock_scope(3);
+        assert_eq!(class_of(3), 2, "nesting merges the inner lock");
+        assert!(!mark_slow_path_pending_for_scope(inner));
+
+        finish_lock_scope(2);
+        assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
+
+        finish_lock_scope(3);
         assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
     }
 

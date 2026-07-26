@@ -317,6 +317,22 @@ fn word_with_lock_id(lock_id: u32, flags: u32) -> u32 {
     (lock_id << USER_ADMISSION_LOCK_ID_SHIFT) | (flags & USER_ADMISSION_FLAG_MASK)
 }
 
+/// Word published while admission is disabled: the lock class stays visible and
+/// every admission flag is dropped.
+#[inline(always)]
+fn cleared_flags_word(class: u32, value: u32) -> u32 {
+    word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
+}
+
+#[inline(always)]
+fn exit_word(class: u32, value: u32, enabled: bool) -> u32 {
+    if enabled {
+        word_with_lock_id(class, (flags(value) | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION)
+    } else {
+        cleared_flags_word(class, value)
+    }
+}
+
 /// Hands out one id per lock while ids last, then reports every further lock as
 /// unmanaged.
 fn allocate_lock_id() -> u32 {
@@ -458,6 +474,11 @@ pub fn mark_critical_section_entered_for_scope(scope: LockAdmissionScope) {
     }
 }
 
+/// Publishes the critical-section exit for the lock that currently owns the
+/// admission word, even when an inner scope is still held: condition variables
+/// release the outer contended mutex while their internal mutex stays locked,
+/// and leaving `IN_CRITICAL_SECTION` set there pins the CPU admission slot for
+/// the whole sleep.
 #[inline(always)]
 pub fn finish_lock_scope(lock_id: u32) {
     THREAD_HELD_DEPTH.with(|depth| {
@@ -466,10 +487,14 @@ pub fn finish_lock_scope(lock_id: u32) {
             return;
         }
 
-        if held == 1 {
-            if managed_lock_id(lock_id) {
+        if managed_lock_id(lock_id) {
+            if held == 1 {
                 mark_critical_section_exit_for_lock(lock_id);
+            } else {
+                mark_critical_section_exit_for_owned_lock(lock_id);
             }
+        }
+        if held == 1 {
             THREAD_OUTER_LOCK_ID.with(|outer| outer.set(UNMANAGED_LOCK_ID));
         }
         depth.set(held - 1);
@@ -487,8 +512,35 @@ pub fn mark_slow_path_pending_for_lock(lock_id: u32) -> bool {
 }
 
 #[inline(always)]
-pub fn mark_cond_reacquire_pending_for_lock(lock_id: u32) -> bool {
-    mark_cond_reacquire_pending_for_lock_with_admission_enabled(lock_id, admission_enabled())
+pub fn mark_cond_reacquire_pending_for_cond_mutex(lock_id: u32) -> bool {
+    mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(lock_id, admission_enabled())
+}
+
+/// Acknowledges a cond-reacquire hint published for this scope: the consumed
+/// token is cleared in the same word access that matched it, so the caller can
+/// block on the lock without asking admission again.
+#[inline(always)]
+pub fn take_cond_reacquire_pending_for_scope(scope: LockAdmissionScope) -> bool {
+    if !scope.outer_managed {
+        return false;
+    }
+
+    let class = class_of(scope.lock_id);
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        if user_lock_id_for_value(value) != class
+            || flags(value) & (SLOW_PATH_PENDING | TOKEN_CONSUMED)
+                != SLOW_PATH_PENDING | TOKEN_CONSUMED
+        {
+            return false;
+        }
+
+        word.store(
+            word_with_lock_id(class, flags(value) & !TOKEN_CONSUMED),
+            Ordering::Relaxed,
+        );
+        true
+    })
 }
 
 #[inline(always)]
@@ -543,36 +595,43 @@ fn mark_slow_path_pending_for_lock_with_admission_enabled(lock_id: u32, enabled:
             };
             word_with_lock_id(class, preserved_flags | SLOW_PATH_PENDING)
         } else {
-            word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
+            cleared_flags_word(class, value)
         };
         word.store(next, Ordering::Relaxed);
     });
     enabled
 }
 
+/// Publishes the cond-reacquire hint only while the word still describes the
+/// just-unlocked cond mutex and no managed scope stays held: any other state
+/// belongs to an enclosing critical section that must keep owning the word.
 #[inline(always)]
-fn mark_cond_reacquire_pending_for_lock_with_admission_enabled(
+fn mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(
     lock_id: u32,
     enabled: bool,
 ) -> bool {
-    if !managed_lock_id(lock_id) {
+    if !managed_lock_id(lock_id) || THREAD_HELD_DEPTH.with(|depth| depth.get()) != 0 {
         return false;
     }
 
     let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
+        if user_lock_id_for_value(value) != class {
+            return false;
+        }
+
         let next = if enabled {
             word_with_lock_id(
                 class,
                 (flags(value) | SLOW_PATH_PENDING | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION,
             )
         } else {
-            word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
+            cleared_flags_word(class, value)
         };
         word.store(next, Ordering::Relaxed);
-    });
-    enabled
+        enabled
+    })
 }
 
 #[inline(always)]
@@ -613,7 +672,7 @@ fn mark_critical_section_entered_for_lock_with_admission_enabled(lock_id: u32, e
                 (flags(value) | IN_CRITICAL_SECTION) & !(SLOW_PATH_PENDING | TOKEN_CONSUMED),
             )
         } else {
-            word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
+            cleared_flags_word(class, value)
         };
         word.store(next, Ordering::Relaxed);
     });
@@ -651,15 +710,24 @@ fn mark_critical_section_exit_for_lock_with_admission_enabled(lock_id: u32, enab
     let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
-        let next = if enabled {
-            word_with_lock_id(
-                class,
-                (flags(value) | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION,
-            )
-        } else {
-            word_with_lock_id(class, flags(value) & !TRANSIENT_FLAGS)
-        };
-        word.store(next, Ordering::Relaxed);
+        word.store(exit_word(class, value, enabled), Ordering::Relaxed);
+    });
+}
+
+/// Out-of-order unlock: the exit word is published only while the admission
+/// word still describes the class of `lock_id`, testing and storing in one word
+/// access.
+#[inline(always)]
+fn mark_critical_section_exit_for_owned_lock(lock_id: u32) {
+    let enabled = admission_enabled();
+    let class = class_of(lock_id);
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        if user_lock_id_for_value(value) != class {
+            return;
+        }
+
+        word.store(exit_word(class, value, enabled), Ordering::Relaxed);
     });
 }
 
@@ -768,7 +836,8 @@ mod tests {
         UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_class, allocate_lock_id,
         begin_lock_scope, class_of, clear_token_consumed_for_scope, finish_lock_scope,
         force_dump_for_test, force_lock_class_policy_for_test, force_merge_for_test,
-        lock_class_policy, managed_lock_id, mark_cond_reacquire_pending_for_lock,
+        lock_class_policy, managed_lock_id, mark_cond_reacquire_pending_for_cond_mutex,
+        mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled,
         mark_critical_section_entered, mark_critical_section_entered_for_scope,
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
@@ -776,8 +845,8 @@ mod tests {
         parse_lock_class_policy, reset_lock_id_allocator_for_test, reset_state,
         reset_thread_depth_for_test, reset_transient_state, reset_transitions_for_tests,
         reset_union_find_for_tests, set_inactive_queue_seq_ptrs, slow_path_yield_required,
-        take_classes_dirty, token_consumed_for_scope, transition_count_for_test,
-        union_lock_classes, word_for_test,
+        take_classes_dirty, take_cond_reacquire_pending_for_scope, token_consumed_for_scope,
+        transition_count_for_test, union_lock_classes, word_for_test,
     };
 
     static INACTIVE_QUEUE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -996,6 +1065,49 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_unlock_publishes_the_exit_word_for_the_outer_lock() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let outer = begin_lock_scope(2);
+        assert!(mark_slow_path_pending_for_scope(outer));
+        mark_critical_section_entered_for_scope(outer);
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
+
+        let inner = begin_lock_scope(MAX_LOCK_CLASSES);
+        assert!(!mark_slow_path_pending_for_scope(inner));
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
+
+        finish_lock_scope(2);
+        assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
+
+        finish_lock_scope(MAX_LOCK_CLASSES);
+        assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn out_of_order_unlock_with_a_managed_inner_lock_publishes_both_exits() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let outer = begin_lock_scope(2);
+        mark_critical_section_entered_for_scope(outer);
+
+        let inner = begin_lock_scope(3);
+        assert!(!mark_slow_path_pending_for_scope(inner));
+
+        finish_lock_scope(2);
+        assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
+
+        finish_lock_scope(3);
+        assert_eq!(word_for_test(), word_for(3, TOKEN_CONSUMED));
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
     fn next_slow_path_after_consuming_token_exposes_consumed_flag_until_yield() {
         reset_state();
         reset_thread_depth_for_test();
@@ -1041,16 +1153,83 @@ mod tests {
         reset_thread_depth_for_test();
     }
 
+    fn release_managed_lock_for_test(lock_id: u32) {
+        let scope = begin_lock_scope(lock_id);
+        mark_critical_section_entered_for_scope(scope);
+        finish_lock_scope(lock_id);
+    }
+
     #[test]
-    fn cond_reacquire_hint_marks_slow_path_and_consumed_token_for_lock() {
+    fn cond_reacquire_hint_drives_the_full_relock_transition() {
         reset_state();
+        reset_thread_depth_for_test();
 
-        mark_cond_reacquire_pending_for_lock(4);
+        release_managed_lock_for_test(4);
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
 
+        assert!(mark_cond_reacquire_pending_for_cond_mutex(4));
         assert_eq!(
             word_for_test(),
             word_for(4, SLOW_PATH_PENDING | TOKEN_CONSUMED)
         );
+
+        let relock = begin_lock_scope(4);
+        assert!(take_cond_reacquire_pending_for_scope(relock));
+        assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
+
+        assert!(!take_cond_reacquire_pending_for_scope(relock));
+        assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
+
+        mark_critical_section_entered_for_scope(relock);
+        assert_eq!(word_for_test(), word_for(4, IN_CRITICAL_SECTION));
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn cond_reacquire_hint_is_skipped_for_another_lock_id() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        release_managed_lock_for_test(4);
+
+        assert!(!mark_cond_reacquire_pending_for_cond_mutex(5));
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
+
+        let other = begin_lock_scope(5);
+        assert!(!take_cond_reacquire_pending_for_scope(other));
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn cond_reacquire_hint_is_skipped_while_an_outer_lock_stays_held() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let outer = begin_lock_scope(2);
+        mark_critical_section_entered_for_scope(outer);
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
+
+        assert!(!mark_cond_reacquire_pending_for_cond_mutex(3));
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
+
+        finish_lock_scope(2);
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn disabled_admission_cond_reacquire_hint_leaves_flags_clear() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        release_managed_lock_for_test(4);
+
+        assert!(!mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(4, false));
+        assert_eq!(word_for_test(), word_for(4, 0));
+
+        reset_thread_depth_for_test();
     }
 
     #[test]

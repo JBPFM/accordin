@@ -86,6 +86,19 @@ macro_rules! define_scheduler_loader {
                     bss.class_active_peak.as_mut_ptr(),
                     bss.class_inactive_depth.as_mut_ptr(),
                 );
+                if debug_counters {
+                    $crate::bpf_counters::set_routing_counter_ptrs([
+                        &mut bss.select_local_direct as *mut u64,
+                        &mut bss.wake_consumed_seen as *mut u64,
+                        &mut bss.wake_consumed_granted as *mut u64,
+                        &mut bss.wake_consumed_inactive as *mut u64,
+                        &mut bss.wake_consumed_normal as *mut u64,
+                        &mut bss.wake_read_fail as *mut u64,
+                        &mut bss.running_pending_grant_success as *mut u64,
+                        &mut bss.running_pending_grant_failure as *mut u64,
+                        &mut bss.block_release_read_fail as *mut u64,
+                    ]);
+                }
             }
 
             let link = ::scx_utils::scx_ops_attach!(skel, accordin_ops)?;
@@ -101,6 +114,7 @@ macro_rules! define_scheduler_loader {
             fn drop(&mut self) {
                 $crate::mutex_hook::set_registered_thread_count_ptr(::std::ptr::null_mut());
                 $crate::width_control::clear_class_state_ptrs();
+                $crate::bpf_counters::clear_routing_counter_ptrs();
                 let _ = self._link.take();
                 let _ = self._skel.take();
                 ::log::info!("{SCHEDULER_NAME} scheduler stopped");
@@ -119,6 +133,12 @@ macro_rules! define_scheduler_loader {
                 ::simplelog::ColorChoice::Auto,
             );
 
+            let stats_only = $crate::env::env_flag(STATS_ONLY_ENV);
+            let debug_counters = $crate::env::env_flag(DEBUG_COUNTERS_ENV);
+            // Userspace hint counters stay valid without the scheduler, so they
+            // are armed before the disable-bpf exit.
+            $crate::mutex_hook::set_cv_admission_counters_enabled(debug_counters);
+
             if $crate::env::env_flag(DISABLE_BPF_ENV) {
                 ::log::info!(
                     "{SCHEDULER_NAME} scheduler disabled by env {}",
@@ -130,9 +150,6 @@ macro_rules! define_scheduler_loader {
                 );
                 return;
             }
-
-            let stats_only = $crate::env::env_flag(STATS_ONLY_ENV);
-            let debug_counters = $crate::env::env_flag(DEBUG_COUNTERS_ENV);
 
             let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false, stats_only, debug_counters) {
                 Ok(state) => {

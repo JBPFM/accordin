@@ -126,6 +126,11 @@ ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accord
 MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
+ACCORDIN_ENV_PASSTHROUGH_PREFIXES = (
+    "ACCORDIN_",
+    "MCS_ACCORDIN_",
+    "MCS_TAS_ACCORDIN_",
+)
 ROOT_REQUIRED_PRELOAD_LOCKS = {
     lock
     for lock in experiment_defaults.ACCORDIN_VARIANT_LOCKS
@@ -562,6 +567,18 @@ def combine_ld_preload(preload_library: Path) -> str:
     return f"{preload_library}:{existing}" if existing else str(preload_library)
 
 
+def accordin_env_passthrough(env: dict[str, str | None]) -> dict[str, str | None]:
+    # sudo -n env drops the caller environment, so accordin toggles must be forwarded
+    # explicitly; entries the caller already pinned or unset keep precedence.
+    merged: dict[str, str | None] = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith(ACCORDIN_ENV_PASSTHROUGH_PREFIXES) and key not in env
+    }
+    merged.update(env)
+    return merged
+
+
 def accordin_preload_env(
     preload_library: Path,
     *,
@@ -576,7 +593,7 @@ def accordin_preload_env(
     if experiment_defaults.accordin_disables_admission(lock):
         env["ACCORDIN_DISABLE_ADMISSION"] = "1"
         env["MCS_TAS_ACCORDIN_STATS_ONLY"] = "1"
-    return env
+    return accordin_env_passthrough(env)
 
 
 def taskset_wrapper_env(env: dict[str, str | None]) -> dict[str, str | None]:
@@ -611,14 +628,16 @@ def accordin_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None]
 def mcs_accordin_preload_env(
     preload_library: Path = MCS_ACCORDIN_PRELOAD_LIBRARY,
 ) -> dict[str, str | None]:
-    return {
-        "LD_PRELOAD": combine_ld_preload(preload_library),
-        "ACCORDIN_DISABLE_ADMISSION": None,
-        "MCS_ACCORDIN_DISABLE_BPF": None,
-        "MCS_ACCORDIN_STATS_ONLY": None,
-        "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
-        "MCS_TAS_ACCORDIN_STATS_ONLY": None,
-    }
+    return accordin_env_passthrough(
+        {
+            "LD_PRELOAD": combine_ld_preload(preload_library),
+            "ACCORDIN_DISABLE_ADMISSION": None,
+            "MCS_ACCORDIN_DISABLE_BPF": None,
+            "MCS_ACCORDIN_STATS_ONLY": None,
+            "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
+            "MCS_TAS_ACCORDIN_STATS_ONLY": None,
+        }
+    )
 
 
 def mcs_accordin_command_prefix() -> tuple[list[str], dict[str, str | None]]:

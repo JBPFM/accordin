@@ -94,10 +94,8 @@ MCS_ACCORDIN_DIRECT_PACKAGE = "mcs_accordin_direct"
 MCS_ACCORDIN_DIRECT_PRELOAD_LIBRARY = (
     REPO_ROOT / "target" / "release" / "libmcs_accordin_direct.so"
 )
-MCS_ACCORDIN_DIRECT_ENV_PREFIX = "MCS_ACCORDIN_DIRECT_"
 MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_ACCORDIN_DIRECT_DISABLE_BPF"
 MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_ACCORDIN_DIRECT_STATS_ONLY"
-MCS_TAS_ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
 MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 MCS_TAS_ACCORDIN_DIRECT_NO_ADMISSION_LOCK = "mcs_tas_accordin_direct_no_admission"
@@ -252,7 +250,7 @@ Default benchmark settings:
   benchmarks={','.join(DEFAULT_BENCHMARKS)}
   lock-profile={DEFAULT_LOCK_PROFILE}
   accordin-mode={DEFAULT_ACCORDIN_MODE}
-  benchmark accordin modes={','.join(f"{benchmark}:{mode}" for benchmark, mode in BENCHMARK_ACCORDIN_MODE_OVERRIDES.items())}
+  benchmark accordin modes (only when --accordin-mode is omitted)={','.join(f"{benchmark}:{mode}" for benchmark, mode in BENCHMARK_ACCORDIN_MODE_OVERRIDES.items())}
   leveldb direct adapter benchmarks={','.join(LEVELDB_DIRECT_ADAPTER_BENCHMARKS)}
   leveldb direct adapter locks={','.join(LEVELDB_DIRECT_ADAPTER_LOCKS)}
   minimal locks={','.join(MINIMAL_LOCKS)}
@@ -341,15 +339,16 @@ Examples:
     parser.add_argument(
         "--accordin-mode",
         choices=ACCORDIN_MODES,
-        default=DEFAULT_ACCORDIN_MODE,
+        default=None,
         help=(
             "Accordin implementation used for Accordin lock profiles and aliases. "
             f"{ACCORDIN_MODE_DIRECT} uses libmcs_tas_accordin_direct.so; "
             f"explicit mcs_accordin uses libmcs_accordin_direct.so; "
             f"{ACCORDIN_MODE_MUTEX_HOOK} uses libmcs_tas_accordin.so for all pthread mutex hooks. "
-            "readrandom and fillrandom are forced to accordin_direct; "
-            "readrandom and fillrandom also use LevelDB direct adapters for non-Accordin benchmark locks; "
-            f"other benchmarks use this mode. Default: {DEFAULT_ACCORDIN_MODE}."
+            "Passing this flag applies the given mode to every benchmark; "
+            "when it is omitted, readrandom and fillrandom fall back to accordin_direct. "
+            "readrandom and fillrandom always use LevelDB direct adapters for non-Accordin benchmark locks. "
+            f"Default: {DEFAULT_ACCORDIN_MODE}."
         ),
     )
     parser.add_argument(
@@ -361,9 +360,9 @@ Examples:
             "Use mutex to run without interpose. "
             "Aliases: mcs-tas == mcstas, mcs_tse/mcs-tse == mcs_extension, "
             "readrandom/fillrandom use LevelDB direct adapters for non-Accordin benchmark locks, "
-            "accordin aliases follow --accordin-mode before benchmark-specific "
-            "readrandom/fillrandom direct remapping; only the admission-only Accordin "
-            "variant is supported."
+            "accordin aliases follow --accordin-mode, which also disables the benchmark-specific "
+            "readrandom/fillrandom direct remapping when it is passed explicitly; only the "
+            "admission-only Accordin variant is supported."
         ),
     )
     parser.add_argument(
@@ -428,7 +427,11 @@ Examples:
             f"Default: {','.join(DEFAULT_INIT_EXISTING_BENCHMARKS)}."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.accordin_mode_explicit = args.accordin_mode is not None
+    if args.accordin_mode is None:
+        args.accordin_mode = DEFAULT_ACCORDIN_MODE
+    return args
 
 
 def parse_csv_strings(value: str) -> tuple[str, ...]:
@@ -485,7 +488,9 @@ def canonical_leveldb_lock(lock: str) -> str:
     return normalize_leveldb_lock(normalized)
 
 
-def benchmark_accordin_mode(benchmark: str, *, fallback: str) -> str:
+def benchmark_accordin_mode(benchmark: str, *, fallback: str, explicit: bool = False) -> str:
+    if explicit:
+        return fallback
     return BENCHMARK_ACCORDIN_MODE_OVERRIDES.get(benchmark, fallback)
 
 
@@ -494,8 +499,13 @@ def effective_lock_for_benchmark(
     lock: str,
     *,
     accordin_mode: str = DEFAULT_ACCORDIN_MODE,
+    accordin_mode_explicit: bool = False,
 ) -> str:
-    effective_mode = benchmark_accordin_mode(benchmark, fallback=accordin_mode)
+    effective_mode = benchmark_accordin_mode(
+        benchmark,
+        fallback=accordin_mode,
+        explicit=accordin_mode_explicit,
+    )
     normalized = canonical_leveldb_lock(lock)
     if experiment_defaults.is_mcs_accordin_lock(normalized):
         return normalized
@@ -512,6 +522,7 @@ def effective_locks_for_benchmarks(
     locks: tuple[str, ...],
     *,
     accordin_mode: str = DEFAULT_ACCORDIN_MODE,
+    accordin_mode_explicit: bool = False,
 ) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
@@ -519,6 +530,7 @@ def effective_locks_for_benchmarks(
                 benchmark,
                 lock,
                 accordin_mode=accordin_mode,
+                accordin_mode_explicit=accordin_mode_explicit,
             )
             for benchmark in benchmarks
             for lock in locks
@@ -721,12 +733,7 @@ def mcs_tas_accordin_direct_preload_env(
     *,
     lock: str = MCS_TAS_ACCORDIN_DIRECT_ADMISSION_ONLY_LOCK,
 ) -> dict[str, str | None]:
-    env = preload_env(preload_library)
-    if env is None:
-        env = {}
-    for key, value in os.environ.items():
-        if key.startswith(MCS_TAS_ACCORDIN_DIRECT_ENV_PREFIX):
-            env[key] = value
+    env: dict[str, str | None] = dict(preload_env(preload_library) or {})
     env.update(
         {
             ACCORDIN_HOOK_SCOPE_ENV: None,
@@ -740,30 +747,26 @@ def mcs_tas_accordin_direct_preload_env(
     if leveldb_direct_accordin_disables_admission(lock):
         env["ACCORDIN_DISABLE_ADMISSION"] = "1"
         env[MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV] = "1"
-    return env
+    return experiment_three.accordin_env_passthrough(env)
 
 
 def mcs_accordin_direct_preload_env(
     preload_library: Path = MCS_ACCORDIN_DIRECT_PRELOAD_LIBRARY,
 ) -> dict[str, str | None]:
-    env = preload_env(preload_library)
-    if env is None:
-        env = {}
-    for key, value in os.environ.items():
-        if key.startswith(MCS_ACCORDIN_DIRECT_ENV_PREFIX):
-            env[key] = value
+    env: dict[str, str | None] = dict(preload_env(preload_library) or {})
     env.update(
         {
             ACCORDIN_HOOK_SCOPE_ENV: None,
             "ACCORDIN_DISABLE_ADMISSION": None,
             "MCS_ACCORDIN_DISABLE_BPF": None,
             "MCS_ACCORDIN_STATS_ONLY": None,
+            "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
             MCS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
             MCS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
         }
     )
     env.update(experiment_defaults.accordin_width_env())
-    return env
+    return experiment_three.accordin_env_passthrough(env)
 
 
 def default_result_root() -> Path:
@@ -1367,6 +1370,7 @@ def run_benchmarks(
     selected_runs: set[RunKey] | None,
     keep_db: bool,
     accordin_mode: str,
+    accordin_mode_explicit: bool,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     init_benchmarks = set(init_existing_benchmarks)
@@ -1379,6 +1383,7 @@ def run_benchmarks(
                 benchmark,
                 lock,
                 accordin_mode=accordin_mode,
+                accordin_mode_explicit=accordin_mode_explicit,
             )
             for thread in runnable_threads_for_lock(effective_lock, threads):
                 if uses_reads:
@@ -1506,6 +1511,7 @@ def write_settings(
     lock_profile: str,
     lock_profile_source: str,
     accordin_mode: str,
+    accordin_mode_explicit: bool,
     command_timeout_seconds: int,
 ) -> None:
     effective_locks_by_benchmark = {
@@ -1514,6 +1520,7 @@ def write_settings(
                 (benchmark,),
                 locks,
                 accordin_mode=accordin_mode,
+                accordin_mode_explicit=accordin_mode_explicit,
             )
         )
         for benchmark in benchmarks
@@ -1533,7 +1540,11 @@ def write_settings(
         "benchmarks": [{"key": benchmark, "label": benchmark_label(benchmark)} for benchmark in benchmarks],
         "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
         "benchmark_accordin_modes": {
-            benchmark: benchmark_accordin_mode(benchmark, fallback=accordin_mode)
+            benchmark: benchmark_accordin_mode(
+                benchmark,
+                fallback=accordin_mode,
+                explicit=accordin_mode_explicit,
+            )
             for benchmark in benchmarks
         },
         "benchmark_leveldb_direct_adapter_locks": {
@@ -1548,6 +1559,7 @@ def write_settings(
         "lock_profile": lock_profile,
         "lock_profile_source": lock_profile_source,
         "accordin_mode": accordin_mode,
+        "accordin_mode_explicit": accordin_mode_explicit,
         "threads": list(threads),
         "machine_profile": experiment_defaults.ACTIVE_MACHINE_CONFIG.name,
         "machine_profile_env": experiment_defaults.PROFILE_ENV,
@@ -1937,6 +1949,7 @@ def main() -> int:
             benchmarks,
             locks,
             accordin_mode=args.accordin_mode,
+            accordin_mode_explicit=args.accordin_mode_explicit,
         )
         validate_benchmark_lock_compatibility(benchmarks, effective_locks)
 
@@ -1973,6 +1986,7 @@ def main() -> int:
             lock_profile=args.lock_profile,
             lock_profile_source="manual" if args.locks is not None else "profile",
             accordin_mode=args.accordin_mode,
+            accordin_mode_explicit=args.accordin_mode_explicit,
             command_timeout_seconds=args.command_timeout_seconds,
         )
         failures: list[dict[str, str]] = []
@@ -1992,6 +2006,7 @@ def main() -> int:
             selected_runs=selected_runs,
             keep_db=args.keep_db,
             accordin_mode=args.accordin_mode,
+            accordin_mode_explicit=args.accordin_mode_explicit,
         )
         raw_path = write_raw_csv(result_root, raw_rows)
         summary_rows = summarize_rows(raw_rows)

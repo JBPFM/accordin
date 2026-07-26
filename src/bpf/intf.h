@@ -29,6 +29,7 @@
 #define ENQ_PATH_SLOW_GRANTED_LOCAL 4U
 #define ENQ_PATH_SLOW_INACTIVE 5U
 #define ENQ_PATH_FORCE_INACTIVE 6U
+#define ENQ_PATH_SELECT_LOCAL_DIRECT 7U
 
 struct task_scx_ctx {
   unsigned int initialized;

@@ -2,6 +2,8 @@ pub mod arch;
 
 pub mod admission;
 
+pub mod bpf_counters;
+
 pub mod cpu_affinity;
 
 pub mod env;

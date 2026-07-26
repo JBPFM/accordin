@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
@@ -56,7 +56,68 @@ static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
 static REGISTERED_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 static REGISTERED_THREAD_COUNT_BPF: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 const HOOK_SCOPE_ENV: &str = "ACCORDIN_HOOK_SCOPE";
-const CV_ADMISSION_HINT_ENV: &str = "ACCORDIN_CV_ADMISSION_HINT";
+const DISABLE_CV_ADMISSION_HINT_ENV: &str = "ACCORDIN_DISABLE_CV_ADMISSION_HINT";
+
+static CV_COUNTERS_ENABLED: AtomicBool = AtomicBool::new(false);
+static CV_HINTS_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+static CV_SPECIALIZED_RELOCKS: AtomicU64 = AtomicU64::new(0);
+static CV_FALLBACK_RELOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// Reconciles the userspace side of the cond-reacquire protocol against the
+/// scheduler's wake-routing counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CvAdmissionCounters {
+    pub hints_published: u64,
+    pub specialized_relocks: u64,
+    pub fallback_relocks: u64,
+}
+
+pub fn cv_admission_counters() -> CvAdmissionCounters {
+    CvAdmissionCounters {
+        hints_published: CV_HINTS_PUBLISHED.load(Ordering::Relaxed),
+        specialized_relocks: CV_SPECIALIZED_RELOCKS.load(Ordering::Relaxed),
+        fallback_relocks: CV_FALLBACK_RELOCKS.load(Ordering::Relaxed),
+    }
+}
+
+/// The counters share cache lines across every hooked thread, so they stay off
+/// unless the run explicitly asks for debug counters.
+#[inline]
+pub fn cv_admission_counters_enabled() -> bool {
+    CV_COUNTERS_ENABLED.load(Ordering::Relaxed)
+}
+
+#[doc(hidden)]
+pub fn set_cv_admission_counters_enabled(enabled: bool) {
+    CV_COUNTERS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn bump_cv_counter(counter: &AtomicU64) {
+    if !CV_COUNTERS_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_hint_published() {
+    bump_cv_counter(&CV_HINTS_PUBLISHED);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_specialized_relock() {
+    bump_cv_counter(&CV_SPECIALIZED_RELOCKS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_fallback_relock() {
+    bump_cv_counter(&CV_FALLBACK_RELOCKS);
+}
 
 #[inline(always)]
 pub fn current_tid() -> u32 {
@@ -99,7 +160,7 @@ pub fn registered_hook_scope_enabled() -> bool {
 #[doc(hidden)]
 pub fn cv_admission_hint_enabled() -> bool {
     static CV_ADMISSION_HINT_ENABLED: OnceLock<bool> = OnceLock::new();
-    *CV_ADMISSION_HINT_ENABLED.get_or_init(|| crate::env::env_flag(CV_ADMISSION_HINT_ENV))
+    *CV_ADMISSION_HINT_ENABLED.get_or_init(|| !crate::env::env_flag(DISABLE_CV_ADMISSION_HINT_ENV))
 }
 
 fn hooked_mutexes() -> &'static Mutex<HashSet<usize>> {
@@ -285,25 +346,19 @@ macro_rules! export_mutex_hooks {
                 });
             }
 
+            /// Whether the acquire bracket still has to ask admission for a
+            /// slot, or whether the caller already holds the routing decision.
+            #[derive(Clone, Copy, PartialEq, Eq)]
+            enum AcquireMode {
+                Normal,
+                AlreadyAdmitted,
+            }
+
             #[inline(always)]
             fn lock_with_stats(lock: &<Backend as MutexHookBackend>::LockState, lock_id: u32) {
                 if Backend::USES_ADMISSION_SCOPE {
                     let scope = $crate::admission::begin_lock_scope(lock_id);
-                    if !$crate::admission::token_consumed_for_scope(scope)
-                        && Backend::try_lock(lock)
-                    {
-                        record_lock_acquired_for_scope(scope);
-                        return;
-                    }
-
-                    let wait_start = record_wait_start();
-                    if $crate::admission::mark_slow_path_pending_for_scope(scope) {
-                        std::thread::yield_now();
-                        $crate::admission::clear_token_consumed_for_scope(scope);
-                    }
-                    Backend::lock(lock);
-                    record_wait_end(wait_start);
-                    record_lock_acquired_for_scope(scope);
+                    lock_scope_with_stats(lock, scope, AcquireMode::Normal);
                     return;
                 }
 
@@ -316,6 +371,70 @@ macro_rules! export_mutex_hooks {
                 Backend::lock(lock);
                 record_wait_end(wait_start);
                 record_lock_acquired();
+            }
+
+            #[inline(always)]
+            fn lock_scope_with_stats(
+                lock: &<Backend as MutexHookBackend>::LockState,
+                scope: $crate::admission::LockAdmissionScope,
+                mode: AcquireMode,
+            ) {
+                let normal = mode == AcquireMode::Normal;
+
+                if normal
+                    && !$crate::admission::token_consumed_for_scope(scope)
+                    && Backend::try_lock(lock)
+                {
+                    record_lock_acquired_for_scope(scope);
+                    return;
+                }
+
+                let wait_start = record_wait_start();
+                if normal && $crate::admission::mark_slow_path_pending_for_scope(scope) {
+                    std::thread::yield_now();
+                    $crate::admission::clear_token_consumed_for_scope(scope);
+                }
+                Backend::lock(lock);
+                record_wait_end(wait_start);
+                record_lock_acquired_for_scope(scope);
+            }
+
+            #[inline(always)]
+            fn publish_cond_reacquire_hint(lock_id: u32) {
+                if Backend::USES_ADMISSION_SCOPE
+                    && $crate::mutex_hook::cv_admission_hint_enabled()
+                    && $crate::admission::mark_cond_reacquire_pending_for_cond_mutex(lock_id)
+                {
+                    $crate::mutex_hook::record_cv_hint_published();
+                }
+            }
+
+            /// Reacquires the cond mutex after a wait. A waiter that actually
+            /// blocked was already routed through admission at wake time, so
+            /// taking the published hint acknowledges the consumed token and the
+            /// lock is entered without re-requesting admission.
+            #[inline(always)]
+            fn relock_after_cond_wait(
+                lock: &<Backend as MutexHookBackend>::LockState,
+                lock_id: u32,
+                slept: bool,
+            ) {
+                if !Backend::USES_ADMISSION_SCOPE {
+                    lock_with_stats(lock, lock_id);
+                    return;
+                }
+
+                let scope = $crate::admission::begin_lock_scope(lock_id);
+                let mode = if slept
+                    && $crate::admission::take_cond_reacquire_pending_for_scope(scope)
+                {
+                    $crate::mutex_hook::record_cv_specialized_relock();
+                    AcquireMode::AlreadyAdmitted
+                } else {
+                    $crate::mutex_hook::record_cv_fallback_relock();
+                    AcquireMode::Normal
+                };
+                lock_scope_with_stats(lock, scope, mode);
             }
 
             #[inline(always)]
@@ -725,16 +844,24 @@ macro_rules! export_mutex_hooks {
             #[inline(never)]
             const fn cold_path() {}
 
+            /// Returns 0 when the wait completed, otherwise the errno reported
+            /// by the syscall, so callers classify the outcome without reading
+            /// thread-local errno themselves.
             #[inline(always)]
-            unsafe fn futex_wait(addr: *const AtomicU32, expected: u32) -> libc::c_long {
+            unsafe fn futex_wait(addr: *const AtomicU32, expected: u32) -> libc::c_int {
                 unsafe {
-                    libc::syscall(
+                    let ret = libc::syscall(
                         libc::SYS_futex,
                         addr as *const u32,
                         FUTEX_WAIT_PRIVATE,
                         expected,
                         std::ptr::null::<libc::timespec>(),
-                    )
+                    );
+                    if ret == 0 {
+                        0
+                    } else {
+                        *libc::__errno_location()
+                    }
                 }
             }
 
@@ -743,9 +870,9 @@ macro_rules! export_mutex_hooks {
                 addr: *const AtomicU32,
                 expected: u32,
                 abstime: *const libc::timespec,
-            ) -> libc::c_long {
+            ) -> libc::c_int {
                 unsafe {
-                    libc::syscall(
+                    let ret = libc::syscall(
                         libc::SYS_futex,
                         addr as *const u32,
                         FUTEX_WAIT_BITSET_PRIVATE_REALTIME,
@@ -753,7 +880,12 @@ macro_rules! export_mutex_hooks {
                         abstime,
                         std::ptr::null::<libc::c_void>(),
                         FUTEX_BITSET_MATCH_ANY,
-                    )
+                    );
+                    if ret == 0 {
+                        0
+                    } else {
+                        *libc::__errno_location()
+                    }
                 }
             }
 
@@ -1081,15 +1213,13 @@ macro_rules! export_mutex_hooks {
                     let seq = (*cond_state).seq.load(Ordering::Acquire);
                     (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
                     unlock_with_stats(&(*state).lock, (*state).lock_id);
-                    if Backend::USES_ADMISSION_SCOPE
-                        && $crate::mutex_hook::cv_admission_hint_enabled()
-                    {
-                        $crate::admission::mark_cond_reacquire_pending_for_lock((*state).lock_id);
-                    }
+                    publish_cond_reacquire_hint((*state).lock_id);
+                    let mut slept = false;
                     while (*cond_state).seq.load(Ordering::Acquire) == seq {
-                        futex_wait(&(*cond_state).seq, seq);
+                        let rc = futex_wait(&(*cond_state).seq, seq);
+                        slept |= rc == 0 || rc == libc::EINTR;
                     }
-                    lock_with_stats(&(*state).lock, (*state).lock_id);
+                    relock_after_cond_wait(&(*state).lock, (*state).lock_id, slept);
                     0
                 }
             }
@@ -1121,24 +1251,20 @@ macro_rules! export_mutex_hooks {
                     let mut ret = 0;
                     (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
                     unlock_with_stats(&(*state).lock, (*state).lock_id);
-                    if Backend::USES_ADMISSION_SCOPE
-                        && $crate::mutex_hook::cv_admission_hint_enabled()
-                    {
-                        $crate::admission::mark_cond_reacquire_pending_for_lock((*state).lock_id);
-                    }
+                    publish_cond_reacquire_hint((*state).lock_id);
+                    let mut slept = false;
                     while (*cond_state).seq.load(Ordering::Acquire) == seq {
-                        if futex_wait_until_realtime(&(*cond_state).seq, seq, abstime) != 0 {
-                            let errno = *libc::__errno_location();
-                            if errno == libc::ETIMEDOUT {
-                                if (*cond_state).seq.load(Ordering::Acquire) == seq {
-                                    cancel_one_waiter(cond_state);
-                                    ret = libc::ETIMEDOUT;
-                                }
-                                break;
+                        let rc = futex_wait_until_realtime(&(*cond_state).seq, seq, abstime);
+                        slept |= rc == 0 || rc == libc::EINTR || rc == libc::ETIMEDOUT;
+                        if rc == libc::ETIMEDOUT {
+                            if (*cond_state).seq.load(Ordering::Acquire) == seq {
+                                cancel_one_waiter(cond_state);
+                                ret = libc::ETIMEDOUT;
                             }
+                            break;
                         }
                     }
-                    lock_with_stats(&(*state).lock, (*state).lock_id);
+                    relock_after_cond_wait(&(*state).lock, (*state).lock_id, slept);
                     ret
                 }
             }
@@ -1153,10 +1279,12 @@ mod tests {
     use libbpf_rs::MapFlags;
 
     use super::{
-        ThreadCtxMapOps, hook_scope_value_is_registered, hooked_cond_registered,
-        hooked_mutex_registered, register_hooked_cond_addr, register_hooked_mutex_addr,
-        register_thread_ctx_with_map, unregister_hooked_cond_addr, unregister_hooked_mutex_addr,
-        unregister_thread_ctx_with_map,
+        ThreadCtxMapOps, cv_admission_counters, cv_admission_counters_enabled,
+        hook_scope_value_is_registered, hooked_cond_registered, hooked_mutex_registered,
+        record_cv_fallback_relock, record_cv_hint_published, record_cv_specialized_relock,
+        register_hooked_cond_addr, register_hooked_mutex_addr, register_thread_ctx_with_map,
+        set_cv_admission_counters_enabled, unregister_hooked_cond_addr,
+        unregister_hooked_mutex_addr, unregister_thread_ctx_with_map,
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1270,34 +1398,92 @@ mod tests {
     }
 
     #[test]
-    fn cond_wait_path_can_mark_admission_hint_before_futex_sleep() {
-        let source = include_str!("mutex_hook.rs");
-        let implementation = source
+    fn cv_admission_counters_only_count_while_enabled() {
+        assert!(!cv_admission_counters_enabled());
+
+        let baseline = cv_admission_counters();
+        record_cv_hint_published();
+        record_cv_specialized_relock();
+        record_cv_fallback_relock();
+        assert_eq!(cv_admission_counters(), baseline);
+
+        set_cv_admission_counters_enabled(true);
+        record_cv_hint_published();
+        record_cv_specialized_relock();
+        record_cv_fallback_relock();
+        set_cv_admission_counters_enabled(false);
+
+        let counters = cv_admission_counters();
+        assert_eq!(counters.hints_published, baseline.hints_published + 1);
+        assert_eq!(
+            counters.specialized_relocks,
+            baseline.specialized_relocks + 1
+        );
+        assert_eq!(counters.fallback_relocks, baseline.fallback_relocks + 1);
+    }
+
+    fn hook_implementation_source() -> &'static str {
+        include_str!("mutex_hook.rs")
             .split_once("#[cfg(test)]")
             .map(|(implementation, _)| implementation)
-            .expect("mutex_hook.rs should contain a test module");
+            .expect("mutex_hook.rs should contain a test module")
+    }
 
-        assert!(implementation.contains("const CV_ADMISSION_HINT_ENV"));
+    #[test]
+    fn cond_wait_path_marks_admission_hint_before_futex_sleep() {
+        let implementation = hook_implementation_source();
+
+        assert!(implementation.contains("const DISABLE_CV_ADMISSION_HINT_ENV"));
         assert!(implementation.contains("fn cv_admission_hint_enabled()"));
 
         assert_eq!(
             implementation
-                .matches("mark_cond_reacquire_pending_for_lock")
+                .matches("publish_cond_reacquire_hint(")
                 .count(),
-            2,
-            "both cond_wait and cond_timedwait should publish the admission hint"
+            3,
+            "one definition plus the cond_wait and cond_timedwait call sites"
         );
 
-        let hint_pos = implementation
-            .find("mark_cond_reacquire_pending_for_lock")
-            .expect("cond wait should mark the lock admission hint");
-        let wait_pos = implementation
+        let cond_wait = implementation
+            .split_once("pub unsafe extern \"C\" fn pthread_cond_wait")
+            .map(|(_, body)| body)
+            .expect("the macro should define the cond wait hook");
+        let hint_pos = cond_wait
+            .find("publish_cond_reacquire_hint(")
+            .expect("cond wait should publish the lock admission hint");
+        let wait_pos = cond_wait
             .find("futex_wait(&(*cond_state).seq, seq)")
             .expect("cond wait should still use futex wait");
 
         assert!(
             hint_pos < wait_pos,
             "cond wait should publish the admission hint before sleeping"
+        );
+    }
+
+    #[test]
+    fn cond_wait_path_relocks_through_the_specialized_reacquire() {
+        let implementation = hook_implementation_source();
+
+        assert_eq!(
+            implementation
+                .matches("relock_after_cond_wait(&(*state).lock, (*state).lock_id, slept)")
+                .count(),
+            2,
+            "both cond wait paths should relock through the cond-specific reacquire"
+        );
+
+        let reacquire = implementation
+            .split_once("fn relock_after_cond_wait")
+            .and_then(|(_, rest)| rest.split_once("#[inline(always)]"))
+            .map(|(body, _)| body)
+            .expect("the macro should define the cond-specific reacquire");
+
+        assert!(reacquire.contains("take_cond_reacquire_pending_for_scope"));
+        assert!(reacquire.contains("AcquireMode::AlreadyAdmitted"));
+        assert!(
+            !reacquire.contains("yield_now"),
+            "the already-admitted arm should not notify admission again"
         );
     }
 }

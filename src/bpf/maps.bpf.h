@@ -56,5 +56,16 @@ volatile __u64 dispatch_inactive_success;
 volatile __u64 dispatch_inactive_empty;
 volatile __u64 dbg_acct_calls = 0;
 volatile __u64 dbg_acct_read_ok = 0;
+/* Admission-routing evidence: updated with atomic adds so the totals reconcile
+ * (wake_consumed_seen == granted + inactive + normal). */
+volatile __u64 select_local_direct;
+volatile __u64 wake_consumed_seen;
+volatile __u64 wake_consumed_granted;
+volatile __u64 wake_consumed_inactive;
+volatile __u64 wake_consumed_normal;
+volatile __u64 wake_read_fail;
+volatile __u64 running_pending_grant_success;
+volatile __u64 running_pending_grant_failure;
+volatile __u64 block_release_read_fail;
 
 #endif /* __MAPS_BPF_H */

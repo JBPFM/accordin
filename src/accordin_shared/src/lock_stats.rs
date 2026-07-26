@@ -7,6 +7,7 @@ use crate::admission;
 use crate::arch::{
     wait_time_elapsed_ns_between, wait_time_start, wait_time_to_ns, wait_time_total_to_ns,
 };
+use crate::bpf_counters;
 use crate::cpu_affinity;
 use crate::mutex_hook;
 
@@ -376,12 +377,43 @@ pub fn print_process_stats(label: &str) {
     println!("avg_outside_ns_elapsed: {avg_outside_ns_elapsed:.2}");
     println!("outside_ns_unlock_gap_samples: {outside_gap_samples}");
 
+    print_cv_admission_counters();
+    print_bpf_routing_counters();
+
     if let Some(cpu_count) = cpu_affinity::current_dynamic_cpu_count() {
         println!("dynamic_cpu_affinity_cpus: {cpu_count}");
         println!("dynamic_cpu_window_ns: {}", dynamic_cpu_window_ns());
         println!("dynamic_cpu_critical_ewma_alpha: {DYNAMIC_CPU_CRITICAL_EWMA_ALPHA:.2}");
         println!("dynamic_cpu_outside_ewma_alpha: {DYNAMIC_CPU_OUTSIDE_EWMA_ALPHA:.2}");
     }
+}
+
+/// Both groups print unconditionally once their gate is on, so a missing line
+/// means the evidence was disabled rather than observed as zero.
+fn print_cv_admission_counters() {
+    if !mutex_hook::cv_admission_counters_enabled() {
+        return;
+    }
+
+    let counters = mutex_hook::cv_admission_counters();
+    eprintln!(
+        "[lock_stats] cv_admission hints_published={} specialized_relocks={} fallback_relocks={}",
+        counters.hints_published, counters.specialized_relocks, counters.fallback_relocks
+    );
+}
+
+fn print_bpf_routing_counters() {
+    let Some(values) = bpf_counters::routing_counters() else {
+        return;
+    };
+
+    let fields = bpf_counters::ROUTING_COUNTER_NAMES
+        .iter()
+        .zip(values.iter())
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("[lock_stats] bpf_routing {fields}");
 }
 
 #[inline(always)]

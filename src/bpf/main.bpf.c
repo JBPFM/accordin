@@ -30,6 +30,16 @@ static __always_inline bool registered_threads_active(void) {
   return registered_thread_count != 0;
 }
 
+static __always_inline void bump_counter(volatile __u64 *counter) {
+  __sync_fetch_and_add(counter, 1);
+}
+
+/* For sites that are not already inside a hoisted debug gate. */
+static __always_inline void bump_debug_counter(volatile __u64 *counter) {
+  if (debug_counters_enabled())
+    bump_counter(counter);
+}
+
 static __always_inline bool inactive_dispatch_needed(void) {
   return inactive_empty_seq != inactive_enqueue_seq;
 }
@@ -248,11 +258,35 @@ static __always_inline bool move_selected_inactive_to_local(__u32 dispatch_cpu) 
   return false;
 }
 
+/* Single sink for enqueue evidence: every routing decision lands here exactly
+ * once, so a hinted wakeup contributes exactly one wake_consumed_* class. */
 static __always_inline void
 record_enqueue_state(struct task_scx_ctx *task_ctx, __u64 dsq_id,
                      __u32 lock_id, __u32 path, __u32 cpu,
-                     __u32 user_ctx_word) {
-  if (!debug_counters_enabled() || !task_ctx)
+                     __u32 user_ctx_word, bool hinted) {
+  if (!debug_counters_enabled())
+    return;
+
+  if (hinted) {
+    switch (path) {
+    case ENQ_PATH_ADMISSION_LOCAL:
+    case ENQ_PATH_SLOW_GRANTED_LOCAL:
+      bump_counter(&wake_consumed_granted);
+      break;
+    case ENQ_PATH_SLOW_INACTIVE:
+    case ENQ_PATH_FORCE_INACTIVE:
+      bump_counter(&wake_consumed_inactive);
+      break;
+    case ENQ_PATH_NORMAL_DSQ:
+    case ENQ_PATH_NORMAL_LOCAL_FAST:
+      bump_counter(&wake_consumed_normal);
+      break;
+    default:
+      break;
+    }
+  }
+
+  if (!task_ctx)
     return;
 
   task_ctx->last_enqueue_dsq = dsq_id;
@@ -306,6 +340,14 @@ static __always_inline bool user_token_consumed(__u32 user_ctx_word) {
 static __always_inline bool user_explicit_release(__u32 user_ctx_word) {
   return !user_slow_path_pending(user_ctx_word) &&
          !user_in_critical_section(user_ctx_word);
+}
+
+/* Wakeup carrying the cond-reacquire signature. A failed user-word read leaves
+ * the word at zero, so an unregistered task never matches. */
+static __always_inline bool wake_hinted(__u64 enq_flags, __u32 user_ctx_word) {
+  return (enq_flags & SCX_ENQ_WAKEUP) &&
+         user_slow_path_pending(user_ctx_word) &&
+         user_token_consumed(user_ctx_word);
 }
 
 static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx) {
@@ -422,7 +464,8 @@ static __always_inline void enqueue_normal_dsq_recorded(
     struct task_struct *p, struct task_scx_ctx *task_ctx, __u64 enq_flags,
     __u32 lock_id, __u32 user_ctx_word) {
   record_enqueue_state(task_ctx, NORMAL_DSQ_ID, lock_id, ENQ_PATH_NORMAL_DSQ,
-                       ADMISSION_CPU_NONE, user_ctx_word);
+                       ADMISSION_CPU_NONE, user_ctx_word,
+                       wake_hinted(enq_flags, user_ctx_word));
   scx_bpf_dsq_insert(p, NORMAL_DSQ_ID, SCX_SLICE_DFL, enq_flags);
   record_normal_enqueue();
 }
@@ -445,7 +488,8 @@ static __always_inline bool enqueue_normal_local_fast_recorded(
     return false;
 
   record_enqueue_state(task_ctx, SCX_DSQ_LOCAL_ON | cpu, lock_id,
-                       ENQ_PATH_NORMAL_LOCAL_FAST, cpu, user_ctx_word);
+                       ENQ_PATH_NORMAL_LOCAL_FAST, cpu, user_ctx_word,
+                       wake_hinted(enq_flags, user_ctx_word));
   scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
   return true;
 }
@@ -528,7 +572,8 @@ static __always_inline bool enqueue_force_inactive(struct task_struct *p,
   task_ctx->must_run_on_admission_cpu = 0;
   task_ctx->force_inactive_wait = 0;
   record_enqueue_state(task_ctx, inactive_dsq_id(lock_id), lock_id,
-                       ENQ_PATH_FORCE_INACTIVE, cpu, user_ctx_word);
+                       ENQ_PATH_FORCE_INACTIVE, cpu, user_ctx_word,
+                       wake_hinted(enq_flags, user_ctx_word));
   scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
   record_inactive_enqueue();
   return true;
@@ -582,8 +627,12 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
 
   if (!task_ctx->holds_admission && have_user &&
       user_slow_path_pending(user_ctx_word) && valid_lock_id(lock_id) &&
-      cpu < MAX_CPUS && task_cpu_allowed(p, cpu))
-    grant_admission(p, task_ctx, lock_id, cpu);
+      cpu < MAX_CPUS && task_cpu_allowed(p, cpu)) {
+    if (grant_admission(p, task_ctx, lock_id, cpu))
+      bump_debug_counter(&running_pending_grant_success);
+    else
+      bump_debug_counter(&running_pending_grant_failure);
+  }
 
   if (task_ctx->must_run_on_admission_cpu && task_ctx->admission_cpu == cpu)
     task_ctx->must_run_on_admission_cpu = 0;
@@ -596,6 +645,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   bool is_idle = false;
   bool have_user = false;
   bool wants_slow_path = false;
+  bool debug_counters;
   s32 cpu;
 
   if (stats_only_enabled()) {
@@ -617,6 +667,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
     return select_cpu_without_admission(p, prev_cpu, wake_flags);
   }
 
+  debug_counters = debug_counters_enabled();
   task_ctx = get_task_ctx(p);
   if (task_ctx) {
     have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
@@ -654,8 +705,18 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
 
   if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu) &&
       !wants_slow_path && !inactive_dispatch_needed() &&
-      !normal_dispatch_needed())
+      !normal_dispatch_needed()) {
+    /* A hinted task always wants the slow path, so this shortcut never carries
+     * a wake_consumed_* class. */
+    record_enqueue_state(task_ctx, SCX_DSQ_LOCAL,
+                         have_user ? effective_lock_id(user_ctx_word)
+                                   : UNMANAGED_LOCK_ID,
+                         ENQ_PATH_SELECT_LOCAL_DIRECT, (__u32)cpu,
+                         user_ctx_word, false);
+    if (debug_counters)
+      bump_counter(&select_local_direct);
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+  }
 
   return cpu;
 }
@@ -665,6 +726,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   __u32 user_ctx_word = 0;
   __u32 lock_id = UNMANAGED_LOCK_ID;
   bool have_user = false;
+  bool debug_counters;
   __u32 cpu;
 
   if (stats_only_enabled()) {
@@ -702,13 +764,26 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   if (have_user)
     lock_id = effective_lock_id(user_ctx_word);
 
+  debug_counters = debug_counters_enabled();
+  if (debug_counters) {
+    bool wake = enq_flags & SCX_ENQ_WAKEUP;
+
+    /* Only a task that already published a user word can fail the read; tasks
+     * that never registered are not part of the protocol. */
+    if (wake && !have_user && task_ctx->user_ctx_ptr)
+      bump_counter(&wake_read_fail);
+    /* Every wakeup counted here reaches exactly one wake_consumed_* class in
+     * record_enqueue_state below. */
+    if (wake_hinted(enq_flags, user_ctx_word))
+      bump_counter(&wake_consumed_seen);
+  }
+
   clear_invalid_admission_cpu(p, task_ctx);
 
   if (consumed_token_reuse_requested(task_ctx, have_user, user_ctx_word)) {
     cpu = requested_cpu(p, task_ctx, -1);
     release_admission(p, task_ctx);
-    enqueue_force_inactive(p, task_ctx, lock_id, cpu, enq_flags,
-                           user_ctx_word);
+    enqueue_force_inactive(p, task_ctx, lock_id, cpu, enq_flags, user_ctx_word);
     return;
   }
 
@@ -718,8 +793,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   if (task_ctx->force_inactive_wait && have_user &&
       user_slow_path_pending(user_ctx_word)) {
     cpu = requested_cpu(p, task_ctx, -1);
-    enqueue_force_inactive(p, task_ctx, lock_id, cpu, enq_flags,
-                           user_ctx_word);
+    enqueue_force_inactive(p, task_ctx, lock_id, cpu, enq_flags, user_ctx_word);
     return;
   }
 
@@ -727,7 +801,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       (task_ctx->holds_admission || task_ctx->must_run_on_admission_cpu)) {
     record_enqueue_state(task_ctx, SCX_DSQ_LOCAL_ON | task_ctx->admission_cpu,
                          lock_id, ENQ_PATH_ADMISSION_LOCAL,
-                         task_ctx->admission_cpu, user_ctx_word);
+                         task_ctx->admission_cpu, user_ctx_word,
+                         wake_hinted(enq_flags, user_ctx_word));
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | task_ctx->admission_cpu,
                        SCX_SLICE_DFL, enq_flags);
     return;
@@ -744,13 +819,15 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
     if (grant_admission(p, task_ctx, lock_id, cpu)) {
       record_enqueue_state(task_ctx, SCX_DSQ_LOCAL_ON | cpu, lock_id,
-                           ENQ_PATH_SLOW_GRANTED_LOCAL, cpu, user_ctx_word);
+                           ENQ_PATH_SLOW_GRANTED_LOCAL, cpu, user_ctx_word,
+                           wake_hinted(enq_flags, user_ctx_word));
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
       return;
     }
 
     record_enqueue_state(task_ctx, inactive_dsq_id(lock_id), lock_id,
-                         ENQ_PATH_SLOW_INACTIVE, cpu, user_ctx_word);
+                         ENQ_PATH_SLOW_INACTIVE, cpu, user_ctx_word,
+                         wake_hinted(enq_flags, user_ctx_word));
     scx_bpf_dsq_insert(p, inactive_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
     record_inactive_enqueue();
     return;
@@ -764,7 +841,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     cpu = pick_task_cpu(p, -1);
     if (valid_cpu(cpu) && task_cpumask_allows(p, cpu)) {
       record_enqueue_state(task_ctx, SCX_DSQ_LOCAL_ON | cpu, lock_id,
-                           ENQ_PATH_NORMAL_LOCAL_FAST, cpu, user_ctx_word);
+                           ENQ_PATH_NORMAL_LOCAL_FAST, cpu, user_ctx_word,
+                           wake_hinted(enq_flags, user_ctx_word));
       scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL,
                          enq_flags);
       return;
@@ -889,13 +967,40 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
     return;
   }
 
+  if (!runnable) {
+    /* A block invalidates any routing decision made for a runnable re-enqueue,
+     * so the wakeup is classified from scratch. */
+    task_ctx->force_inactive_wait = 0;
+    task_ctx->must_run_on_admission_cpu = 0;
+
+    if (!task_ctx->holds_admission)
+      return;
+
+    /* Only a confirmed critical section justifies pinning the slot while the
+     * owner sleeps; the lock it protects cannot progress without it. */
+    if (task_in_critical_section(task_ctx, have_user, user_ctx_word)) {
+      task_ctx->must_run_on_admission_cpu = 1;
+      return;
+    }
+
+    /* Any other block gives the slot back and re-enters admission at wakeup.
+     * An unreadable user word is treated as not-in-critical-section: a real
+     * owner resumes without a slot and protect_critical_section re-pins it at
+     * its next runnable stop. */
+    if (!have_user)
+      bump_debug_counter(&block_release_read_fail);
+
+    release_admission(p, task_ctx);
+    return;
+  }
+
   if (consumed_token_reuse_requested(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
     task_ctx->force_inactive_wait = 1;
     return;
   }
 
-  if (runnable && task_in_critical_section(task_ctx, have_user, user_ctx_word)) {
+  if (task_in_critical_section(task_ctx, have_user, user_ctx_word)) {
     protect_critical_section(p, task_ctx, lock_id);
     return;
   }
@@ -917,7 +1022,7 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
       debug_counters_mode, registered_thread_count, normal_enqueue_seq,
       normal_empty_seq, scx_bpf_dsq_nr_queued(NORMAL_DSQ_ID),
       inactive_enqueue_seq, inactive_empty_seq);
-  if (debug_counters_enabled())
+  if (debug_counters_enabled()) {
     scx_bpf_dump(
         "accordin_dispatch calls=%llu normal_skip_seq=%llu normal_attempts=%llu "
         "normal_success=%llu normal_empty=%llu inactive_unavail=%llu "
@@ -928,6 +1033,17 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
         dispatch_inactive_unavailable, dispatch_inactive_budget_blocked,
         dispatch_inactive_attempts, dispatch_inactive_success,
         dispatch_inactive_empty);
+    scx_bpf_dump(
+        "accordin_routing select_local_direct=%llu wake_consumed_seen=%llu "
+        "wake_consumed_granted=%llu wake_consumed_inactive=%llu "
+        "wake_consumed_normal=%llu wake_read_fail=%llu "
+        "running_pending_grant_success=%llu "
+        "running_pending_grant_failure=%llu block_release_read_fail=%llu\n",
+        select_local_direct, wake_consumed_seen, wake_consumed_granted,
+        wake_consumed_inactive, wake_consumed_normal, wake_read_fail,
+        running_pending_grant_success, running_pending_grant_failure,
+        block_release_read_fail);
+  }
 
 #pragma unroll
   for (lock_id = 0; lock_id < MAX_LOCK_CLASSES; lock_id++) {

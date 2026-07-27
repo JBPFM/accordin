@@ -26,14 +26,15 @@ const DEFAULT_HOLDOFF_WINDOWS: u32 = 3;
 const DEFAULT_DEADZONE: u32 = 1;
 const DEFAULT_TICK_WINDOW_NS: u64 = 10_000_000;
 
-/// A class's admitted set holds its lock holder as well as its waiters, so a
-/// width of 1 leaves no slot for a successor: nothing may be admitted until the
-/// holder has released, every handoff then costs a full park/dispatch round
-/// trip with no overlap, and a thread that re-acquires in a loop keeps the only
-/// slot while parked waiters age. Two — one for the holder, one for the
-/// successor — is the narrowest width at which a handoff can overlap the
-/// critical section it follows. Statically configured widths are exempt; the
-/// floor bounds what the feedback loop may converge on.
+/// A class's admitted set holds its waiters only: the lock holder runs whatever
+/// the width says, so a width of 1 admits one successor alongside the holder.
+/// One admitted waiter is not enough to keep a class moving — a class held
+/// there under high-frequency contention on a short critical section stalls
+/// outright, long enough for the sched_ext watchdog to eject the scheduler — so
+/// the floor is two admitted waiters, the narrowest width at which such a class
+/// keeps making progress. Widths never reach 0, which BPF reads as unlimited.
+/// Statically configured widths are exempt; the floor bounds what the feedback
+/// loop may converge on.
 const DEFAULT_MIN_WIDTH: u32 = 2;
 
 /// The critical section is smoothed aggressively and the non-critical section
@@ -63,6 +64,7 @@ static CLASS_WIDTH_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 static CLASS_ACTIVE_PTR: AtomicPtr<i32> = AtomicPtr::new(std::ptr::null_mut());
 static CLASS_ACTIVE_PEAK_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 static CLASS_INACTIVE_DEPTH_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
+static CLASS_INACTIVE_DEPTH_PEAK_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 
 static LAST_TICK_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -328,23 +330,34 @@ fn settle_seed(current: u32, fresh: u32, deadzone: u32) -> u32 {
 /// more threads than cores from climbing to the budget. The dead zone is
 /// two-sided around the seed: a width already within `deadzone` of the model
 /// target does not move.
+///
+/// `peak` is admission-gated: a class is never seen holding more admissions
+/// than the width that granted them, so a peak below the width is evidence of
+/// spare capacity only while nothing is queued. A `depth` above zero is a
+/// waiter denied admission under the current width right now, and it vetoes
+/// every shrink — neither the peak nor the model may narrow a class whose
+/// demand already exceeds its cap, since narrowing it lowers the ceiling the
+/// next window's peak is measured against.
 fn width_vote(enforced: u32, seed: u32, peak: u32, depth: u32, deadzone: u32) -> i32 {
     if enforced == 0 || seed == 0 {
         return 0;
     }
 
-    // Under-occupied: the class never filled its width during the window.
-    // Measured inability to use the width outranks what the model asks for.
-    if peak.saturating_add(deadzone).saturating_add(1) <= enforced {
+    let queued = depth > 0;
+
+    // Under-occupied: the class never filled its width during the window and
+    // held no one back. Measured inability to use the width outranks what the
+    // model asks for.
+    if !queued && peak.saturating_add(deadzone).saturating_add(1) <= enforced {
         return -1;
     }
 
-    let saturated = peak >= enforced && depth > 0;
+    let saturated = peak >= enforced && queued;
     if saturated && seed > enforced.saturating_add(deadzone) {
         return 1;
     }
 
-    if enforced > seed.saturating_add(deadzone) {
+    if !queued && enforced > seed.saturating_add(deadzone) {
         -1
     } else {
         0
@@ -392,10 +405,8 @@ fn confirm_step(vote: &mut StepVote, direction: i32, confirm_windows: u32) -> i3
 }
 
 /// Confines a width to the range the controller may commit and publish. The
-/// floor matters most on the very first commit: a seed of 1 would otherwise
-/// pin a class at a width the feedback loop can never climb out of, because a
-/// class held at 1 barely gets admitted and so never produces the saturation
-/// evidence that would grow it.
+/// range never reaches 0, which BPF reads as unlimited, so a class the model
+/// values at nothing is still published at the floor.
 fn floored_width(width: u32, min_width: u32, width_max: u32) -> u32 {
     width.clamp(clamped_min_width(min_width, width_max), width_max.max(1))
 }
@@ -526,6 +537,23 @@ impl ClassController {
         }
     }
 
+    /// Commits the width a class enters the loop at, once the model has seeded
+    /// it for the first time.
+    ///
+    /// That first seed describes a class nothing has bounded yet: it reports the
+    /// concurrency the class reached on its own, not concurrency some enforced
+    /// width denied it, so it is no evidence that a wider width is usable. A
+    /// class parked at a width it cannot use stalls for every window the loop
+    /// needs to step back down, so a class enters at the floor — the narrowest
+    /// width at which a contended class keeps moving — and earns anything above
+    /// it through the growth path, where each step needs saturation with waiters
+    /// still queued behind it, confirmed over consecutive windows. The seed goes
+    /// on steering that growth from the next window; it just does not decide
+    /// where the class starts.
+    fn commit_initial_width(&mut self, min_width: u32, width_max: u32, acquires: u64) {
+        self.commit_width(clamped_min_width(min_width, width_max), acquires);
+    }
+
     fn commit_width(&mut self, width: u32, acquires: u64) {
         self.width = width;
         self.ticks_since_change = 0;
@@ -616,6 +644,20 @@ fn take_class_active_peak(class: usize) -> u32 {
     }
 }
 
+/// Reads and clears the window peak of the inactive queue, on the same terms as
+/// the admission peak.
+fn take_class_inactive_depth_peak(class: usize) -> u32 {
+    let Some(ptr) = class_ptr(&CLASS_INACTIVE_DEPTH_PEAK_PTR, class) else {
+        return 0;
+    };
+    unsafe {
+        let peak = ptr.read_volatile();
+        ptr.write_volatile(0);
+        peak
+    }
+}
+
+/// Waiters currently parked in the class's inactive queue.
 fn class_inactive_depth(class: usize) -> u32 {
     let Some(ptr) = class_ptr(&CLASS_INACTIVE_DEPTH_PTR, class) else {
         return 0;
@@ -623,7 +665,8 @@ fn class_inactive_depth(class: usize) -> u32 {
     unsafe { ptr.read_volatile() }
 }
 
-/// Tasks currently holding admission for the class.
+/// Waiters currently admitted for the class. A task stops counting once it
+/// takes the lock, so this never includes the holder.
 fn class_active(class: usize) -> u32 {
     let Some(ptr) = class_ptr(&CLASS_ACTIVE_PTR, class) else {
         return 0;
@@ -631,12 +674,33 @@ fn class_active(class: usize) -> u32 {
     unsafe { ptr.read_volatile() }.max(0) as u32
 }
 
+/// Level a per-class signal reached over the window, from the two views BPF
+/// offers of it: the high-water mark, which the controller clears by reading,
+/// and the level standing at the instant of the read. A rise that fell back
+/// before the tick survives only in the mark; a level still standing after an
+/// earlier read consumed the mark survives only in the live view.
+fn window_level(peak: u32, live: u32) -> u32 {
+    peak.max(live)
+}
+
 /// How full the class got over the window. The peak only advances when a task
 /// newly gains admission, so a class whose holders keep their admission across
 /// many acquisitions can report a stale peak; the live level closes that gap
 /// and keeps the under-occupancy rule from shrinking a saturated class.
 fn class_occupancy(class: usize) -> u32 {
-    take_class_active_peak(class).max(class_active(class))
+    window_level(take_class_active_peak(class), class_active(class))
+}
+
+/// How deep the class queued over the window. A short critical section lets a
+/// contention burst park several waiters and drain them again well inside one
+/// tick, so the live depth on its own reports an idle queue for a class that
+/// spent the window denying admission; the peak is what carries that demand to
+/// the shrink veto and the occupancy bound.
+fn class_queue_depth(class: usize) -> u32 {
+    window_level(
+        take_class_inactive_depth_peak(class),
+        class_inactive_depth(class),
+    )
 }
 
 fn publish_class_width(class: usize, width: u32) {
@@ -712,7 +776,7 @@ fn run_tick() {
 
     for class in 1..CLASS_COUNT {
         let peak = class_occupancy(class);
-        let depth = class_inactive_depth(class);
+        let depth = class_queue_depth(class);
         let averages = lock_stats::take_class_sample_averages(class as u32);
         let acquires = lock_stats::class_acquires(class as u32);
         let entry = &mut classes[class];
@@ -741,7 +805,7 @@ fn run_tick() {
         }
 
         if entry.width == 0 {
-            entry.commit_width(floored_width(entry.seed, min_width, width_max), acquires);
+            entry.commit_initial_width(min_width, width_max, acquires);
         } else {
             let vote = width_vote(entry.published, entry.seed, peak, depth, deadzone);
             let step = confirm_step(&mut entry.vote, vote, holdoff_windows);
@@ -815,16 +879,19 @@ pub fn set_class_state_ptrs(
     class_active: *mut i32,
     class_active_peak: *mut u32,
     class_inactive_depth: *mut u32,
+    class_inactive_depth_peak: *mut u32,
 ) {
     CLASS_WIDTH_PTR.store(class_width, Ordering::Release);
     CLASS_ACTIVE_PTR.store(class_active, Ordering::Release);
     CLASS_ACTIVE_PEAK_PTR.store(class_active_peak, Ordering::Release);
     CLASS_INACTIVE_DEPTH_PTR.store(class_inactive_depth, Ordering::Release);
+    CLASS_INACTIVE_DEPTH_PEAK_PTR.store(class_inactive_depth_peak, Ordering::Release);
 }
 
 #[doc(hidden)]
 pub fn clear_class_state_ptrs() {
     set_class_state_ptrs(
+        std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -841,7 +908,7 @@ mod tests {
         clamped_min_width, class_demand, confirm_step, controller_active_with, count_cpulist,
         floored_width, fold_merged_classes, numa_critical_penalty_ns, parse_fixed_class_widths,
         parse_tick_window_ns, seed_from_averages, settle_seed, step_allowed, stepped_width,
-        width_vote,
+        width_vote, window_level,
     };
 
     const HOLDOFF: u32 = 3;
@@ -976,6 +1043,19 @@ mod tests {
     }
 
     #[test]
+    fn a_window_keeps_whichever_of_the_mark_and_the_live_level_is_larger() {
+        // A rise that fell back before the tick is only in the mark.
+        assert_eq!(window_level(7, 0), 7);
+        // A level that outlives the read that consumed the mark is only live.
+        assert_eq!(window_level(0, 7), 7);
+        // Neither view may pull the other down.
+        assert_eq!(window_level(7, 3), 7);
+        assert_eq!(window_level(3, 7), 7);
+        // A window in which the signal never moved reports nothing.
+        assert_eq!(window_level(0, 0), 0);
+    }
+
+    #[test]
     fn the_seed_never_exceeds_holders_plus_waiters() {
         // A cold class whose think time reads high is still bounded by the
         // threads that actually use it.
@@ -1008,7 +1088,10 @@ mod tests {
         assert_eq!(width_vote(9, 8, 9, 5, DEADZONE), 0);
         // Outside the dead zone the width follows the model, one step at a time.
         assert_eq!(width_vote(9, 11, 9, 5, DEADZONE), 1);
-        assert_eq!(width_vote(9, 7, 9, 5, DEADZONE), -1);
+        // Downwards only once the queue is empty: a saturated class with five
+        // waiters holds its width whatever the seed reads.
+        assert_eq!(width_vote(9, 7, 9, 5, DEADZONE), 0);
+        assert_eq!(width_vote(9, 7, 8, 0, DEADZONE), -1);
     }
 
     #[test]
@@ -1027,10 +1110,29 @@ mod tests {
         assert_eq!(width_vote(6, 8, 5, 0, DEADZONE), 0);
         // peak <= width - 1 - deadzone shrinks.
         assert_eq!(width_vote(6, 8, 4, 0, DEADZONE), -1);
-        // A width the model no longer justifies shrinks too, one step at a time.
-        assert_eq!(width_vote(8, 6, 8, 4, DEADZONE), -1);
+        // A width the model no longer justifies shrinks too, one step at a
+        // time, once nothing is queued behind it.
+        assert_eq!(width_vote(8, 6, 8, 0, DEADZONE), -1);
         // ... but only outside the dead zone around the seed.
         assert_eq!(width_vote(7, 6, 7, 4, DEADZONE), 0);
+        // A fully saturated class with four waiters holds: the model's lower
+        // seed does not outrank real queued demand.
+        assert_eq!(width_vote(8, 6, 8, 4, DEADZONE), 0);
+    }
+
+    #[test]
+    fn queued_waiters_veto_a_shrink_however_the_model_and_the_peak_read() {
+        // A waiter parked in the inactive queue was denied admission under the
+        // width in force, so the class wants more of it than it was allowed to
+        // use. Every shrink is vetoed while the queue is occupied, whether the
+        // peak fell short of the width or the model asks for less than it.
+        assert_eq!(width_vote(6, 3, 6, 2, DEADZONE), 0);
+        assert_eq!(width_vote(6, 3, 5, 2, DEADZONE), 0);
+        assert_eq!(width_vote(6, 3, 4, 2, DEADZONE), 0);
+        // With the queue empty the same signals describe a class that is
+        // genuinely over-provisioned, and it steps down.
+        assert_eq!(width_vote(6, 3, 5, 0, DEADZONE), -1);
+        assert_eq!(width_vote(6, 3, 4, 0, DEADZONE), -1);
     }
 
     #[test]
@@ -1043,22 +1145,25 @@ mod tests {
     }
 
     #[test]
-    fn a_seed_of_one_commits_at_the_floor() {
-        // The model asking for a single server is exactly the case the floor
-        // exists for; a class committed at 1 never recovers on its own.
-        assert_eq!(floored_width(1, MIN_WIDTH, 96), MIN_WIDTH);
+    fn a_width_below_the_floor_is_published_at_the_floor() {
+        // A class the controller values at nothing is still published as a
+        // width, because 0 reads as unlimited.
         assert_eq!(floored_width(0, MIN_WIDTH, 96), MIN_WIDTH);
-        // Wider seeds are left alone, and the hard cap still wins.
+        // A single server is the case the floor exists for; a raised floor
+        // lifts it further.
+        assert_eq!(floored_width(1, MIN_WIDTH, 96), MIN_WIDTH);
+        assert_eq!(floored_width(1, 3, 96), 3);
+        // Wider widths are left alone, and the hard cap still wins.
         assert_eq!(floored_width(9, MIN_WIDTH, 96), 9);
         assert_eq!(floored_width(9, MIN_WIDTH, 4), 4);
         // A floor above the cap collapses to the cap.
-        assert_eq!(floored_width(1, MIN_WIDTH, 1), 1);
+        assert_eq!(floored_width(3, 3, 1), 1);
     }
 
     #[test]
     fn a_width_never_steps_below_the_floor() {
-        // Holder plus successor: shrinking stops there however hard the
-        // occupancy signal pushes down.
+        // Shrinking stops at the floor however hard the occupancy signal
+        // pushes down.
         assert_eq!(stepped_width(MIN_WIDTH, -1, MIN_WIDTH, 96), MIN_WIDTH);
         assert_eq!(stepped_width(1, -1, MIN_WIDTH, 96), MIN_WIDTH);
         // A wider floor is honoured too.
@@ -1275,6 +1380,36 @@ mod tests {
 
         assert_eq!(classes[2].width, 5);
         assert!(classes[5].absorbed);
+    }
+
+    #[test]
+    fn a_class_enters_the_loop_at_the_floor_whatever_its_first_seed_asked_for() {
+        let mut class = ClassController::new();
+        class.seed = 9;
+
+        class.commit_initial_width(MIN_WIDTH, 96, 128);
+
+        // The model estimate of the first window buys no width of its own: the
+        // class starts at the floor and has to earn the rest one confirmed step
+        // at a time.
+        assert_eq!(class.width, MIN_WIDTH);
+        assert_ne!(class.width, floored_width(class.seed, MIN_WIDTH, 96));
+        assert_eq!(class.history(), vec![MIN_WIDTH]);
+        // The seed itself is untouched, so it can steer growth from here on.
+        assert_eq!(class.seed, 9);
+        // Entering the loop starts the holdoff and the full-window gate.
+        assert_eq!(class.ticks_since_change, 0);
+        assert_eq!(class.acquires_at_change, 128);
+    }
+
+    #[test]
+    fn a_class_enters_no_wider_than_a_budget_that_cannot_seat_the_floor() {
+        let mut class = ClassController::new();
+        class.seed = 9;
+
+        class.commit_initial_width(3, 1, 0);
+
+        assert_eq!(class.width, 1);
     }
 
     #[test]

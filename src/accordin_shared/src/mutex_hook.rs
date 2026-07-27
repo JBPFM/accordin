@@ -294,7 +294,8 @@ macro_rules! export_mutex_hooks {
             use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
             use $crate::lock_stats::{
-                record_hold_end_sample, record_lock_acquired, record_lock_acquired_for_lock,
+                record_cv_sleep_end, record_cv_sleep_start, record_hold_end_sample,
+                record_lock_acquired, record_lock_acquired_for_lock,
                 record_lock_acquired_for_scope, record_post_unlock, record_thread_start,
                 record_wait_end, record_wait_start,
             };
@@ -1214,11 +1215,17 @@ macro_rules! export_mutex_hooks {
                     (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
                     unlock_with_stats(&(*state).lock, (*state).lock_id);
                     publish_cond_reacquire_hint((*state).lock_id);
+                    // The mutex is released across the sleep, so the sleep lands
+                    // in the released class's unlock-to-acquire gap. Bracketing
+                    // it here covers both relock modes, which are chosen only
+                    // after the sleep ends.
+                    let cv_sleep_start = record_cv_sleep_start();
                     let mut slept = false;
                     while (*cond_state).seq.load(Ordering::Acquire) == seq {
                         let rc = futex_wait(&(*cond_state).seq, seq);
                         slept |= rc == 0 || rc == libc::EINTR;
                     }
+                    record_cv_sleep_end(cv_sleep_start);
                     relock_after_cond_wait(&(*state).lock, (*state).lock_id, slept);
                     0
                 }
@@ -1252,6 +1259,7 @@ macro_rules! export_mutex_hooks {
                     (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
                     unlock_with_stats(&(*state).lock, (*state).lock_id);
                     publish_cond_reacquire_hint((*state).lock_id);
+                    let cv_sleep_start = record_cv_sleep_start();
                     let mut slept = false;
                     while (*cond_state).seq.load(Ordering::Acquire) == seq {
                         let rc = futex_wait_until_realtime(&(*cond_state).seq, seq, abstime);
@@ -1264,6 +1272,7 @@ macro_rules! export_mutex_hooks {
                             break;
                         }
                     }
+                    record_cv_sleep_end(cv_sleep_start);
                     relock_after_cond_wait(&(*state).lock, (*state).lock_id, slept);
                     ret
                 }
@@ -1459,6 +1468,45 @@ mod tests {
             hint_pos < wait_pos,
             "cond wait should publish the admission hint before sleeping"
         );
+    }
+
+    #[test]
+    fn cond_wait_path_brackets_the_sleep_for_the_class_sample() {
+        let implementation = hook_implementation_source();
+
+        for (name, hook) in [
+            ("cond wait", "pub unsafe extern \"C\" fn pthread_cond_wait"),
+            (
+                "cond timedwait",
+                "pub unsafe extern \"C\" fn pthread_cond_timedwait",
+            ),
+        ] {
+            let body = implementation
+                .split_once(hook)
+                .map(|(_, body)| body)
+                .unwrap_or_else(|| panic!("the macro should define the {name} hook"));
+            let hint_pos = body
+                .find("publish_cond_reacquire_hint(")
+                .unwrap_or_else(|| panic!("{name} should publish the lock admission hint"));
+            let sleep_start_pos = body
+                .find("record_cv_sleep_start()")
+                .unwrap_or_else(|| panic!("{name} should open the sleep bracket"));
+            let sleep_end_pos = body
+                .find("record_cv_sleep_end(cv_sleep_start)")
+                .unwrap_or_else(|| panic!("{name} should close the sleep bracket"));
+            let relock_pos = body
+                .find("relock_after_cond_wait(")
+                .unwrap_or_else(|| panic!("{name} should relock the cond mutex"));
+
+            assert!(
+                hint_pos < sleep_start_pos && sleep_start_pos < sleep_end_pos,
+                "{name} should bracket the sleep loop itself"
+            );
+            assert!(
+                sleep_end_pos < relock_pos,
+                "{name} should close the bracket before the relock mode is chosen"
+            );
+        }
     }
 
     #[test]

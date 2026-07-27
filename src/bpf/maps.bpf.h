@@ -40,9 +40,17 @@ volatile __u32 cpu_last_inactive_lock[MAX_CPUS];
 volatile __u32 cpu_inactive_dispatch_count[MAX_CPUS];
 volatile __u32 width_control_enabled;
 volatile __u32 class_width[MAX_LOCK_CLASSES]; /* 0 = unlimited */
+/* Waiters currently admitted for the class. A task counts from the grant that
+ * admitted it until it takes the lock: width bounds the queue in front of a
+ * lock, and the holder runs regardless of it. */
 volatile __s32 class_active[MAX_LOCK_CLASSES];
 volatile __u32 class_active_peak[MAX_LOCK_CLASSES];
 volatile __u32 class_inactive_depth[MAX_LOCK_CLASSES];
+/* High-water mark of class_inactive_depth. Contention arrives in bursts far
+ * shorter than a controller window, so a queue can fill and drain entirely
+ * between two reads of the live depth; the mark keeps that demand visible.
+ * BPF only ever raises it, the controller clears it by reading it. */
+volatile __u32 class_inactive_depth_peak[MAX_LOCK_CLASSES];
 volatile __u64 class_active_underflow_events;
 volatile __u32 inactive_previous_lock_percent;
 volatile __u32 inactive_enqueue_seq;

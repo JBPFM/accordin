@@ -64,6 +64,7 @@ struct ThreadStatsAux {
     outside_unlock_sample: u64,
     outside_wait_start_sample: u64,
     outside_wait_total: u64,
+    cv_sleep_total: u64,
     class_sample_armed: bool,
     class_hold_start_sample: u64,
 }
@@ -90,6 +91,7 @@ impl ThreadStatsAux {
             outside_unlock_sample: 0,
             outside_wait_start_sample: 0,
             outside_wait_total: 0,
+            cv_sleep_total: 0,
             class_sample_armed: false,
             class_hold_start_sample: 0,
         }
@@ -273,17 +275,22 @@ fn class_sample_averages(
 /// Only invoked on outermost unlocks.
 ///
 /// The non-critical section must exclude queueing, otherwise the
-/// `1 + ncs / cs` model measures the very contention it is meant to size:
-/// `wait_sample` is the time this acquire spent waiting for the lock and is
-/// removed from the gap. Time spent under other locks stays in the gap and
-/// biases the estimate high, which the occupancy feedback and the CPU budget
-/// then trim.
+/// `1 + ncs / cs` model measures the very contention it is meant to size.
+/// Two spans of the gap are queueing rather than think time and are removed
+/// from it: `wait_sample`, the time this acquire spent blocked on the lock
+/// itself, and `cv_sleep_sample`, the time spent parked in a condition-variable
+/// wait between the class's previous unlock and this acquire. Both are disjoint
+/// and both lie inside the gap. A condition variable serializes its waiters, so
+/// leaving its sleep in would let a waiting turn read as concurrency the class
+/// can absorb. Time spent under other locks stays in the gap and biases the
+/// estimate high, which the occupancy feedback and the CPU budget then trim.
 #[inline(always)]
 fn attribute_outermost_class_sample(
     aux: &mut ThreadStatsAux,
     class: u32,
     unlock_sample: u64,
     wait_sample: u64,
+    cv_sleep_sample: u64,
 ) -> bool {
     let previous_unlock = replace_last_unlock_sample(class, unlock_sample);
     if !aux.class_sample_armed {
@@ -291,8 +298,13 @@ fn attribute_outermost_class_sample(
     }
 
     let critical_ns = wait_time_elapsed_ns_between(aux.class_hold_start_sample, unlock_sample);
-    let outside_ns = last_unlock_gap_sample(previous_unlock, aux.class_hold_start_sample)
-        .map(|gap| wait_time_total_to_ns(gap.saturating_sub(wait_sample)));
+    let outside_ns =
+        last_unlock_gap_sample(previous_unlock, aux.class_hold_start_sample).map(|gap| {
+            wait_time_total_to_ns(
+                gap.saturating_sub(wait_sample)
+                    .saturating_sub(cv_sleep_sample),
+            )
+        });
     let recorded = record_class_sample(class, critical_ns, outside_ns);
     aux.class_sample_armed = false;
     aux.class_hold_start_sample = 0;
@@ -649,6 +661,51 @@ pub fn record_wait_end(wait_start: u64) {
 }
 
 #[inline(always)]
+fn add_cv_sleep_span(aux: &mut ThreadStatsAux, sleep_start: u64, sleep_end: u64) {
+    aux.cv_sleep_total = aux
+        .cv_sleep_total
+        .saturating_add(sleep_end.saturating_sub(sleep_start));
+}
+
+/// Opens the bracket around a condition-variable sleep, which the cond-wait
+/// hook enters after releasing the mutex and leaves before re-acquiring it.
+///
+/// The sleep gets its own accumulator rather than reusing
+/// `wait_start_sample`/`wait_end_sample`: those hold a single open interval that
+/// the re-acquisition following the sleep overwrites, and the totals they feed
+/// report time blocked on a mutex, which a parked waiter is not. Returns 0 when
+/// the operation is not sampled, which `record_cv_sleep_end` reads as no
+/// interval. The sampling decision is the same one the following acquire would
+/// reach: it is already fixed for this operation by the unlock that preceded the
+/// sleep.
+#[inline(always)]
+pub fn record_cv_sleep_start() -> u64 {
+    unsafe {
+        let aux = &mut *thread_aux();
+        decide_operation_sampling(aux);
+        if !aux.op_sampled {
+            return 0;
+        }
+    }
+
+    wait_time_start()
+}
+
+/// Closes the bracket and adds the sleep to the span that the next outermost
+/// unlock removes from its class's non-critical section.
+#[inline(always)]
+pub fn record_cv_sleep_end(sleep_start: u64) {
+    if sleep_start == 0 {
+        return;
+    }
+
+    let sleep_end = wait_time_start();
+    unsafe {
+        add_cv_sleep_span(&mut *thread_aux(), sleep_start, sleep_end);
+    }
+}
+
+#[inline(always)]
 pub fn record_lock_acquired() {
     admission::mark_critical_section_entered();
     record_lock_acquired_stats();
@@ -758,6 +815,14 @@ pub fn record_post_unlock(hold_end: u64, lock_id: u32) {
         aux.wait_start_sample = 0;
         aux.wait_end_sample = 0;
 
+        // Taken and cleared on every unlock, like the wait bracket above, so a
+        // sleep only ever reaches the acquire that directly followed it: a
+        // condition-variable wait taken under an outer lock is time that outer
+        // critical section really spent holding, and must not be carved out of
+        // the outer class's non-critical section.
+        let cv_sleep_total = aux.cv_sleep_total;
+        aux.cv_sleep_total = 0;
+
         let critical_total = if hold_end != 0 && aux.hold_start_sample != 0 {
             hold_end.saturating_sub(aux.hold_start_sample)
         } else {
@@ -792,6 +857,7 @@ pub fn record_post_unlock(hold_end: u64, lock_id: u32) {
                 admission::class_of(lock_id),
                 post_unlock_sample,
                 wait_total,
+                cv_sleep_total,
             )
         {
             tick_sample = post_unlock_sample;
@@ -852,12 +918,13 @@ mod tests {
 
     use super::{
         DEFAULT_SAMPLE_STRIDE, THREAD_LAST_UNLOCK, THREAD_LOCK_DEPTH, ThreadStatsAux,
-        advance_periodic_sample, attribute_outermost_class_sample,
+        add_cv_sleep_span, advance_periodic_sample, attribute_outermost_class_sample,
         begin_outside_gap_sample_with_enabled, class_sample_averages, class_stats,
         decide_operation_sampling_with_enabled, enter_lock_scope_depth, exit_lock_scope_depth,
         finish_outside_gap_sample, last_unlock_gap_sample, last_unlock_sample, parse_sample_stride,
-        record_class_sample, record_lock_acquired, record_post_unlock,
-        refresh_thread_elapsed_for_aux, replace_last_unlock_sample, take_class_sample_averages,
+        record_class_sample, record_cv_sleep_end, record_cv_sleep_start, record_lock_acquired,
+        record_post_unlock, refresh_thread_elapsed_for_aux, replace_last_unlock_sample,
+        take_class_sample_averages,
     };
 
     fn reset_class_stats(class: u32) {
@@ -1190,7 +1257,9 @@ mod tests {
         replace_last_unlock_sample(11, 1_000);
 
         // A gap of 2_000 with 1_500 of it spent queueing leaves 500 of think time.
-        assert!(attribute_outermost_class_sample(&mut aux, 11, 3_400, 1_500));
+        assert!(attribute_outermost_class_sample(
+            &mut aux, 11, 3_400, 1_500, 0
+        ));
 
         let stats = class_stats(11).expect("managed class");
         assert_eq!(stats.ncs_count.load(Ordering::Relaxed), 1);
@@ -1199,6 +1268,125 @@ mod tests {
             wait_time_total_to_ns(500)
         );
         assert_eq!(last_unlock_sample(11), 3_400);
+    }
+
+    #[test]
+    fn per_lock_ncs_excludes_a_condition_variable_sleep() {
+        reset_last_unlock();
+        reset_class_stats(12);
+        reset_class_stats(13);
+
+        // Both classes see the same 10_000 gap, 300 of it spent queueing for the
+        // lock. Class 12 spent 9_500 of the rest parked in a condition-variable
+        // wait; class 13 spent all of it outside any lock.
+        let sleeper_ncs = {
+            let mut aux = ThreadStatsAux {
+                class_sample_armed: true,
+                class_hold_start_sample: 11_000,
+                ..ThreadStatsAux::new()
+            };
+            replace_last_unlock_sample(12, 1_000);
+            assert!(attribute_outermost_class_sample(
+                &mut aux, 12, 11_400, 300, 9_500
+            ));
+            let stats = class_stats(12).expect("managed class");
+            assert_eq!(stats.ncs_count.load(Ordering::Relaxed), 1);
+            stats.ncs_sum_ns.load(Ordering::Relaxed)
+        };
+
+        let thinker_ncs = {
+            let mut aux = ThreadStatsAux {
+                class_sample_armed: true,
+                class_hold_start_sample: 11_000,
+                ..ThreadStatsAux::new()
+            };
+            replace_last_unlock_sample(13, 1_000);
+            assert!(attribute_outermost_class_sample(
+                &mut aux, 13, 11_400, 300, 0
+            ));
+            let stats = class_stats(13).expect("managed class");
+            stats.ncs_sum_ns.load(Ordering::Relaxed)
+        };
+
+        assert_eq!(sleeper_ncs, wait_time_total_to_ns(200));
+        assert_eq!(thinker_ncs, wait_time_total_to_ns(9_700));
+        assert!(
+            sleeper_ncs < thinker_ncs,
+            "the sleep must not read as think time"
+        );
+    }
+
+    #[test]
+    fn cv_sleep_spans_accumulate_across_repeated_waits() {
+        let mut aux = ThreadStatsAux::new();
+
+        add_cv_sleep_span(&mut aux, 1_000, 1_700);
+        add_cv_sleep_span(&mut aux, 2_000, 2_300);
+        assert_eq!(aux.cv_sleep_total, 1_000);
+
+        // Saturating: an out-of-order pair never subtracts from the total.
+        add_cv_sleep_span(&mut aux, 3_000, 2_500);
+        assert_eq!(aux.cv_sleep_total, 1_000);
+    }
+
+    #[test]
+    fn cv_sleep_bracket_is_gated_on_the_sampled_operation() {
+        let aux = super::thread_aux();
+
+        unsafe {
+            *aux = ThreadStatsAux {
+                op_sample_decided: true,
+                op_sampled: false,
+                ..ThreadStatsAux::new()
+            };
+        }
+        assert_eq!(record_cv_sleep_start(), 0);
+        record_cv_sleep_end(0);
+        unsafe {
+            assert_eq!((*aux).cv_sleep_total, 0);
+        }
+
+        unsafe {
+            *aux = ThreadStatsAux {
+                op_sample_decided: true,
+                op_sampled: true,
+                ..ThreadStatsAux::new()
+            };
+        }
+        let sleep_start = record_cv_sleep_start();
+        assert_ne!(sleep_start, 0, "a sampled operation opens the bracket");
+        record_cv_sleep_end(sleep_start);
+        unsafe {
+            assert!(
+                (*aux).cv_sleep_total < 1_000_000_000,
+                "the closed bracket accumulates the span, not the clock origin"
+            );
+            *aux = ThreadStatsAux::new();
+        }
+    }
+
+    #[test]
+    fn post_unlock_clears_the_cv_sleep_span_it_consumed() {
+        let aux = super::thread_aux();
+        reset_lock_scope_depth();
+
+        unsafe {
+            *aux = ThreadStatsAux {
+                thread_start_sample: 100,
+                hold_start_sample: 180,
+                cv_sleep_total: 4_000,
+                op_sample_decided: true,
+                op_sampled: true,
+                ..ThreadStatsAux::new()
+            };
+        }
+
+        record_post_unlock(260, 0);
+
+        unsafe {
+            assert_eq!((*aux).cv_sleep_total, 0);
+            *aux = ThreadStatsAux::new();
+        }
     }
 
     #[test]

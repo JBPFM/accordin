@@ -35,6 +35,11 @@ struct task_scx_ctx {
   unsigned int initialized;
   unsigned int holds_admission;
   unsigned int admitted_class;
+  /* Set while this admission episode is counted against the width of
+   * admitted_class. It is the token that keeps the class counter balanced: the
+   * grant that sets it is the only increment, the clear that follows is the
+   * only decrement, and a holder never carries it. */
+  unsigned int width_slot_held;
   unsigned int admission_cpu;
   unsigned int must_run_on_admission_cpu;
   unsigned int force_inactive_wait;

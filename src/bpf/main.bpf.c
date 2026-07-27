@@ -321,6 +321,8 @@ DEFINE_CLASS_SLOT_LOOKUP(lookup_class_active_peak, __u32, class_active_peak)
 DEFINE_CLASS_SLOT_LOOKUP(lookup_class_width, __u32, class_width)
 DEFINE_CLASS_SLOT_LOOKUP(lookup_class_inactive_depth, __u32,
                          class_inactive_depth)
+DEFINE_CLASS_SLOT_LOOKUP(lookup_class_inactive_depth_peak, __u32,
+                         class_inactive_depth_peak)
 
 static __always_inline void account_admission_grant(__u32 lock_id) {
   volatile __s32 *active = lookup_class_active(lock_id);
@@ -355,10 +357,30 @@ static __always_inline void account_admission_release(__u32 lock_id) {
   }
 }
 
+/* The two width-slot helpers are the only pair that may move class_active, and
+ * task_ctx->width_slot_held is the token that makes them alternate: taking a
+ * slot is the sole increment of the class counter, returning it the sole
+ * decrement, at most once each per admission episode. */
+static __always_inline void take_width_slot(struct task_scx_ctx *task_ctx,
+                                            __u32 lock_id) {
+  task_ctx->width_slot_held = 1;
+  account_admission_grant(lock_id);
+}
+
+static __always_inline void release_width_slot(struct task_scx_ctx *task_ctx) {
+  if (!task_ctx->width_slot_held)
+    return;
+
+  task_ctx->width_slot_held = 0;
+  account_admission_release(task_ctx->admitted_class);
+}
+
 /* The inactive-depth counters exist only for width control, so each one owns
  * its feature gate rather than relying on every call site to repeat it. */
 static __always_inline void account_inactive_depth_enqueue(__u32 lock_id) {
   volatile __u32 *depth;
+  volatile __u32 *peak;
+  __u32 new_depth;
 
   if (!width_control_enabled)
     return;
@@ -367,7 +389,12 @@ static __always_inline void account_inactive_depth_enqueue(__u32 lock_id) {
   if (!depth)
     return;
 
-  __sync_fetch_and_add(depth, 1);
+  new_depth = __sync_fetch_and_add(depth, 1) + 1;
+
+  /* Peak is advisory (controller reads-and-clears); a plain store is fine. */
+  peak = lookup_class_inactive_depth_peak(lock_id);
+  if (peak && new_depth > *peak)
+    *peak = new_depth;
 }
 
 static __always_inline void account_inactive_depth_release(__u32 lock_id) {
@@ -398,7 +425,7 @@ static __always_inline void reset_inactive_depth(__u32 lock_id) {
 }
 
 /* Sole expression of the width rule: a class may take another CPU while fewer
- * tasks hold its admission than its published width. Unlimited (width 0), an
+ * waiters are admitted for it than its published width. Unlimited (width 0), an
  * unmanaged id, and the feature being off all mean "no cap". */
 static __always_inline bool class_dispatch_eligible(__u32 lock_id) {
   volatile __u32 *width;
@@ -581,16 +608,15 @@ static __always_inline void release_admission(struct task_struct *p,
                                               struct task_scx_ctx *task_ctx) {
   __u32 cpu = task_ctx->admission_cpu;
   __u32 pid = p->pid;
-  bool was_held = task_ctx->holds_admission;
-  __u32 admitted_class = task_ctx->admitted_class;
   volatile __u32 *owner;
 
   owner = lookup_cpu_owner(cpu);
   if (owner && *owner == pid)
     *owner = 0;
 
-  if (was_held)
-    account_admission_release(admitted_class);
+  /* Returns the slot only if the episode still carries one; a task that reached
+   * its critical section gave it back there. */
+  release_width_slot(task_ctx);
 
   clear_admission_state(task_ctx);
 
@@ -598,9 +624,13 @@ static __always_inline void release_admission(struct task_struct *p,
     scx_bpf_kick_cpu(cpu, 0);
 }
 
+/* `in_critical_section` says the task already owns the lock at grant time. Such
+ * a task runs whatever the width says, so its episode starts without a slot;
+ * every other grant is a waiter and takes one. */
 static __always_inline bool grant_admission(struct task_struct *p,
                                             struct task_scx_ctx *task_ctx,
-                                            __u32 lock_id, __u32 cpu) {
+                                            __u32 lock_id, __u32 cpu,
+                                            bool in_critical_section) {
   __u32 pid = p->pid;
   bool was_held = task_ctx->holds_admission;
   volatile __u32 *owner;
@@ -622,7 +652,9 @@ static __always_inline bool grant_admission(struct task_struct *p,
   task_ctx->admission_cpu = cpu;
   if (!was_held) {
     task_ctx->admitted_class = lock_id;
-    account_admission_grant(lock_id);
+    task_ctx->width_slot_held = 0;
+    if (!in_critical_section)
+      take_width_slot(task_ctx, lock_id);
   }
   return true;
 }
@@ -784,6 +816,17 @@ static __always_inline bool task_in_critical_section(
   return false;
 }
 
+/* Width bounds the waiters queued in front of a lock, not the task holding it:
+ * once the user word shows the lock taken, the slot goes back to the class so
+ * the next waiter can be admitted while the critical section runs. Called
+ * wherever BPF reads the word of a task that may hold admission; the slot token
+ * makes every call after the first a no-op. */
+static __always_inline void note_critical_section_entry(
+    struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
+  if (task_in_critical_section(task_ctx, have_user, user_ctx_word))
+    release_width_slot(task_ctx);
+}
+
 static __always_inline bool enqueue_force_inactive(struct task_struct *p,
                                                    struct task_scx_ctx *task_ctx,
                                                    __u32 lock_id, __u32 cpu,
@@ -827,7 +870,7 @@ static __always_inline void protect_critical_section(struct task_struct *p,
 
   task_ctx->admission_cpu = cpu;
   if (!task_ctx->holds_admission)
-    grant_admission(p, task_ctx, lock_id, cpu);
+    grant_admission(p, task_ctx, lock_id, cpu, true);
 
   task_ctx->must_run_on_admission_cpu = 1;
 }
@@ -857,12 +900,15 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
     return;
   }
 
+  note_critical_section_entry(task_ctx, have_user, user_ctx_word);
+
   if (!task_ctx->holds_admission && have_user &&
       user_slow_path_pending(user_ctx_word) && valid_lock_id(lock_id) &&
       cpu < MAX_CPUS && task_cpu_allowed(p, cpu)) {
     if (!class_dispatch_eligible(lock_id))
       task_ctx->force_inactive_wait = 1;
-    else if (grant_admission(p, task_ctx, lock_id, cpu))
+    else if (grant_admission(p, task_ctx, lock_id, cpu,
+                             user_in_critical_section(user_ctx_word)))
       bump_debug_counter(&running_pending_grant_success);
     else
       bump_debug_counter(&running_pending_grant_failure);
@@ -1052,7 +1098,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     task_ctx->admission_cpu = cpu;
 
     if (class_dispatch_eligible(lock_id) &&
-        grant_admission(p, task_ctx, lock_id, cpu)) {
+        grant_admission(p, task_ctx, lock_id, cpu,
+                        user_in_critical_section(user_ctx_word))) {
       record_enqueue_state(task_ctx, SCX_DSQ_LOCAL_ON | cpu, lock_id,
                            ENQ_PATH_SLOW_GRANTED_LOCAL, cpu, user_ctx_word,
                            wake_hinted(enq_flags, user_ctx_word));
@@ -1212,6 +1259,8 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
     return;
   }
 
+  note_critical_section_entry(task_ctx, have_user, user_ctx_word);
+
   if (!runnable) {
     /* A block invalidates any routing decision made for a runnable re-enqueue,
      * so the wakeup is classified from scratch. */
@@ -1321,10 +1370,12 @@ void BPF_STRUCT_OPS(accordin_dump_task, struct scx_dump_ctx *dump_ctx,
   if (!task_ctx)
     return;
 
-  scx_bpf_dump(
-      "accordin_task pid=%d tgid=%d holds=%u adm_cpu=%u must=%u force=%u\n",
-      p->pid, p->tgid, task_ctx->holds_admission, task_ctx->admission_cpu,
-      task_ctx->must_run_on_admission_cpu, task_ctx->force_inactive_wait);
+  scx_bpf_dump("accordin_task pid=%d tgid=%d holds=%u slot=%u adm_cpu=%u "
+               "must=%u force=%u\n",
+               p->pid, p->tgid, task_ctx->holds_admission,
+               task_ctx->width_slot_held, task_ctx->admission_cpu,
+               task_ctx->must_run_on_admission_cpu,
+               task_ctx->force_inactive_wait);
   if (debug_counters_enabled())
     scx_bpf_dump(
         "accordin_task_enqueue pid=%d last_path=%u last_lock=%u last_cpu=%u "

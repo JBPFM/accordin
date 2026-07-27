@@ -38,6 +38,17 @@ volatile __u32 debug_counters_mode = 0;
 volatile __u32 cpu_admission_owner[MAX_CPUS];
 volatile __u32 cpu_last_inactive_lock[MAX_CPUS];
 volatile __u32 cpu_inactive_dispatch_count[MAX_CPUS];
+/* Managed rank the next deficit probe on this CPU starts from. The probe scans
+ * a fixed window, so this cursor advancing between calls is what carries the
+ * scan across the classes the window left out. A cursor left behind by a wider
+ * span is reset by the probe, since the fallback span is the widest one and a
+ * first publish can therefore narrow the span under a cursor. */
+volatile __u32 cpu_inactive_probe_cursor[MAX_CPUS];
+/* Managed class ranks the deficit probe rotates over, published by userspace.
+ * Lock ids are dense from 1 upward, so the ranks past the ids handed out hold
+ * no class and probing them only spends window. 0 means no span published yet;
+ * the probe then rotates over the whole managed space. */
+volatile __u32 inactive_probe_span;
 volatile __u32 width_control_enabled;
 volatile __u32 class_width[MAX_LOCK_CLASSES]; /* 0 = unlimited */
 /* Waiters currently admitted for the class. A task counts from the grant that

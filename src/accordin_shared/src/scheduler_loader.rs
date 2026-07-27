@@ -86,6 +86,7 @@ macro_rules! define_scheduler_loader {
                     bss.class_active_peak.as_mut_ptr(),
                     bss.class_inactive_depth.as_mut_ptr(),
                     bss.class_inactive_depth_peak.as_mut_ptr(),
+                    &mut bss.inactive_probe_span as *mut u32,
                 );
                 if debug_counters {
                     $crate::bpf_counters::set_routing_counter_ptrs([

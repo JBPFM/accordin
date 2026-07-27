@@ -138,39 +138,26 @@ static __always_inline struct task_scx_ctx *get_task_ctx(struct task_struct *p) 
   return task_ctx;
 }
 
-static __always_inline volatile __u32 *lookup_cpu_owner(__u32 cpu) {
-  __u32 idx;
+/* Bounds a per-CPU array access for the verifier. The mask is what proves the
+ * index in range, so MAX_CPUS has to stay a power of two. */
+#define DEFINE_CPU_SLOT_LOOKUP(fn, array)                                      \
+  static __always_inline volatile __u32 *fn(__u32 cpu) {                       \
+    __u32 idx;                                                                 \
+                                                                               \
+    if (cpu >= MAX_CPUS)                                                       \
+      return 0;                                                                \
+                                                                               \
+    idx = cpu & (MAX_CPUS - 1);                                                \
+    barrier_var(idx);                                                          \
+    return &array[idx];                                                        \
+  }
 
-  if (cpu >= MAX_CPUS)
-    return 0;
-
-  idx = cpu & (MAX_CPUS - 1);
-  barrier_var(idx);
-  return &cpu_admission_owner[idx];
-}
-
-static __always_inline volatile __u32 *lookup_cpu_last_inactive_lock(__u32 cpu) {
-  __u32 idx;
-
-  if (cpu >= MAX_CPUS)
-    return 0;
-
-  idx = cpu & (MAX_CPUS - 1);
-  barrier_var(idx);
-  return &cpu_last_inactive_lock[idx];
-}
-
-static __always_inline volatile __u32 *
-lookup_cpu_inactive_dispatch_count(__u32 cpu) {
-  __u32 idx;
-
-  if (cpu >= MAX_CPUS)
-    return 0;
-
-  idx = cpu & (MAX_CPUS - 1);
-  barrier_var(idx);
-  return &cpu_inactive_dispatch_count[idx];
-}
+DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_owner, cpu_admission_owner)
+DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_last_inactive_lock, cpu_last_inactive_lock)
+DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_inactive_dispatch_count,
+                       cpu_inactive_dispatch_count)
+DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_inactive_probe_cursor,
+                       cpu_inactive_probe_cursor)
 
 static __always_inline bool inactive_dispatch_budget_available(__u32 cpu) {
   volatile __u32 *count = lookup_cpu_inactive_dispatch_count(cpu);
@@ -451,19 +438,42 @@ static __always_inline bool class_dispatch_eligible(__u32 lock_id) {
  * width so an uncapped class with waiters is always preferred. */
 #define INACTIVE_DEFICIT_UNLIMITED (1 << 24)
 
-static __always_inline __u32 select_inactive_deficit_class(void) {
+/* Widest-deficit class among the INACTIVE_DEFICIT_PROBE_WIDTH classes starting
+ * at this CPU's probe cursor, or UNMANAGED_LOCK_ID when the window holds no
+ * eligible class with waiters. The window rotates over the ranks userspace
+ * reports as allocated rather than the whole class space, so it does not spend
+ * its width on ranks that hold no class.
+ *
+ * The window is a preference, not the guarantee of service: the caller falls
+ * back to a scan that visits every class, so a class the window skipped is
+ * still dispatched, only without deficit ordering. The cursor advances on every
+ * call, so a class stays outside the window for at most a full sweep. */
+static __always_inline __u32 select_inactive_deficit_class(__u32 dispatch_cpu) {
+  volatile __u32 *cursor = lookup_cpu_inactive_probe_cursor(dispatch_cpu);
+  __u32 span = inactive_probe_ranks(inactive_probe_span);
   __u32 best_lock = UNMANAGED_LOCK_ID;
   __s32 best_deficit = 0;
-  __u32 lock_id;
+  __u32 rank = 0;
+  __u32 probe;
+
+  if (cursor) {
+    rank = *cursor;
+    if (rank >= span)
+      rank = 0;
+    *cursor = inactive_next_probe_rank(rank, span);
+  }
 
 #pragma unroll
-  for (lock_id = 1; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+  for (probe = 0; probe < INACTIVE_DEFICIT_PROBE_WIDTH; probe++) {
+    __u32 lock_id = inactive_lock_at_rank(rank);
     volatile __u32 *depth = lookup_class_inactive_depth(lock_id);
     volatile __u32 *width;
     volatile __s32 *active;
     __u32 w;
     __s32 in_flight;
     __s32 deficit;
+
+    rank = inactive_wrap_rank(rank, span);
 
     /* Most classes are idle, so settle the cheap test before deriving the
      * width and active slots for the ones that are not. */
@@ -570,7 +580,7 @@ move_selected_inactive_to_local(__u32 dispatch_cpu) {
     return INACTIVE_MOVE_MOVED;
 
   if (width_control_enabled) {
-    __u32 best = select_inactive_deficit_class();
+    __u32 best = select_inactive_deficit_class(dispatch_cpu);
 
     if (valid_lock_id(best) &&
         try_move_inactive(dispatch_cpu, best, &blocked))

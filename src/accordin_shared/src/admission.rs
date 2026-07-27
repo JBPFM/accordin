@@ -11,7 +11,10 @@ const TOKEN_CONSUMED: u32 = 1 << 2;
 const TRANSIENT_FLAGS: u32 = SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED;
 pub const USER_ADMISSION_FLAG_MASK: u32 = 0x7;
 pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 3;
-pub const MAX_LOCK_CLASSES: u32 = 16;
+/// Must equal `MAX_LOCK_CLASSES` in the BPF `intf.h`: the scheduler loader
+/// assigns a `[u32; CLASS_COUNT]` into the skeleton's per-class BSS array, so a
+/// mismatch is a build error rather than a silent truncation.
+pub const MAX_LOCK_CLASSES: u32 = 64;
 pub const UNMANAGED_LOCK_ID: u32 = 0;
 pub const DISABLE_ADMISSION_ENV: &str = "ACCORDIN_DISABLE_ADMISSION";
 const WIDTH_MERGE_ENV: &str = "ACCORDIN_WIDTH_MERGE";
@@ -360,6 +363,10 @@ fn allocate_lock_id() -> u32 {
 /// can renumber a lock that already exists.
 pub fn allocate_lock_class() -> u32 {
     let lock_id = allocate_lock_id();
+    // The probe span follows the ids handed out. Publishing it here rather
+    // than from the controller tick covers the fixed-width mode, where the
+    // tick never runs.
+    crate::width_control::publish_inactive_probe_span();
     if lock_id != UNMANAGED_LOCK_ID {
         return lock_id;
     }
@@ -368,6 +375,13 @@ pub fn allocate_lock_class() -> u32 {
         LockClassPolicy::Fold => fold_overflow_lock_id(),
         LockClassPolicy::Unmanaged => UNMANAGED_LOCK_ID,
     }
+}
+
+/// Managed lock ids handed out so far. Ids are dense from 1 upward and an
+/// overflowing lock folds onto an id already in use, so this is also the
+/// highest managed id in play.
+pub fn allocated_class_count() -> u32 {
+    NEXT_LOCK_ID.load(Ordering::Relaxed).saturating_sub(1)
 }
 
 /// Deals overflowing locks round-robin over the managed ids. Folding reuses the
@@ -838,9 +852,10 @@ mod tests {
     use super::{
         IN_CRITICAL_SECTION, LockClassPolicy, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, TOKEN_CONSUMED,
         UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_class, allocate_lock_id,
-        begin_lock_scope, class_of, clear_token_consumed_for_scope, finish_lock_scope,
-        force_dump_for_test, force_lock_class_policy_for_test, force_merge_for_test,
-        lock_class_policy, managed_lock_id, mark_cond_reacquire_pending_for_cond_mutex,
+        allocated_class_count, begin_lock_scope, class_of, clear_token_consumed_for_scope,
+        finish_lock_scope, force_dump_for_test, force_lock_class_policy_for_test,
+        force_merge_for_test, lock_class_policy, managed_lock_id,
+        mark_cond_reacquire_pending_for_cond_mutex,
         mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled,
         mark_critical_section_entered, mark_critical_section_entered_for_scope,
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
@@ -1310,7 +1325,7 @@ mod tests {
     fn lock_id_allocator_exhausts_at_configured_class_limit() {
         let _allocator = isolate_allocator_state(None);
 
-        assert_eq!(MAX_LOCK_CLASSES, 16);
+        assert_eq!(MAX_LOCK_CLASSES, 64);
         for expected in 1..MAX_LOCK_CLASSES {
             assert_eq!(allocate_lock_id(), expected);
         }
@@ -1378,6 +1393,20 @@ mod tests {
         // A full round of overflow lands on every managed id exactly once.
         assert_eq!(&ids[managed.len()..2 * managed.len()], &managed[..]);
         assert_eq!(&ids[2 * managed.len()..], &managed[..]);
+    }
+
+    #[test]
+    fn allocated_class_count_tracks_the_ids_handed_out() {
+        let _allocator = isolate_allocator_state(Some(LockClassPolicy::Fold));
+
+        assert_eq!(allocated_class_count(), 0);
+        allocate_lock_classes(2);
+        assert_eq!(allocated_class_count(), 2);
+
+        // Ids run out at the class limit and folded overflow locks reuse them,
+        // so the count stops at the managed space.
+        allocate_lock_classes(MAX_LOCK_CLASSES as usize + 8);
+        assert_eq!(allocated_class_count(), MAX_LOCK_CLASSES - 1);
     }
 
     #[test]

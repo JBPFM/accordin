@@ -60,11 +60,17 @@ const MIN_ACQUIRES_PER_DECISION: u64 = 32;
 /// controller shows a short run of identical trailing values.
 const WIDTH_HISTORY_LEN: usize = 8;
 
+/// Managed class ranks, i.e. `CLASS_COUNT` without the unmanaged sentinel.
+/// Matches `MANAGED_LOCK_COUNT` on the BPF side, which walks a ring of exactly
+/// this many ranks.
+const MANAGED_CLASS_COUNT: u32 = MAX_LOCK_CLASSES - 1;
+
 static CLASS_WIDTH_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 static CLASS_ACTIVE_PTR: AtomicPtr<i32> = AtomicPtr::new(std::ptr::null_mut());
 static CLASS_ACTIVE_PEAK_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 static CLASS_INACTIVE_DEPTH_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 static CLASS_INACTIVE_DEPTH_PEAK_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
+static INACTIVE_PROBE_SPAN_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 
 static LAST_TICK_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -710,6 +716,30 @@ fn publish_class_width(class: usize, width: u32) {
     unsafe { ptr.write_volatile(width) }
 }
 
+/// Managed class ranks the BPF deficit probe may rotate over. Bounded by the
+/// ranks that exist: the probe indexes the per-class arrays by rank, and a span
+/// past the ring would send it outside them.
+fn clamped_probe_span(allocated: u32) -> u32 {
+    allocated.min(MANAGED_CLASS_COUNT)
+}
+
+fn store_probe_span(ptr: *mut u32, allocated: u32) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe { ptr.write_volatile(clamped_probe_span(allocated)) }
+}
+
+/// Publishes how many managed class ranks the deficit probe should rotate over.
+/// Driven by lock-class allocation rather than the controller tick, which does
+/// not run in fixed-width mode while the probe does.
+pub fn publish_inactive_probe_span() {
+    store_probe_span(
+        INACTIVE_PROBE_SPAN_PTR.load(Ordering::Acquire),
+        admission::allocated_class_count(),
+    );
+}
+
 /// Throttled entry point driven by the per-class sampling path. Elects a single
 /// writer per window by CAS so the tick body runs once and publishes once.
 ///
@@ -873,6 +903,9 @@ pub fn class_report(class: u32) -> Option<ClassWidthReport> {
     })
 }
 
+/// Hands BPF's per-class state to the controller. The probe span is published
+/// here as well, so classes allocated before the scheduler attached are
+/// covered.
 #[doc(hidden)]
 pub fn set_class_state_ptrs(
     class_width: *mut u32,
@@ -880,17 +913,22 @@ pub fn set_class_state_ptrs(
     class_active_peak: *mut u32,
     class_inactive_depth: *mut u32,
     class_inactive_depth_peak: *mut u32,
+    inactive_probe_span: *mut u32,
 ) {
     CLASS_WIDTH_PTR.store(class_width, Ordering::Release);
     CLASS_ACTIVE_PTR.store(class_active, Ordering::Release);
     CLASS_ACTIVE_PEAK_PTR.store(class_active_peak, Ordering::Release);
     CLASS_INACTIVE_DEPTH_PTR.store(class_inactive_depth, Ordering::Release);
     CLASS_INACTIVE_DEPTH_PEAK_PTR.store(class_inactive_depth_peak, Ordering::Release);
+    INACTIVE_PROBE_SPAN_PTR.store(inactive_probe_span, Ordering::Release);
+
+    publish_inactive_probe_span();
 }
 
 #[doc(hidden)]
 pub fn clear_class_state_ptrs() {
     set_class_state_ptrs(
+        std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -903,12 +941,13 @@ pub fn clear_class_state_ptrs() {
 mod tests {
     use super::{
         CLASS_COUNT, CROSS_NUMA_CRITICAL_PENALTY_NS, ClassController, DEFAULT_MIN_WIDTH,
-        DEFAULT_TICK_WINDOW_NS, MAX_STATIC_WIDTH, MIN_ACQUIRES_PER_DECISION,
-        MULTICORE_CRITICAL_PENALTY_NS, StepVote, arbitrate_budget, bound_seed_by_occupancy,
-        clamped_min_width, class_demand, confirm_step, controller_active_with, count_cpulist,
-        floored_width, fold_merged_classes, numa_critical_penalty_ns, parse_fixed_class_widths,
-        parse_tick_window_ns, seed_from_averages, settle_seed, step_allowed, stepped_width,
-        width_vote, window_level,
+        DEFAULT_TICK_WINDOW_NS, MANAGED_CLASS_COUNT, MAX_LOCK_CLASSES, MAX_STATIC_WIDTH,
+        MIN_ACQUIRES_PER_DECISION, MULTICORE_CRITICAL_PENALTY_NS, StepVote, arbitrate_budget,
+        bound_seed_by_occupancy, clamped_min_width, clamped_probe_span, class_demand, confirm_step,
+        controller_active_with, count_cpulist, floored_width, fold_merged_classes,
+        numa_critical_penalty_ns, parse_fixed_class_widths, parse_tick_window_ns,
+        seed_from_averages, settle_seed, step_allowed, stepped_width, store_probe_span, width_vote,
+        window_level,
     };
 
     const HOLDOFF: u32 = 3;
@@ -949,12 +988,15 @@ mod tests {
 
     #[test]
     fn invalid_entries_are_ignored_defensively() {
-        let widths =
-            parse_fixed_class_widths(Some("not-a-number"), Some("0:9,16:9,x:1,2:oops,3:7,,5"))
-                .expect("config present");
+        let out_of_range = MAX_LOCK_CLASSES;
+        let widths = parse_fixed_class_widths(
+            Some("not-a-number"),
+            Some(&format!("0:9,{out_of_range}:9,x:1,2:oops,3:7,,5")),
+        )
+        .expect("config present");
         // Unparseable fixed width leaves the all-zero base intact.
         assert_eq!(widths[1], 0);
-        // Class 0 (unmanaged) and class 16 (out of range) are rejected.
+        // The unmanaged class and a class past the limit are both rejected.
         assert_eq!(widths[0], 0);
         // Only the well-formed entry lands.
         assert_eq!(widths[3], 7);
@@ -1410,6 +1452,37 @@ mod tests {
         class.commit_initial_width(3, 1, 0);
 
         assert_eq!(class.width, 1);
+    }
+
+    #[test]
+    fn a_probe_span_never_exceeds_the_ranks_that_exist() {
+        assert_eq!(clamped_probe_span(0), 0);
+        assert_eq!(clamped_probe_span(2), 2);
+        assert_eq!(clamped_probe_span(MANAGED_CLASS_COUNT), MANAGED_CLASS_COUNT);
+        assert_eq!(
+            clamped_probe_span(MANAGED_CLASS_COUNT + 1),
+            MANAGED_CLASS_COUNT
+        );
+        assert_eq!(clamped_probe_span(u32::MAX), MANAGED_CLASS_COUNT);
+        // The probe reads class `rank + 1`, so the widest span it may be given
+        // still leaves the highest rank inside the per-class arrays.
+        assert!((clamped_probe_span(u32::MAX) as usize) < CLASS_COUNT);
+    }
+
+    #[test]
+    fn publishing_a_span_through_a_null_pointer_is_a_no_op() {
+        store_probe_span(std::ptr::null_mut(), 4);
+    }
+
+    #[test]
+    fn a_published_span_lands_clamped_in_the_slot() {
+        let mut slot = 0u32;
+
+        store_probe_span(&mut slot, 2);
+        assert_eq!(slot, 2);
+
+        store_probe_span(&mut slot, u32::MAX);
+        assert_eq!(slot, MANAGED_CLASS_COUNT);
     }
 
     #[test]

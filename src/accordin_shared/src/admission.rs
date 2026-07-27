@@ -155,6 +155,18 @@ fn lock_class_policy() -> LockClassPolicy {
     })
 }
 
+/// Dependency merging and a statically configured width are mutually exclusive,
+/// and the static configuration wins even against an explicit merge request.
+/// A merge renames a lock's class, so an entry naming that class in the
+/// operator's map stops describing anything the lock resolves to; and the fold
+/// that reconciles a merged-away class with its canonical one belongs to the
+/// controller tick, which a static width configuration replaces. Leaving the
+/// two on together would let a merge silently retire a configured width with no
+/// signal that it stopped applying.
+fn merge_enabled_with(width_control: bool, fixed_widths: bool, requested: bool) -> bool {
+    width_control && !fixed_widths && requested
+}
+
 #[inline(always)]
 fn merge_enabled() -> bool {
     if merge_forced() {
@@ -164,7 +176,11 @@ fn merge_enabled() -> bool {
     static MERGE_ENABLED: OnceLock<bool> = OnceLock::new();
 
     *MERGE_ENABLED.get_or_init(|| {
-        crate::width_control::enabled() && crate::env::env_flag_default_on(WIDTH_MERGE_ENV)
+        merge_enabled_with(
+            crate::width_control::enabled(),
+            crate::width_control::fixed_widths_configured(),
+            crate::env::env_flag_default_on(WIDTH_MERGE_ENV),
+        )
     })
 }
 
@@ -861,7 +877,7 @@ mod tests {
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
-        parse_lock_class_policy, reset_lock_id_allocator_for_test, reset_state,
+        merge_enabled_with, parse_lock_class_policy, reset_lock_id_allocator_for_test, reset_state,
         reset_thread_depth_for_test, reset_transient_state, reset_transitions_for_tests,
         reset_union_find_for_tests, set_inactive_queue_seq_ptrs, slow_path_yield_required,
         take_classes_dirty, take_cond_reacquire_pending_for_scope, token_consumed_for_scope,
@@ -1528,6 +1544,53 @@ mod tests {
 
         force_merge_for_test(true);
         assert_eq!(class_of(3), 2);
+    }
+
+    /// Resolves the merge gate from raw width settings the way the process
+    /// resolves it from the environment. Merging is requested throughout, which
+    /// is what an explicit `ACCORDIN_WIDTH_MERGE=1` amounts to.
+    fn merge_enabled_for_settings(fixed: Option<&str>, class_map: Option<&str>) -> bool {
+        const WIDTH_CONTROL: bool = true;
+        const REQUESTED: bool = true;
+
+        merge_enabled_with(
+            WIDTH_CONTROL,
+            crate::width_control::fixed_widths_present_with(WIDTH_CONTROL, fixed, class_map),
+            REQUESTED,
+        )
+    }
+
+    #[test]
+    fn a_fixed_width_takes_class_merging_out_of_play() {
+        assert!(!merge_enabled_for_settings(Some("4"), None));
+    }
+
+    #[test]
+    fn a_width_class_map_takes_class_merging_out_of_play() {
+        assert!(!merge_enabled_for_settings(None, Some("3:5")));
+        assert!(!merge_enabled_for_settings(Some("4"), Some("3:5")));
+    }
+
+    #[test]
+    fn merging_follows_the_request_while_no_static_width_is_configured() {
+        assert!(merge_enabled_for_settings(None, None));
+        assert!(merge_enabled_with(true, false, true));
+        assert!(!merge_enabled_with(true, false, false));
+    }
+
+    #[test]
+    fn static_widths_do_not_reach_merging_while_width_control_is_off() {
+        // Without the feature there is no width to configure, so neither
+        // variable counts as one ...
+        assert!(!crate::width_control::fixed_widths_present_with(
+            false,
+            Some("4"),
+            Some("3:5")
+        ));
+        // ... and merging is off either way, exactly as it is without any of
+        // this machinery.
+        assert!(!merge_enabled_with(false, false, true));
+        assert!(!merge_enabled_with(false, true, true));
     }
 
     #[test]

@@ -90,9 +90,37 @@ pub fn fixed_class_widths() -> Option<[u32; CLASS_COUNT]> {
         return None;
     }
 
-    let fixed = std::env::var(FIXED_WIDTH_ENV).ok();
-    let class_map = std::env::var(WIDTH_CLASS_MAP_ENV).ok();
+    let (fixed, class_map) = fixed_width_settings();
     parse_fixed_class_widths(fixed.as_deref(), class_map.as_deref())
+}
+
+fn fixed_width_settings() -> (Option<String>, Option<String>) {
+    (
+        std::env::var(FIXED_WIDTH_ENV).ok(),
+        std::env::var(WIDTH_CLASS_MAP_ENV).ok(),
+    )
+}
+
+/// Whether raw settings ask for statically configured widths. Gated on the
+/// feature switch: with width control off there is no width to fix, so neither
+/// variable is read as configuration.
+pub(crate) fn fixed_widths_present_with(
+    enabled: bool,
+    fixed: Option<&str>,
+    class_map: Option<&str>,
+) -> bool {
+    enabled && parse_fixed_class_widths(fixed, class_map).is_some()
+}
+
+/// Whether an operator configured static widths, resolved once.
+/// `fixed_class_widths` reads the environment on every call; callers on the
+/// lock acquisition path must come through here instead.
+pub(crate) fn fixed_widths_configured() -> bool {
+    static CONFIGURED: OnceLock<bool> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        let (fixed, class_map) = fixed_width_settings();
+        fixed_widths_present_with(enabled(), fixed.as_deref(), class_map.as_deref())
+    })
 }
 
 fn parse_fixed_class_widths(
@@ -168,7 +196,7 @@ fn controller_active_with(enabled: bool, fixed_widths_present: bool) -> bool {
 
 fn controller_active() -> bool {
     static ACTIVE: OnceLock<bool> = OnceLock::new();
-    *ACTIVE.get_or_init(|| controller_active_with(enabled(), fixed_class_widths().is_some()))
+    *ACTIVE.get_or_init(|| controller_active_with(enabled(), fixed_widths_configured()))
 }
 
 fn tick_window_ns() -> u64 {

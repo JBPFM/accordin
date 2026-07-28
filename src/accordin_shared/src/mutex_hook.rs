@@ -163,6 +163,7 @@ pub fn cv_admission_hint_enabled() -> bool {
     *CV_ADMISSION_HINT_ENABLED.get_or_init(|| !crate::env::env_flag(DISABLE_CV_ADMISSION_HINT_ENV))
 }
 
+// Registry membership is only consulted under registered hook scope, so writers are gated on it too.
 fn hooked_mutexes() -> &'static Mutex<HashSet<usize>> {
     static HOOKED_MUTEXES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
     HOOKED_MUTEXES.get_or_init(|| Mutex::new(HashSet::new()))
@@ -718,7 +719,9 @@ macro_rules! export_mutex_hooks {
                         std::mem::size_of::<libc::pthread_cond_t>(),
                     );
                     (*(cond as *mut usize)) = ptr as usize;
-                    $crate::mutex_hook::register_hooked_cond_addr(cond);
+                    if $crate::mutex_hook::registered_hook_scope_enabled() {
+                        $crate::mutex_hook::register_hooked_cond_addr(cond);
+                    }
                     0
                 }
             }
@@ -828,7 +831,9 @@ macro_rules! export_mutex_hooks {
                     });
                     let ptr = Box::into_raw(state);
                     atomic.store(ptr as usize, Ordering::Release);
-                    $crate::mutex_hook::register_hooked_cond_addr(cond);
+                    if $crate::mutex_hook::registered_hook_scope_enabled() {
+                        $crate::mutex_hook::register_hooked_cond_addr(cond);
+                    }
                     return Ok(ptr);
                 }
             }
@@ -969,7 +974,9 @@ macro_rules! export_mutex_hooks {
                     let mutex = mutex.cast::<libc::pthread_mutex_t>();
                     let val = state_atomic(mutex).load(Ordering::Acquire);
                     if val > SENTINEL {
-                        $crate::mutex_hook::register_hooked_mutex_addr(mutex);
+                        if $crate::mutex_hook::registered_hook_scope_enabled() {
+                            $crate::mutex_hook::register_hooked_mutex_addr(mutex);
+                        }
                         return 0;
                     }
 
@@ -985,7 +992,7 @@ macro_rules! export_mutex_hooks {
                     }
 
                     let ret = initialize_hook_state(mutex);
-                    if ret == 0 {
+                    if ret == 0 && $crate::mutex_hook::registered_hook_scope_enabled() {
                         $crate::mutex_hook::register_hooked_mutex_addr(mutex);
                     }
                     ret
@@ -1002,7 +1009,9 @@ macro_rules! export_mutex_hooks {
                     }
 
                     let mutex = mutex.cast::<libc::pthread_mutex_t>();
-                    $crate::mutex_hook::unregister_hooked_mutex_addr(mutex);
+                    if $crate::mutex_hook::registered_hook_scope_enabled() {
+                        $crate::mutex_hook::unregister_hooked_mutex_addr(mutex);
+                    }
 
                     let atomic = state_atomic(mutex);
                     let val = atomic.load(Ordering::Acquire);
@@ -1027,7 +1036,9 @@ macro_rules! export_mutex_hooks {
                         return real_pthread_mutex_destroy(mutex);
                     }
 
-                    $crate::mutex_hook::unregister_hooked_mutex_addr(mutex);
+                    if $crate::mutex_hook::registered_hook_scope_enabled() {
+                        $crate::mutex_hook::unregister_hooked_mutex_addr(mutex);
+                    }
 
                     let atomic = state_atomic(mutex);
                     let val = atomic.load(Ordering::Acquire);
@@ -1136,7 +1147,9 @@ macro_rules! export_mutex_hooks {
                         return real_pthread_cond_destroy(cond);
                     }
 
-                    $crate::mutex_hook::unregister_hooked_cond_addr(cond);
+                    if $crate::mutex_hook::registered_hook_scope_enabled() {
+                        $crate::mutex_hook::unregister_hooked_cond_addr(cond);
+                    }
 
                     let atomic = cond_atomic(cond);
                     let val = atomic.load(Ordering::Acquire);

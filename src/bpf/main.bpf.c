@@ -521,8 +521,11 @@ inactive_move_missed(__u64 dsq_id) {
                                            : INACTIVE_MOVE_EMPTY;
 }
 
+/* `force` waives width control for this attempt and nothing else: the
+ * nr_queued/BLOCKED reporting stays as it is so a forced scan cannot arm the
+ * scan-empty gate over a class that still holds tasks. */
 static __always_inline enum inactive_move_outcome
-move_inactive_to_local(__u32 dispatch_cpu, __u32 lock_id) {
+move_inactive_to_local(__u32 dispatch_cpu, __u32 lock_id, bool force) {
   __u64 dsq_id;
 
   if (!valid_lock_id(lock_id))
@@ -530,7 +533,7 @@ move_inactive_to_local(__u32 dispatch_cpu, __u32 lock_id) {
 
   dsq_id = inactive_dsq_id(lock_id);
 
-  if (!class_dispatch_eligible(lock_id))
+  if (!force && !class_dispatch_eligible(lock_id))
     return inactive_move_missed(dsq_id);
 
   if (scx_bpf_dsq_move_to_local(dsq_id)) {
@@ -552,9 +555,9 @@ move_inactive_to_local(__u32 dispatch_cpu, __u32 lock_id) {
  * caller's flag. Every candidate in a scan goes through here so the tri-state
  * contract is honoured once instead of at each attempt. */
 static __always_inline bool try_move_inactive(__u32 dispatch_cpu, __u32 lock_id,
-                                              bool *blocked) {
+                                              bool force, bool *blocked) {
   enum inactive_move_outcome outcome =
-      move_inactive_to_local(dispatch_cpu, lock_id);
+      move_inactive_to_local(dispatch_cpu, lock_id, force);
 
   if (outcome == INACTIVE_MOVE_BLOCKED)
     *blocked = true;
@@ -563,7 +566,7 @@ static __always_inline bool try_move_inactive(__u32 dispatch_cpu, __u32 lock_id,
 }
 
 static __always_inline enum inactive_move_outcome
-move_selected_inactive_to_local(__u32 dispatch_cpu) {
+move_selected_inactive_to_local(__u32 dispatch_cpu, bool force) {
   volatile __u32 *last_lock_ptr;
   __u32 previous_lock_id = UNMANAGED_LOCK_ID;
   __u32 random = bpf_get_prandom_u32();
@@ -578,14 +581,14 @@ move_selected_inactive_to_local(__u32 dispatch_cpu) {
     previous_lock_id = *last_lock_ptr;
 
   if (valid_lock_id(previous_lock_id) && prefer_previous &&
-      try_move_inactive(dispatch_cpu, previous_lock_id, &blocked))
+      try_move_inactive(dispatch_cpu, previous_lock_id, force, &blocked))
     return INACTIVE_MOVE_MOVED;
 
   if (width_control_enabled) {
     __u32 best = select_inactive_deficit_class(dispatch_cpu);
 
     if (valid_lock_id(best) &&
-        try_move_inactive(dispatch_cpu, best, &blocked))
+        try_move_inactive(dispatch_cpu, best, force, &blocked))
       return INACTIVE_MOVE_MOVED;
   }
 
@@ -597,12 +600,12 @@ move_selected_inactive_to_local(__u32 dispatch_cpu) {
     if (!valid_lock_id(lock_id))
       break;
 
-    if (try_move_inactive(dispatch_cpu, lock_id, &blocked))
+    if (try_move_inactive(dispatch_cpu, lock_id, force, &blocked))
       return INACTIVE_MOVE_MOVED;
   }
 
   if (valid_lock_id(previous_lock_id) && !prefer_previous &&
-      try_move_inactive(dispatch_cpu, previous_lock_id, &blocked))
+      try_move_inactive(dispatch_cpu, previous_lock_id, force, &blocked))
     return INACTIVE_MOVE_MOVED;
 
   return blocked ? INACTIVE_MOVE_BLOCKED : INACTIVE_MOVE_EMPTY;
@@ -1151,13 +1154,14 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 /* One drain attempt against the inactive queues. Reports whether a task moved;
  * a BLOCKED scan deliberately leaves the scan-empty sequence gate unarmed. */
 static __always_inline bool try_dispatch_inactive(__u32 cpu, __u32 inactive_seq,
-                                                  bool debug_counters) {
+                                                  bool debug_counters,
+                                                  bool force) {
   enum inactive_move_outcome outcome;
 
   if (debug_counters)
     dispatch_inactive_attempts += 1;
 
-  outcome = move_selected_inactive_to_local(cpu);
+  outcome = move_selected_inactive_to_local(cpu, force);
   if (outcome == INACTIVE_MOVE_MOVED) {
     record_inactive_dispatch(cpu);
     if (debug_counters)
@@ -1173,9 +1177,19 @@ static __always_inline bool try_dispatch_inactive(__u32 cpu, __u32 inactive_seq,
   return false;
 }
 
+/* Interval between inactive scans that ignore the sequence gate, the admission
+ * slot and width control. The sched_ext watchdog ejects the scheduler after
+ * about 30 s of a runnable task never running, so a period in milliseconds
+ * bounds the extra parking a bookkeeping or width-controller mistake can impose
+ * on a queued waiter with three orders of magnitude to spare, while the leak is
+ * at most a hundred width-bypassing dispatches a second across the machine. */
+#define INACTIVE_FORCE_DRAIN_PERIOD_NS 10000000ULL
+
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   __u32 inactive_seq;
   __u32 normal_seq;
+  __u64 now;
+  bool force_inactive;
   bool inactive_cpu_available;
   bool debug_counters;
 
@@ -1226,7 +1240,20 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
     dispatch_normal_skip_seq += 1;
   }
 
-  if (!inactive_dispatch_needed_for(inactive_seq))
+  /* A scan the period is due for runs whatever the gates say, so a waiter left
+   * in a class queue by stale bookkeeping or by a width the controller never
+   * reopens waits milliseconds rather than until something else happens to
+   * enqueue. A task moved this way reaches the running hook like any other and
+   * takes its admission grant there. */
+  now = bpf_ktime_get_ns();
+  force_inactive = now >= inactive_force_drain_at;
+  if (force_inactive) {
+    inactive_force_drain_at = now + INACTIVE_FORCE_DRAIN_PERIOD_NS;
+    if (debug_counters)
+      dispatch_inactive_forced += 1;
+  }
+
+  if (!force_inactive && !inactive_dispatch_needed_for(inactive_seq))
     return;
 
   inactive_cpu_available = inactive_dispatch_cpu_available((__u32)cpu);
@@ -1238,11 +1265,13 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   }
 
   if (inactive_cpu_available && inactive_dispatch_budget_available((__u32)cpu) &&
-      try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters))
+      try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters,
+                            force_inactive))
     return;
 
-  if (inactive_cpu_available &&
-      try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters))
+  if ((force_inactive || inactive_cpu_available) &&
+      try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters,
+                            force_inactive))
     return;
 }
 
@@ -1343,12 +1372,12 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
         "accordin_dispatch calls=%llu normal_skip_seq=%llu normal_attempts=%llu "
         "normal_success=%llu normal_empty=%llu inactive_unavail=%llu "
         "inactive_budget_blocked=%llu inactive_attempts=%llu "
-        "inactive_success=%llu inactive_empty=%llu\n",
+        "inactive_success=%llu inactive_empty=%llu inactive_forced=%llu\n",
         dispatch_calls, dispatch_normal_skip_seq, dispatch_normal_attempts,
         dispatch_normal_success, dispatch_normal_empty,
         dispatch_inactive_unavailable, dispatch_inactive_budget_blocked,
         dispatch_inactive_attempts, dispatch_inactive_success,
-        dispatch_inactive_empty);
+        dispatch_inactive_empty, dispatch_inactive_forced);
     scx_bpf_dump(
         "accordin_routing select_local_direct=%llu wake_consumed_seen=%llu "
         "wake_consumed_granted=%llu wake_consumed_inactive=%llu "

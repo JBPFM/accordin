@@ -68,6 +68,10 @@ volatile __u32 inactive_enqueue_seq;
 volatile __u32 inactive_empty_seq;
 volatile __u32 normal_enqueue_seq;
 volatile __u32 normal_empty_seq;
+/* Deadline of the next inactive scan that ignores the gates guarding the
+ * ordinary scan. Concurrent CPUs may both observe it expired and both force;
+ * that costs one extra scan and is why no exclusion is taken here. */
+volatile __u64 inactive_force_drain_at;
 volatile __u32 registered_thread_count;
 volatile __u64 dispatch_calls;
 volatile __u64 dispatch_normal_skip_seq;
@@ -79,6 +83,7 @@ volatile __u64 dispatch_inactive_budget_blocked;
 volatile __u64 dispatch_inactive_attempts;
 volatile __u64 dispatch_inactive_success;
 volatile __u64 dispatch_inactive_empty;
+volatile __u64 dispatch_inactive_forced;
 volatile __u64 dbg_acct_calls = 0;
 volatile __u64 dbg_acct_read_ok = 0;
 /* Admission-routing evidence: updated with atomic adds so the totals reconcile

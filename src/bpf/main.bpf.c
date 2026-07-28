@@ -48,8 +48,10 @@ static __always_inline bool inactive_dispatch_needed_for(__u32 inactive_seq) {
   return inactive_empty_seq != inactive_seq;
 }
 
+/* Enqueue callbacks run concurrently on every CPU, so the bump has to be atomic
+ * or a lost increment leaves the gate closed over a queued task. */
 static __always_inline void record_inactive_enqueue(void) {
-  inactive_enqueue_seq += 1;
+  __sync_fetch_and_add(&inactive_enqueue_seq, 1);
 }
 
 static __always_inline void record_inactive_scan_empty(__u32 inactive_seq) {
@@ -65,7 +67,7 @@ static __always_inline bool normal_dispatch_needed(void) {
 }
 
 static __always_inline void record_normal_enqueue(void) {
-  normal_enqueue_seq += 1;
+  __sync_fetch_and_add(&normal_enqueue_seq, 1);
 }
 
 static __always_inline void record_normal_scan_empty(__u32 normal_seq) {
@@ -1194,7 +1196,15 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   inactive_seq = inactive_enqueue_seq;
   normal_seq = normal_enqueue_seq;
 
-  if (normal_dispatch_needed_for(normal_seq)) {
+  /* The sequence gate is only advisory here, because it can close over a queued
+   * task: an insert issued from the enqueue callback lands on the DSQ after the
+   * callback returns, and a move_to_local on another CPU lifts a task off the
+   * list and puts it back on failure, both without an enqueue to reopen the
+   * gate. The kernel's queue count decides, so a gate closed by either race
+   * heals at the next dispatch on any CPU instead of stranding the task until
+   * some later enqueue arrives. */
+  if (normal_dispatch_needed_for(normal_seq) ||
+      scx_bpf_dsq_nr_queued(NORMAL_DSQ_ID) > 0) {
     if (debug_counters)
       dispatch_normal_attempts += 1;
     if (scx_bpf_dsq_move_to_local(NORMAL_DSQ_ID)) {

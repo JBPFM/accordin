@@ -564,7 +564,14 @@ pub fn mark_cond_reacquire_pending_for_cond_mutex(lock_id: u32) -> bool {
 /// cond-reacquire hint.
 #[inline(always)]
 pub fn set_cv_sleep_for_lock(lock_id: u32) -> bool {
-    set_cv_sleep_for_lock_with_admission_enabled(lock_id, admission_enabled())
+    arm_cv_sleep_for_lock(lock_id).is_armed()
+}
+
+/// Publishes the cv-sleep state and hands back the handle another thread needs
+/// to retire it on this thread's behalf.
+#[inline(always)]
+pub fn arm_cv_sleep_for_lock(lock_id: u32) -> CvSleepArm {
+    arm_cv_sleep_for_lock_with_admission_enabled(lock_id, admission_enabled())
 }
 
 /// Acknowledges a cond-reacquire hint published for this scope: the consumed
@@ -685,6 +692,89 @@ fn mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(
     })
 }
 
+/// A published cv-sleep state, addressed so that a thread other than the
+/// sleeper can take it back.
+///
+/// Admission words are thread-local, so the only way to reach a sleeper's word
+/// is through the address the sleeper published; the value it published travels
+/// with the address because the retirement is a compare-and-exchange against
+/// exactly that value.
+///
+/// The handle borrows the sleeper's thread-local storage. It is valid for as
+/// long as that thread is alive, which the wake protocol that uses it
+/// guarantees: the handle is published before the sleep and is only read by the
+/// thread that releases that sleep.
+#[derive(Clone, Copy)]
+pub struct CvSleepArm {
+    word: *const AtomicU32,
+    armed: u32,
+}
+
+impl CvSleepArm {
+    /// A handle naming nothing, which every operation on it is a no-op for.
+    pub const fn none() -> Self {
+        Self {
+            word: std::ptr::null(),
+            armed: 0,
+        }
+    }
+
+    /// Rebuilds a handle from the two values a sleeper published for its waker.
+    #[inline(always)]
+    pub fn from_parts(word_addr: usize, armed: u32) -> Self {
+        Self {
+            word: word_addr as *const AtomicU32,
+            armed,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_armed(&self) -> bool {
+        !self.word.is_null()
+    }
+
+    #[inline(always)]
+    pub fn word_addr(&self) -> usize {
+        self.word as usize
+    }
+
+    #[inline(always)]
+    pub fn armed_value(&self) -> u32 {
+        self.armed
+    }
+
+    /// Takes the published state back, and reports whether this call is the one
+    /// that did it.
+    ///
+    /// What replaces it is the class with no flag, which is what a thread that
+    /// has finished with a lock publishes and what the sleeper would leave
+    /// behind itself; see `retire_cv_sleep_to_released`. Retiring from either
+    /// side therefore lands on the same word, and neither side has to know
+    /// which of them got there first.
+    ///
+    /// The exchange is what makes a cross-thread write to a thread-local word
+    /// sound. A sleeper never writes its own word while it is inside the futex
+    /// wait this state was published for, so the only writer that can race here
+    /// is one that left the wait early; that one has already rewritten the word,
+    /// the exchange sees a value other than the armed one and fails, and what it
+    /// wrote stands. A failed retirement costs the routing of one wake and
+    /// nothing else: the sleeper retires the state itself once its wait ends.
+    #[inline(always)]
+    pub fn retire(&self) -> bool {
+        let Some(word) = (unsafe { self.word.as_ref() }) else {
+            return false;
+        };
+
+        word.compare_exchange(
+            self.armed,
+            lock_id_bits(self.armed),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+    }
+}
+
 /// Publishes the cv-sleep state for the lock the waiter will re-acquire: the
 /// word names that lock and carries no other flag, because the thread is about
 /// to release the lock it holds and block outside any critical section.
@@ -692,22 +782,32 @@ fn mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(
 /// Nothing is published while a managed scope stays held: that scope owns the
 /// word, exactly as it does for the cond-reacquire hint.
 #[inline(always)]
-fn set_cv_sleep_for_lock_with_admission_enabled(lock_id: u32, enabled: bool) -> bool {
+fn arm_cv_sleep_for_lock_with_admission_enabled(lock_id: u32, enabled: bool) -> CvSleepArm {
     if !managed_lock_id(lock_id) || THREAD_HELD_DEPTH.with(|depth| depth.get()) != 0 {
-        return false;
+        return CvSleepArm::none();
     }
 
     let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
-        let next = if enabled {
-            word_with_lock_id(class, CV_SLEEP)
-        } else {
-            cleared_flags_word(class, value)
-        };
-        word.store(next, Ordering::Relaxed);
-    });
-    enabled
+        if !enabled {
+            word.store(cleared_flags_word(class, value), Ordering::Relaxed);
+            return CvSleepArm::none();
+        }
+
+        let armed = word_with_lock_id(class, CV_SLEEP);
+        word.store(armed, Ordering::Relaxed);
+        CvSleepArm {
+            word: word as *const AtomicU32,
+            armed,
+        }
+    })
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn set_cv_sleep_for_lock_with_admission_enabled(lock_id: u32, enabled: bool) -> bool {
+    arm_cv_sleep_for_lock_with_admission_enabled(lock_id, enabled).is_armed()
 }
 
 #[inline(always)]
@@ -854,6 +954,30 @@ pub fn retire_cv_sleep_to_pending(slept: bool) {
     });
 }
 
+/// Retires the cv-sleep state of a waiter that is done with the lock it named
+/// instead of about to re-acquire it, which is what a wake carrying the work's
+/// result rather than the lock leaves behind.
+///
+/// The class stays in the word with no flag, the state every ordinary release
+/// publishes: the scheduler reads it as a thread that has finished with the
+/// lock, so a grant made for a re-acquisition that never happens is taken back
+/// at the next stopping rather than held for the rest of the wake.
+///
+/// Reports whether there was a state left to retire, which is how a waiter
+/// learns that its waker did not take it back before the wake.
+#[inline(always)]
+pub fn retire_cv_sleep_to_released() -> bool {
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        if flags(value) & CV_SLEEP == 0 {
+            return false;
+        }
+
+        word.store(lock_id_bits(value), Ordering::Relaxed);
+        true
+    })
+}
+
 #[inline(always)]
 fn clear_token_consumed_for_lock(lock_id: u32) {
     if !managed_lock_id(lock_id) {
@@ -964,12 +1088,14 @@ fn transition_count_for_test(prev: u32, next: u32) -> u32 {
 mod tests {
     use std::sync::{Mutex, MutexGuard};
 
+    use super::cv_sleep_set_for_test;
     use super::{
-        CV_SLEEP, IN_CRITICAL_SECTION, LockClassPolicy, MAX_LOCK_CLASSES, SLOW_PATH_PENDING,
-        TOKEN_CONSUMED, UNMANAGED_LOCK_ID, USER_ADMISSION_FLAG_MASK, USER_ADMISSION_LOCK_ID_SHIFT,
-        allocate_lock_class, allocate_lock_id, allocated_class_count, begin_lock_scope, class_of,
-        clear_token_consumed_for_scope, cleared_flags_word, exit_word, finish_lock_scope, flags,
-        force_dump_for_test, force_lock_class_policy_for_test, force_merge_for_test,
+        CV_SLEEP, CvSleepArm, IN_CRITICAL_SECTION, LockClassPolicy, MAX_LOCK_CLASSES,
+        SLOW_PATH_PENDING, TOKEN_CONSUMED, UNMANAGED_LOCK_ID, USER_ADMISSION_FLAG_MASK,
+        USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_class, allocate_lock_id, allocated_class_count,
+        arm_cv_sleep_for_lock, arm_cv_sleep_for_lock_with_admission_enabled, begin_lock_scope,
+        class_of, clear_token_consumed_for_scope, cleared_flags_word, exit_word, finish_lock_scope,
+        flags, force_dump_for_test, force_lock_class_policy_for_test, force_merge_for_test,
         lock_class_policy, managed_lock_id, mark_cond_reacquire_pending_for_cond_mutex,
         mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled,
         mark_critical_section_entered, mark_critical_section_entered_for_scope,
@@ -978,11 +1104,12 @@ mod tests {
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
         merge_enabled_with, parse_lock_class_policy, reset_lock_id_allocator_for_test, reset_state,
         reset_thread_depth_for_test, reset_transient_state, reset_transitions_for_tests,
-        reset_union_find_for_tests, retire_cv_sleep_to_pending, set_cv_sleep_for_lock,
-        set_cv_sleep_for_lock_with_admission_enabled, set_inactive_queue_seq_ptrs,
-        slow_path_yield_required, take_classes_dirty, take_cond_reacquire_pending_for_scope,
-        token_consumed_for_scope, transition_count_for_test, union_lock_classes,
-        user_lock_id_for_value, word_for_test, word_with_lock_id,
+        reset_union_find_for_tests, retire_cv_sleep_to_pending, retire_cv_sleep_to_released,
+        set_cv_sleep_for_lock, set_cv_sleep_for_lock_with_admission_enabled,
+        set_inactive_queue_seq_ptrs, slow_path_yield_required, take_classes_dirty,
+        take_cond_reacquire_pending_for_scope, token_consumed_for_scope, transition_count_for_test,
+        union_lock_classes, user_lock_id_for_value, user_word_addr, word_for_test,
+        word_with_lock_id,
     };
 
     static INACTIVE_QUEUE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1413,6 +1540,151 @@ mod tests {
 
         assert!(!mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(4, false));
         assert_eq!(word_for_test(), word_for(4, 0));
+
+        reset_thread_depth_for_test();
+    }
+
+    /// The handle is only usable if it names exactly what was published: the
+    /// retirement is an exchange against that value, so an armed value that
+    /// does not match the word retires nothing.
+    #[test]
+    fn an_arm_handle_names_the_word_and_the_exact_value_published() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let arm = arm_cv_sleep_for_lock(4);
+
+        assert!(arm.is_armed());
+        assert_eq!(arm.word_addr(), user_word_addr() as usize);
+        assert_eq!(arm.armed_value(), word_for(class_of(4), CV_SLEEP));
+        assert_eq!(word_for_test(), arm.armed_value());
+
+        assert!(arm.retire());
+        assert_eq!(
+            word_for_test(),
+            word_for(class_of(4), 0),
+            "a retirement from either side lands on the released word"
+        );
+
+        reset_thread_depth_for_test();
+    }
+
+    /// Only the first retirement takes the state, so a second waker cannot
+    /// clear a state the owner published again afterwards.
+    #[test]
+    fn a_second_retirement_of_the_same_arm_reports_no_state_to_take() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let arm = arm_cv_sleep_for_lock(4);
+        assert!(arm.retire());
+        assert!(!arm.retire());
+
+        reset_thread_depth_for_test();
+    }
+
+    /// The owner is allowed to leave the sleep early and rewrite its own word.
+    /// Losing the exchange against that write is the tolerated outcome: the
+    /// state the owner published stands and only the routing of one wake is
+    /// lost.
+    #[test]
+    fn a_retirement_that_loses_the_exchange_leaves_the_owners_word_alone() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let arm = arm_cv_sleep_for_lock(4);
+        retire_cv_sleep_to_pending(true);
+        let rewritten = word_for_test();
+        assert_eq!(rewritten, word_for(class_of(4), SLOW_PATH_PENDING));
+
+        assert!(!arm.retire());
+        assert_eq!(word_for_test(), rewritten);
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn an_arm_handle_round_trips_through_its_parts() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let arm = arm_cv_sleep_for_lock(4);
+        let rebuilt = CvSleepArm::from_parts(arm.word_addr(), arm.armed_value());
+
+        assert!(rebuilt.is_armed());
+        assert!(rebuilt.retire());
+        assert_eq!(word_for_test(), word_for(class_of(4), 0));
+
+        reset_thread_depth_for_test();
+    }
+
+    /// Either side may be the one that retires a published sleep, and neither
+    /// knows which got there first, so both have to leave the same word behind.
+    #[test]
+    fn both_sides_of_a_retirement_leave_the_same_word() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let arm = arm_cv_sleep_for_lock(4);
+        assert!(arm.retire());
+        let by_the_waker = word_for_test();
+
+        reset_state();
+        arm_cv_sleep_for_lock(4);
+        retire_cv_sleep_to_released();
+
+        assert_eq!(word_for_test(), by_the_waker);
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn an_unarmed_handle_retires_nothing() {
+        let none = CvSleepArm::none();
+
+        assert!(!none.is_armed());
+        assert_eq!(none.word_addr(), 0);
+        assert!(!none.retire());
+    }
+
+    /// A class the backend does not manage, a scope that still owns the word,
+    /// and admission turned off each leave the waiter unrouted, so none of them
+    /// may hand out a handle a waker would act on.
+    #[test]
+    fn nothing_is_armed_when_the_sleep_state_is_not_published() {
+        reset_state();
+        reset_thread_depth_for_test();
+        assert!(!arm_cv_sleep_for_lock(UNMANAGED_LOCK_ID).is_armed());
+
+        let outer = begin_lock_scope(2);
+        mark_critical_section_entered_for_scope(outer);
+        assert!(!arm_cv_sleep_for_lock(3).is_armed());
+        finish_lock_scope(2);
+
+        reset_state();
+        reset_thread_depth_for_test();
+        assert!(!arm_cv_sleep_for_lock_with_admission_enabled(4, false).is_armed());
+        assert_eq!(word_for_test(), word_for(class_of(4), 0));
+
+        reset_thread_depth_for_test();
+    }
+
+    /// A waiter that returns without re-acquiring the lock is done with it, and
+    /// the class alone is what a thread done with a lock publishes.
+    #[test]
+    fn a_released_retirement_leaves_the_class_with_no_flag() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        arm_cv_sleep_for_lock(4);
+        retire_cv_sleep_to_released();
+
+        assert_eq!(word_for_test(), word_for(class_of(4), 0));
+        assert!(!cv_sleep_set_for_test(4));
+
+        // Nothing is published any more, so a second retirement is inert.
+        retire_cv_sleep_to_released();
+        assert_eq!(word_for_test(), word_for(class_of(4), 0));
 
         reset_thread_depth_for_test();
     }

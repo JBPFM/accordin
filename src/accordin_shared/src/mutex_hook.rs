@@ -68,6 +68,16 @@ static CV_DRAIN_WAKES: AtomicU64 = AtomicU64::new(0);
 static CV_STRANDING_WAKES: AtomicU64 = AtomicU64::new(0);
 static CV_STAGED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 static CV_BINDING_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_ARMS: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_SPURIOUS_WAKES: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_COMPLETED_POSTS: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_LEADER_POSTS: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_ROUTE_TAKEBACKS: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_ROUTE_TAKEBACK_UNPUBLISHED: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_ROUTE_TAKEBACK_LOST: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_COMPLETED_MISROUTES: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_RELOCKS_ADMITTED: AtomicU64 = AtomicU64::new(0);
+static WRITER_EVENT_RELOCKS_NORMAL: AtomicU64 = AtomicU64::new(0);
 
 /// Reconciles the userspace side of the cond-reacquire protocol against the
 /// scheduler's wake-routing counters.
@@ -122,6 +132,56 @@ pub fn cv_requeue_counters() -> CvRequeueCounters {
         stranding_wakes: CV_STRANDING_WAKES.load(Ordering::Relaxed),
         staged_high_water: CV_STAGED_HIGH_WATER.load(Ordering::Relaxed),
         binding_conflicts: CV_BINDING_CONFLICTS.load(Ordering::Relaxed),
+    }
+}
+
+/// Accounts the writer-event wake protocol against the routing it asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriterEventCounters {
+    /// Waits that blocked and published the cv-sleep state, so the scheduler
+    /// could route the wake that ends them. A wait that found its reason
+    /// already published never publishes and is not counted here.
+    pub arms: u64,
+    /// Wakes that left the reason unset, so the wait blocked again.
+    pub spurious_wakes: u64,
+    /// Waiters released with their work already done, which return without
+    /// re-acquiring the mutex.
+    pub completed_posts: u64,
+    /// Waiters released as the new queue head, whose wake keeps the routed
+    /// state so the scheduler admits them as it makes them runnable.
+    pub leader_posts: u64,
+    /// Completed posts that took the routed state back from the waiter.
+    pub route_takebacks: u64,
+    /// Completed posts that found no state published, because the waiter had
+    /// not reached its sleep yet.
+    pub route_takeback_unpublished: u64,
+    /// Completed posts that lost the exchange to a waiter which had already
+    /// left its sleep and rewritten its own word.
+    pub route_takeback_lost: u64,
+    /// Completed wakes that still carried the routed state when the reason
+    /// landed, so the scheduler admitted a re-acquisition that never happened.
+    /// This is the outcome the takeback exists to keep at zero; the two counts
+    /// above are the attempts, this is the result.
+    pub completed_misroutes: u64,
+    /// Re-acquisitions that entered on the decision their wake was granted.
+    pub relocks_admitted: u64,
+    /// Re-acquisitions that asked admission for a slot themselves, which is
+    /// what a wait that never blocked leaves behind.
+    pub relocks_normal: u64,
+}
+
+pub fn writer_event_counters() -> WriterEventCounters {
+    WriterEventCounters {
+        arms: WRITER_EVENT_ARMS.load(Ordering::Relaxed),
+        spurious_wakes: WRITER_EVENT_SPURIOUS_WAKES.load(Ordering::Relaxed),
+        completed_posts: WRITER_EVENT_COMPLETED_POSTS.load(Ordering::Relaxed),
+        leader_posts: WRITER_EVENT_LEADER_POSTS.load(Ordering::Relaxed),
+        route_takebacks: WRITER_EVENT_ROUTE_TAKEBACKS.load(Ordering::Relaxed),
+        route_takeback_unpublished: WRITER_EVENT_ROUTE_TAKEBACK_UNPUBLISHED.load(Ordering::Relaxed),
+        route_takeback_lost: WRITER_EVENT_ROUTE_TAKEBACK_LOST.load(Ordering::Relaxed),
+        completed_misroutes: WRITER_EVENT_COMPLETED_MISROUTES.load(Ordering::Relaxed),
+        relocks_admitted: WRITER_EVENT_RELOCKS_ADMITTED.load(Ordering::Relaxed),
+        relocks_normal: WRITER_EVENT_RELOCKS_NORMAL.load(Ordering::Relaxed),
     }
 }
 
@@ -202,6 +262,66 @@ pub fn record_cv_stranding_wake() {
 #[inline(always)]
 pub fn record_cv_binding_conflict() {
     bump_cv_counter(&CV_BINDING_CONFLICTS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_arm() {
+    bump_cv_counter(&WRITER_EVENT_ARMS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_spurious_wake() {
+    bump_cv_counter(&WRITER_EVENT_SPURIOUS_WAKES);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_completed_post() {
+    bump_cv_counter(&WRITER_EVENT_COMPLETED_POSTS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_leader_post() {
+    bump_cv_counter(&WRITER_EVENT_LEADER_POSTS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_route_takeback() {
+    bump_cv_counter(&WRITER_EVENT_ROUTE_TAKEBACKS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_route_takeback_unpublished() {
+    bump_cv_counter(&WRITER_EVENT_ROUTE_TAKEBACK_UNPUBLISHED);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_route_takeback_lost() {
+    bump_cv_counter(&WRITER_EVENT_ROUTE_TAKEBACK_LOST);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_completed_misroute() {
+    bump_cv_counter(&WRITER_EVENT_COMPLETED_MISROUTES);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_relock_admitted() {
+    bump_cv_counter(&WRITER_EVENT_RELOCKS_ADMITTED);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_writer_event_relock_normal() {
+    bump_cv_counter(&WRITER_EVENT_RELOCKS_NORMAL);
 }
 
 #[doc(hidden)]
@@ -390,6 +510,7 @@ macro_rules! export_mutex_hooks {
                 record_wait_end, record_wait_start,
             };
             use $crate::mutex_hook::MutexHookBackend;
+            use $crate::writer_event::{EventRelock, WakeReason, WriterEvent};
 
             type Backend = $backend;
 
@@ -1253,6 +1374,197 @@ macro_rules! export_mutex_hooks {
                         |relock| relock_after_cond_wait(&*state, relock),
                     )
                 }
+            }
+
+            /// The writer event as the C ABI hands it out: the wake protocol
+            /// plus the binding of the hooked mutex it belongs to.
+            ///
+            /// The whole object lives in caller-owned storage. The waiters this
+            /// exists for are created per operation, and an allocation per
+            /// operation is the cost the protocol is there to remove; for the
+            /// same reason the binding is resolved once per mutex rather than
+            /// once per waiter, so initializing one is a plain struct write.
+            #[repr(C)]
+            struct HookWriterEvent {
+                event: WriterEvent,
+                state: *mut HookState,
+            }
+
+            #[inline(always)]
+            unsafe fn writer_event_ref<'a>(
+                event: *mut libc::c_void,
+            ) -> Result<&'a HookWriterEvent, libc::c_int> {
+                if event.is_null() {
+                    return Err(libc::EINVAL);
+                }
+
+                Ok(unsafe { &*event.cast::<HookWriterEvent>() })
+            }
+
+            /// The storage a caller has to provide for one event.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn accordin_writer_event_size() -> usize {
+                std::mem::size_of::<HookWriterEvent>()
+            }
+
+            /// The alignment that storage has to satisfy.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn accordin_writer_event_align() -> usize {
+                std::mem::align_of::<HookWriterEvent>()
+            }
+
+            /// Resolves a mutex to the binding its events are initialized from,
+            /// which is the whole of what an event needs to know about it.
+            ///
+            /// Answering this costs a registry lookup under a scoped hook, and
+            /// the answer never changes for a given mutex, so it is asked once
+            /// and the caller keeps it for the mutex's lifetime. The binding
+            /// stays valid for exactly that long: it names the hook state, which
+            /// only a destroy of the mutex releases.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_writer_event_bind(
+                mutex: *mut libc::c_void,
+                out_binding: *mut *mut libc::c_void,
+            ) -> libc::c_int {
+                unsafe {
+                    if out_binding.is_null() {
+                        return libc::EINVAL;
+                    }
+
+                    // The re-acquisition enters the backend lock directly, so a
+                    // mutex the hook is not interposing is refused rather than
+                    // locked twice under two different lock words.
+                    let mutex = mutex.cast::<libc::pthread_mutex_t>();
+                    if !should_hook_mutex(mutex) {
+                        return libc::ENOTSUP;
+                    }
+
+                    ensure_registered();
+                    let state = match ensure_state(mutex) {
+                        Ok(state) => state,
+                        Err(ret) => return ret,
+                    };
+
+                    out_binding.write(state.cast::<libc::c_void>());
+                    0
+                }
+            }
+
+            /// Puts a fresh event into caller-owned storage, bound to what
+            /// `accordin_writer_event_bind` resolved for its mutex.
+            ///
+            /// This runs once per waiter, so it does no lookups of its own. The
+            /// thread is already registered by then: a waiter arms while holding
+            /// the mutex, and taking the mutex is what registers it.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_writer_event_init(
+                event: *mut libc::c_void,
+                binding: *mut libc::c_void,
+            ) -> libc::c_int {
+                unsafe {
+                    if event.is_null() || binding.is_null() {
+                        return libc::EINVAL;
+                    }
+
+                    let event = event.cast::<HookWriterEvent>();
+                    WriterEvent::init_in_place(std::ptr::addr_of_mut!((*event).event));
+                    std::ptr::addr_of_mut!((*event).state).write(binding.cast::<HookState>());
+                    0
+                }
+            }
+
+            /// Declares the waiter unreleased. The caller must still hold the
+            /// mutex: past the release a poster may publish a reason at any
+            /// moment, and one arriving first would be overwritten here.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_writer_event_arm(
+                event: *mut libc::c_void,
+            ) -> libc::c_int {
+                let event = match unsafe { writer_event_ref(event) } {
+                    Ok(event) => event,
+                    Err(ret) => return ret,
+                };
+
+                event.event.arm();
+                0
+            }
+
+            /// Blocks until a poster publishes a reason and reports it: 0 for a
+            /// waiter whose work is done, 1 for the new queue head. The caller
+            /// must have released the mutex first.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_writer_event_wait(
+                event: *mut libc::c_void,
+            ) -> libc::c_int {
+                let event = match unsafe { writer_event_ref(event) } {
+                    Ok(event) => event,
+                    Err(_) => return -1,
+                };
+
+                let lock_id = unsafe { (*event.state).lock_id };
+                match event.event.wait(lock_id, Backend::USES_ADMISSION_SCOPE) {
+                    WakeReason::Completed => 0,
+                    WakeReason::BecomeLeader => 1,
+                }
+            }
+
+            /// Re-acquires the mutex for a waiter the wait made leader, in the
+            /// mode that wait decided: a routed wakeup already carries the
+            /// admission decision and enters the lock without asking again.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_writer_event_relock(
+                event: *mut libc::c_void,
+            ) -> libc::c_int {
+                let event = match unsafe { writer_event_ref(event) } {
+                    Ok(event) => event,
+                    Err(ret) => return ret,
+                };
+                let state = unsafe { &*event.state };
+
+                if !Backend::USES_ADMISSION_SCOPE {
+                    lock_with_stats(state);
+                    return 0;
+                }
+
+                let scope = $crate::admission::begin_lock_scope(state.lock_id);
+                let mode = match event.event.take_relock_mode() {
+                    EventRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
+                    EventRelock::Normal => AcquireMode::Normal,
+                };
+                lock_scope_with_stats(state, scope, mode);
+                0
+            }
+
+            /// Releases a waiter whose work the caller already did. The caller
+            /// must have published the result first, and must never touch the
+            /// event again: the waiter may destroy it the instant the reason
+            /// lands.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_writer_event_post_completed(
+                event: *mut libc::c_void,
+            ) -> libc::c_int {
+                let event = match unsafe { writer_event_ref(event) } {
+                    Ok(event) => event,
+                    Err(ret) => return ret,
+                };
+
+                event.event.post_completed();
+                0
+            }
+
+            /// Hands the queue head to a waiter that still has work to do. As
+            /// with a completed post, the event must not be touched again.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn accordin_writer_event_post_leader(
+                event: *mut libc::c_void,
+            ) -> libc::c_int {
+                let event = match unsafe { writer_event_ref(event) } {
+                    Ok(event) => event,
+                    Err(ret) => return ret,
+                };
+
+                event.event.post_leader();
+                0
             }
         }
     };

@@ -21,7 +21,16 @@ for symbol in \
   mcs_tas_accordin_direct_cond_wait \
   mcs_tas_accordin_direct_cond_timedwait \
   mcs_tas_accordin_direct_cond_signal \
-  mcs_tas_accordin_direct_cond_broadcast
+  mcs_tas_accordin_direct_cond_broadcast \
+  mcs_tas_accordin_direct_writer_event_size \
+  mcs_tas_accordin_direct_writer_event_align \
+  mcs_tas_accordin_direct_writer_event_bind \
+  mcs_tas_accordin_direct_writer_event_init \
+  mcs_tas_accordin_direct_writer_event_arm \
+  mcs_tas_accordin_direct_writer_event_wait \
+  mcs_tas_accordin_direct_writer_event_relock \
+  mcs_tas_accordin_direct_writer_event_post_completed \
+  mcs_tas_accordin_direct_writer_event_post_leader
 do
   if ! grep -Eq "[[:space:]]${symbol}$" <<<"$symbols"; then
     echo "missing direct ABI symbol: $symbol" >&2

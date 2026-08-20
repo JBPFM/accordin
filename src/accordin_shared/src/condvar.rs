@@ -938,7 +938,7 @@ fn relock_mode(publication: SleepPublication, slept: bool) -> CondRelock {
 /// syscall, so callers classify the outcome without reading thread-local errno
 /// themselves.
 #[inline(always)]
-unsafe fn futex_wait(addr: *const AtomicU32, expected: u32) -> libc::c_int {
+pub(crate) unsafe fn futex_wait(addr: *const AtomicU32, expected: u32) -> libc::c_int {
     unsafe {
         let ret = libc::syscall(
             libc::SYS_futex,
@@ -1018,7 +1018,7 @@ unsafe fn futex_cmp_requeue(
 }
 
 #[inline(always)]
-unsafe fn futex_wake(addr: *const AtomicU32, count: libc::c_int) -> libc::c_long {
+pub(crate) unsafe fn futex_wake(addr: *const AtomicU32, count: libc::c_int) -> libc::c_long {
     unsafe {
         libc::syscall(
             libc::SYS_futex,

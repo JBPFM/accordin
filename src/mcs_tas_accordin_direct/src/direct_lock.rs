@@ -4,6 +4,7 @@ use std::cell::{Cell, UnsafeCell};
 
 use accordin_shared::condvar::{CondMutex, CondRelock, CondStaging, CondState};
 use accordin_shared::mutex_hook::{LockBackendAdapter, MutexHookBackend};
+use accordin_shared::writer_event::{EventRelock, WakeReason, WriterEvent};
 
 type DirectBackend = LockBackendAdapter<crate::mcs_tas::McsTasLockRaw>;
 
@@ -348,6 +349,178 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_broadcast(
     0
 }
 
+/// The writer event as the C API hands it out: the wake protocol plus the
+/// binding of the mutex it belongs to.
+///
+/// The whole object lives in caller-owned storage. The waiters this exists for
+/// are created per operation, and an allocation per operation is the cost the
+/// protocol is there to remove; for the same reason the binding is resolved
+/// once per mutex rather than once per waiter, so initializing one is a plain
+/// struct write.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct mcs_tas_accordin_direct_writer_event {
+    event: WriterEvent,
+    mutex: *const mcs_tas_accordin_direct_mutex,
+}
+
+#[inline(always)]
+unsafe fn writer_event_ref<'a>(
+    event: *mut mcs_tas_accordin_direct_writer_event,
+) -> Result<&'a mcs_tas_accordin_direct_writer_event, libc::c_int> {
+    if event.is_null() {
+        Err(libc::EINVAL)
+    } else {
+        Ok(unsafe { &*event })
+    }
+}
+
+/// The storage a caller has to provide for one event.
+#[unsafe(no_mangle)]
+pub extern "C" fn mcs_tas_accordin_direct_writer_event_size() -> usize {
+    std::mem::size_of::<mcs_tas_accordin_direct_writer_event>()
+}
+
+/// The alignment that storage has to satisfy.
+#[unsafe(no_mangle)]
+pub extern "C" fn mcs_tas_accordin_direct_writer_event_align() -> usize {
+    std::mem::align_of::<mcs_tas_accordin_direct_writer_event>()
+}
+
+/// Resolves a mutex to the binding its events are initialized from, which is
+/// the whole of what an event needs to know about it.
+///
+/// The answer never changes for a given mutex, so it is asked once and the
+/// caller keeps it for the mutex's lifetime; the binding stays valid for
+/// exactly that long.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_bind(
+    mutex: *mut mcs_tas_accordin_direct_mutex,
+    out_binding: *mut *mut libc::c_void,
+) -> libc::c_int {
+    if mutex.is_null() || out_binding.is_null() {
+        return libc::EINVAL;
+    }
+
+    ensure_registered();
+    unsafe { out_binding.write(mutex.cast::<libc::c_void>()) };
+    0
+}
+
+/// Puts a fresh event into caller-owned storage, bound to what
+/// `mcs_tas_accordin_direct_writer_event_bind` resolved for its mutex.
+///
+/// This runs once per waiter, so it does no lookups of its own. The thread is
+/// already registered by then: a waiter arms while holding the mutex, and
+/// taking the mutex is what registers it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_init(
+    event: *mut mcs_tas_accordin_direct_writer_event,
+    binding: *mut libc::c_void,
+) -> libc::c_int {
+    if event.is_null() || binding.is_null() {
+        return libc::EINVAL;
+    }
+
+    unsafe {
+        WriterEvent::init_in_place(std::ptr::addr_of_mut!((*event).event));
+        std::ptr::addr_of_mut!((*event).mutex)
+            .write(binding.cast::<mcs_tas_accordin_direct_mutex>());
+    }
+    0
+}
+
+/// Declares the waiter unreleased. The caller must still hold the mutex: past
+/// the release a poster may publish a reason at any moment, and one arriving
+/// first would be overwritten here.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_arm(
+    event: *mut mcs_tas_accordin_direct_writer_event,
+) -> libc::c_int {
+    let event = match unsafe { writer_event_ref(event) } {
+        Ok(event) => event,
+        Err(ret) => return ret,
+    };
+
+    event.event.arm();
+    0
+}
+
+/// Blocks until a poster publishes a reason and reports it: 0 for a waiter
+/// whose work is done, 1 for the new queue head. The caller must have released
+/// the mutex first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_wait(
+    event: *mut mcs_tas_accordin_direct_writer_event,
+) -> libc::c_int {
+    let event = match unsafe { writer_event_ref(event) } {
+        Ok(event) => event,
+        Err(_) => return -1,
+    };
+
+    let lock_id = unsafe { (*event.mutex).lock_id };
+    match event.event.wait(
+        lock_id,
+        <DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE,
+    ) {
+        WakeReason::Completed => 0,
+        WakeReason::BecomeLeader => 1,
+    }
+}
+
+/// Re-acquires the mutex for a waiter the wait made leader, in the mode that
+/// wait decided: a routed wakeup already carries the admission decision and
+/// enters the lock without asking again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_relock(
+    event: *mut mcs_tas_accordin_direct_writer_event,
+) -> libc::c_int {
+    let event = match unsafe { writer_event_ref(event) } {
+        Ok(event) => event,
+        Err(ret) => return ret,
+    };
+    let mutex = unsafe { &*event.mutex };
+
+    let scope = accordin_shared::admission::begin_lock_scope(mutex.lock_id);
+    let mode = match event.event.take_relock_mode() {
+        EventRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
+        EventRelock::Normal => AcquireMode::Normal,
+    };
+    lock_scope_with_stats(mutex, scope, mode);
+    0
+}
+
+/// Releases a waiter whose work the caller already did. The caller must have
+/// published the result first, and must never touch the event again: the waiter
+/// may destroy it the instant the reason lands.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_post_completed(
+    event: *mut mcs_tas_accordin_direct_writer_event,
+) -> libc::c_int {
+    let event = match unsafe { writer_event_ref(event) } {
+        Ok(event) => event,
+        Err(ret) => return ret,
+    };
+
+    event.event.post_completed();
+    0
+}
+
+/// Hands the queue head to a waiter that still has work to do. As with a
+/// completed post, the event must not be touched again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_post_leader(
+    event: *mut mcs_tas_accordin_direct_writer_event,
+) -> libc::c_int {
+    let event = match unsafe { writer_event_ref(event) } {
+        Ok(event) => event,
+        Err(ret) => return ret,
+    };
+
+    event.event.post_leader();
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -362,7 +535,13 @@ mod tests {
         mcs_tas_accordin_direct_cond_wait, mcs_tas_accordin_direct_mutex,
         mcs_tas_accordin_direct_mutex_create, mcs_tas_accordin_direct_mutex_destroy,
         mcs_tas_accordin_direct_mutex_lock, mcs_tas_accordin_direct_mutex_trylock,
-        mcs_tas_accordin_direct_mutex_unlock,
+        mcs_tas_accordin_direct_mutex_unlock, mcs_tas_accordin_direct_writer_event,
+        mcs_tas_accordin_direct_writer_event_arm, mcs_tas_accordin_direct_writer_event_bind,
+        mcs_tas_accordin_direct_writer_event_init,
+        mcs_tas_accordin_direct_writer_event_post_completed,
+        mcs_tas_accordin_direct_writer_event_post_leader,
+        mcs_tas_accordin_direct_writer_event_relock, mcs_tas_accordin_direct_writer_event_size,
+        mcs_tas_accordin_direct_writer_event_wait,
     };
 
     /// The C API hands out raw pointers to shared state, which the test moves
@@ -723,6 +902,143 @@ mod tests {
             assert_eq!(mcs_tas_accordin_direct_cond_signal(pair.cond), 0);
             assert_eq!(mcs_tas_accordin_direct_cond_broadcast(pair.cond), 0);
             assert_eq!(mcs_tas_accordin_direct_cond_destroy(pair.cond), 0);
+        }
+    }
+
+    /// The two reasons a queue wakes a waiter for, driven through the C API the
+    /// way a leader/follower write queue drives them: one follower is released
+    /// with its work done and returns without the mutex, the other is made the
+    /// new head and comes back holding it.
+    #[test]
+    fn direct_writer_event_separates_the_completed_and_leader_wakes() {
+        #[derive(Clone, Copy)]
+        struct EventArgs {
+            mutex: *mut mcs_tas_accordin_direct_mutex,
+            event: *mut mcs_tas_accordin_direct_writer_event,
+        }
+
+        unsafe impl Send for EventArgs {}
+
+        fn wait_for_a_reason(args: EventArgs) -> libc::c_int {
+            unsafe {
+                assert_eq!(mcs_tas_accordin_direct_mutex_lock(args.mutex), 0);
+                assert_eq!(mcs_tas_accordin_direct_writer_event_arm(args.event), 0);
+                assert_eq!(mcs_tas_accordin_direct_mutex_unlock(args.mutex), 0);
+                let reason = mcs_tas_accordin_direct_writer_event_wait(args.event);
+                if reason == 1 {
+                    assert_eq!(mcs_tas_accordin_direct_writer_event_relock(args.event), 0);
+                    assert_eq!(mcs_tas_accordin_direct_mutex_unlock(args.mutex), 0);
+                }
+                reason
+            }
+        }
+
+        let mutex = mcs_tas_accordin_direct_mutex_create();
+        assert!(!mutex.is_null());
+        assert!(mcs_tas_accordin_direct_writer_event_size() >= std::mem::size_of::<usize>());
+
+        let mut binding = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_bind(mutex, &mut binding),
+                0
+            );
+        }
+        assert!(!binding.is_null());
+
+        let mut completed = std::mem::MaybeUninit::<mcs_tas_accordin_direct_writer_event>::uninit();
+        let mut leader = std::mem::MaybeUninit::<mcs_tas_accordin_direct_writer_event>::uninit();
+        let completed_args = EventArgs {
+            mutex,
+            event: completed.as_mut_ptr(),
+        };
+        let leader_args = EventArgs {
+            mutex,
+            event: leader.as_mut_ptr(),
+        };
+
+        unsafe {
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_init(completed_args.event, binding),
+                0
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_init(leader_args.event, binding),
+                0
+            );
+        }
+
+        let waiters = [completed_args, leader_args]
+            .map(|args| std::thread::spawn(move || wait_for_a_reason(args)));
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        unsafe {
+            assert_eq!(mcs_tas_accordin_direct_mutex_lock(mutex), 0);
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_post_completed(completed_args.event),
+                0
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_post_leader(leader_args.event),
+                0
+            );
+            assert_eq!(mcs_tas_accordin_direct_mutex_unlock(mutex), 0);
+        }
+
+        let [completed_reason, leader_reason] =
+            waiters.map(|waiter| waiter.join().expect("every waiter should finish"));
+        assert_eq!(completed_reason, 0);
+        assert_eq!(leader_reason, 1);
+
+        unsafe {
+            assert_eq!(mcs_tas_accordin_direct_mutex_destroy(mutex), 0);
+        }
+    }
+
+    #[test]
+    fn direct_writer_event_rejects_null_arguments() {
+        let mutex = mcs_tas_accordin_direct_mutex_create();
+        let mut event = std::mem::MaybeUninit::<mcs_tas_accordin_direct_writer_event>::uninit();
+        let mut binding = std::ptr::null_mut();
+
+        unsafe {
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_bind(std::ptr::null_mut(), &mut binding),
+                libc::EINVAL
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_bind(mutex, std::ptr::null_mut()),
+                libc::EINVAL
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_bind(mutex, &mut binding),
+                0
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_init(std::ptr::null_mut(), binding),
+                libc::EINVAL
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_init(event.as_mut_ptr(), std::ptr::null_mut()),
+                libc::EINVAL
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_arm(std::ptr::null_mut()),
+                libc::EINVAL
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_wait(std::ptr::null_mut()),
+                -1
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_post_completed(std::ptr::null_mut()),
+                libc::EINVAL
+            );
+            assert_eq!(
+                mcs_tas_accordin_direct_writer_event_post_leader(std::ptr::null_mut()),
+                libc::EINVAL
+            );
+            assert_eq!(mcs_tas_accordin_direct_mutex_destroy(mutex), 0);
         }
     }
 

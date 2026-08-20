@@ -23,3 +23,5 @@ pub mod mutex_hook;
 pub mod timeslice_extension;
 
 pub mod width_control;
+
+pub mod writer_event;

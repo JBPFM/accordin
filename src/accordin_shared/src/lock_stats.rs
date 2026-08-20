@@ -618,6 +618,21 @@ fn print_cv_admission_counters() {
         requeue.staged_high_water,
         requeue.binding_conflicts
     );
+
+    let writer_event = mutex_hook::writer_event_counters();
+    eprintln!(
+        "[lock_stats] writer_event arms={} spurious_wakes={} completed_posts={} leader_posts={} route_takebacks={} route_takeback_unpublished={} route_takeback_lost={} completed_misroutes={} relocks_admitted={} relocks_normal={}",
+        writer_event.arms,
+        writer_event.spurious_wakes,
+        writer_event.completed_posts,
+        writer_event.leader_posts,
+        writer_event.route_takebacks,
+        writer_event.route_takeback_unpublished,
+        writer_event.route_takeback_lost,
+        writer_event.completed_misroutes,
+        writer_event.relocks_admitted,
+        writer_event.relocks_normal
+    );
 }
 
 fn print_bpf_routing_counters() {

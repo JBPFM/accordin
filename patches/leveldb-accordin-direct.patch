@@ -1,5 +1,5 @@
 diff --git a/benchmarks/db_bench.cc b/benchmarks/db_bench.cc
-index 429a61a..a407153 100644
+index 429a61a..59a9c8e 100644
 --- a/benchmarks/db_bench.cc
 +++ b/benchmarks/db_bench.cc
 @@ -351,7 +351,11 @@ struct SharedState {
@@ -55,29 +55,100 @@ index 429a61a..a407153 100644
      shared.mu.Unlock();
  
      for (int i = 1; i < n; i++) {
-@@ -1086,5 +1098,8 @@ int main(int argc, char** argv) {
+@@ -1086,5 +1098,9 @@ int main(int argc, char** argv) {
  
    leveldb::Benchmark benchmark;
    benchmark.Run();
 +  benchmark.Close();
 +  leveldb::port::PrintLockTimingProcessStats();
 +  leveldb::port::PrintCvStats();
++  leveldb::port::PrintWriterEventStats();
    return 0;
  }
 diff --git a/db/db_impl.cc b/db/db_impl.cc
-index 1a4e459..d308feb 100644
+index 1a4e459..b0356de 100644
 --- a/db/db_impl.cc
 +++ b/db/db_impl.cc
-@@ -42,7 +42,7 @@ const int kNumNonTableCacheFiles = 10;
+@@ -42,15 +42,77 @@ const int kNumNonTableCacheFiles = 10;
  // Information kept for every waiting writer
  struct DBImpl::Writer {
    explicit Writer(port::Mutex* mu)
 -      : batch(nullptr), sync(false), done(false), cv(mu) {}
-+      : batch(nullptr), sync(false), done(false), cv(mu, "writer_queue") {}
++      : batch(nullptr),
++        sync(false),
++        done(false),
++        mu(mu),
++        cv(mu, "writer_queue"),
++        event(mu) {}
++
++  // Blocks until this writer either heads the queue or has had its batch
++  // written by the writer that does. Returns true holding mu, leaving the queue
++  // to be re-checked; returns false not holding mu, with the write already
++  // complete and its status published.
++  //
++  // The release and the re-acquisition are hidden from the analysis because
++  // this returns in two different lock states, which no annotation expresses.
++  bool AwaitTurn() NO_THREAD_SAFETY_ANALYSIS;
++
++  // Releases this writer with its batch already written and its status already
++  // published. REQUIRES: the caller holds mu and has removed this writer from
++  // the queue. The caller must not touch this object again: the writer it
++  // releases may return and destroy it as the wake lands.
++  void PostCompleted();
++
++  // Hands the head of the queue to this writer, which still has its batch to
++  // write. The same last-touch rule applies.
++  void PostLeader();
  
    Status status;
    WriteBatch* batch;
-@@ -135,7 +135,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+   bool sync;
+   bool done;
++  port::Mutex* const mu;
+   port::CondVar cv;
++  // Carries the wake when the event backend is available and the run asks for
++  // it; inert otherwise, and then every wake goes through cv above.
++  port::WriterEvent event;
+ };
+ 
++bool DBImpl::Writer::AwaitTurn() NO_THREAD_SAFETY_ANALYSIS {
++  if (!event.Active()) {
++    cv.Wait();
++    return true;
++  }
++
++  // The reason code has to be published before the mutex is given up, and the
++  // sleep state the wake is routed from has to be published after it, which is
++  // why the two halves sit on either side of the release.
++  event.Arm();
++  mu->Unlock();
++  if (event.Wait() == port::WriterEvent::kCompleted) {
++    return false;
++  }
++  event.Relock();
++  return true;
++}
++
++void DBImpl::Writer::PostCompleted() {
++  if (event.Active()) {
++    event.PostCompleted();
++    return;
++  }
++  cv.Signal();
++}
++
++void DBImpl::Writer::PostLeader() {
++  if (event.Active()) {
++    event.PostLeader();
++    return;
++  }
++  cv.Signal();
++}
++
+ struct DBImpl::CompactionState {
+   // Files produced by compaction
+   struct Output {
+@@ -135,7 +197,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
        table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
        db_lock_(nullptr),
        shutting_down_(false),
@@ -86,7 +157,7 @@ index 1a4e459..d308feb 100644
        mem_(nullptr),
        imm_(nullptr),
        has_imm_(false),
-@@ -147,7 +147,12 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+@@ -147,7 +209,12 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
        background_compaction_scheduled_(false),
        manual_compaction_(nullptr),
        versions_(new VersionSet(dbname_, &options_, table_cache_,
@@ -100,11 +171,96 @@ index 1a4e459..d308feb 100644
  
  DBImpl::~DBImpl() {
    // Wait for background work to finish.
+@@ -1197,16 +1264,60 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
+   return DB::Delete(options, key);
+ }
+ 
+-Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
++namespace {
++
++// Releases a mutex the enclosing scope acquired, unless that scope says the
++// release has already happened.
++//
++// MutexLock cannot express this: a writer whose batch the queue head already
++// wrote returns from Write() without the mutex, so exactly one of that
++// function's exits must not release it while all the others, including an
++// exception unwinding out of the batch it is building, still must.
++class WriteQueueLock {
++ public:
++  explicit WriteQueueLock(port::Mutex* mu) NO_THREAD_SAFETY_ANALYSIS : mu_(mu) {}
++  ~WriteQueueLock() NO_THREAD_SAFETY_ANALYSIS {
++    if (mu_ != nullptr) {
++      mu_->Unlock();
++    }
++  }
++
++  // Gives up the release, for the one path that has already been released by
++  // something else.
++  void Dismiss() { mu_ = nullptr; }
++
++  WriteQueueLock(const WriteQueueLock&) = delete;
++  WriteQueueLock& operator=(const WriteQueueLock&) = delete;
++
++ private:
++  port::Mutex* mu_;
++};
++
++}  // namespace
++
++// The completed-write return leaves this function without mutex_ while every
++// other return leaves it released after having held it, and the analysis has no
++// way to describe a function whose exit lock state depends on the path. The
++// discipline it would otherwise check is stated at each return instead.
++Status DBImpl::Write(const WriteOptions& options,
++                     WriteBatch* updates) NO_THREAD_SAFETY_ANALYSIS {
+   Writer w(&mutex_);
+   w.batch = updates;
+   w.sync = options.sync;
+   w.done = false;
+ 
+-  MutexLock l(&mutex_);
++  mutex_.Lock();
++  WriteQueueLock queue_lock(&mutex_);
+   writers_.push_back(&w);
+   while (!w.done && &w != writers_.front()) {
+-    w.cv.Wait();
++    if (!w.AwaitTurn()) {
++      // The one return out of this function that holds no lock, and so the one
++      // that dismisses the guard. The writer that wrote this batch published
++      // the status before releasing this one and never touches it again, so
++      // reading it here needs nothing further.
++      queue_lock.Dismiss();
++      return w.status;
++    }
+   }
+   if (w.done) {
+     return w.status;
+@@ -1257,14 +1368,18 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+     if (ready != &w) {
+       ready->status = status;
+       ready->done = true;
+-      ready->cv.Signal();
++      // Last touch of *ready: it may return from Write() and destroy itself the
++      // instant this releases it.
++      ready->PostCompleted();
+     }
++    // A pointer comparison, never a dereference, so a writer already gone is
++    // still a valid thing to compare against.
+     if (ready == last_writer) break;
+   }
+ 
+   // Notify new head of write queue
+   if (!writers_.empty()) {
+-    writers_.front()->cv.Signal();
++    writers_.front()->PostLeader();
+   }
+ 
+   return status;
 diff --git a/port/port_stdcxx.h b/port/port_stdcxx.h
-index 2bda48d..74fda47 100644
+index 2bda48d..3a4e77f 100644
 --- a/port/port_stdcxx.h
 +++ b/port/port_stdcxx.h
-@@ -29,58 +29,497 @@
+@@ -29,60 +29,796 @@
  #include <snappy.h>
  #endif  // HAVE_SNAPPY
  
@@ -144,14 +300,46 @@ index 2bda48d..74fda47 100644
 +    __attribute__((weak));
 +int mcs_tas_accordin_direct_cond_broadcast(mcs_tas_accordin_direct_cond* cond)
 +    __attribute__((weak));
++
++// Per-waiter wake event for a leader/follower queue, exported by the direct
++// library against its own mutex and by the pthread hook against the
++// pthread_mutex_t the hook interposes. Both families are optional: a build with
++// neither of them present keeps the condition-variable path.
++size_t mcs_tas_accordin_direct_writer_event_size() __attribute__((weak));
++size_t mcs_tas_accordin_direct_writer_event_align() __attribute__((weak));
++int mcs_tas_accordin_direct_writer_event_bind(mcs_tas_accordin_direct_mutex* mutex,
++                                              void** out_binding)
++    __attribute__((weak));
++int mcs_tas_accordin_direct_writer_event_init(void* event, void* binding)
++    __attribute__((weak));
++int mcs_tas_accordin_direct_writer_event_arm(void* event) __attribute__((weak));
++int mcs_tas_accordin_direct_writer_event_wait(void* event)
++    __attribute__((weak));
++int mcs_tas_accordin_direct_writer_event_relock(void* event)
++    __attribute__((weak));
++int mcs_tas_accordin_direct_writer_event_post_completed(void* event)
++    __attribute__((weak));
++int mcs_tas_accordin_direct_writer_event_post_leader(void* event)
++    __attribute__((weak));
++
++size_t accordin_writer_event_size() __attribute__((weak));
++size_t accordin_writer_event_align() __attribute__((weak));
++int accordin_writer_event_bind(void* mutex, void** out_binding)
++    __attribute__((weak));
++int accordin_writer_event_init(void* event, void* binding) __attribute__((weak));
++int accordin_writer_event_arm(void* event) __attribute__((weak));
++int accordin_writer_event_wait(void* event) __attribute__((weak));
++int accordin_writer_event_relock(void* event) __attribute__((weak));
++int accordin_writer_event_post_completed(void* event) __attribute__((weak));
++int accordin_writer_event_post_leader(void* event) __attribute__((weak));
 +}
 +
  namespace leveldb {
  namespace port {
  
  class CondVar;
- 
--// Thinly wraps std::mutex.
++class WriterEvent;
++
 +struct LockTimingThreadStats {
 +  uint64_t hold_ns_total = 0;
 +  uint64_t hold_samples = 0;
@@ -415,7 +603,8 @@ index 2bda48d..74fda47 100644
 +  }
 +  std::fflush(stdout);
 +}
-+
+ 
+-// Thinly wraps std::mutex.
 +// Wraps std::mutex, with an opt-in mcs_tas_accordin_direct backend.
  class LOCKABLE Mutex {
   public:
@@ -480,8 +669,16 @@ index 2bda48d..74fda47 100644
 +  void unlock() UNLOCK_FUNCTION() { Unlock(); }
    void AssertHeld() ASSERT_EXCLUSIVE_LOCK() {}
  
++  // The binding a writer event is initialized from, or nullptr when this mutex
++  // has no event backend. Resolving it consults a process-wide registry, and
++  // the answer never changes for a given mutex, so it is resolved on the first
++  // ask and every writer after that pays one relaxed load. Defined below the
++  // WriterEvent declarations, which own the backend selection.
++  void* WriterEventBinding();
++
   private:
    friend class CondVar;
++  friend class WriterEvent;
 +
 +  void StartLockTimingHold() {
 +    lock_timing_hold_start_ns_ =
@@ -503,6 +700,8 @@ index 2bda48d..74fda47 100644
 +  mcs_tas_accordin_direct_mutex* direct_ = nullptr;
 +  bool lock_timing_enabled_ = false;
 +  uint64_t lock_timing_hold_start_ns_ = 0;
++  std::once_flag writer_event_once_;
++  void* writer_event_binding_ = nullptr;
  };
  
 -// Thinly wraps std::condition_variable.
@@ -609,9 +808,265 @@ index 2bda48d..74fda47 100644
 +  std::atomic<uint64_t> waiters_;
 +  std::once_flag direct_once_;
 +  mcs_tas_accordin_direct_cond* direct_ = nullptr;
++};
++
++// Reason codes and posts, so a run can be read as one wake per waiter with the
++// two reasons split. Wait durations go into the CV histogram table under
++// kWriterEventCvLabel, which puts them on the same scale as the condition
++// variable they replace.
++constexpr const char* kWriterEventCvLabel = "writer_event";
++
++struct WriterEventStats {
++  std::atomic<uint64_t> completed_wakes;
++  std::atomic<uint64_t> leader_wakes;
++  std::atomic<uint64_t> completed_posts;
++  std::atomic<uint64_t> leader_posts;
  };
  
++inline WriterEventStats& WriterEventStatsRef() {
++  static WriterEventStats stats;
++  return stats;
++}
++
++inline bool WriterEventEnabledByEnv() {
++  static const bool enabled = EnvFlagEnabled("ACCORDIN_WRITER_EVENT", false);
++  return enabled;
++}
++
++// The event lives inside the waiter, which is a stack object created per
++// operation, so its storage is reserved here rather than allocated. The library
++// reports its own size and alignment and one that does not fit leaves the
++// feature off, which keeps the layout out of this header.
++constexpr size_t kWriterEventStorageSize = 64;
++constexpr size_t kWriterEventStorageAlign = 16;
++
++inline bool DirectWriterEventAvailable() {
++  static const bool available =
++      WriterEventEnabledByEnv() &&
++      mcs_tas_accordin_direct_writer_event_size != nullptr &&
++      mcs_tas_accordin_direct_writer_event_align != nullptr &&
++      mcs_tas_accordin_direct_writer_event_bind != nullptr &&
++      mcs_tas_accordin_direct_writer_event_init != nullptr &&
++      mcs_tas_accordin_direct_writer_event_arm != nullptr &&
++      mcs_tas_accordin_direct_writer_event_wait != nullptr &&
++      mcs_tas_accordin_direct_writer_event_relock != nullptr &&
++      mcs_tas_accordin_direct_writer_event_post_completed != nullptr &&
++      mcs_tas_accordin_direct_writer_event_post_leader != nullptr &&
++      mcs_tas_accordin_direct_writer_event_size() <= kWriterEventStorageSize &&
++      mcs_tas_accordin_direct_writer_event_align() <= kWriterEventStorageAlign;
++  return available;
++}
++
++inline bool HookWriterEventAvailable() {
++  static const bool available =
++      WriterEventEnabledByEnv() && accordin_writer_event_size != nullptr &&
++      accordin_writer_event_align != nullptr &&
++      accordin_writer_event_bind != nullptr &&
++      accordin_writer_event_init != nullptr &&
++      accordin_writer_event_arm != nullptr &&
++      accordin_writer_event_wait != nullptr &&
++      accordin_writer_event_relock != nullptr &&
++      accordin_writer_event_post_completed != nullptr &&
++      accordin_writer_event_post_leader != nullptr &&
++      accordin_writer_event_size() <= kWriterEventStorageSize &&
++      accordin_writer_event_align() <= kWriterEventStorageAlign;
++  return available;
++}
++
++// Ends the process on a writer-event call that cannot fail and did. Every such
++// call is a step of a protocol whose remaining steps assume it succeeded, and
++// the two that matter leave the caller either running a critical section
++// without the mutex or waiting for a reason nobody will publish.
++inline void WriterEventFatal(const char* what, int ret) {
++  std::fprintf(stderr, "leveldb: writer event %s failed with %d\n", what, ret);
++  std::fflush(stderr);
++  std::abort();
++}
++
++inline void PrintWriterEventStats() {
++  if (!CvStatsEnabled()) {
++    return;
++  }
++  const WriterEventStats& stats = WriterEventStatsRef();
++  std::fprintf(stdout, "leveldb_writer_event_enabled: %d\n",
++               WriterEventEnabledByEnv() ? 1 : 0);
++  std::fprintf(
++      stdout, "leveldb_writer_event_completed_wakes: %llu\n",
++      static_cast<unsigned long long>(
++          stats.completed_wakes.load(std::memory_order_relaxed)));
++  std::fprintf(stdout, "leveldb_writer_event_leader_wakes: %llu\n",
++               static_cast<unsigned long long>(
++                   stats.leader_wakes.load(std::memory_order_relaxed)));
++  std::fprintf(
++      stdout, "leveldb_writer_event_completed_posts: %llu\n",
++      static_cast<unsigned long long>(
++          stats.completed_posts.load(std::memory_order_relaxed)));
++  std::fprintf(stdout, "leveldb_writer_event_leader_posts: %llu\n",
++               static_cast<unsigned long long>(
++                   stats.leader_posts.load(std::memory_order_relaxed)));
++  std::fflush(stdout);
++}
++
++// A per-waiter wake event for leader/follower queues.
++//
++// A condition variable conflates the two reasons such a queue wakes a waiter
++// for. This splits them into a reason code the waiter blocks on: a waiter whose
++// work the queue head already did returns without re-acquiring the mutex, and a
++// waiter promoted to head re-acquires it carrying the admission decision its
++// wake was granted.
++//
++// The event is inert unless the backend library exports it and the run asks for
++// it; callers keep their condition variable whenever Active() says no, so the
++// off path is the path this file always had.
++class WriterEvent {
++ public:
++  enum WakeReason { kCompleted = 0, kBecomeLeader = 1 };
++
++  // Costs one flag test per construction when the feature is off, and one
++  // relaxed load plus a struct write when it is on: the mutex answered which
++  // backend it uses and what to bind to once, at its first writer.
++  explicit WriterEvent(Mutex* mu) : mu_(mu) {
++    if (!WriterEventEnabledByEnv()) {
++      return;
++    }
++    void* binding = mu->WriterEventBinding();
++    if (binding == nullptr) {
++      return;
++    }
++    direct_ = mu->direct_ != nullptr;
++    active_ = (direct_ ? mcs_tas_accordin_direct_writer_event_init(Storage(),
++                                                                   binding)
++                       : accordin_writer_event_init(Storage(), binding)) == 0;
++    if (active_ && CvStatsEnabled()) {
++      stats_ = CvLabelStatsFor(kWriterEventCvLabel);
++    }
++  }
++
++  // Nothing to release: the event lives in the storage below for exactly as
++  // long as this object does.
++  ~WriterEvent() = default;
++
++  WriterEvent(const WriterEvent&) = delete;
++  WriterEvent& operator=(const WriterEvent&) = delete;
++
++  bool Active() const { return active_; }
++
++  // Declares the waiter unreleased. REQUIRES: the mutex is held, so that no
++  // post can land before the declaration and be overwritten by it.
++  //
++  // A failure here would leave the waiter about to block on a reason word it
++  // never claimed, which no caller can recover from, so it is fatal.
++  void Arm() {
++    const int ret = direct_ ? mcs_tas_accordin_direct_writer_event_arm(Storage())
++                            : accordin_writer_event_arm(Storage());
++    if (ret != 0) {
++      WriterEventFatal("arm", ret);
++    }
++  }
++
++  // Blocks until a post publishes a reason. REQUIRES: the mutex is released.
++  //
++  // Anything the backend reports that is not one of the two reasons is read as
++  // kBecomeLeader, which is the only mapping that cannot lose a write. A
++  // caller told kBecomeLeader re-acquires the mutex and re-reads the queue, so
++  // a writer that was in fact already completed still finds its own state and
++  // returns the status the leader published; a caller told kCompleted returns
++  // immediately on the strength of that report, and if it was wrong it returns
++  // a status nobody set for a batch nobody wrote.
++  WakeReason Wait() {
++    const uint64_t wait_start_ns = LockTimingNowNs();
++    const int reason = direct_
++                           ? mcs_tas_accordin_direct_writer_event_wait(Storage())
++                           : accordin_writer_event_wait(Storage());
++    if (stats_ != nullptr) {
++      RecordCvWait(stats_, LockTimingNowNs() - wait_start_ns);
++    }
++    WriterEventStats& counters = WriterEventStatsRef();
++    if (reason == kCompleted) {
++      counters.completed_wakes.fetch_add(1, std::memory_order_relaxed);
++      return kCompleted;
++    }
++    counters.leader_wakes.fetch_add(1, std::memory_order_relaxed);
++    return kBecomeLeader;
++  }
++
++  // Re-acquires the mutex for a waiter this event made head of the queue.
++  // Bypasses Mutex::Lock() because the admission decision the wake carried
++  // belongs to this acquisition, so the hold sample is opened here instead.
++  //
++  // The caller runs the queue's critical section next, so a failure that left
++  // the mutex unheld has no safe continuation and is fatal.
++  void Relock() {
++    const int ret = direct_
++                        ? mcs_tas_accordin_direct_writer_event_relock(Storage())
++                        : accordin_writer_event_relock(Storage());
++    if (ret != 0) {
++      WriterEventFatal("relock", ret);
++    }
++    mu_->StartLockTimingHold();
++  }
++
++  // Releases a waiter whose work the caller already did.
++  //
++  // REQUIRES: the result is already published. This is the caller's last access
++  // to the event: the waiter may return and destroy it as the reason lands.
++  void PostCompleted() {
++    WriterEventStatsRef().completed_posts.fetch_add(1,
++                                                    std::memory_order_relaxed);
++    if (direct_) {
++      mcs_tas_accordin_direct_writer_event_post_completed(Storage());
++      return;
++    }
++    accordin_writer_event_post_completed(Storage());
++  }
++
++  // Hands the head of the queue over. As with a completed post, this is the
++  // caller's last access to the event.
++  void PostLeader() {
++    WriterEventStatsRef().leader_posts.fetch_add(1, std::memory_order_relaxed);
++    if (direct_) {
++      mcs_tas_accordin_direct_writer_event_post_leader(Storage());
++      return;
++    }
++    accordin_writer_event_post_leader(Storage());
++  }
++
++ private:
++  void* Storage() { return static_cast<void*>(storage_); }
++
++  Mutex* const mu_;
++  CvLabelStats* stats_ = nullptr;
++  bool active_ = false;
++  bool direct_ = false;
++  alignas(kWriterEventStorageAlign) unsigned char storage_[kWriterEventStorageSize];
++};
++
++// Resolving a binding consults a process-wide registry keyed by mutex address,
++// which is far too much work to repeat for every writer, and the answer is a
++// property of the mutex that cannot change while it exists. std::call_once
++// makes the resolution single without putting a lock on the path that reads it.
++inline void* Mutex::WriterEventBinding() {
++  std::call_once(writer_event_once_, [this]() {
++    if (direct_ != nullptr) {
++      if (!DirectWriterEventAvailable() ||
++          mcs_tas_accordin_direct_writer_event_bind(
++              direct_, &writer_event_binding_) != 0) {
++        writer_event_binding_ = nullptr;
++      }
++      return;
++    }
++    if (!HookWriterEventAvailable() ||
++        accordin_writer_event_bind(mu_.native_handle(),
++                                   &writer_event_binding_) != 0) {
++      writer_event_binding_ = nullptr;
++    }
++  });
++  return writer_event_binding_;
++}
++
  inline bool Snappy_Compress(const char* input, size_t length,
+                             std::string* output) {
+ #if HAVE_SNAPPY
 diff --git a/util/env_posix.cc b/util/env_posix.cc
 index d84cd1e..f0be489 100644
 --- a/util/env_posix.cc

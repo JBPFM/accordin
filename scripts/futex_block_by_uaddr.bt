@@ -1,0 +1,123 @@
+#!/usr/bin/env bpftrace
+/*
+ * futex_block_by_uaddr.bt - attribute futex blocking time to futex words.
+ *
+ * Usage:
+ *   sudo bpftrace scripts/futex_block_by_uaddr.bt <pid>
+ *
+ * What it measures:
+ *   Every FUTEX_WAIT-class syscall issued by the target process (all threads
+ *   sharing the tgid given as <pid>) is paired enter->exit, and the blocked
+ *   duration is attributed to the futex word address passed as uaddr. The END
+ *   block reports, per uaddr, the number of waits, the total blocked
+ *   nanoseconds, the longest single wait, plus a global log2 histogram of wait
+ *   durations in microseconds. Wake-side operations (FUTEX_WAKE,
+ *   FUTEX_WAKE_BITSET, FUTEX_REQUEUE, FUTEX_CMP_REQUEUE) are counted per uaddr
+ *   as well, so a blocking futex word can be matched to the thread path that
+ *   signals it. Each per-uaddr table keeps the 20 heaviest entries and prints
+ *   them in ascending order, so the dominant futex word is the last line.
+ *
+ * Caveat:
+ *   uaddr is a raw user-space address. This script does no symbolication and
+ *   cannot name the condition variable behind a futex word. Mapping a hot uaddr
+ *   back to a specific LevelDB condition variable is done by cross-referencing
+ *   the user-space leveldb_cv_* counters collected over the same run (wait and
+ *   signal counts, aggregate wait time), not by anything this script reports.
+ *   Condition variables embedded in per-Writer stack objects give short-lived
+ *   uaddrs, but stack addresses are recycled across writers, so the number of
+ *   distinct keys stays bounded in practice. If the report looks truncated,
+ *   raise BPFTRACE_MAP_KEYS_MAX (default 4096) in the environment.
+ *
+ * Op decoding follows FUTEX_CMD_MASK: FUTEX_PRIVATE_FLAG (128) and
+ * FUTEX_CLOCK_REALTIME (256) are stripped before the command is compared.
+ */
+
+BEGIN
+{
+	if ($1 == 0) {
+		printf("usage: bpftrace futex_block_by_uaddr.bt <pid>\n");
+		exit();
+	}
+	printf("tracing futex activity of pid %d, Ctrl-C to report\n", $1);
+}
+
+/*
+ * Both tracepoint arguments are read before any branch: the verifier rejects
+ * context dereferences that follow pointer arithmetic on a conditional path.
+ */
+tracepoint:syscalls:sys_enter_futex
+/pid == $1/
+{
+	$op = args->op & ~(128 | 256);
+	$uaddr = args->uaddr;
+
+	// FUTEX_WAIT and FUTEX_WAIT_BITSET block the calling thread.
+	if ($op == 0) {
+		@op_count["FUTEX_WAIT"] = count();
+		@wait_start[tid] = nsecs;
+		@wait_uaddr[tid] = $uaddr;
+	} else if ($op == 9) {
+		@op_count["FUTEX_WAIT_BITSET"] = count();
+		@wait_start[tid] = nsecs;
+		@wait_uaddr[tid] = $uaddr;
+	} else if ($op == 1) {
+		@op_count["FUTEX_WAKE"] = count();
+		@wake_count[$uaddr] = count();
+	} else if ($op == 10) {
+		@op_count["FUTEX_WAKE_BITSET"] = count();
+		@wake_count[$uaddr] = count();
+	} else if ($op == 3) {
+		@op_count["FUTEX_REQUEUE"] = count();
+		@wake_count[$uaddr] = count();
+	} else if ($op == 4) {
+		@op_count["FUTEX_CMP_REQUEUE"] = count();
+		@wake_count[$uaddr] = count();
+	}
+}
+
+tracepoint:syscalls:sys_exit_futex
+/pid == $1 && @wait_start[tid] != 0/
+{
+	$delta = nsecs - @wait_start[tid];
+	$uaddr = @wait_uaddr[tid];
+
+	@total_ns[$uaddr] = sum($delta);
+	@count[$uaddr] = count();
+	@max_ns[$uaddr] = max($delta);
+	@hist_us = hist($delta / 1000);
+
+	delete(@wait_start[tid]);
+	delete(@wait_uaddr[tid]);
+}
+
+END
+{
+	clear(@wait_start);
+	clear(@wait_uaddr);
+
+	printf("\n=== futex op counts (private flag stripped) ===\n");
+	print(@op_count);
+
+	printf("\n=== wait duration histogram (us) ===\n");
+	print(@hist_us);
+
+	printf("\n=== top uaddrs by total blocked ns ===\n");
+	print(@total_ns, 20);
+
+	printf("\n=== wait count per uaddr (top 20) ===\n");
+	print(@count, 20);
+
+	printf("\n=== longest single wait per uaddr, ns (top 20) ===\n");
+	print(@max_ns, 20);
+
+	printf("\n=== wake-side ops per uaddr (top 20) ===\n");
+	print(@wake_count, 20);
+
+	// Suppress the implicit dump of every map that bpftrace emits on exit.
+	clear(@op_count);
+	clear(@hist_us);
+	clear(@total_ns);
+	clear(@count);
+	clear(@max_ns);
+	clear(@wake_count);
+}

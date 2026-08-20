@@ -31,6 +31,10 @@ ACCORDIN_BASE_LOCK = ACCORDIN_ADMISSION_ONLY_LOCK
 ACCORDIN_NO_ADMISSION_LOCK = "mcs_tas_accordin_no_admission"
 ACCORDIN_TASKSET_LOCK = "mcs_tas_accordin_taskset"
 MCS_ACCORDIN_LOCK = "mcs_accordin"
+# Not interposed: the benchmark resolves the direct C API from the preloaded library
+# itself. It still loads the BPF scheduler from .init_array, so it needs root exactly
+# as the hooked variants do.
+MCS_TAS_ACCORDIN_DIRECT_LOCK = "mcs_tas_accordin_direct"
 PTHREAD_SPINLOCK_LOCK = "pthread_spinlock"
 ACCORDIN_VARIANT_LOCKS = (
     ACCORDIN_BASE_LOCK,

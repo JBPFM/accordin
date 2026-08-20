@@ -601,8 +601,11 @@ fn print_cv_admission_counters() {
 
     let counters = mutex_hook::cv_admission_counters();
     eprintln!(
-        "[lock_stats] cv_admission hints_published={} specialized_relocks={} fallback_relocks={}",
-        counters.hints_published, counters.specialized_relocks, counters.fallback_relocks
+        "[lock_stats] cv_admission hints_published={} specialized_relocks={} fallback_relocks={} route_relocks={}",
+        counters.hints_published,
+        counters.specialized_relocks,
+        counters.fallback_relocks,
+        counters.route_relocks
     );
 }
 

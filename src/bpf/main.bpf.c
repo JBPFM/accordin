@@ -74,6 +74,33 @@ static __always_inline void record_normal_scan_empty(__u32 normal_seq) {
   normal_empty_seq = normal_seq;
 }
 
+static __always_inline bool cv_route_active(void) {
+  return cv_route_enabled != 0;
+}
+
+/* Whether any thread sits on a cvready queue. A park counts before the drain
+ * that takes the thread off the queue does, and nothing else removes a task
+ * from these queues, so the two counters differ exactly while one is occupied;
+ * a task whose insert has not landed yet is already counted, so it is never
+ * missed. Being exact is what lets this gate stand alone: the cvready selection
+ * probes a window of the class space, and an empty verdict from one scan cannot
+ * speak for the classes it never looked at. */
+static __always_inline bool cvready_queues_occupied(void) {
+  return cvready_enqueue_seq != cvready_drained_count;
+}
+
+static __always_inline bool cvready_dispatch_needed(void) {
+  return cv_route_active() && cvready_queues_occupied();
+}
+
+static __always_inline void record_cvready_enqueue(void) {
+  __sync_fetch_and_add(&cvready_enqueue_seq, 1);
+}
+
+static __always_inline void record_cvready_drained(void) {
+  __sync_fetch_and_add(&cvready_drained_count, 1);
+}
+
 static __always_inline bool task_cpumask_allows(struct task_struct *p,
                                                 __u32 cpu) {
   if (cpu >= MAX_CPUS)
@@ -107,6 +134,10 @@ static __always_inline __u32 effective_lock_id(__u32 user_ctx_word) {
 
 static __always_inline __u64 inactive_dsq_id(__u32 lock_id) {
   return INACTIVE_DSQ_BASE + lock_id;
+}
+
+static __always_inline __u64 cvready_dsq_id(__u32 lock_id) {
+  return CVREADY_DSQ_BASE + lock_id;
 }
 
 static __always_inline void init_task_ctx_if_needed(struct task_scx_ctx *task_ctx) {
@@ -160,6 +191,52 @@ DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_inactive_dispatch_count,
                        cpu_inactive_dispatch_count)
 DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_inactive_probe_cursor,
                        cpu_inactive_probe_cursor)
+DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_cvready_streak, cpu_cvready_streak)
+DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_last_cvready_lock, cpu_last_cvready_lock)
+DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_cvready_probe_cursor, cpu_cvready_probe_cursor)
+
+/* Whether this CPU may still take a cvready task ahead of the class queues. A
+ * limit of 0 disables the priority outright, so no CPU ever qualifies. Only the
+ * preference is bounded here: the periodic forced pass moves a cvready task
+ * without asking, and spends no budget when it does. */
+static __always_inline bool cvready_priority_available(__u32 cpu) {
+  volatile __u32 *streak;
+
+  if (cv_priority_streak_limit == 0)
+    return false;
+
+  streak = lookup_cpu_cvready_streak(cpu);
+  return !streak || *streak < cv_priority_streak_limit;
+}
+
+static __always_inline void record_cvready_priority_dispatch(__u32 cpu) {
+  volatile __u32 *streak = lookup_cpu_cvready_streak(cpu);
+
+  if (streak && *streak < cv_priority_streak_limit)
+    *streak += 1;
+}
+
+/* Any dispatch that served the class queues or the normal queue ends the
+ * streak: the budget exists to bound how long cvready keeps a CPU, and it has
+ * just been handed back. */
+static __always_inline void reset_cvready_streak(__u32 cpu) {
+  volatile __u32 *streak = lookup_cpu_cvready_streak(cpu);
+
+  if (streak)
+    *streak = 0;
+}
+
+static __always_inline void record_cvready_dispatch_lock(__u32 cpu,
+                                                         __u32 lock_id) {
+  volatile __u32 *last_lock;
+
+  if (!valid_lock_id(lock_id))
+    return;
+
+  last_lock = lookup_cpu_last_cvready_lock(cpu);
+  if (last_lock)
+    *last_lock = lock_id;
+}
 
 static __always_inline bool inactive_dispatch_budget_available(__u32 cpu) {
   volatile __u32 *count = lookup_cpu_inactive_dispatch_count(cpu);
@@ -278,9 +355,18 @@ static __always_inline bool user_token_consumed(__u32 user_ctx_word) {
   return user_ctx_word & USER_ADMISSION_TOKEN_CONSUMED;
 }
 
+static __always_inline bool user_cv_sleep(__u32 user_ctx_word) {
+  return user_ctx_word & USER_ADMISSION_CV_SLEEP;
+}
+
+/* A word with neither flag set says the thread is done with the lock. The
+ * cond-sleep bit is set with both flags clear by construction, so it would fall
+ * into this shape and lose the class it names; it is excluded here and every
+ * caller that wants the release for a cond sleeper asks for it explicitly. */
 static __always_inline bool user_explicit_release(__u32 user_ctx_word) {
   return !user_slow_path_pending(user_ctx_word) &&
-         !user_in_critical_section(user_ctx_word);
+         !user_in_critical_section(user_ctx_word) &&
+         !user_cv_sleep(user_ctx_word);
 }
 
 /* Wakeup carrying the cond-reacquire signature. A failed user-word read leaves
@@ -611,9 +697,85 @@ move_selected_inactive_to_local(__u32 dispatch_cpu, bool force) {
   return blocked ? INACTIVE_MOVE_BLOCKED : INACTIVE_MOVE_EMPTY;
 }
 
+/* One attempt on a cvready class queue. `force` waives width control only.
+ * There is no empty-or-blocked verdict to report as the inactive drain has:
+ * cvready occupancy is counted at the park and the drain, so no caller has to
+ * tell a queue that ran dry from one this CPU may not run, and the queue count
+ * that distinguishes them is not read.
+ *
+ * No inactive-depth accounting happens here: class_inactive_depth is what the
+ * deficit probe and the width controller read as "waiters queued for the lock",
+ * and a cond waiter parked here has not asked for admission yet. */
+static __always_inline bool move_cvready_to_local(__u32 dispatch_cpu,
+                                                  __u32 lock_id, bool force) {
+  if (!valid_lock_id(lock_id))
+    return false;
+
+  if (!force && !class_dispatch_eligible(lock_id))
+    return false;
+
+  if (!scx_bpf_dsq_move_to_local(cvready_dsq_id(lock_id)))
+    return false;
+
+  record_cvready_dispatch_lock(dispatch_cpu, lock_id);
+  record_cvready_drained();
+  return true;
+}
+
+/* Selects the cvready class this CPU drains: the class it was last pointed at,
+ * then a window of CVREADY_PROBE_WIDTH ranks from the CPU's rotating cursor.
+ * Unlike the inactive selection there is no full-space fallback scan behind it,
+ * and there must not be one: dispatch already spends a large part of the
+ * verifier's instruction budget on the inactive scan, and a second unrolled
+ * sweep over the class space would not load. The rotating cursor is what still
+ * reaches every class, one window per call; the class a park pointed this CPU
+ * at is reached by the first attempt whatever the cursor is doing. */
+static __always_inline bool move_selected_cvready_to_local(__u32 dispatch_cpu,
+                                                           bool force) {
+  volatile __u32 *cursor = lookup_cpu_cvready_probe_cursor(dispatch_cpu);
+  volatile __u32 *last_lock_ptr;
+  __u32 previous_lock_id = UNMANAGED_LOCK_ID;
+  __u32 span = inactive_probe_ranks(inactive_probe_span);
+  __u32 rank = 0;
+  __u32 probe;
+
+  last_lock_ptr = lookup_cpu_last_cvready_lock(dispatch_cpu);
+  if (last_lock_ptr)
+    previous_lock_id = *last_lock_ptr;
+
+  /* A signal usually releases several waiters of the same lock, so the class
+   * this CPU served last is the likeliest to still hold one. */
+  if (valid_lock_id(previous_lock_id) &&
+      move_cvready_to_local(dispatch_cpu, previous_lock_id, force))
+    return true;
+
+  if (cursor) {
+    rank = *cursor;
+    if (rank >= span)
+      rank = 0;
+    *cursor = cvready_next_probe_rank(rank, span);
+  }
+
+#pragma unroll
+  for (probe = 0; probe < CVREADY_PROBE_WIDTH; probe++) {
+    __u32 lock_id = inactive_lock_at_rank(rank);
+
+    rank = inactive_wrap_rank(rank, span);
+
+    if (lock_id == previous_lock_id)
+      continue;
+
+    if (move_cvready_to_local(dispatch_cpu, lock_id, force))
+      return true;
+  }
+
+  return false;
+}
+
 static __always_inline void clear_admission_state(struct task_scx_ctx *task_ctx) {
   task_ctx->holds_admission = 0;
   task_ctx->admitted_class = 0;
+  task_ctx->cv_admitted = 0;
   task_ctx->must_run_on_admission_cpu = 0;
   task_ctx->force_inactive_wait = 0;
   task_ctx->admission_cpu = ADMISSION_CPU_NONE;
@@ -731,7 +893,8 @@ static __always_inline s32 select_cpu_without_admission(struct task_struct *p,
   }
 
   if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu) &&
-      !inactive_dispatch_needed() && !normal_dispatch_needed())
+      !inactive_dispatch_needed() && !normal_dispatch_needed() &&
+      !cvready_dispatch_needed())
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
   return cpu;
@@ -757,7 +920,8 @@ static __always_inline bool enqueue_normal_local_fast_recorded(
     __u32 lock_id, __u32 user_ctx_word) {
   __u32 cpu;
 
-  if (inactive_dispatch_needed() || normal_dispatch_needed())
+  if (inactive_dispatch_needed() || normal_dispatch_needed() ||
+      cvready_dispatch_needed())
     return false;
 
   cpu = pick_task_cpu(p, -1);
@@ -821,6 +985,45 @@ static __always_inline bool should_release_from_user(
     return false;
 
   return user_explicit_release(user_ctx_word);
+}
+
+/* A cond sleeper has already dropped the managed lock and is on its way into a
+ * futex wait, so the token it still carries buys nothing and the CPU it pins is
+ * wanted by whoever it woke. The class the word names describes the re-acquire
+ * after the wait, not this episode, so the token goes back here and the wake is
+ * routed from scratch.
+ *
+ * A token granted to the wake itself is exempt: the word still shows the sleep
+ * until the woken thread reaches userspace and retires it, so reading it as a
+ * sleeper again would revoke the grant before the thread ever ran on it. */
+static __always_inline bool should_release_from_cv_sleep(
+    const struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
+  return task_ctx->holds_admission && !task_ctx->cv_admitted && have_user &&
+         user_cv_sleep(user_ctx_word);
+}
+
+/* Ends the exemption above. The word leaving the cond-sleep state is what says
+ * the woken thread has run and published what it is doing now, so from here the
+ * ordinary release rules describe it again. An unreadable word keeps the
+ * exemption: nothing observed says the sleep is over. */
+static __always_inline void note_cv_admission_state(
+    struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
+  if (have_user && !user_cv_sleep(user_ctx_word))
+    task_ctx->cv_admitted = 0;
+}
+
+/* Wake of a thread whose user word still shows the cond sleep it is returning
+ * from. The has-token cases are settled before this is asked, so a match here
+ * is a thread with no admission that named the lock it is about to re-acquire.
+ */
+static __always_inline bool cv_reacquire_requested(
+    const struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
+  if (!cv_route_active() || task_ctx->holds_admission ||
+      task_ctx->must_run_on_admission_cpu)
+    return false;
+
+  return have_user && user_cv_sleep(user_ctx_word) &&
+         valid_lock_id(effective_lock_id(user_ctx_word));
 }
 
 static __always_inline bool task_in_critical_section(
@@ -910,7 +1113,9 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
   if (have_user)
     lock_id = effective_lock_id(user_ctx_word);
-  if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
+  note_cv_admission_state(task_ctx, have_user, user_ctx_word);
+  if (should_release_from_user(task_ctx, have_user, user_ctx_word) ||
+      should_release_from_cv_sleep(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
     return;
   }
@@ -998,9 +1203,15 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
   if (wants_slow_path && valid_cpu(cpu) && task_cpu_allowed(p, (__u32)cpu))
     task_ctx->admission_cpu = (__u32)cpu;
 
+  /* A cond re-acquire is excluded from the shortcut even though the CPU is
+   * idle: taking it would skip the enqueue callback, which is where the wake is
+   * granted admission or parked. The CPU chosen here is still the one it lands
+   * on, since the grant is asked for on the task's current CPU. */
   if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu) &&
       !wants_slow_path && !inactive_dispatch_needed() &&
-      !normal_dispatch_needed()) {
+      !normal_dispatch_needed() && !cvready_dispatch_needed() &&
+      !(task_ctx &&
+        cv_reacquire_requested(task_ctx, have_user, user_ctx_word))) {
     /* A hinted task always wants the slow path, so this shortcut never carries
      * a wake_consumed_* class. */
     record_enqueue_state(task_ctx, SCX_DSQ_LOCAL,
@@ -1067,6 +1278,12 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
      * that never registered are not part of the protocol. */
     if (wake && !have_user && task_ctx->user_ctx_ptr)
       bump_counter(&wake_read_fail);
+    /* Failed reads of a published pointer while routing is on. The cond branch
+     * cannot run without the word, so this bounds the wakes routing could have
+     * claimed; it does not separate them from the tasks that were never going
+     * to take that branch. */
+    if (cv_route_active() && !have_user && task_ctx->user_ctx_ptr)
+      bump_counter(&cv_word_read_fail);
     /* Every wakeup counted here reaches exactly one wake_consumed_* class in
      * record_enqueue_state below. */
     if (wake_hinted(enq_flags, user_ctx_word))
@@ -1074,6 +1291,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   }
 
   clear_invalid_admission_cpu(p, task_ctx);
+  note_cv_admission_state(task_ctx, have_user, user_ctx_word);
 
   if (consumed_token_reuse_requested(task_ctx, have_user, user_ctx_word)) {
     cpu = requested_cpu(p, task_ctx, -1);
@@ -1082,8 +1300,59 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     return;
   }
 
-  if (should_release_from_user(task_ctx, have_user, user_ctx_word))
+  /* Both releases run before the cond branch below, which is what makes the
+   * order has-token, then cond sleep, then pending: a task that still carried a
+   * token from before its wait has given it back by the time the cond branch
+   * asks. */
+  if (should_release_from_user(task_ctx, have_user, user_ctx_word) ||
+      should_release_from_cv_sleep(task_ctx, have_user, user_ctx_word))
     release_admission(p, task_ctx);
+
+  if (cv_reacquire_requested(task_ctx, have_user, user_ctx_word) &&
+      valid_lock_id(lock_id)) {
+    if (debug_counters)
+      bump_counter(&cv_wake_enq);
+
+    cpu = requested_cpu(p, task_ctx, -1);
+    if (cpu >= MAX_CPUS) {
+      enqueue_normal_dsq_recorded(p, task_ctx, enq_flags, lock_id,
+                                  user_ctx_word);
+      return;
+    }
+    task_ctx->admission_cpu = cpu;
+
+    /* The cond sleeper is a waiter for the lock it named, never its holder, so
+     * the grant takes a width slot like any other waiter's. */
+    if (class_dispatch_eligible(lock_id) &&
+        grant_admission(p, task_ctx, lock_id, cpu, false)) {
+      /* The word still names the sleep this wake is returning from, and stays
+       * that way until the thread runs and retires it. */
+      task_ctx->cv_admitted = 1;
+      record_enqueue_state(task_ctx, SCX_DSQ_LOCAL_ON | cpu, lock_id,
+                           ENQ_PATH_CV_GRANTED_LOCAL, cpu, user_ctx_word,
+                           false);
+      if (debug_counters)
+        bump_counter(&cv_grant_at_enq);
+      scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
+      return;
+    }
+
+    record_enqueue_state(task_ctx, cvready_dsq_id(lock_id), lock_id,
+                         ENQ_PATH_CV_PARKED, cpu, user_ctx_word, false);
+    scx_bpf_dsq_insert(p, cvready_dsq_id(lock_id), SCX_SLICE_DFL, enq_flags);
+    record_cvready_enqueue();
+    /* The class queues are drained through a probe window narrower than the
+     * class space, so a parked waiter needs a CPU that reaches its class
+     * without waiting for a cursor to arrive at it. The CPU picked for the
+     * waiter is one its cpumask allows, so naming the class in that CPU's
+     * affinity slot and kicking it makes the first attempt after the park the
+     * one that looks straight at this queue. */
+    record_cvready_dispatch_lock(cpu, lock_id);
+    scx_bpf_kick_cpu(cpu, 0);
+    if (debug_counters)
+      bump_counter(&cv_parked);
+    return;
+  }
 
   if (task_ctx->force_inactive_wait && have_user &&
       user_slow_path_pending(user_ctx_word)) {
@@ -1177,6 +1446,49 @@ static __always_inline bool try_dispatch_inactive(__u32 cpu, __u32 inactive_seq,
   return false;
 }
 
+/* One drain attempt against the cvready queues. Unlike the inactive one it
+ * reports nothing back to the dispatch gate: the selection reaches a window of
+ * the class space rather than all of it, so an empty verdict here would close
+ * the gate over a class the window never probed. Occupancy is counted at the
+ * park and the drain instead, which the gate reads directly. */
+static __always_inline bool try_dispatch_cvready(__u32 cpu, bool debug_counters,
+                                                 bool force) {
+  if (!move_selected_cvready_to_local(cpu, force))
+    return false;
+
+  if (debug_counters) {
+    bump_counter(&cv_dispatch);
+    if (force)
+      bump_counter(&cv_dispatch_forced);
+  }
+  return true;
+}
+
+/* Whether this CPU should look at the cvready queues at all. The occupancy
+ * counters answer that for the machine; the kernel's queue count for the class
+ * this CPU was last pointed at is kept as a cross-check, because that class is
+ * either the one the CPU last drained or the one a park chose this CPU for. */
+static __always_inline bool cvready_dispatch_pending(__u32 cpu) {
+  volatile __u32 *last_lock;
+  __u32 lock_id;
+
+  if (!cv_route_active())
+    return false;
+
+  if (cvready_queues_occupied())
+    return true;
+
+  last_lock = lookup_cpu_last_cvready_lock(cpu);
+  if (!last_lock)
+    return false;
+
+  lock_id = *last_lock;
+  if (!valid_lock_id(lock_id))
+    return false;
+
+  return scx_bpf_dsq_nr_queued(cvready_dsq_id(lock_id)) > 0;
+}
+
 /* Interval between inactive scans that ignore the sequence gate, the admission
  * slot and width control. The sched_ext watchdog ejects the scheduler after
  * about 30 s of a runnable task never running, so a period in milliseconds
@@ -1191,6 +1503,8 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   __u64 now;
   bool force_inactive;
   bool inactive_cpu_available;
+  bool cvready_pending;
+  bool cvready_attempted = false;
   bool debug_counters;
 
   (void)prev;
@@ -1209,6 +1523,24 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
 
   inactive_seq = inactive_enqueue_seq;
   normal_seq = normal_enqueue_seq;
+  cvready_pending = cvready_dispatch_pending((__u32)cpu);
+
+  /* A scan the period is due for runs whatever the gates say, so a waiter left
+   * in a class queue by stale bookkeeping or by a width the controller never
+   * reopens waits milliseconds rather than until something else happens to
+   * enqueue. A task moved this way reaches the running hook like any other and
+   * takes its admission grant there.
+   *
+   * The deadline is read before the normal queue is served: every return below
+   * it belongs to a CPU that found normal work, and sustained normal traffic
+   * would otherwise keep the period from ever being noticed. */
+  now = bpf_ktime_get_ns();
+  force_inactive = now >= inactive_force_drain_at;
+  if (force_inactive) {
+    inactive_force_drain_at = now + INACTIVE_FORCE_DRAIN_PERIOD_NS;
+    if (debug_counters)
+      dispatch_inactive_forced += 1;
+  }
 
   /* The sequence gate is only advisory here, because it can close over a queued
    * task: an insert issued from the enqueue callback lands on the DSQ after the
@@ -1223,12 +1555,14 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
       dispatch_normal_attempts += 1;
     if (scx_bpf_dsq_move_to_local(NORMAL_DSQ_ID)) {
       reset_inactive_dispatch_budget((__u32)cpu);
+      reset_cvready_streak((__u32)cpu);
       if (debug_counters)
         dispatch_normal_success += 1;
       /* Returning unconditionally lets a steady normal stream starve the
        * inactive queues on exactly the CPUs able to drain them; the CPUs that
        * do reach the scan may be excluded by the waiters' cpumask. */
-      if (!inactive_dispatch_needed_for(inactive_seq))
+      if (!force_inactive && !inactive_dispatch_needed_for(inactive_seq) &&
+          !cvready_pending)
         return;
     } else {
       if (debug_counters)
@@ -1240,20 +1574,8 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
     dispatch_normal_skip_seq += 1;
   }
 
-  /* A scan the period is due for runs whatever the gates say, so a waiter left
-   * in a class queue by stale bookkeeping or by a width the controller never
-   * reopens waits milliseconds rather than until something else happens to
-   * enqueue. A task moved this way reaches the running hook like any other and
-   * takes its admission grant there. */
-  now = bpf_ktime_get_ns();
-  force_inactive = now >= inactive_force_drain_at;
-  if (force_inactive) {
-    inactive_force_drain_at = now + INACTIVE_FORCE_DRAIN_PERIOD_NS;
-    if (debug_counters)
-      dispatch_inactive_forced += 1;
-  }
-
-  if (!force_inactive && !inactive_dispatch_needed_for(inactive_seq))
+  if (!force_inactive && !inactive_dispatch_needed_for(inactive_seq) &&
+      !cvready_pending)
     return;
 
   inactive_cpu_available = inactive_dispatch_cpu_available((__u32)cpu);
@@ -1264,14 +1586,44 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
       dispatch_inactive_budget_blocked += 1;
   }
 
+  /* A thread returning from a cond wait is one the next holder of the lock is
+   * already waiting on, so it goes before the queue of threads that only asked
+   * for the lock. The streak bounds that preference; the forced pass ignores
+   * both the streak and the admission slot, and falls through afterwards so the
+   * same period still forces the class queues. */
+  if (cv_route_active() && (force_inactive || cvready_pending)) {
+    bool cvready_priority =
+        cvready_priority_available((__u32)cpu) && inactive_cpu_available;
+
+    if (force_inactive || cvready_priority) {
+      cvready_attempted = true;
+      if (try_dispatch_cvready((__u32)cpu, debug_counters, force_inactive) &&
+          !force_inactive) {
+        record_cvready_priority_dispatch((__u32)cpu);
+        return;
+      }
+    }
+  }
+
   if (inactive_cpu_available && inactive_dispatch_budget_available((__u32)cpu) &&
       try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters,
-                            force_inactive))
+                            force_inactive)) {
+    reset_cvready_streak((__u32)cpu);
     return;
+  }
 
   if ((force_inactive || inactive_cpu_available) &&
       try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters,
-                            force_inactive))
+                            force_inactive)) {
+    reset_cvready_streak((__u32)cpu);
+    return;
+  }
+
+  /* Same-priority attempt: the class queues had nothing for this CPU, so a
+   * cvready task takes the slot without spending streak budget. This is the
+   * only path that drains cvready when the priority is turned off. */
+  if (cvready_pending && !cvready_attempted && inactive_cpu_available &&
+      try_dispatch_cvready((__u32)cpu, debug_counters, false))
     return;
 }
 
@@ -1302,8 +1654,14 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
   if (have_user)
     lock_id = effective_lock_id(user_ctx_word);
+  note_cv_admission_state(task_ctx, have_user, user_ctx_word);
 
-  if (should_release_from_user(task_ctx, have_user, user_ctx_word)) {
+  /* The cond-sleep release is asked for here as well, so a thread stopping with
+   * that bit set gives its token back whether it is about to block on the futex
+   * or was merely preempted on the way there. Leaving it to the !runnable
+   * branch below would keep a stale token across the preemption. */
+  if (should_release_from_user(task_ctx, have_user, user_ctx_word) ||
+      should_release_from_cv_sleep(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
     return;
   }
@@ -1365,6 +1723,10 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
       debug_counters_mode, registered_thread_count, normal_enqueue_seq,
       normal_empty_seq, scx_bpf_dsq_nr_queued(NORMAL_DSQ_ID),
       inactive_enqueue_seq, inactive_empty_seq);
+  scx_bpf_dump("accordin_cv route=%u streak_limit=%u cvready_seq=%u "
+               "cvready_drained=%u\n",
+               cv_route_enabled, cv_priority_streak_limit, cvready_enqueue_seq,
+               cvready_drained_count);
   scx_bpf_dump("accordin_width width_ctl=%u underflow=%llu\n",
                width_control_enabled, class_active_underflow_events);
   if (debug_counters_enabled()) {
@@ -1388,6 +1750,11 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
         wake_consumed_inactive, wake_consumed_normal, wake_read_fail,
         running_pending_grant_success, running_pending_grant_failure,
         block_release_read_fail);
+    scx_bpf_dump("accordin_cv_routing cv_wake_enq=%llu cv_grant_at_enq=%llu "
+                 "cv_parked=%llu cv_dispatch=%llu cv_dispatch_forced=%llu "
+                 "cv_word_read_fail=%llu\n",
+                 cv_wake_enq, cv_grant_at_enq, cv_parked, cv_dispatch,
+                 cv_dispatch_forced, cv_word_read_fail);
   }
 
 #pragma unroll
@@ -1406,6 +1773,20 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
       scx_bpf_dump(
           "accordin_class lock=%u width=%u active=%d peak=%u depth=%u\n",
           lock_id, width, active, peak, depth);
+  }
+
+  /* Kept out of the loop above so the routing feature adds nothing to the dump
+   * program when it is off, and so it can be dropped on its own if the dump
+   * ever runs short of budget. */
+  if (!cv_route_active())
+    return;
+
+#pragma unroll
+  for (lock_id = 0; lock_id < MAX_LOCK_CLASSES; lock_id++) {
+    s32 queued = scx_bpf_dsq_nr_queued(cvready_dsq_id(lock_id));
+
+    if (queued)
+      scx_bpf_dump("accordin_cvready_q lock=%u queued=%d\n", lock_id, queued);
   }
 }
 
@@ -1460,6 +1841,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
 #pragma unroll
   for (lock_id = 0; lock_id < MAX_LOCK_CLASSES; lock_id++) {
     ret = scx_bpf_create_dsq(inactive_dsq_id(lock_id), -1);
+    if (ret)
+      return ret;
+
+    /* Created whatever the routing switch says: an empty DSQ costs nothing,
+     * and every cvready queue existing means no path has to prove the switch
+     * was on before it may name one. */
+    ret = scx_bpf_create_dsq(cvready_dsq_id(lock_id), -1);
     if (ret)
       return ret;
   }

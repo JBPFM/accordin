@@ -13,6 +13,9 @@
 ///   `*_DEBUG_COUNTERS`, and `*_INACTIVE_PREVIOUS_LOCK_PERCENT`.
 /// - `single_lock_mode` — optional boolean that tells the BPF scheduler this backend uses the
 ///   legacy global admission word and therefore does not need per-lock inactive DSQs.
+///
+/// `ACCORDIN_CV_ROUTE` and `ACCORDIN_CV_PRIO` are read unprefixed, because the
+/// mutex hook reads the same names whichever backend is preloaded.
 #[macro_export]
 macro_rules! define_scheduler_loader {
     (scheduler_name = $scheduler:expr, env_prefix = $env_prefix:expr $(,)?) => {
@@ -33,6 +36,48 @@ macro_rules! define_scheduler_loader {
         const DEBUG_COUNTERS_ENV: &str = concat!($env_prefix, "_DEBUG_COUNTERS");
         const INACTIVE_PREVIOUS_LOCK_PERCENT_ENV: &str =
             concat!($env_prefix, "_INACTIVE_PREVIOUS_LOCK_PERCENT");
+        // Not prefixed: the mutex hook publishes the cond-sleep bit under the
+        // same variable, and the two sides have to agree whatever backend the
+        // preload happens to be.
+        const CV_ROUTE_ENV: &str = "ACCORDIN_CV_ROUTE";
+        const CV_PRIORITY_STREAK_ENV: &str = "ACCORDIN_CV_PRIO";
+
+        // The scheduler reads the user admission word through the layout these
+        // constants describe, so a divergence between the generated bindings
+        // and the userspace mirror has to fail the build rather than misroute
+        // at run time.
+        const _: () = {
+            assert!(
+                crate::bpf_intf::USER_ADMISSION_FLAG_MASK
+                    == $crate::admission::USER_ADMISSION_FLAG_MASK
+            );
+            assert!(
+                crate::bpf_intf::USER_ADMISSION_LOCK_ID_SHIFT
+                    == $crate::admission::USER_ADMISSION_LOCK_ID_SHIFT
+            );
+            assert!(crate::bpf_intf::MAX_LOCK_CLASSES == $crate::admission::MAX_LOCK_CLASSES);
+            // The userspace mirror of the flag itself is private to the
+            // admission module, so the bit is pinned by position and by the
+            // two invariants the routing depends on: it lives inside the flag
+            // field, and it does not collide with the other three flags.
+            assert!(crate::bpf_intf::USER_ADMISSION_CV_SLEEP == 1 << 3);
+            assert!(
+                crate::bpf_intf::USER_ADMISSION_CV_SLEEP
+                    & crate::bpf_intf::USER_ADMISSION_FLAG_MASK
+                    == crate::bpf_intf::USER_ADMISSION_CV_SLEEP
+            );
+            assert!(
+                crate::bpf_intf::USER_ADMISSION_CV_SLEEP
+                    & (crate::bpf_intf::USER_ADMISSION_IN_CRITICAL_SECTION
+                        | crate::bpf_intf::USER_ADMISSION_SLOW_PATH_PENDING
+                        | crate::bpf_intf::USER_ADMISSION_TOKEN_CONSUMED)
+                    == 0
+            );
+            assert!(
+                crate::bpf_intf::USER_ADMISSION_FLAG_MASK
+                    == (1 << crate::bpf_intf::USER_ADMISSION_LOCK_ID_SHIFT) - 1
+            );
+        };
 
         static SCHEDULER_STATE: ::std::sync::OnceLock<SchedulerState> = ::std::sync::OnceLock::new();
 
@@ -67,6 +112,13 @@ macro_rules! define_scheduler_loader {
                     0,
                     100,
                 );
+                bss.cv_route_enabled = u32::from($crate::env::env_flag(CV_ROUTE_ENV));
+                bss.cv_priority_streak_limit = $crate::env::env_u32_clamped(
+                    CV_PRIORITY_STREAK_ENV,
+                    crate::bpf_intf::CV_PRIORITY_STREAK_LIMIT_DEFAULT,
+                    0,
+                    crate::bpf_intf::CV_PRIORITY_STREAK_LIMIT_MAX,
+                );
                 bss.width_control_enabled = u32::from($crate::width_control::enabled());
                 if let Some(class_widths) = $crate::width_control::fixed_class_widths() {
                     bss.class_width = class_widths;
@@ -99,6 +151,12 @@ macro_rules! define_scheduler_loader {
                         &mut bss.running_pending_grant_success as *mut u64,
                         &mut bss.running_pending_grant_failure as *mut u64,
                         &mut bss.block_release_read_fail as *mut u64,
+                        &mut bss.cv_wake_enq as *mut u64,
+                        &mut bss.cv_grant_at_enq as *mut u64,
+                        &mut bss.cv_parked as *mut u64,
+                        &mut bss.cv_dispatch as *mut u64,
+                        &mut bss.cv_dispatch_forced as *mut u64,
+                        &mut bss.cv_word_read_fail as *mut u64,
                     ]);
                 }
             }

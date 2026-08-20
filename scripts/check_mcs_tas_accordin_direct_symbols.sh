@@ -15,7 +15,13 @@ for symbol in \
   mcs_tas_accordin_direct_mutex_destroy \
   mcs_tas_accordin_direct_mutex_lock \
   mcs_tas_accordin_direct_mutex_trylock \
-  mcs_tas_accordin_direct_mutex_unlock
+  mcs_tas_accordin_direct_mutex_unlock \
+  mcs_tas_accordin_direct_cond_create \
+  mcs_tas_accordin_direct_cond_destroy \
+  mcs_tas_accordin_direct_cond_wait \
+  mcs_tas_accordin_direct_cond_timedwait \
+  mcs_tas_accordin_direct_cond_signal \
+  mcs_tas_accordin_direct_cond_broadcast
 do
   if ! grep -Eq "[[:space:]]${symbol}$" <<<"$symbols"; then
     echo "missing direct ABI symbol: $symbol" >&2

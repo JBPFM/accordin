@@ -55,6 +55,15 @@ LEVELDB_UNSUPPORTED_LOCKS = frozenset(
         experiment_defaults.MCS_ACCORDIN_LOCK,
     }
 )
+# The direct lock is not interposed: LevelDB's port::Mutex resolves the direct C API
+# from the preloaded library itself, so the run carries no pthread hooking at all. It
+# stays opt-in through --locks, and the hook variants remain the profile defaults.
+MCS_TAS_ACCORDIN_DIRECT_LOCK = experiment_defaults.MCS_TAS_ACCORDIN_DIRECT_LOCK
+MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY = (
+    REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
+)
+MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
+MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 MINIMAL_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
 FULL_LOCKS = tuple(
     dict.fromkeys(
@@ -331,6 +340,7 @@ def validate_leveldb_locks(locks: tuple[str, ...]) -> tuple[str, ...]:
         | set(MINIMAL_LOCKS)
         | set(experiment_defaults.LOCK_ALIASES.values())
         | set(experiment_defaults.LOCK_LABELS)
+        | {MCS_TAS_ACCORDIN_DIRECT_LOCK}
     ) - set(LEVELDB_UNSUPPORTED_LOCKS)
     unsupported = [lock for lock in locks if lock not in supported]
     if unsupported:
@@ -429,12 +439,31 @@ def accordin_preload_env(
     return env
 
 
+def mcs_tas_accordin_direct_preload_env() -> dict[str, str | None]:
+    env: dict[str, str | None] = dict(
+        preload_env(MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY) or {}
+    )
+    env.update(
+        {
+            ACCORDIN_HOOK_SCOPE_ENV: None,
+            "ACCORDIN_DISABLE_ADMISSION": None,
+            "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
+            MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
+            MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
+        }
+    )
+    env.update(experiment_defaults.accordin_width_env())
+    return experiment_three.accordin_env_passthrough(env)
+
+
 def default_result_root() -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     return REPO_ROOT / "experiments" / "results" / f"experiment4_{timestamp}"
 
 
 def lock_label(lock: str) -> str:
+    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
+        return "Accordin direct"
     return experiment_defaults.lock_label(lock)
 
 
@@ -598,6 +627,31 @@ def ensure_db_bench(
         raise RuntimeError(f"LevelDB db_bench is still unavailable after build: {db_bench}")
 
 
+def ensure_mcs_tas_accordin_direct_preload(
+    *,
+    build_missing: bool,
+    logger: experiment_three.CommandLogger,
+) -> None:
+    if MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY.is_file():
+        return
+    if not build_missing:
+        raise RuntimeError(
+            f"LD_PRELOAD helper is missing: {MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY}. "
+            "Run cargo build -p mcs_tas_accordin_direct --release or rerun with --build-missing."
+        )
+
+    logger.run(
+        ["cargo", "build", "-p", "mcs_tas_accordin_direct", "--release"],
+        log_name="build_mcs_tas_accordin_direct.log",
+        cwd=REPO_ROOT,
+        timeout_seconds=0,
+    )
+    if not MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY.is_file():
+        raise RuntimeError(
+            f"LD_PRELOAD helper was not built: {MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY}"
+        )
+
+
 def ensure_lock_helpers(
     locks: tuple[str, ...],
     *,
@@ -607,11 +661,15 @@ def ensure_lock_helpers(
     interpose_locks = tuple(
         lock
         for lock in locks
-        if lock != "mutex" and not experiment_defaults.is_accordin_lock(lock)
+        if lock != "mutex"
+        and lock != MCS_TAS_ACCORDIN_DIRECT_LOCK
+        and not experiment_defaults.is_accordin_lock(lock)
     )
     experiment_three.ensure_interpose_helpers(interpose_locks, build_missing=build_missing, logger=logger)
     if any(experiment_defaults.is_accordin_lock(lock) for lock in locks):
         experiment_three.ensure_accordin_preload(build_missing=build_missing, logger=logger)
+    if MCS_TAS_ACCORDIN_DIRECT_LOCK in locks:
+        ensure_mcs_tas_accordin_direct_preload(build_missing=build_missing, logger=logger)
     if "mcs_extension" in locks:
         experiment_three.ensure_mcs_extension_preload(build_missing=build_missing, logger=logger)
 
@@ -620,6 +678,8 @@ def lock_command_prefix(lock: str) -> tuple[list[str], dict[str, str | None] | N
     lock = normalize_leveldb_lock(lock)
     if experiment_three.is_native_mutex_lock(lock):
         return [], None
+    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
+        return [], mcs_tas_accordin_direct_preload_env()
     if experiment_defaults.is_accordin_lock(lock):
         return experiment_three.accordin_command_prefix_from_env(
             lock,
@@ -998,6 +1058,7 @@ def write_settings(
         "accordin_width_env": experiment_defaults.accordin_width_env(),
         "leveldb_accordin_mutex_hook_variants": list(experiment_defaults.ACCORDIN_VARIANT_LOCKS),
         "mcs_tas_accordin_mutex_hook_preload": str(experiment_three.ACCORDIN_PRELOAD_LIBRARY),
+        "mcs_tas_accordin_direct_preload": str(MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY),
         "flexguard_dir": str(FLEXGUARD_DIR),
         "machine_core_count": experiment_defaults.MACHINE_CORE_COUNT,
     }

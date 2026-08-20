@@ -134,7 +134,10 @@ ACCORDIN_ENV_PASSTHROUGH_PREFIXES = (
 ROOT_REQUIRED_PRELOAD_LOCKS = {
     lock
     for lock in experiment_defaults.ACCORDIN_VARIANT_LOCKS
-} | {experiment_defaults.MCS_ACCORDIN_LOCK}
+} | {
+    experiment_defaults.MCS_ACCORDIN_LOCK,
+    experiment_defaults.MCS_TAS_ACCORDIN_DIRECT_LOCK,
+}
 LOCK_ALIASES = experiment_defaults.LOCK_ALIASES
 LOCK_ORDER = experiment_defaults.LOCK_ORDER
 RESULT_LOG_PATTERN = re.compile(

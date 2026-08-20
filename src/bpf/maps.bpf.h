@@ -49,6 +49,31 @@ volatile __u32 cpu_inactive_probe_cursor[MAX_CPUS];
  * no class and probing them only spends window. 0 means no span published yet;
  * the probe then rotates over the whole managed space. */
 volatile __u32 inactive_probe_span;
+/* Routes threads whose user word carries the cond-variable sleep bit through
+ * the cvready queues. Userspace only publishes that bit under the same switch,
+ * so with this off the bit is never seen and the routing never runs. */
+volatile __u32 cv_route_enabled;
+/* Consecutive cvready dispatches one CPU may take before it has to serve the
+ * class queues again. 0 turns the priority off: cvready is then drained only by
+ * the periodic forced drain and by the attempt that follows a class scan which
+ * gave this CPU nothing, so a cond waiter never overtakes a lock waiter. */
+volatile __u32 cv_priority_streak_limit;
+volatile __u32 cpu_cvready_streak[MAX_CPUS];
+/* Cvready class this CPU is expected to find work in: the one it last drained,
+ * or the one a park just chose this CPU for. It is what the dispatch gate reads
+ * the kernel queue count of, so a parked waiter always has one CPU that looks
+ * at its class whatever the probe cursor is doing. */
+volatile __u32 cpu_last_cvready_lock[MAX_CPUS];
+/* Managed rank the next cvready probe on this CPU starts from. Kept apart from
+ * the inactive cursor so the two sweeps do not drag each other's start rank. */
+volatile __u32 cpu_cvready_probe_cursor[MAX_CPUS];
+volatile __u32 cvready_enqueue_seq;
+/* Threads taken off a cvready queue. Paired with cvready_enqueue_seq this is an
+ * exact occupancy test, which the scan-derived empty gate the inactive queues
+ * use cannot be here: the cvready selection reaches a window of the class space
+ * rather than all of it, so an empty verdict from one scan says nothing about
+ * the classes it never probed. */
+volatile __u32 cvready_drained_count;
 volatile __u32 width_control_enabled;
 volatile __u32 class_width[MAX_LOCK_CLASSES]; /* 0 = unlimited */
 /* Waiters currently admitted for the class. A task counts from the grant that
@@ -97,5 +122,13 @@ volatile __u64 wake_read_fail;
 volatile __u64 running_pending_grant_success;
 volatile __u64 running_pending_grant_failure;
 volatile __u64 block_release_read_fail;
+/* Cond-variable routing evidence: cv_wake_enq == cv_grant_at_enq + cv_parked
+ * plus the enqueues whose class had no CPU to grant on. */
+volatile __u64 cv_wake_enq;
+volatile __u64 cv_grant_at_enq;
+volatile __u64 cv_parked;
+volatile __u64 cv_dispatch;
+volatile __u64 cv_dispatch_forced;
+volatile __u64 cv_word_read_fail;
 
 #endif /* __MAPS_BPF_H */

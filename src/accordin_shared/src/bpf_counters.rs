@@ -9,7 +9,7 @@
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-pub const ROUTING_COUNTER_COUNT: usize = 9;
+pub const ROUTING_COUNTER_COUNT: usize = 15;
 
 /// Counter labels in the order expected by `set_routing_counter_ptrs`.
 pub const ROUTING_COUNTER_NAMES: [&str; ROUTING_COUNTER_COUNT] = [
@@ -22,6 +22,12 @@ pub const ROUTING_COUNTER_NAMES: [&str; ROUTING_COUNTER_COUNT] = [
     "running_pending_grant_success",
     "running_pending_grant_failure",
     "block_release_read_fail",
+    "cv_wake_enq",
+    "cv_grant_at_enq",
+    "cv_parked",
+    "cv_dispatch",
+    "cv_dispatch_forced",
+    "cv_word_read_fail",
 ];
 
 static ROUTING_COUNTER_PTRS: [AtomicPtr<u64>; ROUTING_COUNTER_COUNT] =

@@ -1,8 +1,21 @@
 diff --git a/benchmarks/db_bench.cc b/benchmarks/db_bench.cc
-index 429a61a..d10d852 100644
+index 429a61a..a407153 100644
 --- a/benchmarks/db_bench.cc
 +++ b/benchmarks/db_bench.cc
-@@ -485,11 +485,16 @@ class Benchmark {
+@@ -351,7 +351,11 @@ struct SharedState {
+   bool start GUARDED_BY(mu);
+ 
+   SharedState(int total)
+-      : cv(&mu), total(total), num_initialized(0), num_done(0), start(false) {}
++      : cv(&mu, "bench_shared"),
++        total(total),
++        num_initialized(0),
++        num_done(0),
++        start(false) {}
+ };
+ 
+ // Per-thread state for concurrent executions of the same benchmark.
+@@ -485,11 +489,16 @@ class Benchmark {
    }
  
    ~Benchmark() {
@@ -20,7 +33,7 @@ index 429a61a..d10d852 100644
    void Run() {
      PrintHeader();
      Open();
-@@ -634,6 +639,7 @@ class Benchmark {
+@@ -634,6 +643,7 @@ class Benchmark {
      thread->stats.Start();
      (arg->bm->*(arg->method))(thread);
      thread->stats.Stop();
@@ -28,7 +41,7 @@ index 429a61a..d10d852 100644
  
      {
        MutexLock l(&shared->mu);
-@@ -667,11 +673,13 @@ class Benchmark {
+@@ -667,11 +677,13 @@ class Benchmark {
        shared.cv.Wait();
      }
  
@@ -42,35 +55,56 @@ index 429a61a..d10d852 100644
      shared.mu.Unlock();
  
      for (int i = 1; i < n; i++) {
-@@ -1086,5 +1094,7 @@ int main(int argc, char** argv) {
+@@ -1086,5 +1098,8 @@ int main(int argc, char** argv) {
  
    leveldb::Benchmark benchmark;
    benchmark.Run();
 +  benchmark.Close();
 +  leveldb::port::PrintLockTimingProcessStats();
++  leveldb::port::PrintCvStats();
    return 0;
  }
 diff --git a/db/db_impl.cc b/db/db_impl.cc
-index 1a4e459..df4a82e 100644
+index 1a4e459..d308feb 100644
 --- a/db/db_impl.cc
 +++ b/db/db_impl.cc
-@@ -147,7 +147,10 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+@@ -42,7 +42,7 @@ const int kNumNonTableCacheFiles = 10;
+ // Information kept for every waiting writer
+ struct DBImpl::Writer {
+   explicit Writer(port::Mutex* mu)
+-      : batch(nullptr), sync(false), done(false), cv(mu) {}
++      : batch(nullptr), sync(false), done(false), cv(mu, "writer_queue") {}
+ 
+   Status status;
+   WriteBatch* batch;
+@@ -135,7 +135,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
+       db_lock_(nullptr),
+       shutting_down_(false),
+-      background_work_finished_signal_(&mutex_),
++      background_work_finished_signal_(&mutex_, "bg_work_finished"),
+       mem_(nullptr),
+       imm_(nullptr),
+       has_imm_(false),
+@@ -147,7 +147,12 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
        background_compaction_scheduled_(false),
        manual_compaction_(nullptr),
        versions_(new VersionSet(dbname_, &options_, table_cache_,
 -                               &internal_comparator_)) {}
 +                               &internal_comparator_)) {
 +  mutex_.UseMcsTasAccordinDirect();
-+  mutex_.EnableLockTiming();
++  if (port::LockTimingEnabledByEnv()) {
++    mutex_.EnableLockTiming();
++  }
 +}
  
  DBImpl::~DBImpl() {
    // Wait for background work to finish.
 diff --git a/port/port_stdcxx.h b/port/port_stdcxx.h
-index 2bda48d..f452384 100644
+index 2bda48d..74fda47 100644
 --- a/port/port_stdcxx.h
 +++ b/port/port_stdcxx.h
-@@ -29,39 +29,238 @@
+@@ -29,58 +29,497 @@
  #include <snappy.h>
  #endif  // HAVE_SNAPPY
  
@@ -81,6 +115,8 @@ index 2bda48d..f452384 100644
  #include <cstddef>
 +#include <cstdio>
  #include <cstdint>
++#include <cstdlib>
++#include <cstring>
  #include <mutex>  // NOLINT
  #include <string>
  
@@ -95,6 +131,18 @@ index 2bda48d..f452384 100644
 +int mcs_tas_accordin_direct_mutex_lock(mcs_tas_accordin_direct_mutex* mutex)
 +    __attribute__((weak));
 +int mcs_tas_accordin_direct_mutex_unlock(mcs_tas_accordin_direct_mutex* mutex)
++    __attribute__((weak));
++struct mcs_tas_accordin_direct_cond;
++mcs_tas_accordin_direct_cond* mcs_tas_accordin_direct_cond_create()
++    __attribute__((weak));
++int mcs_tas_accordin_direct_cond_destroy(mcs_tas_accordin_direct_cond* cond)
++    __attribute__((weak));
++int mcs_tas_accordin_direct_cond_wait(mcs_tas_accordin_direct_cond* cond,
++                                      mcs_tas_accordin_direct_mutex* mutex)
++    __attribute__((weak));
++int mcs_tas_accordin_direct_cond_signal(mcs_tas_accordin_direct_cond* cond)
++    __attribute__((weak));
++int mcs_tas_accordin_direct_cond_broadcast(mcs_tas_accordin_direct_cond* cond)
 +    __attribute__((weak));
 +}
 +
@@ -149,6 +197,20 @@ index 2bda48d..f452384 100644
 +inline LockTimingThreadStats& LockTimingCurrentThreadStats() {
 +  static thread_local LockTimingThreadStats stats;
 +  return stats;
++}
++
++inline bool EnvFlagEnabled(const char* name, bool default_value) {
++  const char* value = std::getenv(name);
++  if (value == nullptr) {
++    return default_value;
++  }
++  const std::string setting(value);
++  return setting != "0" && setting != "false" && setting != "off" &&
++         setting != "no";
++}
++
++inline bool LockTimingEnabledByEnv() {
++  return EnvFlagEnabled("LEVELDB_LOCK_TIMING", true);
 +}
 +
 +inline void FlushLockTimingThreadStats() {
@@ -209,6 +271,9 @@ index 2bda48d..f452384 100644
 +}
 +
 +inline void PrintLockTimingProcessStats() {
++  if (!LockTimingEnabledByEnv()) {
++    return;
++  }
 +  FlushLockTimingThreadStats();
 +  const uint64_t elapsed_ns =
 +      LockTimingBenchmarkElapsedNs().load(std::memory_order_acquire);
@@ -227,6 +292,127 @@ index 2bda48d..f452384 100644
 +  std::fprintf(stdout, "leveldb_lock_hold_samples: %llu\n",
 +               static_cast<unsigned long long>(hold_samples));
 +  std::fprintf(stdout, "leveldb_lock_avg_hold_ns: %.2f\n", avg_hold_ns);
++  std::fflush(stdout);
++}
++
++// Condition variable blocking is attributed to a construction-site label
++// instead of a CondVar instance, because writer condition variables are created
++// per Write() call and would otherwise churn the table.
++constexpr int kCvLabelSlots = 8;
++constexpr int kCvWaitBuckets = 32;
++
++// Bucket i > 0 holds wait durations in [2^(i-1), 2^i) nanoseconds; the last
++// bucket absorbs everything above its lower bound.
++inline int CvWaitBucketIndex(uint64_t wait_ns) {
++  if (wait_ns == 0) {
++    return 0;
++  }
++  const int index = 64 - __builtin_clzll(wait_ns);
++  return index >= kCvWaitBuckets ? kCvWaitBuckets - 1 : index;
++}
++
++// Static storage zero-initializes every counter before any thread runs.
++struct CvLabelStats {
++  std::atomic<const char*> label;
++  std::atomic<uint64_t> wait_count;
++  std::atomic<uint64_t> signal_count;
++  std::atomic<uint64_t> broadcast_count;
++  std::atomic<uint64_t> broadcast_fanout;
++  std::atomic<uint64_t> wait_ns_total;
++  std::atomic<uint64_t> wait_buckets[kCvWaitBuckets];
++};
++
++inline CvLabelStats* CvLabelStatsTable() {
++  static CvLabelStats table[kCvLabelSlots];
++  return table;
++}
++
++inline bool CvStatsEnabled() {
++  static const bool enabled =
++      EnvFlagEnabled("LEVELDB_CV_STATS", LockTimingEnabledByEnv());
++  return enabled;
++}
++
++// Labels come from string literals, so the pointer comparison hits first; the
++// string comparison only covers duplicated literals across translation units.
++inline CvLabelStats* CvLabelStatsFor(const char* label) {
++  if (label == nullptr) {
++    label = "other";
++  }
++  CvLabelStats* table = CvLabelStatsTable();
++  for (int i = 0; i < kCvLabelSlots; ++i) {
++    const char* existing = table[i].label.load(std::memory_order_acquire);
++    if (existing != nullptr) {
++      if (existing == label || std::strcmp(existing, label) == 0) {
++        return &table[i];
++      }
++      continue;
++    }
++    const char* expected = nullptr;
++    if (table[i].label.compare_exchange_strong(expected, label,
++                                               std::memory_order_acq_rel,
++                                               std::memory_order_acquire)) {
++      return &table[i];
++    }
++    if (expected == label || std::strcmp(expected, label) == 0) {
++      return &table[i];
++    }
++  }
++  return nullptr;
++}
++
++inline void RecordCvWait(CvLabelStats* stats, uint64_t wait_ns) {
++  stats->wait_count.fetch_add(1, std::memory_order_relaxed);
++  stats->wait_ns_total.fetch_add(wait_ns, std::memory_order_relaxed);
++  stats->wait_buckets[CvWaitBucketIndex(wait_ns)].fetch_add(
++      1, std::memory_order_relaxed);
++}
++
++inline void PrintCvStats() {
++  if (!CvStatsEnabled()) {
++    return;
++  }
++  std::fprintf(stdout, "leveldb_cv_stats_gate: LEVELDB_CV_STATS\n");
++  std::fprintf(stdout, "leveldb_cv_stats_gate_fallback: LEVELDB_LOCK_TIMING\n");
++  std::fprintf(stdout, "leveldb_cv_stats_scope: process_cumulative\n");
++  std::fprintf(stdout, "leveldb_cv_wait_histogram_unit: log2_ns\n");
++  CvLabelStats* table = CvLabelStatsTable();
++  for (int i = 0; i < kCvLabelSlots; ++i) {
++    const char* label = table[i].label.load(std::memory_order_acquire);
++    if (label == nullptr) {
++      continue;
++    }
++    std::fprintf(
++        stdout, "leveldb_cv_wait_count{label=%s}: %llu\n", label,
++        static_cast<unsigned long long>(
++            table[i].wait_count.load(std::memory_order_relaxed)));
++    std::fprintf(
++        stdout, "leveldb_cv_wait_ns_total{label=%s}: %llu\n", label,
++        static_cast<unsigned long long>(
++            table[i].wait_ns_total.load(std::memory_order_relaxed)));
++    std::fprintf(
++        stdout, "leveldb_cv_signal_count{label=%s}: %llu\n", label,
++        static_cast<unsigned long long>(
++            table[i].signal_count.load(std::memory_order_relaxed)));
++    std::fprintf(
++        stdout, "leveldb_cv_broadcast_count{label=%s}: %llu\n", label,
++        static_cast<unsigned long long>(
++            table[i].broadcast_count.load(std::memory_order_relaxed)));
++    std::fprintf(
++        stdout, "leveldb_cv_broadcast_fanout{label=%s}: %llu\n", label,
++        static_cast<unsigned long long>(
++            table[i].broadcast_fanout.load(std::memory_order_relaxed)));
++    std::fprintf(stdout, "leveldb_cv_wait_histogram{label=%s}:", label);
++    for (int bucket = 0; bucket < kCvWaitBuckets; ++bucket) {
++      const uint64_t count =
++          table[i].wait_buckets[bucket].load(std::memory_order_relaxed);
++      if (count != 0) {
++        std::fprintf(stdout, " %d:%llu", bucket,
++                     static_cast<unsigned long long>(count));
++      }
++    }
++    std::fprintf(stdout, "\n");
++  }
 +  std::fflush(stdout);
 +}
 +
@@ -249,11 +435,19 @@ index 2bda48d..f452384 100644
  
 -  void Lock() EXCLUSIVE_LOCK_FUNCTION() { mu_.lock(); }
 -  void Unlock() UNLOCK_FUNCTION() { mu_.unlock(); }
++  // A direct mutex whose CondVars still blocked on the raw std::mutex would
++  // wait on a lock nobody takes, so the cond entry points are part of the
++  // backend the mutex opts into.
 +  void UseMcsTasAccordinDirect() {
 +    if (direct_ != nullptr || mcs_tas_accordin_direct_mutex_create == nullptr ||
 +        mcs_tas_accordin_direct_mutex_destroy == nullptr ||
 +        mcs_tas_accordin_direct_mutex_lock == nullptr ||
-+        mcs_tas_accordin_direct_mutex_unlock == nullptr) {
++        mcs_tas_accordin_direct_mutex_unlock == nullptr ||
++        mcs_tas_accordin_direct_cond_create == nullptr ||
++        mcs_tas_accordin_direct_cond_destroy == nullptr ||
++        mcs_tas_accordin_direct_cond_wait == nullptr ||
++        mcs_tas_accordin_direct_cond_signal == nullptr ||
++        mcs_tas_accordin_direct_cond_broadcast == nullptr) {
 +      return;
 +    }
 +    direct_ = mcs_tas_accordin_direct_mutex_create();
@@ -287,7 +481,8 @@ index 2bda48d..f452384 100644
    void AssertHeld() ASSERT_EXCLUSIVE_LOCK() {}
  
   private:
--  friend class CondVar;
+   friend class CondVar;
++
 +  void StartLockTimingHold() {
 +    lock_timing_hold_start_ns_ =
 +        lock_timing_enabled_ &&
@@ -314,29 +509,122 @@ index 2bda48d..f452384 100644
 +// Wraps condition variables for std::mutex and direct Mutex backends.
  class CondVar {
   public:
-   explicit CondVar(Mutex* mu) : mu_(mu) { assert(mu != nullptr); }
-@@ -71,7 +270,7 @@ class CondVar {
+-  explicit CondVar(Mutex* mu) : mu_(mu) { assert(mu != nullptr); }
+-  ~CondVar() = default;
++  explicit CondVar(Mutex* mu, const char* label = nullptr)
++      : mu_(mu),
++        stats_(CvStatsEnabled() ? CvLabelStatsFor(label) : nullptr),
++        waiters_(0) {
++    assert(mu != nullptr);
++  }
++  ~CondVar() {
++    if (direct_ == nullptr) {
++      return;
++    }
++    const int ret = mcs_tas_accordin_direct_cond_destroy(direct_);
++    assert(ret == 0);
++    (void)ret;
++  }
+ 
+   CondVar(const CondVar&) = delete;
    CondVar& operator=(const CondVar&) = delete;
  
    void Wait() {
--    std::unique_lock<std::mutex> lock(mu_->mu_, std::adopt_lock);
-+    std::unique_lock<Mutex> lock(*mu_, std::adopt_lock);
++    // Adopting the raw std::mutex bypasses Mutex::Unlock()/Lock(), so the hold
++    // sample has to be closed and reopened here to keep the wait out of it.
++    mu_->FinishLockTimingHold();
++    if (stats_ == nullptr) {
++      WaitOnBackend();
++    } else {
++      waiters_.fetch_add(1, std::memory_order_acq_rel);
++      const uint64_t wait_start_ns = LockTimingNowNs();
++      WaitOnBackend();
++      const uint64_t wait_end_ns = LockTimingNowNs();
++      waiters_.fetch_sub(1, std::memory_order_acq_rel);
++      RecordCvWait(stats_, wait_end_ns - wait_start_ns);
++    }
++    mu_->StartLockTimingHold();
++  }
++  void Signal() {
++    if (stats_ != nullptr) {
++      stats_->signal_count.fetch_add(1, std::memory_order_relaxed);
++    }
++    if (mu_->direct_ != nullptr) {
++      const int ret = mcs_tas_accordin_direct_cond_signal(DirectCond());
++      assert(ret == 0);
++      (void)ret;
++      return;
++    }
++    cv_.notify_one();
++  }
++  void SignalAll() {
++    if (stats_ != nullptr) {
++      stats_->broadcast_count.fetch_add(1, std::memory_order_relaxed);
++      stats_->broadcast_fanout.fetch_add(
++          waiters_.load(std::memory_order_acquire), std::memory_order_relaxed);
++    }
++    if (mu_->direct_ != nullptr) {
++      const int ret = mcs_tas_accordin_direct_cond_broadcast(DirectCond());
++      assert(ret == 0);
++      (void)ret;
++      return;
++    }
++    cv_.notify_all();
++  }
++
++ private:
++  // A Mutex adopts the direct backend after the CondVars bound to it already
++  // exist: DBImpl builds background_work_finished_signal_ in its initializer
++  // list and only then calls Mutex::UseMcsTasAccordinDirect(). Creating the
++  // direct cond on first use instead of in the constructor is therefore the
++  // only shape that sees the final backend, and std::call_once keeps the
++  // creation single even though every CondVar operation already runs under the
++  // cond mutex.
++  mcs_tas_accordin_direct_cond* DirectCond() {
++    std::call_once(direct_once_, [this]() {
++      direct_ = mcs_tas_accordin_direct_cond_create();
++    });
++    return direct_;
++  }
++
++  void WaitOnBackend() {
++    if (mu_->direct_ != nullptr) {
++      const int ret =
++          mcs_tas_accordin_direct_cond_wait(DirectCond(), mu_->direct_);
++      assert(ret == 0);
++      (void)ret;
++      return;
++    }
+     std::unique_lock<std::mutex> lock(mu_->mu_, std::adopt_lock);
      cv_.wait(lock);
      lock.release();
    }
-@@ -79,7 +278,7 @@ class CondVar {
-   void SignalAll() { cv_.notify_all(); }
+-  void Signal() { cv_.notify_one(); }
+-  void SignalAll() { cv_.notify_all(); }
  
-  private:
--  std::condition_variable cv_;
-+  std::condition_variable_any cv_;
+- private:
+   std::condition_variable cv_;
    Mutex* const mu_;
++  CvLabelStats* const stats_;
++  std::atomic<uint64_t> waiters_;
++  std::once_flag direct_once_;
++  mcs_tas_accordin_direct_cond* direct_ = nullptr;
  };
  
+ inline bool Snappy_Compress(const char* input, size_t length,
 diff --git a/util/env_posix.cc b/util/env_posix.cc
-index d84cd1e..fb09f96 100644
+index d84cd1e..f0be489 100644
 --- a/util/env_posix.cc
 +++ b/util/env_posix.cc
+@@ -773,7 +773,7 @@ int MaxOpenFiles() {
+ }  // namespace
+ 
+ PosixEnv::PosixEnv()
+-    : background_work_cv_(&background_work_mutex_),
++    : background_work_cv_(&background_work_mutex_, "env_bg_queue"),
+       started_background_thread_(false),
+       mmap_limiter_(MaxMmaps()),
+       fd_limiter_(MaxOpenFiles()) {}
 @@ -815,6 +815,7 @@ void PosixEnv::BackgroundThreadMain() {
  
      background_work_mutex_.Unlock();

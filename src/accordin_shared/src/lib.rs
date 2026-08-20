@@ -4,6 +4,8 @@ pub mod admission;
 
 pub mod bpf_counters;
 
+pub mod condvar;
+
 pub mod cpu_affinity;
 
 pub mod env;

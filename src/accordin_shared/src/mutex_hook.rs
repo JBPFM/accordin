@@ -56,12 +56,12 @@ static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
 static REGISTERED_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 static REGISTERED_THREAD_COUNT_BPF: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 const HOOK_SCOPE_ENV: &str = "ACCORDIN_HOOK_SCOPE";
-const DISABLE_CV_ADMISSION_HINT_ENV: &str = "ACCORDIN_DISABLE_CV_ADMISSION_HINT";
 
 static CV_COUNTERS_ENABLED: AtomicBool = AtomicBool::new(false);
 static CV_HINTS_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 static CV_SPECIALIZED_RELOCKS: AtomicU64 = AtomicU64::new(0);
 static CV_FALLBACK_RELOCKS: AtomicU64 = AtomicU64::new(0);
+static CV_ROUTE_RELOCKS: AtomicU64 = AtomicU64::new(0);
 
 /// Reconciles the userspace side of the cond-reacquire protocol against the
 /// scheduler's wake-routing counters.
@@ -70,6 +70,9 @@ pub struct CvAdmissionCounters {
     pub hints_published: u64,
     pub specialized_relocks: u64,
     pub fallback_relocks: u64,
+    /// Re-acquisitions that took the admission decision from a scheduler-routed
+    /// wakeup rather than from a hint in the user word.
+    pub route_relocks: u64,
 }
 
 pub fn cv_admission_counters() -> CvAdmissionCounters {
@@ -77,6 +80,7 @@ pub fn cv_admission_counters() -> CvAdmissionCounters {
         hints_published: CV_HINTS_PUBLISHED.load(Ordering::Relaxed),
         specialized_relocks: CV_SPECIALIZED_RELOCKS.load(Ordering::Relaxed),
         fallback_relocks: CV_FALLBACK_RELOCKS.load(Ordering::Relaxed),
+        route_relocks: CV_ROUTE_RELOCKS.load(Ordering::Relaxed),
     }
 }
 
@@ -119,6 +123,12 @@ pub fn record_cv_fallback_relock() {
     bump_cv_counter(&CV_FALLBACK_RELOCKS);
 }
 
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_route_relock() {
+    bump_cv_counter(&CV_ROUTE_RELOCKS);
+}
+
 #[inline(always)]
 pub fn current_tid() -> u32 {
     unsafe { libc::syscall(libc::SYS_gettid) as u32 }
@@ -155,12 +165,6 @@ pub fn registered_hook_scope_enabled() -> bool {
     *REGISTERED_SCOPE.get_or_init(|| {
         hook_scope_value_is_registered(std::env::var(HOOK_SCOPE_ENV).ok().as_deref())
     })
-}
-
-#[doc(hidden)]
-pub fn cv_admission_hint_enabled() -> bool {
-    static CV_ADMISSION_HINT_ENABLED: OnceLock<bool> = OnceLock::new();
-    *CV_ADMISSION_HINT_ENABLED.get_or_init(|| !crate::env::env_flag(DISABLE_CV_ADMISSION_HINT_ENV))
 }
 
 // Registry membership is only consulted under registered hook scope, so writers are gated on it too.
@@ -292,11 +296,11 @@ macro_rules! export_mutex_hooks {
             use std::cell::{Cell, UnsafeCell};
             use std::hint::spin_loop;
             use std::sync::OnceLock;
-            use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+            use std::sync::atomic::{AtomicUsize, Ordering};
 
+            use $crate::condvar::{CondMutex, CondRelock, CondState};
             use $crate::lock_stats::{
-                record_cv_sleep_end, record_cv_sleep_start, record_hold_end_sample,
-                record_lock_acquired, record_lock_acquired_for_lock,
+                record_hold_end_sample, record_lock_acquired, record_lock_acquired_for_lock,
                 record_lock_acquired_for_scope, record_post_unlock, record_thread_start,
                 record_wait_end, record_wait_start,
             };
@@ -311,14 +315,6 @@ macro_rules! export_mutex_hooks {
 
             unsafe impl Send for HookState {}
             unsafe impl Sync for HookState {}
-
-            struct CondState {
-                seq: AtomicU32,
-                waiters: AtomicU32,
-            }
-
-            unsafe impl Send for CondState {}
-            unsafe impl Sync for CondState {}
 
             struct ThreadCtxGuard;
 
@@ -401,25 +397,15 @@ macro_rules! export_mutex_hooks {
                 record_lock_acquired_for_scope(scope);
             }
 
-            #[inline(always)]
-            fn publish_cond_reacquire_hint(lock_id: u32) {
-                if Backend::USES_ADMISSION_SCOPE
-                    && $crate::mutex_hook::cv_admission_hint_enabled()
-                    && $crate::admission::mark_cond_reacquire_pending_for_cond_mutex(lock_id)
-                {
-                    $crate::mutex_hook::record_cv_hint_published();
-                }
-            }
-
-            /// Reacquires the cond mutex after a wait. A waiter that actually
-            /// blocked was already routed through admission at wake time, so
-            /// taking the published hint acknowledges the consumed token and the
-            /// lock is entered without re-requesting admission.
+            /// Reacquires the cond mutex after a wait, in the mode the wait
+            /// protocol decided: a routed wakeup already carries the admission
+            /// decision, and a published hint carries it in the user word, so
+            /// both enter the lock without re-requesting admission.
             #[inline(always)]
             fn relock_after_cond_wait(
                 lock: &<Backend as MutexHookBackend>::LockState,
                 lock_id: u32,
-                slept: bool,
+                relock: CondRelock,
             ) {
                 if !Backend::USES_ADMISSION_SCOPE {
                     lock_with_stats(lock, lock_id);
@@ -427,14 +413,18 @@ macro_rules! export_mutex_hooks {
                 }
 
                 let scope = $crate::admission::begin_lock_scope(lock_id);
-                let mode = if slept
-                    && $crate::admission::take_cond_reacquire_pending_for_scope(scope)
-                {
-                    $crate::mutex_hook::record_cv_specialized_relock();
-                    AcquireMode::AlreadyAdmitted
-                } else {
-                    $crate::mutex_hook::record_cv_fallback_relock();
-                    AcquireMode::Normal
+                let mode = match relock {
+                    CondRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
+                    CondRelock::TakeHint
+                        if $crate::admission::take_cond_reacquire_pending_for_scope(scope) =>
+                    {
+                        $crate::mutex_hook::record_cv_specialized_relock();
+                        AcquireMode::AlreadyAdmitted
+                    }
+                    _ => {
+                        $crate::mutex_hook::record_cv_fallback_relock();
+                        AcquireMode::Normal
+                    }
                 };
                 lock_scope_with_stats(lock, scope, mode);
             }
@@ -450,10 +440,6 @@ macro_rules! export_mutex_hooks {
             }
 
             const SENTINEL: usize = 1;
-            const FUTEX_WAIT_PRIVATE: libc::c_int = 128;
-            const FUTEX_WAKE_PRIVATE: libc::c_int = 129;
-            const FUTEX_WAIT_BITSET_PRIVATE_REALTIME: libc::c_int = 9 | 128 | 256;
-            const FUTEX_BITSET_MATCH_ANY: libc::c_uint = libc::c_uint::MAX;
 
             type PthreadMutexInitFn = unsafe extern "C" fn(
                 *mut libc::pthread_mutex_t,
@@ -708,10 +694,7 @@ macro_rules! export_mutex_hooks {
                         return libc::EINVAL;
                     }
 
-                    let state = Box::new(CondState {
-                        seq: AtomicU32::new(0),
-                        waiters: AtomicU32::new(0),
-                    });
+                    let state = Box::new(CondState::new());
                     let ptr = Box::into_raw(state);
                     std::ptr::write_bytes(
                         cond as *mut u8,
@@ -825,10 +808,7 @@ macro_rules! export_mutex_hooks {
                         continue;
                     }
 
-                    let state = Box::new(CondState {
-                        seq: AtomicU32::new(0),
-                        waiters: AtomicU32::new(0),
-                    });
+                    let state = Box::new(CondState::new());
                     let ptr = Box::into_raw(state);
                     atomic.store(ptr as usize, Ordering::Release);
                     if $crate::mutex_hook::registered_hook_scope_enabled() {
@@ -849,105 +829,6 @@ macro_rules! export_mutex_hooks {
             #[cold]
             #[inline(never)]
             const fn cold_path() {}
-
-            /// Returns 0 when the wait completed, otherwise the errno reported
-            /// by the syscall, so callers classify the outcome without reading
-            /// thread-local errno themselves.
-            #[inline(always)]
-            unsafe fn futex_wait(addr: *const AtomicU32, expected: u32) -> libc::c_int {
-                unsafe {
-                    let ret = libc::syscall(
-                        libc::SYS_futex,
-                        addr as *const u32,
-                        FUTEX_WAIT_PRIVATE,
-                        expected,
-                        std::ptr::null::<libc::timespec>(),
-                    );
-                    if ret == 0 {
-                        0
-                    } else {
-                        *libc::__errno_location()
-                    }
-                }
-            }
-
-            #[inline(always)]
-            unsafe fn futex_wait_until_realtime(
-                addr: *const AtomicU32,
-                expected: u32,
-                abstime: *const libc::timespec,
-            ) -> libc::c_int {
-                unsafe {
-                    let ret = libc::syscall(
-                        libc::SYS_futex,
-                        addr as *const u32,
-                        FUTEX_WAIT_BITSET_PRIVATE_REALTIME,
-                        expected,
-                        abstime,
-                        std::ptr::null::<libc::c_void>(),
-                        FUTEX_BITSET_MATCH_ANY,
-                    );
-                    if ret == 0 {
-                        0
-                    } else {
-                        *libc::__errno_location()
-                    }
-                }
-            }
-
-            #[inline(always)]
-            unsafe fn futex_wake(addr: *const AtomicU32, count: libc::c_int) -> libc::c_long {
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_futex,
-                        addr as *const u32,
-                        FUTEX_WAKE_PRIVATE,
-                        count,
-                    )
-                }
-            }
-
-            #[inline(always)]
-            fn signal_one_waiter(cond_state: *mut CondState) -> bool {
-                unsafe {
-                    let waiters = &(*cond_state).waiters;
-                    let mut current = waiters.load(Ordering::Acquire);
-                    while current != 0 {
-                        match waiters.compare_exchange_weak(
-                            current,
-                            current - 1,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => {
-                                (*cond_state).seq.fetch_add(1, Ordering::Release);
-                                return true;
-                            }
-                            Err(next) => current = next,
-                        }
-                    }
-                    false
-                }
-            }
-
-            #[inline(always)]
-            fn cancel_one_waiter(cond_state: *mut CondState) {
-                unsafe {
-                    let waiters = &(*cond_state).waiters;
-                    let mut current = waiters.load(Ordering::Acquire);
-                    while current != 0 {
-                        match waiters.compare_exchange_weak(
-                            current,
-                            current - 1,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => return,
-                            Err(next) => current = next,
-                        }
-                    }
-                }
-            }
 
             #[unsafe(no_mangle)]
             pub unsafe extern "C" fn pthread_mutex_init(
@@ -1176,9 +1057,7 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    if signal_one_waiter(cond_state) {
-                        futex_wake(&(*cond_state).seq, 1);
-                    }
+                    (*cond_state).signal();
                     0
                 }
             }
@@ -1198,10 +1077,7 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    if (*cond_state).waiters.swap(0, Ordering::AcqRel) != 0 {
-                        (*cond_state).seq.fetch_add(1, Ordering::Release);
-                        futex_wake(&(*cond_state).seq, libc::c_int::MAX);
-                    }
+                    (*cond_state).broadcast();
                     0
                 }
             }
@@ -1224,22 +1100,12 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    let seq = (*cond_state).seq.load(Ordering::Acquire);
-                    (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
-                    unlock_with_stats(&(*state).lock, (*state).lock_id);
-                    publish_cond_reacquire_hint((*state).lock_id);
-                    // The mutex is released across the sleep, so the sleep lands
-                    // in the released class's unlock-to-acquire gap. Bracketing
-                    // it here covers both relock modes, which are chosen only
-                    // after the sleep ends.
-                    let cv_sleep_start = record_cv_sleep_start();
-                    let mut slept = false;
-                    while (*cond_state).seq.load(Ordering::Acquire) == seq {
-                        let rc = futex_wait(&(*cond_state).seq, seq);
-                        slept |= rc == 0 || rc == libc::EINTR;
-                    }
-                    record_cv_sleep_end(cv_sleep_start);
-                    relock_after_cond_wait(&(*state).lock, (*state).lock_id, slept);
+                    $crate::condvar::wait(
+                        &*cond_state,
+                        CondMutex::new((*state).lock_id, Backend::USES_ADMISSION_SCOPE),
+                        || unlock_with_stats(&(*state).lock, (*state).lock_id),
+                        |relock| relock_after_cond_wait(&(*state).lock, (*state).lock_id, relock),
+                    );
                     0
                 }
             }
@@ -1267,27 +1133,13 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    let seq = (*cond_state).seq.load(Ordering::Acquire);
-                    let mut ret = 0;
-                    (*cond_state).waiters.fetch_add(1, Ordering::AcqRel);
-                    unlock_with_stats(&(*state).lock, (*state).lock_id);
-                    publish_cond_reacquire_hint((*state).lock_id);
-                    let cv_sleep_start = record_cv_sleep_start();
-                    let mut slept = false;
-                    while (*cond_state).seq.load(Ordering::Acquire) == seq {
-                        let rc = futex_wait_until_realtime(&(*cond_state).seq, seq, abstime);
-                        slept |= rc == 0 || rc == libc::EINTR || rc == libc::ETIMEDOUT;
-                        if rc == libc::ETIMEDOUT {
-                            if (*cond_state).seq.load(Ordering::Acquire) == seq {
-                                cancel_one_waiter(cond_state);
-                                ret = libc::ETIMEDOUT;
-                            }
-                            break;
-                        }
-                    }
-                    record_cv_sleep_end(cv_sleep_start);
-                    relock_after_cond_wait(&(*state).lock, (*state).lock_id, slept);
-                    ret
+                    $crate::condvar::timedwait(
+                        &*cond_state,
+                        CondMutex::new((*state).lock_id, Backend::USES_ADMISSION_SCOPE),
+                        &*abstime,
+                        || unlock_with_stats(&(*state).lock, (*state).lock_id),
+                        |relock| relock_after_cond_wait(&(*state).lock, (*state).lock_id, relock),
+                    )
                 }
             }
         }
@@ -1303,10 +1155,10 @@ mod tests {
     use super::{
         ThreadCtxMapOps, cv_admission_counters, cv_admission_counters_enabled,
         hook_scope_value_is_registered, hooked_cond_registered, hooked_mutex_registered,
-        record_cv_fallback_relock, record_cv_hint_published, record_cv_specialized_relock,
-        register_hooked_cond_addr, register_hooked_mutex_addr, register_thread_ctx_with_map,
-        set_cv_admission_counters_enabled, unregister_hooked_cond_addr,
-        unregister_hooked_mutex_addr, unregister_thread_ctx_with_map,
+        record_cv_fallback_relock, record_cv_hint_published, record_cv_route_relock,
+        record_cv_specialized_relock, register_hooked_cond_addr, register_hooked_mutex_addr,
+        register_thread_ctx_with_map, set_cv_admission_counters_enabled,
+        unregister_hooked_cond_addr, unregister_hooked_mutex_addr, unregister_thread_ctx_with_map,
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1433,6 +1285,7 @@ mod tests {
         record_cv_hint_published();
         record_cv_specialized_relock();
         record_cv_fallback_relock();
+        record_cv_route_relock();
         set_cv_admission_counters_enabled(false);
 
         let counters = cv_admission_counters();
@@ -1442,6 +1295,7 @@ mod tests {
             baseline.specialized_relocks + 1
         );
         assert_eq!(counters.fallback_relocks, baseline.fallback_relocks + 1);
+        assert_eq!(counters.route_relocks, baseline.route_relocks + 1);
     }
 
     fn hook_implementation_source() -> &'static str {
@@ -1452,87 +1306,50 @@ mod tests {
     }
 
     #[test]
-    fn cond_wait_path_marks_admission_hint_before_futex_sleep() {
+    fn cond_wait_hooks_delegate_the_whole_wait_protocol() {
         let implementation = hook_implementation_source();
-
-        assert!(implementation.contains("const DISABLE_CV_ADMISSION_HINT_ENV"));
-        assert!(implementation.contains("fn cv_admission_hint_enabled()"));
-
-        assert_eq!(
-            implementation
-                .matches("publish_cond_reacquire_hint(")
-                .count(),
-            3,
-            "one definition plus the cond_wait and cond_timedwait call sites"
-        );
-
-        let cond_wait = implementation
-            .split_once("pub unsafe extern \"C\" fn pthread_cond_wait")
-            .map(|(_, body)| body)
-            .expect("the macro should define the cond wait hook");
-        let hint_pos = cond_wait
-            .find("publish_cond_reacquire_hint(")
-            .expect("cond wait should publish the lock admission hint");
-        let wait_pos = cond_wait
-            .find("futex_wait(&(*cond_state).seq, seq)")
-            .expect("cond wait should still use futex wait");
 
         assert!(
-            hint_pos < wait_pos,
-            "cond wait should publish the admission hint before sleeping"
+            !implementation.contains("SYS_futex"),
+            "the futex protocol belongs to the shared condvar module"
         );
-    }
 
-    #[test]
-    fn cond_wait_path_brackets_the_sleep_for_the_class_sample() {
-        let implementation = hook_implementation_source();
-
-        for (name, hook) in [
-            ("cond wait", "pub unsafe extern \"C\" fn pthread_cond_wait"),
+        for (name, hook, entry) in [
+            (
+                "cond wait",
+                "pub unsafe extern \"C\" fn pthread_cond_wait",
+                "$crate::condvar::wait(",
+            ),
             (
                 "cond timedwait",
                 "pub unsafe extern \"C\" fn pthread_cond_timedwait",
+                "$crate::condvar::timedwait(",
             ),
         ] {
             let body = implementation
                 .split_once(hook)
                 .map(|(_, body)| body)
                 .unwrap_or_else(|| panic!("the macro should define the {name} hook"));
-            let hint_pos = body
-                .find("publish_cond_reacquire_hint(")
-                .unwrap_or_else(|| panic!("{name} should publish the lock admission hint"));
-            let sleep_start_pos = body
-                .find("record_cv_sleep_start()")
-                .unwrap_or_else(|| panic!("{name} should open the sleep bracket"));
-            let sleep_end_pos = body
-                .find("record_cv_sleep_end(cv_sleep_start)")
-                .unwrap_or_else(|| panic!("{name} should close the sleep bracket"));
+            let entry_pos = body
+                .find(entry)
+                .unwrap_or_else(|| panic!("{name} should run the shared wait protocol"));
+            let unlock_pos = body
+                .find("|| unlock_with_stats(")
+                .unwrap_or_else(|| panic!("{name} should release the mutex through the protocol"));
             let relock_pos = body
-                .find("relock_after_cond_wait(")
-                .unwrap_or_else(|| panic!("{name} should relock the cond mutex"));
+                .find("|relock| relock_after_cond_wait(")
+                .unwrap_or_else(|| panic!("{name} should relock in the mode the protocol picked"));
 
             assert!(
-                hint_pos < sleep_start_pos && sleep_start_pos < sleep_end_pos,
-                "{name} should bracket the sleep loop itself"
-            );
-            assert!(
-                sleep_end_pos < relock_pos,
-                "{name} should close the bracket before the relock mode is chosen"
+                entry_pos < unlock_pos && unlock_pos < relock_pos,
+                "{name} should hand the unlock and the relock to the protocol"
             );
         }
     }
 
     #[test]
-    fn cond_wait_path_relocks_through_the_specialized_reacquire() {
+    fn cond_relock_enters_without_re_requesting_admission() {
         let implementation = hook_implementation_source();
-
-        assert_eq!(
-            implementation
-                .matches("relock_after_cond_wait(&(*state).lock, (*state).lock_id, slept)")
-                .count(),
-            2,
-            "both cond wait paths should relock through the cond-specific reacquire"
-        );
 
         let reacquire = implementation
             .split_once("fn relock_after_cond_wait")
@@ -1540,8 +1357,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the macro should define the cond-specific reacquire");
 
+        assert!(reacquire.contains("CondRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted"));
         assert!(reacquire.contains("take_cond_reacquire_pending_for_scope"));
-        assert!(reacquire.contains("AcquireMode::AlreadyAdmitted"));
         assert!(
             !reacquire.contains("yield_now"),
             "the already-admitted arm should not notify admission again"

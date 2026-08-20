@@ -59,6 +59,19 @@ static __always_inline __u32 inactive_next_probe_rank(__u32 rank, __u32 span) {
   return (rank + INACTIVE_DEFICIT_PROBE_WIDTH) % span;
 }
 
+/* Managed classes one cvready selection examines. It shares the dispatch
+ * program's instruction budget with the deficit probe and the fallback scan, so
+ * it stays a bounded window with no full-space scan behind it: a class the
+ * window misses is reached by a following call through the rotating cursor, and
+ * by the periodic forced drain in the worst case. */
+#define CVREADY_PROBE_WIDTH 4U
+
+/* Start rank of the cvready probe after the one starting at `rank`. `span` is
+ * never 0. */
+static __always_inline __u32 cvready_next_probe_rank(__u32 rank, __u32 span) {
+  return (rank + CVREADY_PROBE_WIDTH) % span;
+}
+
 static __always_inline bool inactive_prefer_previous_lock(__u32 random,
                                                           __u32 percent) {
   if (percent > INACTIVE_PROBABILITY_SCALE)

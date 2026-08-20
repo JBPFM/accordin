@@ -6,11 +6,21 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
 const IN_CRITICAL_SECTION: u32 = 1 << 0;
 const SLOW_PATH_PENDING: u32 = 1 << 1;
 const TOKEN_CONSUMED: u32 = 1 << 2;
+/// Set by a thread immediately before it releases a managed lock to sleep on a
+/// condition variable: the lock-class field then names the lock the thread will
+/// re-acquire on wake. `SLOW_PATH_PENDING` and `IN_CRITICAL_SECTION` are never
+/// set while this bit is.
+///
+/// Right after its futex wait returns the waiter retires the bit into
+/// `SLOW_PATH_PENDING` for the same class rather than clearing it, so the
+/// re-acquisition that follows describes itself as the contender it is; see
+/// `retire_cv_sleep_to_pending`.
+const CV_SLEEP: u32 = 1 << 3;
 /// Everything an admission-disabled word update clears: the flags that describe
 /// one in-flight acquisition rather than the lock's identity.
-const TRANSIENT_FLAGS: u32 = SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED;
-pub const USER_ADMISSION_FLAG_MASK: u32 = 0x7;
-pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 3;
+const TRANSIENT_FLAGS: u32 = SLOW_PATH_PENDING | IN_CRITICAL_SECTION | TOKEN_CONSUMED | CV_SLEEP;
+pub const USER_ADMISSION_FLAG_MASK: u32 = 0xF;
+pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 4;
 /// Must equal `MAX_LOCK_CLASSES` in the BPF `intf.h`: the scheduler loader
 /// assigns a `[u32; CLASS_COUNT]` into the skeleton's per-class BSS array, so a
 /// mismatch is a build error rather than a silent truncation.
@@ -346,7 +356,10 @@ fn cleared_flags_word(class: u32, value: u32) -> u32 {
 #[inline(always)]
 fn exit_word(class: u32, value: u32, enabled: bool) -> u32 {
     if enabled {
-        word_with_lock_id(class, (flags(value) | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION)
+        word_with_lock_id(
+            class,
+            (flags(value) | TOKEN_CONSUMED) & !IN_CRITICAL_SECTION,
+        )
     } else {
         cleared_flags_word(class, value)
     }
@@ -546,6 +559,14 @@ pub fn mark_cond_reacquire_pending_for_cond_mutex(lock_id: u32) -> bool {
     mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(lock_id, admission_enabled())
 }
 
+/// Reports whether the cv-sleep state was published, so a waiter knows whether
+/// the scheduler will route its wakeup or whether it has to fall back to the
+/// cond-reacquire hint.
+#[inline(always)]
+pub fn set_cv_sleep_for_lock(lock_id: u32) -> bool {
+    set_cv_sleep_for_lock_with_admission_enabled(lock_id, admission_enabled())
+}
+
 /// Acknowledges a cond-reacquire hint published for this scope: the consumed
 /// token is cleared in the same word access that matched it, so the caller can
 /// block on the lock without asking admission again.
@@ -664,6 +685,31 @@ fn mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(
     })
 }
 
+/// Publishes the cv-sleep state for the lock the waiter will re-acquire: the
+/// word names that lock and carries no other flag, because the thread is about
+/// to release the lock it holds and block outside any critical section.
+///
+/// Nothing is published while a managed scope stays held: that scope owns the
+/// word, exactly as it does for the cond-reacquire hint.
+#[inline(always)]
+fn set_cv_sleep_for_lock_with_admission_enabled(lock_id: u32, enabled: bool) -> bool {
+    if !managed_lock_id(lock_id) || THREAD_HELD_DEPTH.with(|depth| depth.get()) != 0 {
+        return false;
+    }
+
+    let class = class_of(lock_id);
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        let next = if enabled {
+            word_with_lock_id(class, CV_SLEEP)
+        } else {
+            cleared_flags_word(class, value)
+        };
+        word.store(next, Ordering::Relaxed);
+    });
+    enabled
+}
+
 #[inline(always)]
 pub fn mark_critical_section_entered() {
     mark_critical_section_entered_with_admission_enabled(admission_enabled());
@@ -773,6 +819,41 @@ pub fn clear_token_consumed() {
     });
 }
 
+/// Retires the cv-sleep state once the futex wait has returned, into the state
+/// the re-acquisition that follows contends under: the same lock class with
+/// `SLOW_PATH_PENDING`, which is what every other contender for that class
+/// publishes.
+///
+/// Dropping the flag instead would leave the class alone in the word, which
+/// describes a thread that is done with the lock: the scheduler would take back
+/// the admission it granted the wake, and the re-acquisition would then have no
+/// way to ask for another one. The pending state is cleared where every other
+/// contender clears it, on entering the critical section.
+///
+/// `slept` distinguishes a waiter the scheduler could have routed from one whose
+/// wait never blocked. The latter was not routed at all, so it re-acquires as it
+/// would with routing off, where the hint it published leaves the consumed token
+/// in the word and the re-acquisition suppresses its fast path because of it.
+#[inline(always)]
+pub fn retire_cv_sleep_to_pending(slept: bool) {
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        if flags(value) & CV_SLEEP == 0 {
+            return;
+        }
+
+        let retired = if slept {
+            SLOW_PATH_PENDING
+        } else {
+            SLOW_PATH_PENDING | TOKEN_CONSUMED
+        };
+        word.store(
+            word_with_lock_id(user_lock_id_for_value(value), retired),
+            Ordering::Relaxed,
+        );
+    });
+}
+
 #[inline(always)]
 fn clear_token_consumed_for_lock(lock_id: u32) {
     if !managed_lock_id(lock_id) {
@@ -807,6 +888,24 @@ pub fn reset_transient_state() {
 #[doc(hidden)]
 pub fn word_for_test() -> u32 {
     USER_ADMISSION_WORD.with(|word| word.load(Ordering::Relaxed))
+}
+
+#[doc(hidden)]
+pub fn slow_path_pending_set_for_test(lock_id: u32) -> bool {
+    let class = class_of(lock_id);
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        user_lock_id_for_value(value) == class && flags(value) & SLOW_PATH_PENDING != 0
+    })
+}
+
+#[doc(hidden)]
+pub fn cv_sleep_set_for_test(lock_id: u32) -> bool {
+    let class = class_of(lock_id);
+    USER_ADMISSION_WORD.with(|word| {
+        let value = word.load(Ordering::Relaxed);
+        user_lock_id_for_value(value) == class && flags(value) & CV_SLEEP != 0
+    })
 }
 
 #[doc(hidden)]
@@ -866,12 +965,12 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     use super::{
-        IN_CRITICAL_SECTION, LockClassPolicy, MAX_LOCK_CLASSES, SLOW_PATH_PENDING, TOKEN_CONSUMED,
-        UNMANAGED_LOCK_ID, USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_class, allocate_lock_id,
-        allocated_class_count, begin_lock_scope, class_of, clear_token_consumed_for_scope,
-        finish_lock_scope, force_dump_for_test, force_lock_class_policy_for_test,
-        force_merge_for_test, lock_class_policy, managed_lock_id,
-        mark_cond_reacquire_pending_for_cond_mutex,
+        CV_SLEEP, IN_CRITICAL_SECTION, LockClassPolicy, MAX_LOCK_CLASSES, SLOW_PATH_PENDING,
+        TOKEN_CONSUMED, UNMANAGED_LOCK_ID, USER_ADMISSION_FLAG_MASK, USER_ADMISSION_LOCK_ID_SHIFT,
+        allocate_lock_class, allocate_lock_id, allocated_class_count, begin_lock_scope, class_of,
+        clear_token_consumed_for_scope, cleared_flags_word, exit_word, finish_lock_scope, flags,
+        force_dump_for_test, force_lock_class_policy_for_test, force_merge_for_test,
+        lock_class_policy, managed_lock_id, mark_cond_reacquire_pending_for_cond_mutex,
         mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled,
         mark_critical_section_entered, mark_critical_section_entered_for_scope,
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
@@ -879,9 +978,11 @@ mod tests {
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
         merge_enabled_with, parse_lock_class_policy, reset_lock_id_allocator_for_test, reset_state,
         reset_thread_depth_for_test, reset_transient_state, reset_transitions_for_tests,
-        reset_union_find_for_tests, set_inactive_queue_seq_ptrs, slow_path_yield_required,
-        take_classes_dirty, take_cond_reacquire_pending_for_scope, token_consumed_for_scope,
-        transition_count_for_test, union_lock_classes, word_for_test,
+        reset_union_find_for_tests, retire_cv_sleep_to_pending, set_cv_sleep_for_lock,
+        set_cv_sleep_for_lock_with_admission_enabled, set_inactive_queue_seq_ptrs,
+        slow_path_yield_required, take_classes_dirty, take_cond_reacquire_pending_for_scope,
+        token_consumed_for_scope, transition_count_for_test, union_lock_classes,
+        user_lock_id_for_value, word_for_test, word_with_lock_id,
     };
 
     static INACTIVE_QUEUE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1311,6 +1412,163 @@ mod tests {
         release_managed_lock_for_test(4);
 
         assert!(!mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(4, false));
+        assert_eq!(word_for_test(), word_for(4, 0));
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn a_lock_class_survives_a_word_roundtrip_next_to_every_flag() {
+        for class in [1, MAX_LOCK_CLASSES - 1] {
+            for flag_bits in [
+                0,
+                IN_CRITICAL_SECTION,
+                SLOW_PATH_PENDING,
+                TOKEN_CONSUMED,
+                CV_SLEEP,
+                SLOW_PATH_PENDING | TOKEN_CONSUMED,
+                CV_SLEEP | TOKEN_CONSUMED,
+            ] {
+                let word = word_with_lock_id(class, flag_bits);
+                assert_eq!(user_lock_id_for_value(word), class, "class {class}");
+                assert_eq!(flags(word), flag_bits, "class {class}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_class_field_and_the_flag_field_stay_disjoint() {
+        let highest_class = MAX_LOCK_CLASSES - 1;
+
+        assert_eq!(CV_SLEEP & !USER_ADMISSION_FLAG_MASK, 0);
+        assert_eq!(
+            (highest_class << USER_ADMISSION_LOCK_ID_SHIFT) & USER_ADMISSION_FLAG_MASK,
+            0
+        );
+
+        // A class alone decodes with no flags set ...
+        assert_eq!(flags(word_with_lock_id(highest_class, 0)), 0);
+        // ... and a flag alone decodes as the unmanaged class.
+        assert_eq!(user_lock_id_for_value(CV_SLEEP), UNMANAGED_LOCK_ID);
+    }
+
+    #[test]
+    fn exit_and_cleared_words_keep_the_transition_they_had() {
+        let held = word_with_lock_id(7, IN_CRITICAL_SECTION | SLOW_PATH_PENDING);
+
+        assert_eq!(
+            exit_word(7, held, true),
+            word_with_lock_id(7, SLOW_PATH_PENDING | TOKEN_CONSUMED)
+        );
+        assert_eq!(exit_word(7, held, false), word_with_lock_id(7, 0));
+        assert_eq!(
+            cleared_flags_word(7, word_with_lock_id(7, TOKEN_CONSUMED)),
+            word_with_lock_id(7, 0)
+        );
+        // Cv-sleep degrades with the other in-flight flags.
+        assert_eq!(
+            cleared_flags_word(7, word_with_lock_id(7, CV_SLEEP)),
+            word_with_lock_id(7, 0)
+        );
+    }
+
+    #[test]
+    fn cv_sleep_names_the_lock_the_waiter_will_reacquire() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        release_managed_lock_for_test(4);
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
+
+        set_cv_sleep_for_lock(4);
+        assert_eq!(word_for_test(), word_for(4, CV_SLEEP));
+
+        retire_cv_sleep_to_pending(true);
+        assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
+
+        // The lock slept on and the lock re-acquired need not be the one the
+        // word already carries.
+        set_cv_sleep_for_lock(5);
+        assert_eq!(word_for_test(), word_for(5, CV_SLEEP));
+
+        reset_thread_depth_for_test();
+    }
+
+    /// The retire hands the class to the re-acquisition as an ordinary
+    /// contender: the class it named survives, the sleep state is gone, and the
+    /// two are never published together.
+    #[test]
+    fn retiring_cv_sleep_publishes_the_pending_state_for_the_same_class() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        for class in [1, 4, MAX_LOCK_CLASSES - 1] {
+            for slept in [true, false] {
+                reset_state();
+                set_cv_sleep_for_lock(class);
+                assert_eq!(word_for_test(), word_for(class, CV_SLEEP));
+
+                retire_cv_sleep_to_pending(slept);
+
+                let word = word_for_test();
+                assert_eq!(user_lock_id_for_value(word), class, "class {class}");
+                assert_eq!(flags(word) & CV_SLEEP, 0, "class {class}");
+                assert_ne!(flags(word) & SLOW_PATH_PENDING, 0, "class {class}");
+                // A waiter that never blocked was never routed, so it carries
+                // the consumed token the routing-off relock carries.
+                assert_eq!(
+                    flags(word) & TOKEN_CONSUMED != 0,
+                    !slept,
+                    "class {class}, slept {slept}"
+                );
+            }
+        }
+
+        reset_thread_depth_for_test();
+    }
+
+    /// The retire owns the whole flag field, so a word that never carried the
+    /// sleep state is not turned into a pending one by it.
+    #[test]
+    fn retiring_without_a_published_cv_sleep_leaves_the_word_alone() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        release_managed_lock_for_test(4);
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
+
+        retire_cv_sleep_to_pending(true);
+        assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn cv_sleep_is_skipped_while_a_lock_stays_held() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        let outer = begin_lock_scope(2);
+        mark_critical_section_entered_for_scope(outer);
+
+        set_cv_sleep_for_lock(3);
+        assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
+
+        finish_lock_scope(2);
+        set_cv_sleep_for_lock(UNMANAGED_LOCK_ID);
+        assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
+
+        reset_thread_depth_for_test();
+    }
+
+    #[test]
+    fn disabled_admission_cv_sleep_leaves_flags_clear() {
+        reset_state();
+        reset_thread_depth_for_test();
+
+        release_managed_lock_for_test(4);
+
+        set_cv_sleep_for_lock_with_admission_enabled(4, false);
         assert_eq!(word_for_test(), word_for(4, 0));
 
         reset_thread_depth_for_test();

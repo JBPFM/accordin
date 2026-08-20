@@ -8,26 +8,56 @@
 //! publishes while its mutex is released. The caller owns the mutex itself and
 //! supplies the two operations the protocol brackets its sleep with, an unlock
 //! and a re-acquisition whose admission mode the protocol decides.
+//!
+//! A signal may either wake its waiters or requeue them onto the staging of the
+//! mutex they will re-acquire. Requeueing turns a wake-to-run into a park: the
+//! waiters stay off-CPU until an unlock of that mutex releases them one at a
+//! time, so a broadcast no longer makes every waiter runnable and contending at
+//! once. Both forms are private futex operations on the same words.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::admission;
+use crate::arch::CacheAligned;
 use crate::lock_stats::{record_cv_sleep_end, record_cv_sleep_start};
-use crate::mutex_hook::{record_cv_hint_published, record_cv_route_relock};
+use crate::mutex_hook::{
+    record_cv_binding_conflict, record_cv_drain_wake, record_cv_hint_published,
+    record_cv_requeue_fallback, record_cv_requeued, record_cv_route_relock,
+    record_cv_staged_high_water, record_cv_stranding_wake,
+};
 
 const DISABLE_CV_ADMISSION_HINT_ENV: &str = "ACCORDIN_DISABLE_CV_ADMISSION_HINT";
 const CV_ROUTE_ENV: &str = "ACCORDIN_CV_ROUTE";
+const CV_REQUEUE_ENV: &str = "ACCORDIN_CV_REQUEUE";
 
 const FUTEX_WAIT_PRIVATE: libc::c_int = 128;
 const FUTEX_WAKE_PRIVATE: libc::c_int = 129;
+const FUTEX_CMP_REQUEUE_PRIVATE: libc::c_int = 4 | 128;
 const FUTEX_WAIT_BITSET_PRIVATE_REALTIME: libc::c_int = 9 | 128 | 256;
 const FUTEX_BITSET_MATCH_ANY: libc::c_uint = libc::c_uint::MAX;
+
+/// A requeue only fails against a sequence bump from another signaler, which
+/// cannot repeat indefinitely under any real signal rate; the tries are bounded
+/// so a pathological one falls back to a wake instead of spinning.
+const REQUEUE_ATTEMPTS: u32 = 3;
 
 #[cfg(test)]
 thread_local! {
     static ROUTE_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
+
+thread_local! {
+    static REQUEUE_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether any thread has ever asked for the per-thread requeue override.
+///
+/// Only tests do, and they live in other crates, so the override cannot be
+/// compiled out. The flag keeps it out of the way instead: a preloaded library
+/// never sets it, and every signal then decides from the environment alone
+/// without reaching for thread-local storage.
+static REQUEUE_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
 
 #[doc(hidden)]
 pub fn cv_admission_hint_enabled() -> bool {
@@ -62,11 +92,409 @@ fn force_cv_route_for_test(forced: Option<bool>) {
     ROUTE_FORCED.with(|route| route.set(forced));
 }
 
+fn cv_requeue_env_enabled() -> bool {
+    static CV_REQUEUE: OnceLock<bool> = OnceLock::new();
+    *CV_REQUEUE.get_or_init(|| crate::env::env_flag(CV_REQUEUE_ENV))
+}
+
+/// Whether a signal parks its waiters on the mutex staging instead of waking
+/// them. Only the signalling side reads this: a drain is driven by the staged
+/// count, so a lock keeps releasing waiters that were staged before the switch
+/// was turned off.
+#[inline]
+fn cv_requeue_enabled() -> bool {
+    let from_env = cv_requeue_env_enabled();
+    if !REQUEUE_OVERRIDDEN.load(Ordering::Relaxed) {
+        return from_env;
+    }
+
+    REQUEUE_FORCED
+        .with(std::cell::Cell::get)
+        .unwrap_or(from_env)
+}
+
+/// Overrides the requeue switch for the calling thread only, so that a test
+/// choosing a mode never changes what threads outside it see.
+#[doc(hidden)]
+pub fn force_cv_requeue_for_thread(forced: Option<bool>) {
+    REQUEUE_OVERRIDDEN.store(true, Ordering::Relaxed);
+    REQUEUE_FORCED.with(|requeue| requeue.set(forced));
+}
+
+/// The words a signal parks waiters on, one block per lock.
+///
+/// `stage` is a wait target and nothing else: its value is never read or
+/// compared, and waiters only ever arrive on it by being requeued off a cond
+/// sequence word. `staged` counts the waiters parked there that no unlock has
+/// released yet.
+///
+/// The block is shared: the lock owns it, and every cond whose waits release
+/// that lock holds a reference of its own. A cond may outlive its mutex, and a
+/// signal on it then still reads live memory rather than the freed lock; what
+/// it finds is a retired block, which parks nothing.
+///
+/// The words sit alone on their cache line: every unlock of the lock reads
+/// `staged`, and that read must not pull in the contended tail the lock hands
+/// between its own waiters.
+pub struct CondStagingBlock {
+    words: CacheAligned<StagingWords>,
+}
+
+struct StagingWords {
+    stage: AtomicU32,
+    staged: AtomicU32,
+    /// Cleared when the lock is destroyed. A retired block has no unlock left
+    /// to release anything parked on it, so signals stop parking there.
+    alive: AtomicBool,
+}
+
+impl CondStagingBlock {
+    fn new() -> Self {
+        Self {
+            words: CacheAligned(StagingWords {
+                stage: AtomicU32::new(0),
+                staged: AtomicU32::new(0),
+                alive: AtomicBool::new(true),
+            }),
+        }
+    }
+
+    /// Whether the lock that owns the block still exists.
+    ///
+    /// Read and written with sequential consistency against the staged count:
+    /// a destroy releases what it finds parked, a signal re-reads this after
+    /// parking, and the two orders together leave no waiter parked on a block
+    /// whose destroy has already run.
+    #[inline]
+    fn alive(&self) -> bool {
+        self.words.0.alive.load(Ordering::SeqCst)
+    }
+
+    /// Marks the block dead and releases whatever is parked on it, so a mutex
+    /// destroyed under a live cond leaves nobody waiting for an unlock that is
+    /// never coming.
+    fn retire(&self) {
+        self.words.0.alive.store(false, Ordering::SeqCst);
+        self.release_all();
+    }
+
+    /// Releases one staged waiter, and is the whole cost the staging adds to an
+    /// unlock: a lock that never carried a cond signal pays one relaxed load of
+    /// a line nothing else writes.
+    #[inline(always)]
+    fn drain_one(&self) {
+        if self.words.0.staged.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+
+        self.drain_one_cold();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drain_one_cold(&self) {
+        if self.release_staged_waiter() {
+            record_cv_drain_wake();
+        }
+    }
+
+    /// Claims one staged waiter and wakes it. The claim is what paces the
+    /// release: each caller takes at most one, so the waiters leave the stage
+    /// at the rate the lock is being unlocked at.
+    fn release_staged_waiter(&self) -> bool {
+        let words = &self.words.0;
+        let mut staged = words.staged.load(Ordering::Acquire);
+        while staged != 0 {
+            match words.staged.compare_exchange_weak(
+                staged,
+                staged - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    unsafe { futex_wake(&words.stage, 1) };
+                    return true;
+                }
+                Err(current) => staged = current,
+            }
+        }
+        false
+    }
+
+    /// Gives up the pacing and releases everything at once, which is what a
+    /// retired block does with the waiters it still carries.
+    fn release_all(&self) {
+        let words = &self.words.0;
+        if words.staged.swap(0, Ordering::SeqCst) != 0 {
+            unsafe { futex_wake(&words.stage, libc::c_int::MAX) };
+        }
+    }
+
+    /// Accounts waiters the kernel moved onto the stage.
+    ///
+    /// The count only ever runs too high: a waiter that leaves the stage on a
+    /// timeout or a spurious wake takes no claim with it. Too high costs one
+    /// empty wake per stranded count and nothing else, while too low would
+    /// leave a parked waiter with no release coming, so nothing but a claimed
+    /// wake is allowed to decrement it.
+    fn stage_waiters(&self, moved: u32) {
+        if moved == 0 {
+            return;
+        }
+
+        let previous = self.words.0.staged.fetch_add(moved, Ordering::SeqCst);
+        record_cv_requeued(u64::from(moved));
+        record_cv_staged_high_water(u64::from(previous) + u64::from(moved));
+    }
+
+    fn staged_count(&self) -> u32 {
+        self.words.0.staged.load(Ordering::Acquire)
+    }
+}
+
+/// The staging a lock owns.
+///
+/// The lock holds the block through this, and dropping it retires the block:
+/// the memory stays for as long as some cond is still bound to it, but nothing
+/// is parked there again.
+pub struct CondStaging {
+    block: Arc<CondStagingBlock>,
+}
+
+impl Default for CondStaging {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CondStaging {
+    pub fn new() -> Self {
+        Self {
+            block: Arc::new(CondStagingBlock::new()),
+        }
+    }
+
+    /// Releases one staged waiter on the unlock tail.
+    #[inline(always)]
+    pub fn drain_one(&self) {
+        self.block.drain_one();
+    }
+
+    /// The handle a cond wait binds to, naming the block a signal parks on.
+    ///
+    /// An unlock reads the handle out before it releases the lock, so the
+    /// pointer it drains through is one it read while the lock still existed.
+    #[inline(always)]
+    pub fn handle(&self) -> CondStagingRef {
+        CondStagingRef {
+            block: Arc::as_ptr(&self.block),
+        }
+    }
+
+    /// Waiters parked on the stage that no release has claimed yet, which the
+    /// staging tests account against the wakes they expect.
+    #[doc(hidden)]
+    pub fn staged_count(&self) -> u32 {
+        self.block.staged_count()
+    }
+}
+
+impl Drop for CondStaging {
+    fn drop(&mut self) {
+        self.block.retire();
+    }
+}
+
+thread_local! {
+    /// The staging of the outermost lock this thread holds.
+    ///
+    /// A signaler reads this to decide whether an unlock of its own is still
+    /// coming to drain the stage it just parked on. The lock is identified by
+    /// its block, not by its class: classes are shared as soon as locks are
+    /// created past the class limit, and two locks reading as one there would
+    /// let a signaler leave the release to an unlock of the other lock, which
+    /// never drains this one.
+    ///
+    /// Only the outermost hold is published. A signaler holding an inner lock
+    /// reads whatever it entered first, does not recognise the block, and
+    /// releases one waiter early, which costs the pacing of that one release
+    /// and nothing else.
+    static HELD_STAGING: std::cell::Cell<*const CondStagingBlock> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// How a wait names the staging of the mutex it releases, and how the lock
+/// brackets name the staging they hold and drain.
+///
+/// The handle is borrowed: it is only ever produced from a live lock. A wait
+/// reads it while it still holds the mutex, and takes the cond's own reference
+/// to the block before the wait can end; an unlock reads it before the release
+/// that lets the mutex be destroyed. A cond captures the handle on its first
+/// wait and keeps it; rebinding to a different mutex is unsupported and costs
+/// the cond its staging rather than parking a waiter on a lock that waiter
+/// never releases.
+#[derive(Clone, Copy)]
+pub struct CondStagingRef {
+    block: *const CondStagingBlock,
+}
+
+impl CondStagingRef {
+    /// A cond whose waits release a mutex with no staging: signals wake their
+    /// waiters and nothing is ever parked.
+    pub const fn none() -> Self {
+        Self {
+            block: std::ptr::null(),
+        }
+    }
+
+    /// Records the lock this handle belongs to as the one this thread holds,
+    /// which a nested acquisition leaves to the lock it entered first.
+    #[inline(always)]
+    pub fn publish_hold(&self) {
+        HELD_STAGING.with(|held| {
+            if held.get().is_null() {
+                held.set(self.block);
+            }
+        });
+    }
+
+    /// Gives the record up on the release of the lock that took it. An inner
+    /// lock releasing first finds a record that is not its own and leaves it.
+    #[inline(always)]
+    pub fn clear_hold(&self) {
+        HELD_STAGING.with(|held| {
+            if std::ptr::eq(held.get(), self.block) {
+                held.set(std::ptr::null());
+            }
+        });
+    }
+
+    /// Releases one staged waiter through a handle the caller read while the
+    /// lock still existed.
+    #[inline(always)]
+    pub fn drain_one(&self) {
+        if let Some(block) = unsafe { self.block.as_ref() } {
+            block.drain_one();
+        }
+    }
+}
+
+/// Whether the outermost lock this thread holds is the one that owns `staging`,
+/// and so whether an unlock that drains it is still to come from this thread.
+#[inline]
+fn thread_holds_staging(staging: &CondStagingBlock) -> bool {
+    HELD_STAGING.with(|held| std::ptr::eq(held.get(), staging))
+}
+
+/// The one word a cond publishes its staging in.
+///
+/// The word carries an owned reference to the block, taken when the binding is
+/// published and released when the cond is destroyed. Publishing the whole
+/// handle in a single atomic is what makes a losing racer harmless: it never
+/// leaves half of one binding next to half of another, and the loser drops the
+/// reference it took.
+///
+/// The low bit marks a cond that was waited on with two different mutexes. The
+/// mark leaves the pointer in place for the destroy to release, and the
+/// binding stops being usable, so blocks are addressed by pointer identity
+/// with no sentinel allocation to compare against.
+struct BoundStaging(AtomicUsize);
+
+const CONFLICTING_BINDING: usize = 1;
+
+impl BoundStaging {
+    const fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    /// The block this cond may park new waiters on, which a binding that was
+    /// given up has none of.
+    #[inline]
+    fn parking_target(&self) -> Option<&CondStagingBlock> {
+        let value = self.0.load(Ordering::Acquire);
+        if value & CONFLICTING_BINDING != 0 {
+            return None;
+        }
+
+        self.block_of(value)
+    }
+
+    /// The block this cond is bound to whatever the state of the binding.
+    ///
+    /// Giving a binding up only stops new waiters being parked. Whatever was
+    /// staged before it is still owed a release, so the drain path reads
+    /// through the mark rather than losing the block behind it.
+    #[inline]
+    fn block(&self) -> Option<&CondStagingBlock> {
+        self.block_of(self.0.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    fn block_of(&self, value: usize) -> Option<&CondStagingBlock> {
+        let block = value & !CONFLICTING_BINDING;
+        if block == 0 {
+            return None;
+        }
+
+        Some(unsafe { &*(block as *const CondStagingBlock) })
+    }
+
+    /// The published pointer whatever its state, which is what a later wait
+    /// compares its own mutex against.
+    #[inline]
+    fn raw(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Publishes the binding, taking the cond's own reference to the block
+    /// first so that the block outlives the lock if it has to. A racer that
+    /// published ahead of this one keeps its binding and this reference is
+    /// dropped; a racer that published a different lock is the unsupported
+    /// pairing the binding gives itself up over.
+    fn publish(&self, block: *const CondStagingBlock) {
+        debug_assert_eq!(
+            block as usize & CONFLICTING_BINDING,
+            0,
+            "a cache-line aligned block leaves the low bit to the conflict mark"
+        );
+
+        unsafe { Arc::increment_strong_count(block) };
+        if let Err(published) =
+            self.0
+                .compare_exchange(0, block as usize, Ordering::Release, Ordering::Acquire)
+        {
+            unsafe { Arc::decrement_strong_count(block) };
+            if published & !CONFLICTING_BINDING != block as usize {
+                record_cv_binding_conflict();
+                self.mark_conflicting();
+            }
+        }
+    }
+
+    fn mark_conflicting(&self) {
+        self.0.fetch_or(CONFLICTING_BINDING, Ordering::AcqRel);
+    }
+}
+
+impl Drop for BoundStaging {
+    fn drop(&mut self) {
+        let block =
+            (self.0.load(Ordering::Acquire) & !CONFLICTING_BINDING) as *const CondStagingBlock;
+        if !block.is_null() {
+            unsafe { Arc::decrement_strong_count(block) };
+        }
+    }
+}
+
 /// The futex state behind one condition variable: `seq` is the word waiters
 /// block on, and `waiters` counts the sleepers a signal may hand a wakeup to.
+///
+/// `bound` holds the staging of the mutex the waits release, published as one
+/// word so that a signal reads a whole binding or none of one.
 pub struct CondState {
     seq: AtomicU32,
     waiters: AtomicU32,
+    bound: BoundStaging,
 }
 
 impl Default for CondState {
@@ -80,21 +508,115 @@ impl CondState {
         Self {
             seq: AtomicU32::new(0),
             waiters: AtomicU32::new(0),
+            bound: BoundStaging::new(),
         }
     }
 
-    /// Wakes one waiter, if any is registered.
+    /// Releases one waiter, if any is registered.
     pub fn signal(&self) {
         if self.take_waiter() {
-            unsafe { futex_wake(&self.seq, 1) };
+            self.release_waiters(1);
         }
     }
 
-    /// Wakes every registered waiter with a single sequence bump.
+    /// Releases every registered waiter with a single sequence bump.
     pub fn broadcast(&self) {
         if self.waiters.swap(0, Ordering::AcqRel) != 0 {
             self.seq.fetch_add(1, Ordering::Release);
-            unsafe { futex_wake(&self.seq, libc::c_int::MAX) };
+            self.release_waiters(libc::c_int::MAX);
+        }
+    }
+
+    /// Hands the waiters the sequence bump was made for either to the mutex
+    /// staging or, when there is none to park them on, straight to the run
+    /// queue. A waiter released either way re-checks the sequence and enters
+    /// the same re-acquisition, so the two differ only in when it runs.
+    #[inline]
+    fn release_waiters(&self, count: libc::c_int) {
+        if cv_requeue_enabled() && self.requeue_waiters(count) {
+            return;
+        }
+
+        unsafe { futex_wake(&self.seq, count) };
+    }
+
+    /// Moves up to `count` waiters onto the bound lock's stage. Reports whether
+    /// the move happened, so the caller can wake them instead when it did not.
+    fn requeue_waiters(&self, count: libc::c_int) -> bool {
+        let Some(staging) = self.bound.parking_target() else {
+            return false;
+        };
+        // A lock that no longer exists has no unlock left to release anything
+        // parked on it, so the signal falls back to waking its waiters.
+        if !staging.alive() {
+            return false;
+        }
+
+        for _ in 0..REQUEUE_ATTEMPTS {
+            // The kernel compares the sequence word against this value and
+            // rejects the move if another signaler bumped it in between.
+            let expected = self.seq.load(Ordering::Relaxed);
+            match unsafe { futex_cmp_requeue(&self.seq, count, &staging.words.0.stage, expected) } {
+                Ok(moved) => {
+                    staging.stage_waiters(moved);
+                    // Kicked even when nothing moved: waiters parked by an
+                    // earlier signal are still owed a release, and a signal is
+                    // where a chain that lost its last release picks up again.
+                    start_drain_chain(staging);
+                    return true;
+                }
+                Err(errno) if errno == libc::EAGAIN => continue,
+                Err(_) => break,
+            }
+        }
+
+        record_cv_requeue_fallback();
+        false
+    }
+
+    /// Binds the cond to the staging of the mutex its waits release.
+    ///
+    /// The handle is captured on the first wait because that is the only point
+    /// where a cond and its mutex are seen together; a signal only ever sees
+    /// the cond. A cond that has never waited stays unbound, and its signals
+    /// wake rather than park.
+    fn bind_staging(&self, staging: CondStagingRef) {
+        if staging.block.is_null() {
+            return;
+        }
+
+        let bound = self.bound.raw();
+        if bound != 0 {
+            if bound == staging.block as usize || bound & CONFLICTING_BINDING != 0 {
+                return;
+            }
+
+            // Waiting on one cond with a second mutex is allowed as long as
+            // the first association has ended, and the two are the same thing
+            // from here: nothing distinguishes a re-association from a genuine
+            // overlap, and staging a waiter on a lock its wait never releases
+            // would leave it there. The cond gives its binding up either way
+            // and goes back to waking its waiters, and the count says how
+            // often the pacing was lost this way.
+            record_cv_binding_conflict();
+            self.bound.mark_conflicting();
+            return;
+        }
+
+        self.bound.publish(staging.block);
+    }
+
+    /// Passes on a release this waiter consumed without its wait ending.
+    ///
+    /// A waiter released from the stage whose sequence has not moved goes back
+    /// to sleep on the cond. The release it spent produces no unlock of its
+    /// own, so a waiter parked behind it would be left waiting for a drain
+    /// that nothing runs once the lock goes quiet. Handing the release on
+    /// keeps every staged waiter with a release still coming.
+    #[inline]
+    fn hand_on_stale_release(&self) {
+        if let Some(staging) = self.bound.block() {
+            staging.drain_one();
         }
     }
 
@@ -159,24 +681,60 @@ impl CondState {
         }
 
         self.seq.fetch_add(1, Ordering::Release);
-        unsafe { futex_wake(&self.seq, 1) };
+        self.release_waiters(1);
         0
     }
 }
 
+/// The drain chain runs off unlocks, so the waiters a signal just staged are
+/// released only once somebody unlocks the lock. The signaler answers whether
+/// such an unlock exists by asking about itself: a signaler holding the very
+/// lock the waiters will re-acquire has one still to come and leaves the
+/// release to it, and any other signaler releases the first waiter itself.
+///
+/// The question is deliberately about this thread rather than about the lock
+/// word. A shared probe of the lock would be a store-buffer race against the
+/// unlock that frees it, which no ordering short of a fence on the unlock path
+/// closes; the thread's own record of what it holds is state only this thread
+/// writes, and the answer cannot be stale.
+///
+/// A signaler that does not recognise the lock releases one waiter early,
+/// which is defined to be harmless: the waiter re-acquires the mutex as an
+/// ordinary contender, exactly as it would have without any staging. Backends
+/// that keep no lock bracket of their own always take that branch.
+fn start_drain_chain(staging: &CondStagingBlock) {
+    // A destroy that ran while this signal was parking its waiters may have
+    // released the stage already, and only this side still sees them.
+    if !staging.alive() {
+        staging.release_all();
+        return;
+    }
+
+    if thread_holds_staging(staging) {
+        return;
+    }
+
+    if staging.release_staged_waiter() {
+        record_cv_stranding_wake();
+    }
+}
+
 /// The mutex a cond wait releases across its sleep: the lock class it belongs
-/// to, and whether the backend runs that class through admission at all.
+/// to, whether the backend runs that class through admission at all, and the
+/// staging a signal may park the waiter on.
 #[derive(Clone, Copy)]
 pub struct CondMutex {
     lock_id: u32,
     admission_scoped: bool,
+    staging: CondStagingRef,
 }
 
 impl CondMutex {
-    pub const fn new(lock_id: u32, admission_scoped: bool) -> Self {
+    pub const fn new(lock_id: u32, admission_scoped: bool, staging: CondStagingRef) -> Self {
         Self {
             lock_id,
             admission_scoped,
+            staging,
         }
     }
 }
@@ -219,6 +777,7 @@ where
     U: FnOnce(),
     R: FnOnce(CondRelock),
 {
+    cond.bind_staging(mutex.staging);
     let seq = cond.seq.load(Ordering::Acquire);
     cond.waiters.fetch_add(1, Ordering::AcqRel);
     unlock();
@@ -228,9 +787,18 @@ where
     // relock modes, which are chosen only after the sleep ends.
     let cv_sleep_start = record_cv_sleep_start();
     let mut slept = false;
+    // A signal may have moved this sleep onto the mutex staging, in which case
+    // the wait resumes from there. The loop does not care where it woke up:
+    // the sequence decides whether the wait is over, and a wake off the stage
+    // always follows a bump. Leaving the stage on anything but a claimed
+    // release leaves the staged count too high, which the drain absorbs as one
+    // empty wake.
     while cond.seq.load(Ordering::Acquire) == seq {
         let rc = unsafe { futex_wait(&cond.seq, seq) };
         slept |= rc == 0 || rc == libc::EINTR;
+        if cond.seq.load(Ordering::Acquire) == seq {
+            cond.hand_on_stale_release();
+        }
     }
     retire_sleep_state(publication, slept);
     record_cv_sleep_end(cv_sleep_start);
@@ -250,6 +818,7 @@ where
     U: FnOnce(),
     R: FnOnce(CondRelock),
 {
+    cond.bind_staging(mutex.staging);
     let seq = cond.seq.load(Ordering::Acquire);
     let mut ret = 0;
     cond.waiters.fetch_add(1, Ordering::AcqRel);
@@ -257,6 +826,10 @@ where
     let publication = publish_sleep_state(mutex);
     let cv_sleep_start = record_cv_sleep_start();
     let mut slept = false;
+    // A requeue carries the armed deadline with the sleep, so a wait moved onto
+    // the staging still expires there. Expiring off the stage takes no claim
+    // with it and leaves the staged count too high, which is the same absorbed
+    // over-count an untimed wait leaves on a spurious wake.
     while cond.seq.load(Ordering::Acquire) == seq {
         let rc = unsafe { futex_wait_until_realtime(&cond.seq, seq, abstime) };
         slept |= rc == 0 || rc == libc::EINTR || rc == libc::ETIMEDOUT;
@@ -265,6 +838,9 @@ where
                 ret = cond.retire_expired_waiter(seq);
             }
             break;
+        }
+        if cond.seq.load(Ordering::Acquire) == seq {
+            cond.hand_on_stale_release();
         }
     }
     retire_sleep_state(publication, slept);
@@ -373,6 +949,44 @@ unsafe fn futex_wait_until_realtime(
     }
 }
 
+/// Moves waiters from `seq` onto `stage` without waking any of them, and
+/// reports how many moved or the errno the syscall raised.
+///
+/// The wake count is fixed at zero: the point of the move is that the waiters
+/// stay parked until the lock releases them. `expected` is checked against the
+/// current value of `seq` by the kernel, which reports `EAGAIN` when another
+/// signaler bumped it first.
+///
+/// Every operation on both words carries the private flag, matching the waits
+/// that put the waiters on `seq`: the flag decides which key namespace the
+/// futex is looked up in, so a mismatch would silently address a different
+/// queue. Condition variables shared across processes are outside what this
+/// module supports, as they already were.
+#[inline(always)]
+unsafe fn futex_cmp_requeue(
+    seq: *const AtomicU32,
+    requeue: libc::c_int,
+    stage: *const AtomicU32,
+    expected: u32,
+) -> Result<u32, libc::c_int> {
+    unsafe {
+        let ret = libc::syscall(
+            libc::SYS_futex,
+            seq as *const u32,
+            FUTEX_CMP_REQUEUE_PRIVATE,
+            0 as libc::c_int,
+            requeue,
+            stage as *const u32,
+            expected,
+        );
+        if ret < 0 {
+            Err(*libc::__errno_location())
+        } else {
+            Ok(ret as u32)
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn futex_wake(addr: *const AtomicU32, count: libc::c_int) -> libc::c_long {
     unsafe {
@@ -391,10 +1005,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::{
-        CondMutex, CondRelock, CondState, SleepPublication, force_cv_route_for_test,
+        CondMutex, CondRelock, CondStaging, CondStagingBlock, CondStagingRef, CondState,
+        SleepPublication, force_cv_requeue_for_thread, force_cv_route_for_test, futex_wake,
         publish_sleep_state, relock_mode, retire_sleep_state, timedwait, wait,
     };
     use crate::admission;
+    use crate::mutex_hook::{cv_requeue_counters, set_cv_admission_counters_enabled};
 
     const HINT_LOCK_ID: u32 = 4;
     const ROUTE_LOCK_ID: u32 = 5;
@@ -405,6 +1021,7 @@ mod tests {
     impl Drop for RouteGuard {
         fn drop(&mut self) {
             force_cv_route_for_test(None);
+            force_cv_requeue_for_thread(None);
             admission::reset_thread_depth_for_test();
             admission::reset_state();
         }
@@ -413,7 +1030,12 @@ mod tests {
     /// Starts a wait from the state a hooked unlock leaves behind: the word
     /// names the released class and no scope stays held.
     fn released_cond_mutex(lock_id: u32, route: bool) -> RouteGuard {
+        released_cond_mutex_with(lock_id, route, false)
+    }
+
+    fn released_cond_mutex_with(lock_id: u32, route: bool, requeue: bool) -> RouteGuard {
         force_cv_route_for_test(Some(route));
+        force_cv_requeue_for_thread(Some(requeue));
         admission::reset_thread_depth_for_test();
         admission::reset_state();
 
@@ -421,6 +1043,21 @@ mod tests {
         admission::mark_critical_section_entered_for_scope(scope);
         admission::finish_lock_scope(lock_id);
         RouteGuard
+    }
+
+    /// A signaller only needs the requeue switch: the drain is driven by the
+    /// staged count, and the admission state belongs to the waiting side.
+    struct RequeueGuard;
+
+    impl Drop for RequeueGuard {
+        fn drop(&mut self) {
+            force_cv_requeue_for_thread(None);
+        }
+    }
+
+    fn signalling_thread(requeue: bool) -> RequeueGuard {
+        force_cv_requeue_for_thread(Some(requeue));
+        RequeueGuard
     }
 
     fn word_lock_id() -> u32 {
@@ -432,7 +1069,7 @@ mod tests {
         let _guard = released_cond_mutex(HINT_LOCK_ID, false);
 
         assert_eq!(
-            publish_sleep_state(CondMutex::new(HINT_LOCK_ID, true)),
+            publish_sleep_state(CondMutex::new(HINT_LOCK_ID, true, CondStagingRef::none())),
             SleepPublication::Hint
         );
         assert!(!admission::cv_sleep_set_for_test(HINT_LOCK_ID));
@@ -446,7 +1083,8 @@ mod tests {
     fn routing_on_publishes_cv_sleep_and_retires_it_after_the_wait() {
         let _guard = released_cond_mutex(ROUTE_LOCK_ID, true);
 
-        let publication = publish_sleep_state(CondMutex::new(ROUTE_LOCK_ID, true));
+        let publication =
+            publish_sleep_state(CondMutex::new(ROUTE_LOCK_ID, true, CondStagingRef::none()));
         assert_eq!(publication, SleepPublication::Routed);
         assert!(admission::cv_sleep_set_for_test(ROUTE_LOCK_ID));
         assert_eq!(word_lock_id(), admission::class_of(ROUTE_LOCK_ID));
@@ -476,7 +1114,7 @@ mod tests {
         admission::begin_lock_scope(HINT_LOCK_ID);
 
         assert_eq!(
-            publish_sleep_state(CondMutex::new(HINT_LOCK_ID, true)),
+            publish_sleep_state(CondMutex::new(HINT_LOCK_ID, true, CondStagingRef::none())),
             SleepPublication::None
         );
         assert!(!admission::cv_sleep_set_for_test(HINT_LOCK_ID));
@@ -490,7 +1128,7 @@ mod tests {
         let _guard = released_cond_mutex(ROUTE_LOCK_ID, true);
 
         assert_eq!(
-            publish_sleep_state(CondMutex::new(ROUTE_LOCK_ID, false)),
+            publish_sleep_state(CondMutex::new(ROUTE_LOCK_ID, false, CondStagingRef::none())),
             SleepPublication::None
         );
         assert!(!admission::cv_sleep_set_for_test(ROUTE_LOCK_ID));
@@ -534,7 +1172,7 @@ mod tests {
             let mut observed = None;
             wait(
                 &cond,
-                CondMutex::new(lock_id, true),
+                CondMutex::new(lock_id, true, CondStagingRef::none()),
                 // A signal that lands while the mutex is being released.
                 || {
                     cond.seq.fetch_add(1, Ordering::Release);
@@ -618,7 +1256,7 @@ mod tests {
         let mut observed = None;
         let ret = timedwait(
             &cond,
-            CondMutex::new(ROUTE_LOCK_ID, true),
+            CondMutex::new(ROUTE_LOCK_ID, true, CondStagingRef::none()),
             &abstime,
             || {},
             |relock| observed = Some(relock),
@@ -681,14 +1319,19 @@ mod tests {
         }
     }
 
+    /// Stands in for a hooked mutex: it keeps the same bracket the hook does,
+    /// publishing the staging it holds on acquisition and draining it on the
+    /// unlock tail, which is where the released waiters of a signal come from.
     struct SpinMutex {
         locked: AtomicBool,
+        staging: CondStaging,
     }
 
     impl SpinMutex {
-        const fn new() -> Self {
+        fn new() -> Self {
             Self {
                 locked: AtomicBool::new(false),
+                staging: CondStaging::new(),
             }
         }
 
@@ -696,10 +1339,18 @@ mod tests {
             while self.locked.swap(true, Ordering::Acquire) {
                 std::hint::spin_loop();
             }
+            self.staging.handle().publish_hold();
         }
 
         fn unlock(&self) {
+            let staging = self.staging.handle();
+            staging.clear_hold();
             self.locked.store(false, Ordering::Release);
+            staging.drain_one();
+        }
+
+        fn cond_mutex(&self, lock_id: u32) -> CondMutex {
+            CondMutex::new(lock_id, true, self.staging.handle())
         }
     }
 
@@ -709,18 +1360,24 @@ mod tests {
         payload: AtomicU32,
     }
 
-    fn run_cond_handoff(route: bool) -> CondRelock {
-        let shared = Arc::new(Shared {
-            mutex: SpinMutex::new(),
-            cond: CondState::new(),
-            payload: AtomicU32::new(0),
-        });
+    impl Shared {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                mutex: SpinMutex::new(),
+                cond: CondState::new(),
+                payload: AtomicU32::new(0),
+            })
+        }
+    }
+
+    fn run_cond_handoff(route: bool, requeue: bool) -> CondRelock {
+        let shared = Shared::new();
 
         let waiter = {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
-                let _guard = released_cond_mutex(SMOKE_LOCK_ID, route);
-                let mutex = CondMutex::new(SMOKE_LOCK_ID, true);
+                let _guard = released_cond_mutex_with(SMOKE_LOCK_ID, route, requeue);
+                let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
                 let mut observed = CondRelock::Normal;
 
                 shared.mutex.lock();
@@ -741,11 +1398,12 @@ mod tests {
             })
         };
 
+        let _signaller = signalling_thread(requeue);
         std::thread::sleep(std::time::Duration::from_millis(50));
         shared.mutex.lock();
         shared.payload.store(7, Ordering::Release);
-        shared.mutex.unlock();
         shared.cond.signal();
+        shared.mutex.unlock();
 
         let (payload, observed) = waiter.join().expect("the waiter should finish");
         assert_eq!(payload, 7);
@@ -754,12 +1412,12 @@ mod tests {
 
     #[test]
     fn routing_off_hands_a_signal_over_without_claiming_a_routed_token() {
-        assert_ne!(run_cond_handoff(false), CondRelock::AlreadyAdmitted);
+        assert_ne!(run_cond_handoff(false, false), CondRelock::AlreadyAdmitted);
     }
 
     #[test]
     fn routing_on_hands_a_signal_over_without_consulting_the_hint() {
-        assert_ne!(run_cond_handoff(true), CondRelock::TakeHint);
+        assert_ne!(run_cond_handoff(true, false), CondRelock::TakeHint);
     }
 
     /// The scheduler grants the wake its admission while the word still names
@@ -769,17 +1427,13 @@ mod tests {
     /// the grant would be taken back under the contention it was made for.
     #[test]
     fn a_routed_relock_contends_with_the_class_published_as_pending() {
-        let shared = Arc::new(Shared {
-            mutex: SpinMutex::new(),
-            cond: CondState::new(),
-            payload: AtomicU32::new(0),
-        });
+        let shared = Shared::new();
 
         let waiter = {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
                 let _guard = released_cond_mutex(SMOKE_LOCK_ID, true);
-                let mutex = CondMutex::new(SMOKE_LOCK_ID, true);
+                let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
                 let mut observed = None;
 
                 shared.mutex.lock();
@@ -815,20 +1469,590 @@ mod tests {
         assert!(!cv_sleep, "the sleep state is retired before the relock");
     }
 
+    /// A stage a waiter left without claiming a release keeps its count, so the
+    /// next drains spend that count on wakes nobody is parked for. The only
+    /// cost is those empty wakes: the count still reaches zero, and no waiter
+    /// that is parked is ever left without a release.
+    #[test]
+    fn a_staged_count_left_too_high_costs_empty_wakes_and_nothing_else() {
+        let staging = CondStaging::new();
+        staging.block.stage_waiters(2);
+        assert_eq!(staging.staged_count(), 2);
+
+        staging.drain_one();
+        staging.drain_one();
+        assert_eq!(staging.staged_count(), 0);
+
+        staging.drain_one();
+        assert_eq!(staging.staged_count(), 0);
+    }
+
+    /// The unlock tail reads the staged count on every release, so the words
+    /// keep a line to themselves rather than sharing the one the lock hands
+    /// between its own waiters.
+    #[test]
+    fn staging_words_keep_their_own_cache_line() {
+        assert_eq!(std::mem::align_of::<CondStagingBlock>(), 64);
+        assert_eq!(std::mem::size_of::<CondStagingBlock>(), 64);
+    }
+
+    #[test]
+    fn a_cond_keeps_the_staging_of_its_first_wait() {
+        let mutex = SpinMutex::new();
+        let cond = CondState::new();
+
+        assert!(cond.bound.parking_target().is_none());
+        cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+        cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+
+        let bound = cond
+            .bound
+            .parking_target()
+            .expect("the wait should have bound");
+        assert!(std::ptr::eq(
+            bound,
+            std::sync::Arc::as_ptr(&mutex.staging.block)
+        ));
+    }
+
+    #[test]
+    fn an_unbound_cond_signals_without_reaching_a_staging() {
+        let cond = CondState::new();
+        cond.bind_staging(CondStagingRef::none());
+        assert!(cond.bound.parking_target().is_none());
+
+        let _guard = signalling_thread(true);
+        cond.signal();
+        cond.broadcast();
+    }
+
+    /// A cond used with a second mutex would otherwise park waiters on a lock
+    /// they never release, so it gives up its staging and goes back to waking.
+    #[test]
+    fn a_cond_waited_on_with_two_mutexes_gives_up_its_staging() {
+        let first = SpinMutex::new();
+        let second = SpinMutex::new();
+        let cond = CondState::new();
+
+        cond.bind_staging(first.cond_mutex(SMOKE_LOCK_ID).staging);
+        cond.bind_staging(second.cond_mutex(SMOKE_LOCK_ID).staging);
+        assert!(cond.bound.parking_target().is_none());
+
+        cond.bind_staging(first.cond_mutex(SMOKE_LOCK_ID).staging);
+        assert!(
+            cond.bound.parking_target().is_none(),
+            "the conflict is not undone by a later wait"
+        );
+
+        let _guard = signalling_thread(true);
+        cond.signal();
+        assert_eq!(first.staging.staged_count(), 0);
+        assert_eq!(second.staging.staged_count(), 0);
+    }
+
+    /// Re-associating a cond with another mutex once its first association has
+    /// ended is allowed by POSIX and reads exactly like the unsupported
+    /// overlap, so it costs the pacing rather than an assertion, and the count
+    /// is what a run reports it by.
+    #[test]
+    fn a_second_mutex_costs_the_pacing_and_is_counted() {
+        let first = SpinMutex::new();
+        let second = SpinMutex::new();
+        let cond = CondState::new();
+
+        set_cv_admission_counters_enabled(true);
+        let before = cv_requeue_counters().binding_conflicts;
+        cond.bind_staging(first.cond_mutex(SMOKE_LOCK_ID).staging);
+        cond.bind_staging(second.cond_mutex(SMOKE_LOCK_ID).staging);
+        let after = cv_requeue_counters().binding_conflicts;
+        set_cv_admission_counters_enabled(false);
+
+        assert_eq!(after, before + 1);
+        assert!(cond.bound.parking_target().is_none());
+    }
+
+    /// The conflicting binding keeps the reference it published, so the block
+    /// the first mutex owned is still there for the cond to release when it is
+    /// destroyed rather than being dropped from under a concurrent signal.
+    #[test]
+    fn a_conflicting_binding_still_releases_its_reference() {
+        let first = SpinMutex::new();
+        let second = SpinMutex::new();
+        let block = std::sync::Arc::clone(&first.staging.block);
+
+        {
+            let cond = CondState::new();
+            cond.bind_staging(first.cond_mutex(SMOKE_LOCK_ID).staging);
+            cond.bind_staging(second.cond_mutex(SMOKE_LOCK_ID).staging);
+            assert_eq!(std::sync::Arc::strong_count(&block), 3);
+        }
+
+        assert_eq!(
+            std::sync::Arc::strong_count(&block),
+            2,
+            "destroying the cond gives the block back to the lock that owns it"
+        );
+    }
+
+    /// Giving a binding up stops new waiters being parked and nothing else.
+    /// Whatever the cond staged before is still owed a release, so a waiter
+    /// that wakes stale on it keeps handing its release on through the mark.
+    #[test]
+    fn a_conflicting_binding_still_hands_its_releases_on() {
+        let first = SpinMutex::new();
+        let second = SpinMutex::new();
+        let cond = CondState::new();
+
+        cond.bind_staging(first.cond_mutex(SMOKE_LOCK_ID).staging);
+        first.staging.block.stage_waiters(1);
+        cond.bind_staging(second.cond_mutex(SMOKE_LOCK_ID).staging);
+        assert!(
+            cond.bound.parking_target().is_none(),
+            "the binding no longer parks new waiters"
+        );
+
+        cond.hand_on_stale_release();
+        assert_eq!(
+            first.staging.staged_count(),
+            0,
+            "what was staged before the conflict still has its release handed on"
+        );
+    }
+
+    /// Routing and requeueing decide different halves of a wakeup, so every
+    /// combination has to hand a signal over.
+    #[test]
+    fn every_switch_combination_hands_a_signal_over() {
+        for route in [false, true] {
+            for requeue in [false, true] {
+                let observed = run_cond_handoff(route, requeue);
+                if route {
+                    assert_ne!(observed, CondRelock::TakeHint);
+                } else {
+                    assert_ne!(observed, CondRelock::AlreadyAdmitted);
+                }
+            }
+        }
+    }
+
+    fn await_progress(counter: &AtomicU32, expected: u32, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while counter.load(Ordering::Acquire) < expected {
+            assert!(std::time::Instant::now() < deadline, "{what} stalled");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Each side waits for the other's turn, so a wakeup that never arrives
+    /// stops the round count where it stalled.
+    #[test]
+    fn a_requeued_ping_pong_keeps_making_progress() {
+        const ROUNDS: u32 = 200;
+
+        let shared = Shared::new();
+        let rounds = Arc::new(AtomicU32::new(0));
+
+        let consumer = {
+            let shared = Arc::clone(&shared);
+            let rounds = Arc::clone(&rounds);
+            std::thread::spawn(move || {
+                let _guard = released_cond_mutex_with(SMOKE_LOCK_ID, false, true);
+                let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
+
+                for _ in 0..ROUNDS {
+                    shared.mutex.lock();
+                    while shared.payload.load(Ordering::Acquire) == 0 {
+                        wait(
+                            &shared.cond,
+                            mutex,
+                            || shared.mutex.unlock(),
+                            |_| shared.mutex.lock(),
+                        );
+                    }
+                    shared.payload.store(0, Ordering::Release);
+                    rounds.fetch_add(1, Ordering::Release);
+                    shared.cond.signal();
+                    shared.mutex.unlock();
+                }
+            })
+        };
+
+        let _signaller = signalling_thread(true);
+        let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
+        for round in 0..ROUNDS {
+            shared.mutex.lock();
+            while shared.payload.load(Ordering::Acquire) != 0 {
+                wait(
+                    &shared.cond,
+                    mutex,
+                    || shared.mutex.unlock(),
+                    |_| shared.mutex.lock(),
+                );
+            }
+            shared.payload.store(1, Ordering::Release);
+            shared.cond.signal();
+            shared.mutex.unlock();
+            await_progress(&rounds, round + 1, "the ping-pong");
+        }
+
+        consumer.join().expect("the consumer should finish");
+        assert_eq!(rounds.load(Ordering::Acquire), ROUNDS);
+        assert_eq!(shared.mutex.staging.staged_count(), 0);
+    }
+
+    /// A broadcast parks its waiters instead of making them all runnable, and
+    /// the unlock chain then releases them one at a time. Scheduling cannot be
+    /// asserted, but the staging can: it fills up at the broadcast and is back
+    /// to zero once every waiter has been released.
+    #[test]
+    fn a_requeued_broadcast_releases_every_waiter_through_the_staging() {
+        const WAITERS: u32 = 8;
+
+        let shared = Shared::new();
+        let released = Arc::new(AtomicU32::new(0));
+
+        let waiters = (0..WAITERS)
+            .map(|_| {
+                let shared = Arc::clone(&shared);
+                let released = Arc::clone(&released);
+                std::thread::spawn(move || {
+                    let _guard = released_cond_mutex_with(SMOKE_LOCK_ID, false, true);
+                    let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
+
+                    shared.mutex.lock();
+                    while shared.payload.load(Ordering::Acquire) == 0 {
+                        wait(
+                            &shared.cond,
+                            mutex,
+                            || shared.mutex.unlock(),
+                            |_| shared.mutex.lock(),
+                        );
+                    }
+                    released.fetch_add(1, Ordering::Release);
+                    shared.mutex.unlock();
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let _signaller = signalling_thread(true);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        shared.mutex.lock();
+        shared.payload.store(1, Ordering::Release);
+        shared.cond.broadcast();
+        // The broadcast came from the thread holding the lock, so it left the
+        // release to the unlock below and nothing has drained yet.
+        let staged = shared.mutex.staging.staged_count();
+        shared.mutex.unlock();
+
+        await_progress(&released, WAITERS, "the broadcast");
+        for waiter in waiters {
+            waiter.join().expect("every waiter should finish");
+        }
+
+        assert!(staged > 0, "the broadcast should have parked its waiters");
+        assert_eq!(
+            shared.mutex.staging.staged_count(),
+            0,
+            "every staged waiter should have been released"
+        );
+    }
+
+    /// The drain chain starts at an unlock, and a signaller that holds nothing
+    /// has none coming. Without the probe that answers this the waiter would
+    /// stay parked on the stage for good.
+    #[test]
+    fn a_signaller_holding_nothing_releases_the_waiter_it_staged() {
+        let shared = Shared::new();
+        let released = Arc::new(AtomicU32::new(0));
+
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || {
+                let _guard = released_cond_mutex_with(SMOKE_LOCK_ID, false, true);
+                let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
+
+                shared.mutex.lock();
+                while shared.payload.load(Ordering::Acquire) == 0 {
+                    wait(
+                        &shared.cond,
+                        mutex,
+                        || shared.mutex.unlock(),
+                        |_| shared.mutex.lock(),
+                    );
+                }
+                shared.mutex.unlock();
+                released.fetch_add(1, Ordering::Release);
+            })
+        };
+
+        let _signaller = signalling_thread(true);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        shared.mutex.lock();
+        shared.payload.store(1, Ordering::Release);
+        shared.mutex.unlock();
+        // From here nothing else will unlock this mutex until the waiter runs.
+        shared.cond.signal();
+
+        await_progress(&released, 1, "the stranded waiter");
+        waiter.join().expect("the waiter should finish");
+        assert_eq!(shared.mutex.staging.staged_count(), 0);
+    }
+
+    /// A waiter the stage released whose sequence has not moved goes back to
+    /// sleep, and the release it spent has to reach the waiter behind it.
+    ///
+    /// The interleaving is forced rather than raced for: the stage is given a
+    /// release owed to somebody else, and the sleeping waiter is woken on the
+    /// cond word with no signal behind it, which is exactly what a stale
+    /// release looks like from inside the wait.
+    #[test]
+    fn a_stale_wake_hands_its_release_to_the_waiter_behind_it() {
+        let shared = Shared::new();
+        let parked = Arc::new(AtomicU32::new(0));
+
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            let parked = Arc::clone(&parked);
+            std::thread::spawn(move || {
+                let _guard = released_cond_mutex_with(SMOKE_LOCK_ID, false, true);
+                let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
+
+                shared.mutex.lock();
+                while shared.payload.load(Ordering::Acquire) == 0 {
+                    wait(
+                        &shared.cond,
+                        mutex,
+                        || {
+                            shared.mutex.unlock();
+                            parked.fetch_add(1, Ordering::Release);
+                        },
+                        |_| shared.mutex.lock(),
+                    );
+                }
+                shared.mutex.unlock();
+            })
+        };
+
+        // Past the unlock, so the drain it ran cannot spend the release below.
+        await_progress(&parked, 1, "the waiter reaching its sleep");
+        shared.mutex.staging.block.stage_waiters(1);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while shared.mutex.staging.staged_count() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stale wake should have handed its release on"
+            );
+            unsafe { futex_wake(&shared.cond.seq, 1) };
+            std::thread::yield_now();
+        }
+
+        shared.mutex.lock();
+        shared.payload.store(1, Ordering::Release);
+        shared.cond.signal();
+        shared.mutex.unlock();
+
+        waiter.join().expect("the waiter should finish");
+    }
+
+    /// A signal that moves nobody still kicks the drain chain: waiters an
+    /// earlier signal parked are owed a release either way, and a signal is
+    /// the moment a chain that lost one picks up again.
+    #[test]
+    fn a_signal_that_moves_nobody_still_kicks_the_drain_chain() {
+        let mutex = SpinMutex::new();
+        let cond = CondState::new();
+        let _guard = signalling_thread(true);
+
+        cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+        mutex.staging.block.stage_waiters(1);
+
+        // A registration with no sleeper behind it: the requeue finds nothing
+        // to move, so the staged waiter is all this signal can release.
+        cond.waiters.fetch_add(1, Ordering::AcqRel);
+        cond.signal();
+
+        assert_eq!(
+            mutex.staging.staged_count(),
+            0,
+            "a signal that staged nothing still releases what is already staged"
+        );
+    }
+
+    /// A signaler holding the lock the waiters will re-acquire has an unlock of
+    /// its own coming and leaves the release to it, which is the pacing the
+    /// staging exists for.
+    #[test]
+    fn a_signal_from_inside_the_lock_leaves_the_release_to_the_unlock() {
+        let mutex = SpinMutex::new();
+        let cond = CondState::new();
+        let _guard = signalling_thread(true);
+
+        cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+        mutex.staging.block.stage_waiters(1);
+
+        mutex.lock();
+        cond.waiters.fetch_add(1, Ordering::AcqRel);
+        cond.signal();
+        assert_eq!(
+            mutex.staging.staged_count(),
+            1,
+            "the release belongs to the unlock this signaler still owes"
+        );
+
+        mutex.unlock();
+        assert_eq!(mutex.staging.staged_count(), 0);
+    }
+
+    /// Locks created past the class limit share one class, so a signaler can
+    /// hold a lock whose class is the one the cond's mutex has without holding
+    /// that mutex. The lock is recognised by its staging block rather than by
+    /// its class, so the drain still runs: nothing else would ever unlock the
+    /// cond's mutex and release the waiter parked on it.
+    #[test]
+    fn a_signaler_holding_a_class_mate_of_the_bound_lock_still_drains() {
+        let bound = SpinMutex::new();
+        let class_mate = SpinMutex::new();
+        let cond = CondState::new();
+        let _guard = signalling_thread(true);
+
+        cond.bind_staging(bound.cond_mutex(SMOKE_LOCK_ID).staging);
+        bound.staging.block.stage_waiters(1);
+
+        // Both locks carry SMOKE_LOCK_ID, which is what folding does to them.
+        class_mate.lock();
+        cond.waiters.fetch_add(1, Ordering::AcqRel);
+        cond.signal();
+        assert_eq!(
+            bound.staging.staged_count(),
+            0,
+            "no unlock of the bound lock is coming, so the signal owes the release"
+        );
+        class_mate.unlock();
+    }
+
+    /// Destroying the mutex before the cond is allowed, and so is signalling a
+    /// cond nobody waits on. The binding keeps the staging block alive, so the
+    /// signal reads a retired block instead of the freed lock.
+    #[test]
+    fn a_signal_after_the_mutex_is_destroyed_reaches_a_retired_block() {
+        let cond = CondState::new();
+        let block = {
+            let mutex = SpinMutex::new();
+            cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+            let block = Arc::clone(&mutex.staging.block);
+            assert!(block.alive());
+            block
+        };
+
+        assert!(!block.alive(), "destroying the mutex retires its staging");
+
+        let _guard = signalling_thread(true);
+        cond.waiters.fetch_add(1, Ordering::AcqRel);
+        cond.signal();
+        cond.broadcast();
+
+        assert_eq!(
+            block.staged_count(),
+            0,
+            "a retired block never has a waiter parked on it"
+        );
+    }
+
+    /// A mutex destroyed while waiters are parked on its stage has no unlock
+    /// left to release them, so the destroy releases them itself.
+    #[test]
+    fn destroying_a_mutex_releases_what_is_staged_on_it() {
+        let mutex = SpinMutex::new();
+        let block = Arc::clone(&mutex.staging.block);
+        block.stage_waiters(2);
+
+        drop(mutex);
+
+        assert_eq!(block.staged_count(), 0);
+    }
+
+    /// A deadline that expires on the stage takes no release with it. The wait
+    /// ends as the wakeup its signal made it, and the count it left behind is
+    /// spent on the next drain.
+    #[test]
+    fn a_deadline_that_expires_on_the_stage_leaves_the_count_high() {
+        let shared = Shared::new();
+        let outcome = Arc::new(AtomicU32::new(u32::MAX));
+
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            let outcome = Arc::clone(&outcome);
+            std::thread::spawn(move || {
+                let _guard = released_cond_mutex_with(SMOKE_LOCK_ID, false, true);
+                let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
+                let abstime = deadline_in_millis(100);
+
+                shared.mutex.lock();
+                let ret = timedwait(
+                    &shared.cond,
+                    mutex,
+                    &abstime,
+                    || shared.mutex.unlock(),
+                    |_| shared.mutex.lock(),
+                );
+                shared.mutex.unlock();
+                outcome.store(ret as u32, Ordering::Release);
+            })
+        };
+
+        let _signaller = signalling_thread(true);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        shared.mutex.lock();
+        shared.cond.signal();
+        // The mutex stays held past the deadline, and the signal came from the
+        // thread holding it, so the waiter can only leave the stage by expiring
+        // on it.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            shared.mutex.staging.staged_count(),
+            1,
+            "the expired waiter should have left its count behind"
+        );
+        shared.mutex.unlock();
+
+        waiter.join().expect("the waiter should finish");
+        assert_eq!(
+            outcome.load(Ordering::Acquire),
+            0,
+            "a signalled wait reports the wakeup it was given"
+        );
+        assert_eq!(
+            shared.mutex.staging.staged_count(),
+            0,
+            "the next drain spends the count on an empty wake"
+        );
+    }
+
+    fn deadline_in_millis(millis: i64) -> libc::timespec {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
+        let deadline_nsec = now.tv_nsec + millis * 1_000_000;
+        libc::timespec {
+            tv_sec: now.tv_sec + deadline_nsec / 1_000_000_000,
+            tv_nsec: deadline_nsec % 1_000_000_000,
+        }
+    }
+
     #[test]
     fn a_broadcast_releases_every_waiter() {
-        let shared = Arc::new(Shared {
-            mutex: SpinMutex::new(),
-            cond: CondState::new(),
-            payload: AtomicU32::new(0),
-        });
+        let shared = Shared::new();
 
         let waiters = (0..4)
             .map(|_| {
                 let shared = Arc::clone(&shared);
                 std::thread::spawn(move || {
                     let _guard = released_cond_mutex(SMOKE_LOCK_ID, true);
-                    let mutex = CondMutex::new(SMOKE_LOCK_ID, true);
+                    let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
 
                     shared.mutex.lock();
                     while shared.payload.load(Ordering::Acquire) == 0 {

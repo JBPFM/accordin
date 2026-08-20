@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 
-use accordin_shared::condvar::{CondMutex, CondRelock, CondState};
+use accordin_shared::condvar::{CondMutex, CondRelock, CondStaging, CondState};
 use accordin_shared::mutex_hook::{LockBackendAdapter, MutexHookBackend};
 
 type DirectBackend = LockBackendAdapter<crate::mcs_tas::McsTasLockRaw>;
@@ -18,6 +18,30 @@ const _: () = assert!(<DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE)
 pub struct mcs_tas_accordin_direct_mutex {
     lock: <DirectBackend as MutexHookBackend>::LockState,
     lock_id: u32,
+    /// Waiters a cond signal parked on this mutex, released one per unlock.
+    /// The staging is an owned handle to a shared block, so a cond still bound
+    /// to this mutex after it is destroyed reads a retired block rather than
+    /// freed memory.
+    staging: CondStaging,
+}
+
+impl mcs_tas_accordin_direct_mutex {
+    fn new() -> Self {
+        Self {
+            lock: DirectBackend::create_state(),
+            lock_id: accordin_shared::admission::allocate_lock_class(),
+            staging: CondStaging::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn cond_mutex(&self) -> CondMutex {
+        CondMutex::new(
+            self.lock_id,
+            <DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE,
+            self.staging.handle(),
+        )
+    }
 }
 
 /// The condition variable the C API hands out. The wait protocol lives in the
@@ -66,14 +90,14 @@ enum AcquireMode {
 }
 
 #[inline(always)]
-fn lock_with_stats(lock: &<DirectBackend as MutexHookBackend>::LockState, lock_id: u32) {
-    let scope = accordin_shared::admission::begin_lock_scope(lock_id);
-    lock_scope_with_stats(lock, scope, AcquireMode::Normal);
+fn lock_with_stats(mutex: &mcs_tas_accordin_direct_mutex) {
+    let scope = accordin_shared::admission::begin_lock_scope(mutex.lock_id);
+    lock_scope_with_stats(mutex, scope, AcquireMode::Normal);
 }
 
 #[inline(always)]
 fn lock_scope_with_stats(
-    lock: &<DirectBackend as MutexHookBackend>::LockState,
+    mutex: &mcs_tas_accordin_direct_mutex,
     scope: accordin_shared::admission::LockAdmissionScope,
     mode: AcquireMode,
 ) {
@@ -81,9 +105,10 @@ fn lock_scope_with_stats(
 
     if normal
         && !accordin_shared::admission::token_consumed_for_scope(scope)
-        && DirectBackend::try_lock(lock)
+        && DirectBackend::try_lock(&mutex.lock)
     {
         accordin_shared::lock_stats::record_lock_acquired_for_scope(scope);
+        mutex.staging.handle().publish_hold();
         return;
     }
 
@@ -92,9 +117,10 @@ fn lock_scope_with_stats(
         std::thread::yield_now();
         accordin_shared::admission::clear_token_consumed_for_scope(scope);
     }
-    DirectBackend::lock(lock);
+    DirectBackend::lock(&mutex.lock);
     accordin_shared::lock_stats::record_wait_end(wait_start);
     accordin_shared::lock_stats::record_lock_acquired_for_scope(scope);
+    mutex.staging.handle().publish_hold();
 }
 
 /// Reacquires the cond mutex after a wait, in the mode the wait protocol
@@ -102,12 +128,8 @@ fn lock_scope_with_stats(
 /// published hint carries it in the user word, so both enter the lock without
 /// re-requesting admission.
 #[inline(always)]
-fn relock_after_cond_wait(
-    lock: &<DirectBackend as MutexHookBackend>::LockState,
-    lock_id: u32,
-    relock: CondRelock,
-) {
-    let scope = accordin_shared::admission::begin_lock_scope(lock_id);
+fn relock_after_cond_wait(mutex: &mcs_tas_accordin_direct_mutex, relock: CondRelock) {
+    let scope = accordin_shared::admission::begin_lock_scope(mutex.lock_id);
     let mode = match relock {
         CondRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
         CondRelock::TakeHint
@@ -121,15 +143,28 @@ fn relock_after_cond_wait(
             AcquireMode::Normal
         }
     };
-    lock_scope_with_stats(lock, scope, mode);
+    lock_scope_with_stats(mutex, scope, mode);
 }
 
+/// Releases the lock and then hands the next staged cond waiter to the lock's
+/// own service rate: the release comes first so the waiter finds the lock free,
+/// and the phase bookkeeping comes before it so the drain never runs inside the
+/// critical section.
+///
+/// The staging handle is read while the lock is still held. Past the release
+/// the mutex may already have been destroyed by the thread that took it next,
+/// and the drain then reads a word of a freed block rather than following a
+/// pointer out of freed state.
 #[inline(always)]
-fn unlock_with_stats(lock: &<DirectBackend as MutexHookBackend>::LockState, lock_id: u32) {
+fn unlock_with_stats(mutex: &mcs_tas_accordin_direct_mutex) {
     let hold_end = accordin_shared::lock_stats::record_hold_end_sample();
-    DirectBackend::unlock(lock);
+    let staging = mutex.staging.handle();
+    let lock_id = mutex.lock_id;
+    staging.clear_hold();
+    DirectBackend::unlock(&mutex.lock);
     accordin_shared::admission::finish_lock_scope(lock_id);
     accordin_shared::lock_stats::record_post_unlock(hold_end, lock_id);
+    staging.drain_one();
 }
 
 unsafe fn mutex_ref<'a>(
@@ -154,10 +189,7 @@ unsafe fn cond_ref<'a>(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mcs_tas_accordin_direct_mutex_create() -> *mut mcs_tas_accordin_direct_mutex {
-    Box::into_raw(Box::new(mcs_tas_accordin_direct_mutex {
-        lock: DirectBackend::create_state(),
-        lock_id: accordin_shared::admission::allocate_lock_class(),
-    }))
+    Box::into_raw(Box::new(mcs_tas_accordin_direct_mutex::new()))
 }
 
 #[unsafe(no_mangle)]
@@ -182,7 +214,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_lock(
     };
 
     ensure_registered();
-    lock_with_stats(&mutex.lock, mutex.lock_id);
+    lock_with_stats(mutex);
     0
 }
 
@@ -198,6 +230,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_trylock(
     ensure_registered();
     if DirectBackend::try_lock(&mutex.lock) {
         accordin_shared::lock_stats::record_lock_acquired_for_lock(mutex.lock_id);
+        mutex.staging.handle().publish_hold();
         0
     } else {
         libc::EBUSY
@@ -213,7 +246,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_unlock(
         Err(ret) => return ret,
     };
 
-    unlock_with_stats(&mutex.lock, mutex.lock_id);
+    unlock_with_stats(mutex);
     0
 }
 
@@ -253,12 +286,9 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_wait(
     ensure_registered();
     accordin_shared::condvar::wait(
         &cond.state,
-        CondMutex::new(
-            mutex.lock_id,
-            <DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE,
-        ),
-        || unlock_with_stats(&mutex.lock, mutex.lock_id),
-        |relock| relock_after_cond_wait(&mutex.lock, mutex.lock_id, relock),
+        mutex.cond_mutex(),
+        || unlock_with_stats(mutex),
+        |relock| relock_after_cond_wait(mutex, relock),
     );
     0
 }
@@ -285,13 +315,10 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_timedwait(
     ensure_registered();
     accordin_shared::condvar::timedwait(
         &cond.state,
-        CondMutex::new(
-            mutex.lock_id,
-            <DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE,
-        ),
+        mutex.cond_mutex(),
         unsafe { &*abstime },
-        || unlock_with_stats(&mutex.lock, mutex.lock_id),
-        |relock| relock_after_cond_wait(&mutex.lock, mutex.lock_id, relock),
+        || unlock_with_stats(mutex),
+        |relock| relock_after_cond_wait(mutex, relock),
     )
 }
 
@@ -325,6 +352,8 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_broadcast(
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use accordin_shared::condvar::force_cv_requeue_for_thread;
 
     use super::{
         mcs_tas_accordin_direct_cond, mcs_tas_accordin_direct_cond_broadcast,
@@ -506,6 +535,192 @@ mod tests {
             waiter.join().expect("every waiter should finish");
         }
         pair.destroy();
+    }
+
+    /// The requeue switch belongs to the signalling thread: a waiter's release
+    /// comes from the staged count, which the unlock drains either way.
+    struct RequeueGuard;
+
+    impl Drop for RequeueGuard {
+        fn drop(&mut self) {
+            force_cv_requeue_for_thread(None);
+        }
+    }
+
+    fn signalling_thread() -> RequeueGuard {
+        force_cv_requeue_for_thread(Some(true));
+        RequeueGuard
+    }
+
+    fn await_progress(counter: &AtomicU32, expected: u32, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while counter.load(Ordering::Acquire) < expected {
+            assert!(std::time::Instant::now() < deadline, "{what} stalled");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn direct_cond_ping_pong_makes_progress_with_requeue() {
+        const ROUNDS: u32 = 100;
+
+        let pair = CondPair::create();
+        let payload = Arc::new(AtomicU32::new(0));
+        let rounds = Arc::new(AtomicU32::new(0));
+
+        let consumer = {
+            let payload = Arc::clone(&payload);
+            let rounds = Arc::clone(&rounds);
+            std::thread::spawn(move || unsafe {
+                let pair = pair;
+                let _guard = signalling_thread();
+
+                for _ in 0..ROUNDS {
+                    assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
+                    while payload.load(Ordering::Acquire) == 0 {
+                        assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
+                    }
+                    payload.store(0, Ordering::Release);
+                    rounds.fetch_add(1, Ordering::Release);
+                    assert_eq!(mcs_tas_accordin_direct_cond_signal(pair.cond), 0);
+                    assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
+                }
+            })
+        };
+
+        let _guard = signalling_thread();
+        for round in 0..ROUNDS {
+            unsafe {
+                assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
+                while payload.load(Ordering::Acquire) != 0 {
+                    assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
+                }
+                payload.store(1, Ordering::Release);
+                assert_eq!(mcs_tas_accordin_direct_cond_signal(pair.cond), 0);
+                assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
+            }
+            await_progress(&rounds, round + 1, "the ping-pong");
+        }
+
+        consumer.join().expect("the consumer should finish");
+        assert_eq!(rounds.load(Ordering::Acquire), ROUNDS);
+        pair.destroy();
+    }
+
+    #[test]
+    fn direct_cond_broadcast_releases_every_waiter_with_requeue() {
+        const WAITERS: u32 = 8;
+
+        let pair = CondPair::create();
+        let payload = Arc::new(AtomicU32::new(0));
+        let released = Arc::new(AtomicU32::new(0));
+
+        let waiters = (0..WAITERS)
+            .map(|_| {
+                let payload = Arc::clone(&payload);
+                let released = Arc::clone(&released);
+                std::thread::spawn(move || unsafe {
+                    let pair = pair;
+                    assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
+                    while payload.load(Ordering::Acquire) == 0 {
+                        assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
+                    }
+                    released.fetch_add(1, Ordering::Release);
+                    assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let _guard = signalling_thread();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        unsafe {
+            assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
+            payload.store(1, Ordering::Release);
+            assert_eq!(mcs_tas_accordin_direct_cond_broadcast(pair.cond), 0);
+            assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
+        }
+
+        await_progress(&released, WAITERS, "the broadcast");
+        for waiter in waiters {
+            waiter.join().expect("every waiter should finish");
+        }
+        pair.destroy();
+    }
+
+    /// A signaller that holds nothing has no unlock coming to release the
+    /// waiter it staged, so the signal itself has to start the chain.
+    #[test]
+    fn direct_cond_signal_without_the_mutex_releases_a_staged_waiter() {
+        let pair = CondPair::create();
+        let payload = Arc::new(AtomicU32::new(0));
+        let released = Arc::new(AtomicU32::new(0));
+
+        let waiter = {
+            let payload = Arc::clone(&payload);
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || unsafe {
+                let pair = pair;
+                assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
+                while payload.load(Ordering::Acquire) == 0 {
+                    assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
+                }
+                assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
+                released.fetch_add(1, Ordering::Release);
+            })
+        };
+
+        let _guard = signalling_thread();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        unsafe {
+            assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
+            payload.store(1, Ordering::Release);
+            assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
+            assert_eq!(mcs_tas_accordin_direct_cond_signal(pair.cond), 0);
+        }
+
+        await_progress(&released, 1, "the stranded waiter");
+        waiter.join().expect("the waiter should finish");
+        pair.destroy();
+    }
+
+    /// POSIX lets the mutex be destroyed before the cond, and lets a cond with
+    /// no waiter be signalled. The cond keeps its staging alive across the
+    /// destroy, so the signal reads a retired block rather than the memory the
+    /// mutex was freed from.
+    #[test]
+    fn direct_cond_signal_after_the_mutex_is_destroyed_is_safe() {
+        let pair = CondPair::create();
+        let payload = Arc::new(AtomicU32::new(0));
+
+        let waiter = {
+            let payload = Arc::clone(&payload);
+            std::thread::spawn(move || unsafe {
+                let pair = pair;
+                let _guard = signalling_thread();
+                assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
+                while payload.load(Ordering::Acquire) == 0 {
+                    assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
+                }
+                assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
+            })
+        };
+
+        let _guard = signalling_thread();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        unsafe {
+            assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
+            payload.store(1, Ordering::Release);
+            assert_eq!(mcs_tas_accordin_direct_cond_signal(pair.cond), 0);
+            assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
+        }
+        waiter.join().expect("the waiter should finish");
+
+        unsafe {
+            assert_eq!(mcs_tas_accordin_direct_mutex_destroy(pair.mutex), 0);
+            assert_eq!(mcs_tas_accordin_direct_cond_signal(pair.cond), 0);
+            assert_eq!(mcs_tas_accordin_direct_cond_broadcast(pair.cond), 0);
+            assert_eq!(mcs_tas_accordin_direct_cond_destroy(pair.cond), 0);
+        }
     }
 
     #[test]

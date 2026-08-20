@@ -607,6 +607,17 @@ fn print_cv_admission_counters() {
         counters.fallback_relocks,
         counters.route_relocks
     );
+
+    let requeue = mutex_hook::cv_requeue_counters();
+    eprintln!(
+        "[lock_stats] cv_requeue requeued={} fallbacks={} drain_wakes={} stranding_wakes={} staged_high_water={} binding_conflicts={}",
+        requeue.requeued,
+        requeue.fallbacks,
+        requeue.drain_wakes,
+        requeue.stranding_wakes,
+        requeue.staged_high_water,
+        requeue.binding_conflicts
+    );
 }
 
 fn print_bpf_routing_counters() {

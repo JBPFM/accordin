@@ -62,6 +62,12 @@ static CV_HINTS_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 static CV_SPECIALIZED_RELOCKS: AtomicU64 = AtomicU64::new(0);
 static CV_FALLBACK_RELOCKS: AtomicU64 = AtomicU64::new(0);
 static CV_ROUTE_RELOCKS: AtomicU64 = AtomicU64::new(0);
+static CV_REQUEUED: AtomicU64 = AtomicU64::new(0);
+static CV_REQUEUE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static CV_DRAIN_WAKES: AtomicU64 = AtomicU64::new(0);
+static CV_STRANDING_WAKES: AtomicU64 = AtomicU64::new(0);
+static CV_STAGED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static CV_BINDING_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 
 /// Reconciles the userspace side of the cond-reacquire protocol against the
 /// scheduler's wake-routing counters.
@@ -81,6 +87,40 @@ pub fn cv_admission_counters() -> CvAdmissionCounters {
         specialized_relocks: CV_SPECIALIZED_RELOCKS.load(Ordering::Relaxed),
         fallback_relocks: CV_FALLBACK_RELOCKS.load(Ordering::Relaxed),
         route_relocks: CV_ROUTE_RELOCKS.load(Ordering::Relaxed),
+    }
+}
+
+/// Accounts the staging a cond signal parks its waiters on against the unlocks
+/// that release them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CvRequeueCounters {
+    /// Waiters the kernel moved from the cond sequence word to a lock's stage.
+    pub requeued: u64,
+    /// Signals that gave up on the requeue and woke their waiters directly, so
+    /// the wakeup kept its correctness and lost its pacing.
+    pub fallbacks: u64,
+    /// Staged waiters released by an unlock.
+    pub drain_wakes: u64,
+    /// Staged waiters released by a signaler that found the lock free, which
+    /// leaves no unlock to start the drain chain.
+    pub stranding_wakes: u64,
+    /// Most waiters ever staged on one lock at once.
+    pub staged_high_water: u64,
+    /// Conds that were waited on with a second mutex and gave their binding
+    /// up over it, keeping their signals correct and losing the pacing. A
+    /// cond re-associated with another mutex after its first association ended
+    /// is counted here too: the two are indistinguishable from a binding.
+    pub binding_conflicts: u64,
+}
+
+pub fn cv_requeue_counters() -> CvRequeueCounters {
+    CvRequeueCounters {
+        requeued: CV_REQUEUED.load(Ordering::Relaxed),
+        fallbacks: CV_REQUEUE_FALLBACKS.load(Ordering::Relaxed),
+        drain_wakes: CV_DRAIN_WAKES.load(Ordering::Relaxed),
+        stranding_wakes: CV_STRANDING_WAKES.load(Ordering::Relaxed),
+        staged_high_water: CV_STAGED_HIGH_WATER.load(Ordering::Relaxed),
+        binding_conflicts: CV_BINDING_CONFLICTS.load(Ordering::Relaxed),
     }
 }
 
@@ -127,6 +167,50 @@ pub fn record_cv_fallback_relock() {
 #[inline(always)]
 pub fn record_cv_route_relock() {
     bump_cv_counter(&CV_ROUTE_RELOCKS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_requeued(moved: u64) {
+    if !CV_COUNTERS_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    CV_REQUEUED.fetch_add(moved, Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_requeue_fallback() {
+    bump_cv_counter(&CV_REQUEUE_FALLBACKS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_drain_wake() {
+    bump_cv_counter(&CV_DRAIN_WAKES);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_stranding_wake() {
+    bump_cv_counter(&CV_STRANDING_WAKES);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_binding_conflict() {
+    bump_cv_counter(&CV_BINDING_CONFLICTS);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_cv_staged_high_water(staged: u64) {
+    if !CV_COUNTERS_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    CV_STAGED_HIGH_WATER.fetch_max(staged, Ordering::Relaxed);
 }
 
 #[inline(always)]
@@ -298,7 +382,7 @@ macro_rules! export_mutex_hooks {
             use std::sync::OnceLock;
             use std::sync::atomic::{AtomicUsize, Ordering};
 
-            use $crate::condvar::{CondMutex, CondRelock, CondState};
+            use $crate::condvar::{CondMutex, CondRelock, CondStaging, CondState};
             use $crate::lock_stats::{
                 record_hold_end_sample, record_lock_acquired, record_lock_acquired_for_lock,
                 record_lock_acquired_for_scope, record_post_unlock, record_thread_start,
@@ -311,6 +395,33 @@ macro_rules! export_mutex_hooks {
             struct HookState {
                 lock: <Backend as MutexHookBackend>::LockState,
                 lock_id: u32,
+                /// Waiters a cond signal parked on this lock, released one per
+                /// unlock. Most hooked mutexes never carry a cond, so the state
+                /// stays on its own cache line and the unlock reads it once.
+                staging: CondStaging,
+            }
+
+            impl HookState {
+                fn new() -> Self {
+                    Self {
+                        lock: Backend::create_state(),
+                        lock_id: if Backend::USES_ADMISSION_SCOPE {
+                            $crate::admission::allocate_lock_class()
+                        } else {
+                            $crate::admission::UNMANAGED_LOCK_ID
+                        },
+                        staging: CondStaging::new(),
+                    }
+                }
+
+                #[inline(always)]
+                fn cond_mutex(&self) -> CondMutex {
+                    CondMutex::new(
+                        self.lock_id,
+                        Backend::USES_ADMISSION_SCOPE,
+                        self.staging.handle(),
+                    )
+                }
             }
 
             unsafe impl Send for HookState {}
@@ -353,27 +464,27 @@ macro_rules! export_mutex_hooks {
             }
 
             #[inline(always)]
-            fn lock_with_stats(lock: &<Backend as MutexHookBackend>::LockState, lock_id: u32) {
+            fn lock_with_stats(state: &HookState) {
                 if Backend::USES_ADMISSION_SCOPE {
-                    let scope = $crate::admission::begin_lock_scope(lock_id);
-                    lock_scope_with_stats(lock, scope, AcquireMode::Normal);
+                    let scope = $crate::admission::begin_lock_scope(state.lock_id);
+                    lock_scope_with_stats(state, scope, AcquireMode::Normal);
                     return;
                 }
 
-                if Backend::try_lock(lock) {
+                if Backend::try_lock(&state.lock) {
                     record_lock_acquired();
                     return;
                 }
 
                 let wait_start = record_wait_start();
-                Backend::lock(lock);
+                Backend::lock(&state.lock);
                 record_wait_end(wait_start);
                 record_lock_acquired();
             }
 
             #[inline(always)]
             fn lock_scope_with_stats(
-                lock: &<Backend as MutexHookBackend>::LockState,
+                state: &HookState,
                 scope: $crate::admission::LockAdmissionScope,
                 mode: AcquireMode,
             ) {
@@ -381,9 +492,10 @@ macro_rules! export_mutex_hooks {
 
                 if normal
                     && !$crate::admission::token_consumed_for_scope(scope)
-                    && Backend::try_lock(lock)
+                    && Backend::try_lock(&state.lock)
                 {
                     record_lock_acquired_for_scope(scope);
+                    state.staging.handle().publish_hold();
                     return;
                 }
 
@@ -392,9 +504,10 @@ macro_rules! export_mutex_hooks {
                     std::thread::yield_now();
                     $crate::admission::clear_token_consumed_for_scope(scope);
                 }
-                Backend::lock(lock);
+                Backend::lock(&state.lock);
                 record_wait_end(wait_start);
                 record_lock_acquired_for_scope(scope);
+                state.staging.handle().publish_hold();
             }
 
             /// Reacquires the cond mutex after a wait, in the mode the wait
@@ -402,17 +515,13 @@ macro_rules! export_mutex_hooks {
             /// decision, and a published hint carries it in the user word, so
             /// both enter the lock without re-requesting admission.
             #[inline(always)]
-            fn relock_after_cond_wait(
-                lock: &<Backend as MutexHookBackend>::LockState,
-                lock_id: u32,
-                relock: CondRelock,
-            ) {
+            fn relock_after_cond_wait(state: &HookState, relock: CondRelock) {
                 if !Backend::USES_ADMISSION_SCOPE {
-                    lock_with_stats(lock, lock_id);
+                    lock_with_stats(state);
                     return;
                 }
 
-                let scope = $crate::admission::begin_lock_scope(lock_id);
+                let scope = $crate::admission::begin_lock_scope(state.lock_id);
                 let mode = match relock {
                     CondRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
                     CondRelock::TakeHint
@@ -426,17 +535,32 @@ macro_rules! export_mutex_hooks {
                         AcquireMode::Normal
                     }
                 };
-                lock_scope_with_stats(lock, scope, mode);
+                lock_scope_with_stats(state, scope, mode);
             }
 
+            /// Releases the lock and then hands the next staged cond waiter to
+            /// the lock's own service rate: the release comes first so the
+            /// waiter finds the lock free, and the phase bookkeeping comes
+            /// before it so the drain never runs inside the critical section.
+            ///
+            /// The staging handle is read while the lock is still held. Past
+            /// the release the mutex may already have been destroyed by the
+            /// thread that took it next, and the drain then reads a word of a
+            /// freed block rather than following a pointer out of freed state.
             #[inline(always)]
-            fn unlock_with_stats(lock: &<Backend as MutexHookBackend>::LockState, lock_id: u32) {
+            fn unlock_with_stats(state: &HookState) {
                 let hold_end = record_hold_end_sample();
-                Backend::unlock(lock);
+                let staging = state.staging.handle();
+                let lock_id = state.lock_id;
+                if Backend::USES_ADMISSION_SCOPE {
+                    staging.clear_hold();
+                }
+                Backend::unlock(&state.lock);
                 if Backend::USES_ADMISSION_SCOPE {
                     $crate::admission::finish_lock_scope(lock_id);
                 }
                 record_post_unlock(hold_end, lock_id);
+                staging.drain_one();
             }
 
             const SENTINEL: usize = 1;
@@ -668,14 +792,7 @@ macro_rules! export_mutex_hooks {
                         return libc::EINVAL;
                     }
 
-                    let state = Box::new(HookState {
-                        lock: Backend::create_state(),
-                        lock_id: if Backend::USES_ADMISSION_SCOPE {
-                            $crate::admission::allocate_lock_class()
-                        } else {
-                            $crate::admission::UNMANAGED_LOCK_ID
-                        },
-                    });
+                    let state = Box::new(HookState::new());
                     let ptr = Box::into_raw(state);
 
                     std::ptr::write_bytes(
@@ -751,14 +868,7 @@ macro_rules! export_mutex_hooks {
                         continue;
                     }
 
-                    let state = Box::new(HookState {
-                        lock: Backend::create_state(),
-                        lock_id: if Backend::USES_ADMISSION_SCOPE {
-                            $crate::admission::allocate_lock_class()
-                        } else {
-                            $crate::admission::UNMANAGED_LOCK_ID
-                        },
-                    });
+                    let state = Box::new(HookState::new());
                     let ptr = Box::into_raw(state);
 
                     atomic.store(ptr as usize, Ordering::Release);
@@ -945,7 +1055,7 @@ macro_rules! export_mutex_hooks {
                         Ok(state) => state,
                         Err(ret) => return ret,
                     };
-                    lock_with_stats(&(*state).lock, (*state).lock_id);
+                    lock_with_stats(&*state);
                     0
                 }
             }
@@ -966,6 +1076,7 @@ macro_rules! export_mutex_hooks {
                     if Backend::try_lock(&(*state).lock) {
                         if Backend::USES_ADMISSION_SCOPE {
                             record_lock_acquired_for_lock((*state).lock_id);
+                            (*state).staging.handle().publish_hold();
                         } else {
                             record_lock_acquired();
                         }
@@ -993,7 +1104,7 @@ macro_rules! export_mutex_hooks {
                     let val = atomic.load(Ordering::Acquire);
                     if val > SENTINEL {
                         let state = &*(val as *mut HookState);
-                        unlock_with_stats(&state.lock, state.lock_id);
+                        unlock_with_stats(state);
                         return 0;
                     }
                     libc::EINVAL
@@ -1102,9 +1213,9 @@ macro_rules! export_mutex_hooks {
                     };
                     $crate::condvar::wait(
                         &*cond_state,
-                        CondMutex::new((*state).lock_id, Backend::USES_ADMISSION_SCOPE),
-                        || unlock_with_stats(&(*state).lock, (*state).lock_id),
-                        |relock| relock_after_cond_wait(&(*state).lock, (*state).lock_id, relock),
+                        (*state).cond_mutex(),
+                        || unlock_with_stats(&*state),
+                        |relock| relock_after_cond_wait(&*state, relock),
                     );
                     0
                 }
@@ -1135,10 +1246,10 @@ macro_rules! export_mutex_hooks {
                     };
                     $crate::condvar::timedwait(
                         &*cond_state,
-                        CondMutex::new((*state).lock_id, Backend::USES_ADMISSION_SCOPE),
+                        (*state).cond_mutex(),
                         &*abstime,
-                        || unlock_with_stats(&(*state).lock, (*state).lock_id),
-                        |relock| relock_after_cond_wait(&(*state).lock, (*state).lock_id, relock),
+                        || unlock_with_stats(&*state),
+                        |relock| relock_after_cond_wait(&*state, relock),
                     )
                 }
             }
@@ -1153,12 +1264,14 @@ mod tests {
     use libbpf_rs::MapFlags;
 
     use super::{
-        ThreadCtxMapOps, cv_admission_counters, cv_admission_counters_enabled,
+        ThreadCtxMapOps, cv_admission_counters, cv_admission_counters_enabled, cv_requeue_counters,
         hook_scope_value_is_registered, hooked_cond_registered, hooked_mutex_registered,
-        record_cv_fallback_relock, record_cv_hint_published, record_cv_route_relock,
-        record_cv_specialized_relock, register_hooked_cond_addr, register_hooked_mutex_addr,
-        register_thread_ctx_with_map, set_cv_admission_counters_enabled,
-        unregister_hooked_cond_addr, unregister_hooked_mutex_addr, unregister_thread_ctx_with_map,
+        record_cv_drain_wake, record_cv_fallback_relock, record_cv_hint_published,
+        record_cv_requeue_fallback, record_cv_requeued, record_cv_route_relock,
+        record_cv_specialized_relock, record_cv_staged_high_water, record_cv_stranding_wake,
+        register_hooked_cond_addr, register_hooked_mutex_addr, register_thread_ctx_with_map,
+        set_cv_admission_counters_enabled, unregister_hooked_cond_addr,
+        unregister_hooked_mutex_addr, unregister_thread_ctx_with_map,
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1276,16 +1389,25 @@ mod tests {
         assert!(!cv_admission_counters_enabled());
 
         let baseline = cv_admission_counters();
+        let requeue_baseline = cv_requeue_counters();
         record_cv_hint_published();
         record_cv_specialized_relock();
         record_cv_fallback_relock();
+        record_cv_requeued(4);
+        record_cv_drain_wake();
         assert_eq!(cv_admission_counters(), baseline);
+        assert_eq!(cv_requeue_counters(), requeue_baseline);
 
         set_cv_admission_counters_enabled(true);
         record_cv_hint_published();
         record_cv_specialized_relock();
         record_cv_fallback_relock();
         record_cv_route_relock();
+        record_cv_requeued(2);
+        record_cv_requeue_fallback();
+        record_cv_drain_wake();
+        record_cv_stranding_wake();
+        record_cv_staged_high_water(requeue_baseline.staged_high_water + 3);
         set_cv_admission_counters_enabled(false);
 
         let counters = cv_admission_counters();
@@ -1296,6 +1418,20 @@ mod tests {
         );
         assert_eq!(counters.fallback_relocks, baseline.fallback_relocks + 1);
         assert_eq!(counters.route_relocks, baseline.route_relocks + 1);
+
+        let requeue = cv_requeue_counters();
+        assert_eq!(requeue.requeued, requeue_baseline.requeued + 2);
+        assert_eq!(requeue.fallbacks, requeue_baseline.fallbacks + 1);
+        assert_eq!(requeue.drain_wakes, requeue_baseline.drain_wakes + 1);
+        assert_eq!(
+            requeue.stranding_wakes,
+            requeue_baseline.stranding_wakes + 1
+        );
+        assert_eq!(
+            requeue.staged_high_water,
+            requeue_baseline.staged_high_water + 3,
+            "the high-water mark keeps the largest stage it ever saw"
+        );
     }
 
     fn hook_implementation_source() -> &'static str {

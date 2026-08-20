@@ -10,12 +10,15 @@
 /* Managed classes a single deficit probe examines. The probe cannot sweep the
  * whole class space per call: the loop is unrolled and the verifier explores
  * each iteration's paths separately, so the cost this adds to the dispatch
- * program grows steeply with the width. Measured against the verifier's
- * 1000000-instruction budget at MAX_LOCK_CLASSES 64, dispatch costs 44% of the
- * budget at width 4, 99% at width 7, and is rejected at width 8; width 4 also
- * keeps the program loadable, at 74% of the budget, if the class count doubles
- * again. Any width change has to be re-measured, not reasoned about, because
- * the growth is superlinear and the rest of dispatch shares the same budget.
+ * program grows steeply with the width. What keeps that growth affordable is
+ * the scan being a global subprogram: it is verified once against unknown
+ * arguments rather than once per dispatch state that reaches it, and the
+ * figures below only hold while it stays one. Measured against the verifier's
+ * 1000000-instruction budget at MAX_LOCK_CLASSES 64, with the cvready window at
+ * 4, dispatch costs 10% of the budget at width 4 and 22% at width 8, and is
+ * rejected at width 16. Any width change has to be re-measured, not reasoned
+ * about, because the growth is superlinear and the rest of dispatch, the
+ * cvready window included, shares the same budget.
  *
  * A rotating start rank spreads consecutive probes across the space, so a class
  * outside one window is reached by a following one. */
@@ -63,7 +66,10 @@ static __always_inline __u32 inactive_next_probe_rank(__u32 rank, __u32 span) {
  * program's instruction budget with the deficit probe and the fallback scan, so
  * it stays a bounded window with no full-space scan behind it: a class the
  * window misses is reached by a following call through the rotating cursor, and
- * by the periodic forced drain in the worst case. */
+ * by the periodic forced drain in the worst case. Measured with the deficit
+ * window at 4, dispatch costs 10% of the 1000000-instruction budget at width 4,
+ * 14% at width 8 and 79% at width 16; a sweep of the whole class space is what
+ * those figures rule out. */
 #define CVREADY_PROBE_WIDTH 4U
 
 /* Start rank of the cvready probe after the one starting at `rank`. `span` is

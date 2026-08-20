@@ -171,17 +171,18 @@ static __always_inline struct task_scx_ctx *get_task_ctx(struct task_struct *p) 
   return task_ctx;
 }
 
-/* Bounds a per-CPU array access for the verifier. The mask is what proves the
- * index in range, so MAX_CPUS has to stay a power of two. */
+/* Bounds a per-CPU array access for the verifier. barrier_var comes before the
+ * bound so the compiler cannot fold the check away against a range it derived
+ * elsewhere: the register the verifier then has bounds for is the one the index
+ * is taken from, which a caller-side range check on a copy would not be. */
 #define DEFINE_CPU_SLOT_LOOKUP(fn, array)                                      \
   static __always_inline volatile __u32 *fn(__u32 cpu) {                       \
-    __u32 idx;                                                                 \
+    __u32 idx = cpu;                                                           \
                                                                                \
-    if (cpu >= MAX_CPUS)                                                       \
+    barrier_var(idx);                                                          \
+    if (idx >= MAX_CPUS)                                                       \
       return 0;                                                                \
                                                                                \
-    idx = cpu & (MAX_CPUS - 1);                                                \
-    barrier_var(idx);                                                          \
     return &array[idx];                                                        \
   }
 
@@ -651,7 +652,15 @@ static __always_inline bool try_move_inactive(__u32 dispatch_cpu, __u32 lock_id,
   return outcome == INACTIVE_MOVE_MOVED;
 }
 
-static __always_inline enum inactive_move_outcome
+/* Global, so the verifier checks the unrolled class scan once against unknown
+ * arguments instead of re-exploring it for every combination of dispatch-side
+ * conditions that can reach a call site. The unrolled scan is the largest piece
+ * of code dispatch runs and dispatch reaches it from several distinct states,
+ * so inlining it multiplies those states into its own branch space, and that
+ * product is what the instruction budget cannot pay for. Arguments and the
+ * result are scalars because that is what a global subprogram may take and
+ * return. */
+__noinline enum inactive_move_outcome
 move_selected_inactive_to_local(__u32 dispatch_cpu, bool force) {
   volatile __u32 *last_lock_ptr;
   __u32 previous_lock_id = UNMANAGED_LOCK_ID;
@@ -725,13 +734,15 @@ static __always_inline bool move_cvready_to_local(__u32 dispatch_cpu,
 /* Selects the cvready class this CPU drains: the class it was last pointed at,
  * then a window of CVREADY_PROBE_WIDTH ranks from the CPU's rotating cursor.
  * Unlike the inactive selection there is no full-space fallback scan behind it,
- * and there must not be one: dispatch already spends a large part of the
- * verifier's instruction budget on the inactive scan, and a second unrolled
- * sweep over the class space would not load. The rotating cursor is what still
- * reaches every class, one window per call; the class a park pointed this CPU
- * at is reached by the first attempt whatever the cursor is doing. */
-static __always_inline bool move_selected_cvready_to_local(__u32 dispatch_cpu,
-                                                           bool force) {
+ * and there must not be one: the measured cost of widening this window rules
+ * out a second unrolled sweep over the class space beside the inactive one. The
+ * rotating cursor is what still reaches every class, one window per call; the
+ * class a park pointed this CPU at is reached by the first attempt whatever the
+ * cursor is doing.
+ *
+ * Global for the same reason the inactive selection is: verified once against
+ * unknown arguments instead of once per dispatch state that reaches it. */
+__noinline bool move_selected_cvready_to_local(__u32 dispatch_cpu, bool force) {
   volatile __u32 *cursor = lookup_cpu_cvready_probe_cursor(dispatch_cpu);
   volatile __u32 *last_lock_ptr;
   __u32 previous_lock_id = UNMANAGED_LOCK_ID;

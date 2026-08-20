@@ -80,17 +80,28 @@ static __always_inline bool cv_route_active(void) {
 
 /* Whether any thread sits on a cvready queue. A park counts before the drain
  * that takes the thread off the queue does, and nothing else removes a task
- * from these queues, so the two counters differ exactly while one is occupied;
- * a task whose insert has not landed yet is already counted, so it is never
- * missed. Being exact is what lets this gate stand alone: the cvready selection
- * probes a window of the class space, and an empty verdict from one scan cannot
- * speak for the classes it never looked at. */
+ * from these queues, so the two counters differ exactly while one is occupied.
+ * The park counts after issuing the insert and is still ahead of it: an insert
+ * issued from the enqueue callback lands on the DSQ only once that callback
+ * returns, so the count is in place before any CPU can see the task, and an
+ * occupied queue is never read as empty. Being exact is what lets this gate
+ * stand alone: the cvready selection probes a window of the class space, and an
+ * empty verdict from one scan cannot speak for the classes it never looked
+ * at. */
 static __always_inline bool cvready_queues_occupied(void) {
   return cvready_enqueue_seq != cvready_drained_count;
 }
 
 static __always_inline bool cvready_dispatch_needed(void) {
   return cv_route_active() && cvready_queues_occupied();
+}
+
+/* Whether every queue this scheduler drains looks empty. The reasons a
+ * particular task may still need its enqueue callback are no part of this and
+ * stay separate terms at the call sites. */
+static __always_inline bool no_queued_work_pending(void) {
+  return !inactive_dispatch_needed() && !normal_dispatch_needed() &&
+         !cvready_dispatch_needed();
 }
 
 static __always_inline void record_cvready_enqueue(void) {
@@ -196,47 +207,50 @@ DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_cvready_streak, cpu_cvready_streak)
 DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_last_cvready_lock, cpu_last_cvready_lock)
 DEFINE_CPU_SLOT_LOOKUP(lookup_cpu_cvready_probe_cursor, cpu_cvready_probe_cursor)
 
-/* Whether this CPU may still take a cvready task ahead of the class queues. A
- * limit of 0 disables the priority outright, so no CPU ever qualifies. Only the
- * preference is bounded here: the periodic forced pass moves a cvready task
- * without asking, and spends no budget when it does. */
-static __always_inline bool cvready_priority_available(__u32 cpu) {
-  volatile __u32 *streak;
+/* Whether the cvready preference exists at all. A limit of 0 disables it
+ * outright, so no CPU ever qualifies and no streak slot is worth looking up. */
+static __always_inline bool cvready_priority_enabled(void) {
+  return cv_priority_streak_limit != 0;
+}
 
-  if (cv_priority_streak_limit == 0)
-    return false;
-
-  streak = lookup_cpu_cvready_streak(cpu);
+/* Whether the CPU owning this streak slot may still take a cvready task ahead
+ * of the class queues. Only the preference is bounded here: the periodic forced
+ * pass moves a cvready task without asking, and spends no budget when it does.
+ * The slot is passed in so one lookup serves both this test and the accounting
+ * the dispatch that follows it does. */
+static __always_inline bool cvready_streak_available(volatile __u32 *streak) {
   return !streak || *streak < cv_priority_streak_limit;
 }
 
-static __always_inline void record_cvready_priority_dispatch(__u32 cpu) {
-  volatile __u32 *streak = lookup_cpu_cvready_streak(cpu);
-
+static __always_inline void
+record_cvready_priority_dispatch(volatile __u32 *streak) {
   if (streak && *streak < cv_priority_streak_limit)
     *streak += 1;
 }
 
 /* Any dispatch that served the class queues or the normal queue ends the
  * streak: the budget exists to bound how long cvready keeps a CPU, and it has
- * just been handed back. */
+ * just been handed back. The slot is already 0 on every CPU whose streak the
+ * preference never raised, which is the whole machine while cvready routing is
+ * off, so the store is left out where it would change nothing. */
 static __always_inline void reset_cvready_streak(__u32 cpu) {
   volatile __u32 *streak = lookup_cpu_cvready_streak(cpu);
 
-  if (streak)
+  if (streak && *streak)
     *streak = 0;
+}
+
+/* Points a CPU's affinity slot at the class it should look at next. An id that
+ * names no managed class leaves the slot as it was. */
+static __always_inline void store_cpu_lock_slot(volatile __u32 *slot,
+                                                __u32 lock_id) {
+  if (slot && valid_lock_id(lock_id))
+    *slot = lock_id;
 }
 
 static __always_inline void record_cvready_dispatch_lock(__u32 cpu,
                                                          __u32 lock_id) {
-  volatile __u32 *last_lock;
-
-  if (!valid_lock_id(lock_id))
-    return;
-
-  last_lock = lookup_cpu_last_cvready_lock(cpu);
-  if (last_lock)
-    *last_lock = lock_id;
+  store_cpu_lock_slot(lookup_cpu_last_cvready_lock(cpu), lock_id);
 }
 
 static __always_inline bool inactive_dispatch_budget_available(__u32 cpu) {
@@ -267,14 +281,7 @@ static __always_inline void reset_inactive_dispatch_budget(__u32 cpu) {
 
 static __always_inline void record_inactive_dispatch_lock(__u32 cpu,
                                                           __u32 lock_id) {
-  volatile __u32 *last_lock;
-
-  if (!valid_lock_id(lock_id))
-    return;
-
-  last_lock = lookup_cpu_last_inactive_lock(cpu);
-  if (last_lock)
-    *last_lock = lock_id;
+  store_cpu_lock_slot(lookup_cpu_last_inactive_lock(cpu), lock_id);
 }
 
 /* Single sink for enqueue evidence: every routing decision lands here exactly
@@ -549,7 +556,7 @@ static __always_inline __u32 select_inactive_deficit_class(__u32 dispatch_cpu) {
     rank = *cursor;
     if (rank >= span)
       rank = 0;
-    *cursor = inactive_next_probe_rank(rank, span);
+    *cursor = next_probe_rank(rank, span, INACTIVE_DEFICIT_PROBE_WIDTH);
   }
 
 #pragma unroll
@@ -764,7 +771,7 @@ __noinline bool move_selected_cvready_to_local(__u32 dispatch_cpu, bool force) {
     rank = *cursor;
     if (rank >= span)
       rank = 0;
-    *cursor = cvready_next_probe_rank(rank, span);
+    *cursor = next_probe_rank(rank, span, CVREADY_PROBE_WIDTH);
   }
 
 #pragma unroll
@@ -904,8 +911,7 @@ static __always_inline s32 select_cpu_without_admission(struct task_struct *p,
   }
 
   if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu) &&
-      !inactive_dispatch_needed() && !normal_dispatch_needed() &&
-      !cvready_dispatch_needed())
+      no_queued_work_pending())
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
   return cpu;
@@ -931,8 +937,7 @@ static __always_inline bool enqueue_normal_local_fast_recorded(
     __u32 lock_id, __u32 user_ctx_word) {
   __u32 cpu;
 
-  if (inactive_dispatch_needed() || normal_dispatch_needed() ||
-      cvready_dispatch_needed())
+  if (!no_queued_work_pending())
     return false;
 
   cpu = pick_task_cpu(p, -1);
@@ -1016,11 +1021,24 @@ static __always_inline bool should_release_from_cv_sleep(
 /* Ends the exemption above. The word leaving the cond-sleep state is what says
  * the woken thread has run and published what it is doing now, so from here the
  * ordinary release rules describe it again. An unreadable word keeps the
- * exemption: nothing observed says the sleep is over. */
+ * exemption: nothing observed says the sleep is over. Only the cond-wake grant
+ * ever raises the flag, so with routing off there is nothing to end. */
 static __always_inline void note_cv_admission_state(
     struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
-  if (have_user && !user_cv_sleep(user_ctx_word))
+  if (cv_route_active() && have_user && !user_cv_sleep(user_ctx_word))
     task_ctx->cv_admitted = 0;
+}
+
+/* Whether this episode has to give its admission back. Observing the word is
+ * part of the decision rather than something the callers do first: a word that
+ * has left the cond-sleep state ends the exemption above before the release
+ * rules are applied to it. */
+static __always_inline bool should_release_admission(
+    struct task_scx_ctx *task_ctx, bool have_user, __u32 user_ctx_word) {
+  note_cv_admission_state(task_ctx, have_user, user_ctx_word);
+
+  return should_release_from_user(task_ctx, have_user, user_ctx_word) ||
+         should_release_from_cv_sleep(task_ctx, have_user, user_ctx_word);
 }
 
 /* Wake of a thread whose user word still shows the cond sleep it is returning
@@ -1124,9 +1142,7 @@ static __always_inline void refresh_running_state(struct task_struct *p) {
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
   if (have_user)
     lock_id = effective_lock_id(user_ctx_word);
-  note_cv_admission_state(task_ctx, have_user, user_ctx_word);
-  if (should_release_from_user(task_ctx, have_user, user_ctx_word) ||
-      should_release_from_cv_sleep(task_ctx, have_user, user_ctx_word)) {
+  if (should_release_admission(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
     return;
   }
@@ -1219,8 +1235,7 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
    * granted admission or parked. The CPU chosen here is still the one it lands
    * on, since the grant is asked for on the task's current CPU. */
   if (is_idle && valid_cpu(cpu) && task_cpumask_allows(p, (__u32)cpu) &&
-      !wants_slow_path && !inactive_dispatch_needed() &&
-      !normal_dispatch_needed() && !cvready_dispatch_needed() &&
+      !wants_slow_path && no_queued_work_pending() &&
       !(task_ctx &&
         cv_reacquire_requested(task_ctx, have_user, user_ctx_word))) {
     /* A hinted task always wants the slow path, so this shortcut never carries
@@ -1302,7 +1317,6 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   }
 
   clear_invalid_admission_cpu(p, task_ctx);
-  note_cv_admission_state(task_ctx, have_user, user_ctx_word);
 
   if (consumed_token_reuse_requested(task_ctx, have_user, user_ctx_word)) {
     cpu = requested_cpu(p, task_ctx, -1);
@@ -1314,9 +1328,9 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   /* Both releases run before the cond branch below, which is what makes the
    * order has-token, then cond sleep, then pending: a task that still carried a
    * token from before its wait has given it back by the time the cond branch
-   * asks. */
-  if (should_release_from_user(task_ctx, have_user, user_ctx_word) ||
-      should_release_from_cv_sleep(task_ctx, have_user, user_ctx_word))
+   * asks. The reuse branch above needs no such observation of its own; it hands
+   * the whole episode back before it returns. */
+  if (should_release_admission(task_ctx, have_user, user_ctx_word))
     release_admission(p, task_ctx);
 
   if (cv_reacquire_requested(task_ctx, have_user, user_ctx_word) &&
@@ -1475,31 +1489,6 @@ static __always_inline bool try_dispatch_cvready(__u32 cpu, bool debug_counters,
   return true;
 }
 
-/* Whether this CPU should look at the cvready queues at all. The occupancy
- * counters answer that for the machine; the kernel's queue count for the class
- * this CPU was last pointed at is kept as a cross-check, because that class is
- * either the one the CPU last drained or the one a park chose this CPU for. */
-static __always_inline bool cvready_dispatch_pending(__u32 cpu) {
-  volatile __u32 *last_lock;
-  __u32 lock_id;
-
-  if (!cv_route_active())
-    return false;
-
-  if (cvready_queues_occupied())
-    return true;
-
-  last_lock = lookup_cpu_last_cvready_lock(cpu);
-  if (!last_lock)
-    return false;
-
-  lock_id = *last_lock;
-  if (!valid_lock_id(lock_id))
-    return false;
-
-  return scx_bpf_dsq_nr_queued(cvready_dsq_id(lock_id)) > 0;
-}
-
 /* Interval between inactive scans that ignore the sequence gate, the admission
  * slot and width control. The sched_ext watchdog ejects the scheduler after
  * about 30 s of a runnable task never running, so a period in milliseconds
@@ -1534,7 +1523,6 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
 
   inactive_seq = inactive_enqueue_seq;
   normal_seq = normal_enqueue_seq;
-  cvready_pending = cvready_dispatch_pending((__u32)cpu);
 
   /* A scan the period is due for runs whatever the gates say, so a waiter left
    * in a class queue by stale bookkeeping or by a width the controller never
@@ -1569,12 +1557,6 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
       reset_cvready_streak((__u32)cpu);
       if (debug_counters)
         dispatch_normal_success += 1;
-      /* Returning unconditionally lets a steady normal stream starve the
-       * inactive queues on exactly the CPUs able to drain them; the CPUs that
-       * do reach the scan may be excluded by the waiters' cpumask. */
-      if (!force_inactive && !inactive_dispatch_needed_for(inactive_seq) &&
-          !cvready_pending)
-        return;
     } else {
       if (debug_counters)
         dispatch_normal_empty += 1;
@@ -1585,6 +1567,13 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
     dispatch_normal_skip_seq += 1;
   }
 
+  /* The single gate a CPU that reached here has to pass, whether or not it just
+   * moved a normal task. Returning right after a normal move would let a steady
+   * normal stream starve the class queues on exactly the CPUs able to drain
+   * them, since the CPUs that do reach the scan may be excluded by the waiters'
+   * cpumask. Cvready occupancy is read here rather than with the sequence
+   * snapshots above because nothing before this point looks at it. */
+  cvready_pending = cvready_dispatch_needed();
   if (!force_inactive && !inactive_dispatch_needed_for(inactive_seq) &&
       !cvready_pending)
     return;
@@ -1601,31 +1590,41 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
    * already waiting on, so it goes before the queue of threads that only asked
    * for the lock. The streak bounds that preference; the forced pass ignores
    * both the streak and the admission slot, and falls through afterwards so the
-   * same period still forces the class queues. */
-  if (cv_route_active() && (force_inactive || cvready_pending)) {
-    bool cvready_priority =
-        cvready_priority_available((__u32)cpu) && inactive_cpu_available;
+   * same period still forces the class queues. Occupancy already carries the
+   * routing switch, so only the forced pass has to ask for it. */
+  if (cvready_pending || (force_inactive && cv_route_active())) {
+    volatile __u32 *cvready_streak = 0;
+    bool cvready_priority = false;
+
+    /* The streak slot is only worth reading once this CPU could act on it, so
+     * the cheap disqualifiers come first; the pointer then serves both the
+     * budget test and the dispatch that spends it. */
+    if (inactive_cpu_available && cvready_priority_enabled()) {
+      cvready_streak = lookup_cpu_cvready_streak((__u32)cpu);
+      cvready_priority = cvready_streak_available(cvready_streak);
+    }
 
     if (force_inactive || cvready_priority) {
       cvready_attempted = true;
       if (try_dispatch_cvready((__u32)cpu, debug_counters, force_inactive) &&
           !force_inactive) {
-        record_cvready_priority_dispatch((__u32)cpu);
+        record_cvready_priority_dispatch(cvready_streak);
         return;
       }
     }
   }
 
-  if (inactive_cpu_available && inactive_dispatch_budget_available((__u32)cpu) &&
-      try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters,
-                            force_inactive)) {
-    reset_cvready_streak((__u32)cpu);
-    return;
-  }
-
-  if ((force_inactive || inactive_cpu_available) &&
-      try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters,
-                            force_inactive)) {
+  /* Two passes over the class queues: the first spends this CPU's inactive
+   * burst budget, the second is the one a forced drain is owed whatever that
+   * budget says. Either one that moves a task hands the CPU back to the class
+   * queues and so ends the cvready streak. */
+  if ((inactive_cpu_available &&
+       inactive_dispatch_budget_available((__u32)cpu) &&
+       try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters,
+                             force_inactive)) ||
+      ((force_inactive || inactive_cpu_available) &&
+       try_dispatch_inactive((__u32)cpu, inactive_seq, debug_counters,
+                             force_inactive))) {
     reset_cvready_streak((__u32)cpu);
     return;
   }
@@ -1665,14 +1664,12 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   have_user = read_user_ctx(p, task_ctx, &user_ctx_word);
   if (have_user)
     lock_id = effective_lock_id(user_ctx_word);
-  note_cv_admission_state(task_ctx, have_user, user_ctx_word);
 
   /* The cond-sleep release is asked for here as well, so a thread stopping with
    * that bit set gives its token back whether it is about to block on the futex
    * or was merely preempted on the way there. Leaving it to the !runnable
    * branch below would keep a stale token across the preemption. */
-  if (should_release_from_user(task_ctx, have_user, user_ctx_word) ||
-      should_release_from_cv_sleep(task_ctx, have_user, user_ctx_word)) {
+  if (should_release_admission(task_ctx, have_user, user_ctx_word)) {
     release_admission(p, task_ctx);
     return;
   }

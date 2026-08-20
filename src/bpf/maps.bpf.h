@@ -67,13 +67,18 @@ volatile __u32 cpu_last_cvready_lock[MAX_CPUS];
 /* Managed rank the next cvready probe on this CPU starts from. Kept apart from
  * the inactive cursor so the two sweeps do not drag each other's start rank. */
 volatile __u32 cpu_cvready_probe_cursor[MAX_CPUS];
-volatile __u32 cvready_enqueue_seq;
+/* Threads parked on a cvready queue. Read on every dispatch and raised from the
+ * park side only, so it is kept on a cache line of its own: the drain side
+ * raises the counter below, and sharing a line would make each side's
+ * read-modify-write steal the other's. */
+volatile __u32 cvready_enqueue_seq __attribute__((aligned(64)));
 /* Threads taken off a cvready queue. Paired with cvready_enqueue_seq this is an
  * exact occupancy test, which the scan-derived empty gate the inactive queues
  * use cannot be here: the cvready selection reaches a window of the class space
  * rather than all of it, so an empty verdict from one scan says nothing about
- * the classes it never probed. */
-volatile __u32 cvready_drained_count;
+ * the classes it never probed. Aligned like the counter above so the two sit on
+ * different lines. */
+volatile __u32 cvready_drained_count __attribute__((aligned(64)));
 volatile __u32 width_control_enabled;
 volatile __u32 class_width[MAX_LOCK_CLASSES]; /* 0 = unlimited */
 /* Waiters currently admitted for the class. A task counts from the grant that

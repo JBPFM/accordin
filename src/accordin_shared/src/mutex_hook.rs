@@ -7,7 +7,10 @@ use std::sync::{Mutex, OnceLock};
 
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
+use crate::admission::LockAdmissionScope;
+use crate::condvar::{CondRelock, CondStagingRef};
 use crate::lock_backend::LockBackend;
+use crate::lock_stats::{record_lock_acquired_for_scope, record_wait_end, record_wait_start};
 
 pub trait MutexHookBackend {
     type LockState;
@@ -52,32 +55,173 @@ where
     }
 }
 
+/// Whether an acquire bracket still has to ask admission for a slot, or whether
+/// the caller already holds the routing decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcquireMode {
+    Normal,
+    AlreadyAdmitted,
+}
+
+impl AcquireMode {
+    /// The mode a writer-event re-acquisition enters in.
+    ///
+    /// The wait decided it outright, so no hint is consulted and no cond
+    /// counter moves: the event path publishes no hint and accounts itself
+    /// against counters of its own.
+    #[inline(always)]
+    pub fn for_event_relock(relock: CondRelock) -> Self {
+        match relock {
+            CondRelock::AlreadyAdmitted => Self::AlreadyAdmitted,
+            _ => Self::Normal,
+        }
+    }
+}
+
+/// The mode a cond re-acquisition enters in.
+///
+/// A routed wakeup already carries the admission decision, and a published hint
+/// carries it in the user word, so both enter the lock without re-requesting
+/// admission. A hint that is no longer there leaves the re-acquisition an
+/// ordinary contender.
+#[inline(always)]
+pub fn acquire_mode_for_cond_relock(relock: CondRelock, scope: LockAdmissionScope) -> AcquireMode {
+    match relock {
+        CondRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
+        CondRelock::TakeHint if crate::admission::take_cond_reacquire_pending_for_scope(scope) => {
+            record_cv_specialized_relock();
+            AcquireMode::AlreadyAdmitted
+        }
+        _ => {
+            record_cv_fallback_relock();
+            AcquireMode::Normal
+        }
+    }
+}
+
+/// Takes the backend lock inside an already-opened admission scope and accounts
+/// the acquisition.
+///
+/// Only a `Normal` acquisition asks admission for a slot; a caller that already
+/// holds the decision skips the uncontended attempt and the pending
+/// notification, both of which exist to obtain one.
+#[inline(always)]
+pub fn lock_scope_with_stats<B>(
+    lock: &B::LockState,
+    staging: CondStagingRef,
+    scope: LockAdmissionScope,
+    mode: AcquireMode,
+) where
+    B: MutexHookBackend,
+{
+    let normal = mode == AcquireMode::Normal;
+
+    if normal && !crate::admission::token_consumed_for_scope(scope) && B::try_lock(lock) {
+        record_lock_acquired_for_scope(scope);
+        staging.publish_hold();
+        return;
+    }
+
+    let wait_start = record_wait_start();
+    if normal && crate::admission::mark_slow_path_pending_for_scope(scope) {
+        std::thread::yield_now();
+        crate::admission::clear_token_consumed_for_scope(scope);
+    }
+    B::lock(lock);
+    record_wait_end(wait_start);
+    record_lock_acquired_for_scope(scope);
+    staging.publish_hold();
+}
+
 static THREAD_CTX_MAP: OnceLock<MapHandle> = OnceLock::new();
 static REGISTERED_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 static REGISTERED_THREAD_COUNT_BPF: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 const HOOK_SCOPE_ENV: &str = "ACCORDIN_HOOK_SCOPE";
 
 static CV_COUNTERS_ENABLED: AtomicBool = AtomicBool::new(false);
-static CV_HINTS_PUBLISHED: AtomicU64 = AtomicU64::new(0);
-static CV_SPECIALIZED_RELOCKS: AtomicU64 = AtomicU64::new(0);
-static CV_FALLBACK_RELOCKS: AtomicU64 = AtomicU64::new(0);
-static CV_ROUTE_RELOCKS: AtomicU64 = AtomicU64::new(0);
-static CV_REQUEUED: AtomicU64 = AtomicU64::new(0);
-static CV_REQUEUE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-static CV_DRAIN_WAKES: AtomicU64 = AtomicU64::new(0);
-static CV_STRANDING_WAKES: AtomicU64 = AtomicU64::new(0);
-static CV_STAGED_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
-static CV_BINDING_CONFLICTS: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_ARMS: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_SPURIOUS_WAKES: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_COMPLETED_POSTS: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_LEADER_POSTS: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_ROUTE_TAKEBACKS: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_ROUTE_TAKEBACK_UNPUBLISHED: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_ROUTE_TAKEBACK_LOST: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_COMPLETED_MISROUTES: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_RELOCKS_ADMITTED: AtomicU64 = AtomicU64::new(0);
-static WRITER_EVENT_RELOCKS_NORMAL: AtomicU64 = AtomicU64::new(0);
+
+// Each counter family is one array indexed by its own enum, and the matching
+// name array carries the field order the stats dump prints the family in.
+enum CvAdmissionCounter {
+    HintsPublished,
+    SpecializedRelocks,
+    FallbackRelocks,
+    RouteRelocks,
+}
+
+const CV_ADMISSION_FIELD_COUNT: usize = 4;
+
+pub(crate) const CV_ADMISSION_FIELD_NAMES: [&str; CV_ADMISSION_FIELD_COUNT] = [
+    "hints_published",
+    "specialized_relocks",
+    "fallback_relocks",
+    "route_relocks",
+];
+
+static CV_ADMISSION_COUNTERS: [AtomicU64; CV_ADMISSION_FIELD_COUNT] =
+    [const { AtomicU64::new(0) }; CV_ADMISSION_FIELD_COUNT];
+
+enum CvRequeueCounter {
+    Requeued,
+    Fallbacks,
+    DrainWakes,
+    StrandingWakes,
+    StagedHighWater,
+    BindingConflicts,
+}
+
+const CV_REQUEUE_FIELD_COUNT: usize = 6;
+
+pub(crate) const CV_REQUEUE_FIELD_NAMES: [&str; CV_REQUEUE_FIELD_COUNT] = [
+    "requeued",
+    "fallbacks",
+    "drain_wakes",
+    "stranding_wakes",
+    "staged_high_water",
+    "binding_conflicts",
+];
+
+static CV_REQUEUE_COUNTERS: [AtomicU64; CV_REQUEUE_FIELD_COUNT] =
+    [const { AtomicU64::new(0) }; CV_REQUEUE_FIELD_COUNT];
+
+enum WriterEventCounter {
+    Arms,
+    SpuriousWakes,
+    LeaderPosts,
+    RouteTakebacks,
+    RouteTakebackUnpublished,
+    RouteTakebackLost,
+    CompletedMisroutes,
+    RelocksAdmitted,
+    RelocksNormal,
+}
+
+const WRITER_EVENT_COUNTER_COUNT: usize = 9;
+
+static WRITER_EVENT_COUNTERS: [AtomicU64; WRITER_EVENT_COUNTER_COUNT] =
+    [const { AtomicU64::new(0) }; WRITER_EVENT_COUNTER_COUNT];
+
+/// The writer-event family reports one field it does not store:
+/// `completed_posts`, because every completed post leaves exactly one of the
+/// three takeback outcomes behind and is therefore their sum.
+const WRITER_EVENT_FIELD_COUNT: usize = WRITER_EVENT_COUNTER_COUNT + 1;
+
+pub(crate) const WRITER_EVENT_FIELD_NAMES: [&str; WRITER_EVENT_FIELD_COUNT] = [
+    "arms",
+    "spurious_wakes",
+    "completed_posts",
+    "leader_posts",
+    "route_takebacks",
+    "route_takeback_unpublished",
+    "route_takeback_lost",
+    "completed_misroutes",
+    "relocks_admitted",
+    "relocks_normal",
+];
+
+fn load_counters<const N: usize>(counters: &[AtomicU64; N]) -> [u64; N] {
+    std::array::from_fn(|index| counters[index].load(Ordering::Relaxed))
+}
 
 /// Reconciles the userspace side of the cond-reacquire protocol against the
 /// scheduler's wake-routing counters.
@@ -92,12 +236,17 @@ pub struct CvAdmissionCounters {
 }
 
 pub fn cv_admission_counters() -> CvAdmissionCounters {
+    let values = cv_admission_field_values();
     CvAdmissionCounters {
-        hints_published: CV_HINTS_PUBLISHED.load(Ordering::Relaxed),
-        specialized_relocks: CV_SPECIALIZED_RELOCKS.load(Ordering::Relaxed),
-        fallback_relocks: CV_FALLBACK_RELOCKS.load(Ordering::Relaxed),
-        route_relocks: CV_ROUTE_RELOCKS.load(Ordering::Relaxed),
+        hints_published: values[CvAdmissionCounter::HintsPublished as usize],
+        specialized_relocks: values[CvAdmissionCounter::SpecializedRelocks as usize],
+        fallback_relocks: values[CvAdmissionCounter::FallbackRelocks as usize],
+        route_relocks: values[CvAdmissionCounter::RouteRelocks as usize],
     }
+}
+
+pub(crate) fn cv_admission_field_values() -> [u64; CV_ADMISSION_FIELD_COUNT] {
+    load_counters(&CV_ADMISSION_COUNTERS)
 }
 
 /// Accounts the staging a cond broadcast parks its waiters on against the
@@ -125,14 +274,19 @@ pub struct CvRequeueCounters {
 }
 
 pub fn cv_requeue_counters() -> CvRequeueCounters {
+    let values = cv_requeue_field_values();
     CvRequeueCounters {
-        requeued: CV_REQUEUED.load(Ordering::Relaxed),
-        fallbacks: CV_REQUEUE_FALLBACKS.load(Ordering::Relaxed),
-        drain_wakes: CV_DRAIN_WAKES.load(Ordering::Relaxed),
-        stranding_wakes: CV_STRANDING_WAKES.load(Ordering::Relaxed),
-        staged_high_water: CV_STAGED_HIGH_WATER.load(Ordering::Relaxed),
-        binding_conflicts: CV_BINDING_CONFLICTS.load(Ordering::Relaxed),
+        requeued: values[CvRequeueCounter::Requeued as usize],
+        fallbacks: values[CvRequeueCounter::Fallbacks as usize],
+        drain_wakes: values[CvRequeueCounter::DrainWakes as usize],
+        stranding_wakes: values[CvRequeueCounter::StrandingWakes as usize],
+        staged_high_water: values[CvRequeueCounter::StagedHighWater as usize],
+        binding_conflicts: values[CvRequeueCounter::BindingConflicts as usize],
     }
+}
+
+pub(crate) fn cv_requeue_field_values() -> [u64; CV_REQUEUE_FIELD_COUNT] {
+    load_counters(&CV_REQUEUE_COUNTERS)
 }
 
 /// Accounts the writer-event wake protocol against the routing it asks for.
@@ -144,9 +298,6 @@ pub struct WriterEventCounters {
     pub arms: u64,
     /// Wakes that left the reason unset, so the wait blocked again.
     pub spurious_wakes: u64,
-    /// Waiters released with their work already done, which return without
-    /// re-acquiring the mutex.
-    pub completed_posts: u64,
     /// Waiters released as the new queue head, whose wake keeps the routed
     /// state so the scheduler admits them as it makes them runnable.
     pub leader_posts: u64,
@@ -171,18 +322,38 @@ pub struct WriterEventCounters {
 }
 
 pub fn writer_event_counters() -> WriterEventCounters {
+    let values = load_counters(&WRITER_EVENT_COUNTERS);
     WriterEventCounters {
-        arms: WRITER_EVENT_ARMS.load(Ordering::Relaxed),
-        spurious_wakes: WRITER_EVENT_SPURIOUS_WAKES.load(Ordering::Relaxed),
-        completed_posts: WRITER_EVENT_COMPLETED_POSTS.load(Ordering::Relaxed),
-        leader_posts: WRITER_EVENT_LEADER_POSTS.load(Ordering::Relaxed),
-        route_takebacks: WRITER_EVENT_ROUTE_TAKEBACKS.load(Ordering::Relaxed),
-        route_takeback_unpublished: WRITER_EVENT_ROUTE_TAKEBACK_UNPUBLISHED.load(Ordering::Relaxed),
-        route_takeback_lost: WRITER_EVENT_ROUTE_TAKEBACK_LOST.load(Ordering::Relaxed),
-        completed_misroutes: WRITER_EVENT_COMPLETED_MISROUTES.load(Ordering::Relaxed),
-        relocks_admitted: WRITER_EVENT_RELOCKS_ADMITTED.load(Ordering::Relaxed),
-        relocks_normal: WRITER_EVENT_RELOCKS_NORMAL.load(Ordering::Relaxed),
+        arms: values[WriterEventCounter::Arms as usize],
+        spurious_wakes: values[WriterEventCounter::SpuriousWakes as usize],
+        leader_posts: values[WriterEventCounter::LeaderPosts as usize],
+        route_takebacks: values[WriterEventCounter::RouteTakebacks as usize],
+        route_takeback_unpublished: values[WriterEventCounter::RouteTakebackUnpublished as usize],
+        route_takeback_lost: values[WriterEventCounter::RouteTakebackLost as usize],
+        completed_misroutes: values[WriterEventCounter::CompletedMisroutes as usize],
+        relocks_admitted: values[WriterEventCounter::RelocksAdmitted as usize],
+        relocks_normal: values[WriterEventCounter::RelocksNormal as usize],
     }
+}
+
+pub(crate) fn writer_event_field_values() -> [u64; WRITER_EVENT_FIELD_COUNT] {
+    let counters = writer_event_counters();
+    let completed_posts = counters
+        .route_takebacks
+        .saturating_add(counters.route_takeback_unpublished)
+        .saturating_add(counters.route_takeback_lost);
+    [
+        counters.arms,
+        counters.spurious_wakes,
+        completed_posts,
+        counters.leader_posts,
+        counters.route_takebacks,
+        counters.route_takeback_unpublished,
+        counters.route_takeback_lost,
+        counters.completed_misroutes,
+        counters.relocks_admitted,
+        counters.relocks_normal,
+    ]
 }
 
 /// The counters share cache lines across every hooked thread, so they stay off
@@ -198,140 +369,167 @@ pub fn set_cv_admission_counters_enabled(enabled: bool) {
 }
 
 #[inline(always)]
-fn bump_cv_counter(counter: &AtomicU64) {
+fn add_cv_counter(counter: &AtomicU64, amount: u64) {
     if !CV_COUNTERS_ENABLED.load(Ordering::Relaxed) {
         return;
     }
 
-    counter.fetch_add(1, Ordering::Relaxed);
+    counter.fetch_add(amount, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn bump_cv_counter(counter: &AtomicU64) {
+    add_cv_counter(counter, 1);
+}
+
+#[inline(always)]
+fn raise_cv_counter(counter: &AtomicU64, value: u64) {
+    if !CV_COUNTERS_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    counter.fetch_max(value, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn bump_cv_admission(counter: CvAdmissionCounter) {
+    bump_cv_counter(&CV_ADMISSION_COUNTERS[counter as usize]);
+}
+
+#[inline(always)]
+fn bump_cv_requeue(counter: CvRequeueCounter) {
+    bump_cv_counter(&CV_REQUEUE_COUNTERS[counter as usize]);
+}
+
+#[inline(always)]
+fn bump_writer_event(counter: WriterEventCounter) {
+    bump_cv_counter(&WRITER_EVENT_COUNTERS[counter as usize]);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_hint_published() {
-    bump_cv_counter(&CV_HINTS_PUBLISHED);
+    bump_cv_admission(CvAdmissionCounter::HintsPublished);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_specialized_relock() {
-    bump_cv_counter(&CV_SPECIALIZED_RELOCKS);
+    bump_cv_admission(CvAdmissionCounter::SpecializedRelocks);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_fallback_relock() {
-    bump_cv_counter(&CV_FALLBACK_RELOCKS);
+    bump_cv_admission(CvAdmissionCounter::FallbackRelocks);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_route_relock() {
-    bump_cv_counter(&CV_ROUTE_RELOCKS);
+    bump_cv_admission(CvAdmissionCounter::RouteRelocks);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_requeued(moved: u64) {
-    if !CV_COUNTERS_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
-
-    CV_REQUEUED.fetch_add(moved, Ordering::Relaxed);
+    add_cv_counter(
+        &CV_REQUEUE_COUNTERS[CvRequeueCounter::Requeued as usize],
+        moved,
+    );
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_requeue_fallback() {
-    bump_cv_counter(&CV_REQUEUE_FALLBACKS);
+    bump_cv_requeue(CvRequeueCounter::Fallbacks);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_drain_wake() {
-    bump_cv_counter(&CV_DRAIN_WAKES);
+    bump_cv_requeue(CvRequeueCounter::DrainWakes);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_stranding_wake() {
-    bump_cv_counter(&CV_STRANDING_WAKES);
+    bump_cv_requeue(CvRequeueCounter::StrandingWakes);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_binding_conflict() {
-    bump_cv_counter(&CV_BINDING_CONFLICTS);
+    bump_cv_requeue(CvRequeueCounter::BindingConflicts);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_arm() {
-    bump_cv_counter(&WRITER_EVENT_ARMS);
+    bump_writer_event(WriterEventCounter::Arms);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_spurious_wake() {
-    bump_cv_counter(&WRITER_EVENT_SPURIOUS_WAKES);
+    bump_writer_event(WriterEventCounter::SpuriousWakes);
 }
 
+/// Completed posts carry no counter of their own: each one leaves exactly one
+/// of the three takeback outcomes behind, and the reported count is their sum.
 #[doc(hidden)]
 #[inline(always)]
-pub fn record_writer_event_completed_post() {
-    bump_cv_counter(&WRITER_EVENT_COMPLETED_POSTS);
-}
+pub fn record_writer_event_completed_post() {}
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_leader_post() {
-    bump_cv_counter(&WRITER_EVENT_LEADER_POSTS);
+    bump_writer_event(WriterEventCounter::LeaderPosts);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_route_takeback() {
-    bump_cv_counter(&WRITER_EVENT_ROUTE_TAKEBACKS);
+    bump_writer_event(WriterEventCounter::RouteTakebacks);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_route_takeback_unpublished() {
-    bump_cv_counter(&WRITER_EVENT_ROUTE_TAKEBACK_UNPUBLISHED);
+    bump_writer_event(WriterEventCounter::RouteTakebackUnpublished);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_route_takeback_lost() {
-    bump_cv_counter(&WRITER_EVENT_ROUTE_TAKEBACK_LOST);
+    bump_writer_event(WriterEventCounter::RouteTakebackLost);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_completed_misroute() {
-    bump_cv_counter(&WRITER_EVENT_COMPLETED_MISROUTES);
+    bump_writer_event(WriterEventCounter::CompletedMisroutes);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_relock_admitted() {
-    bump_cv_counter(&WRITER_EVENT_RELOCKS_ADMITTED);
+    bump_writer_event(WriterEventCounter::RelocksAdmitted);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_writer_event_relock_normal() {
-    bump_cv_counter(&WRITER_EVENT_RELOCKS_NORMAL);
+    bump_writer_event(WriterEventCounter::RelocksNormal);
 }
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn record_cv_staged_high_water(staged: u64) {
-    if !CV_COUNTERS_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
-
-    CV_STAGED_HIGH_WATER.fetch_max(staged, Ordering::Relaxed);
+    raise_cv_counter(
+        &CV_REQUEUE_COUNTERS[CvRequeueCounter::StagedHighWater as usize],
+        staged,
+    );
 }
 
 #[inline(always)]
@@ -506,11 +704,12 @@ macro_rules! export_mutex_hooks {
             use $crate::condvar::{CondMutex, CondRelock, CondStaging, CondState};
             use $crate::lock_stats::{
                 record_hold_end_sample, record_lock_acquired, record_lock_acquired_for_lock,
-                record_lock_acquired_for_scope, record_post_unlock, record_thread_start,
-                record_wait_end, record_wait_start,
+                record_post_unlock, record_thread_start, record_wait_end, record_wait_start,
             };
-            use $crate::mutex_hook::MutexHookBackend;
-            use $crate::writer_event::{EventRelock, WakeReason, WriterEvent};
+            use $crate::mutex_hook::{
+                AcquireMode, MutexHookBackend, acquire_mode_for_cond_relock, lock_scope_with_stats,
+            };
+            use $crate::writer_event::WriterEvent;
 
             type Backend = $backend;
 
@@ -577,19 +776,11 @@ macro_rules! export_mutex_hooks {
                 });
             }
 
-            /// Whether the acquire bracket still has to ask admission for a
-            /// slot, or whether the caller already holds the routing decision.
-            #[derive(Clone, Copy, PartialEq, Eq)]
-            enum AcquireMode {
-                Normal,
-                AlreadyAdmitted,
-            }
-
             #[inline(always)]
             fn lock_with_stats(state: &HookState) {
                 if Backend::USES_ADMISSION_SCOPE {
                     let scope = $crate::admission::begin_lock_scope(state.lock_id);
-                    lock_scope_with_stats(state, scope, AcquireMode::Normal);
+                    acquire_in_scope(state, scope, AcquireMode::Normal);
                     return;
                 }
 
@@ -604,38 +795,19 @@ macro_rules! export_mutex_hooks {
                 record_lock_acquired();
             }
 
+            /// Names the hook state's parts for the shared acquire bracket.
             #[inline(always)]
-            fn lock_scope_with_stats(
+            fn acquire_in_scope(
                 state: &HookState,
                 scope: $crate::admission::LockAdmissionScope,
                 mode: AcquireMode,
             ) {
-                let normal = mode == AcquireMode::Normal;
-
-                if normal
-                    && !$crate::admission::token_consumed_for_scope(scope)
-                    && Backend::try_lock(&state.lock)
-                {
-                    record_lock_acquired_for_scope(scope);
-                    state.staging.handle().publish_hold();
-                    return;
-                }
-
-                let wait_start = record_wait_start();
-                if normal && $crate::admission::mark_slow_path_pending_for_scope(scope) {
-                    std::thread::yield_now();
-                    $crate::admission::clear_token_consumed_for_scope(scope);
-                }
-                Backend::lock(&state.lock);
-                record_wait_end(wait_start);
-                record_lock_acquired_for_scope(scope);
-                state.staging.handle().publish_hold();
+                lock_scope_with_stats::<Backend>(&state.lock, state.staging.handle(), scope, mode);
             }
 
             /// Reacquires the cond mutex after a wait, in the mode the wait
-            /// protocol decided: a routed wakeup already carries the admission
-            /// decision, and a published hint carries it in the user word, so
-            /// both enter the lock without re-requesting admission.
+            /// protocol decided. A backend outside admission has no scope to
+            /// carry a decision, so its re-acquisition is an ordinary one.
             #[inline(always)]
             fn relock_after_cond_wait(state: &HookState, relock: CondRelock) {
                 if !Backend::USES_ADMISSION_SCOPE {
@@ -644,20 +816,7 @@ macro_rules! export_mutex_hooks {
                 }
 
                 let scope = $crate::admission::begin_lock_scope(state.lock_id);
-                let mode = match relock {
-                    CondRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
-                    CondRelock::TakeHint
-                        if $crate::admission::take_cond_reacquire_pending_for_scope(scope) =>
-                    {
-                        $crate::mutex_hook::record_cv_specialized_relock();
-                        AcquireMode::AlreadyAdmitted
-                    }
-                    _ => {
-                        $crate::mutex_hook::record_cv_fallback_relock();
-                        AcquireMode::Normal
-                    }
-                };
-                lock_scope_with_stats(state, scope, mode);
+                acquire_in_scope(state, scope, acquire_mode_for_cond_relock(relock, scope));
             }
 
             /// Releases the lock and then hands the next staged cond waiter to
@@ -1376,41 +1535,46 @@ macro_rules! export_mutex_hooks {
                 }
             }
 
-            /// The writer event as the C ABI hands it out: the wake protocol
-            /// plus the binding of the hooked mutex it belongs to.
+            /// Re-acquires the mutex for a waiter a writer-event wait made
+            /// leader.
             ///
-            /// The whole object lives in caller-owned storage. The waiters this
-            /// exists for are created per operation, and an allocation per
-            /// operation is the cost the protocol is there to remove; for the
-            /// same reason the binding is resolved once per mutex rather than
-            /// once per waiter, so initializing one is a plain struct write.
-            #[repr(C)]
-            struct HookWriterEvent {
-                event: WriterEvent,
-                state: *mut HookState,
-            }
-
+            /// A backend outside admission has no scope to carry a decision, so
+            /// its re-acquisition is an ordinary one and the wait's decision is
+            /// never read.
             #[inline(always)]
-            unsafe fn writer_event_ref<'a>(
-                event: *mut libc::c_void,
-            ) -> Result<&'a HookWriterEvent, libc::c_int> {
-                if event.is_null() {
-                    return Err(libc::EINVAL);
+            fn relock_writer_event(state: &HookState, event: &WriterEvent) {
+                if !Backend::USES_ADMISSION_SCOPE {
+                    lock_with_stats(state);
+                    return;
                 }
 
-                Ok(unsafe { &*event.cast::<HookWriterEvent>() })
+                let scope = $crate::admission::begin_lock_scope(state.lock_id);
+                let mode = AcquireMode::for_event_relock(event.take_relock_mode());
+                acquire_in_scope(state, scope, mode);
             }
 
-            /// The storage a caller has to provide for one event.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn accordin_writer_event_size() -> usize {
-                std::mem::size_of::<HookWriterEvent>()
-            }
-
-            /// The alignment that storage has to satisfy.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn accordin_writer_event_align() -> usize {
-                std::mem::align_of::<HookWriterEvent>()
+            $crate::export_writer_event_abi! {
+                /// The writer event as the C ABI hands it out: the wake protocol
+                /// plus the binding of the hooked mutex it belongs to.
+                ///
+                /// The whole object lives in caller-owned storage. The waiters
+                /// this exists for are created per operation, and an allocation
+                /// per operation is the cost the protocol is there to remove;
+                /// for the same reason the binding is resolved once per mutex
+                /// rather than once per waiter, so initializing one is a plain
+                /// struct write.
+                struct HookWriterEvent { binding: HookState }
+                pointer = libc::c_void,
+                admission_scoped = <Backend as MutexHookBackend>::USES_ADMISSION_SCOPE,
+                relock = relock_writer_event,
+                size = accordin_writer_event_size,
+                align = accordin_writer_event_align,
+                init = accordin_writer_event_init,
+                arm = accordin_writer_event_arm,
+                wait = accordin_writer_event_wait,
+                relock_entry = accordin_writer_event_relock,
+                post_completed = accordin_writer_event_post_completed,
+                post_leader = accordin_writer_event_post_leader,
             }
 
             /// Resolves a mutex to the binding its events are initialized from,
@@ -1449,123 +1613,6 @@ macro_rules! export_mutex_hooks {
                     0
                 }
             }
-
-            /// Puts a fresh event into caller-owned storage, bound to what
-            /// `accordin_writer_event_bind` resolved for its mutex.
-            ///
-            /// This runs once per waiter, so it does no lookups of its own. The
-            /// thread is already registered by then: a waiter arms while holding
-            /// the mutex, and taking the mutex is what registers it.
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn accordin_writer_event_init(
-                event: *mut libc::c_void,
-                binding: *mut libc::c_void,
-            ) -> libc::c_int {
-                unsafe {
-                    if event.is_null() || binding.is_null() {
-                        return libc::EINVAL;
-                    }
-
-                    let event = event.cast::<HookWriterEvent>();
-                    WriterEvent::init_in_place(std::ptr::addr_of_mut!((*event).event));
-                    std::ptr::addr_of_mut!((*event).state).write(binding.cast::<HookState>());
-                    0
-                }
-            }
-
-            /// Declares the waiter unreleased. The caller must still hold the
-            /// mutex: past the release a poster may publish a reason at any
-            /// moment, and one arriving first would be overwritten here.
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn accordin_writer_event_arm(
-                event: *mut libc::c_void,
-            ) -> libc::c_int {
-                let event = match unsafe { writer_event_ref(event) } {
-                    Ok(event) => event,
-                    Err(ret) => return ret,
-                };
-
-                event.event.arm();
-                0
-            }
-
-            /// Blocks until a poster publishes a reason and reports it: 0 for a
-            /// waiter whose work is done, 1 for the new queue head. The caller
-            /// must have released the mutex first.
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn accordin_writer_event_wait(
-                event: *mut libc::c_void,
-            ) -> libc::c_int {
-                let event = match unsafe { writer_event_ref(event) } {
-                    Ok(event) => event,
-                    Err(_) => return -1,
-                };
-
-                let lock_id = unsafe { (*event.state).lock_id };
-                match event.event.wait(lock_id, Backend::USES_ADMISSION_SCOPE) {
-                    WakeReason::Completed => 0,
-                    WakeReason::BecomeLeader => 1,
-                }
-            }
-
-            /// Re-acquires the mutex for a waiter the wait made leader, in the
-            /// mode that wait decided: a routed wakeup already carries the
-            /// admission decision and enters the lock without asking again.
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn accordin_writer_event_relock(
-                event: *mut libc::c_void,
-            ) -> libc::c_int {
-                let event = match unsafe { writer_event_ref(event) } {
-                    Ok(event) => event,
-                    Err(ret) => return ret,
-                };
-                let state = unsafe { &*event.state };
-
-                if !Backend::USES_ADMISSION_SCOPE {
-                    lock_with_stats(state);
-                    return 0;
-                }
-
-                let scope = $crate::admission::begin_lock_scope(state.lock_id);
-                let mode = match event.event.take_relock_mode() {
-                    EventRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
-                    EventRelock::Normal => AcquireMode::Normal,
-                };
-                lock_scope_with_stats(state, scope, mode);
-                0
-            }
-
-            /// Releases a waiter whose work the caller already did. The caller
-            /// must have published the result first, and must never touch the
-            /// event again: the waiter may destroy it the instant the reason
-            /// lands.
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn accordin_writer_event_post_completed(
-                event: *mut libc::c_void,
-            ) -> libc::c_int {
-                let event = match unsafe { writer_event_ref(event) } {
-                    Ok(event) => event,
-                    Err(ret) => return ret,
-                };
-
-                event.event.post_completed();
-                0
-            }
-
-            /// Hands the queue head to a waiter that still has work to do. As
-            /// with a completed post, the event must not be touched again.
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn accordin_writer_event_post_leader(
-                event: *mut libc::c_void,
-            ) -> libc::c_int {
-                let event = match unsafe { writer_event_ref(event) } {
-                    Ok(event) => event,
-                    Err(ret) => return ret,
-                };
-
-                event.event.post_leader();
-                0
-            }
         }
     };
 }
@@ -1577,15 +1624,22 @@ mod tests {
     use libbpf_rs::MapFlags;
 
     use super::{
-        ThreadCtxMapOps, cv_admission_counters, cv_admission_counters_enabled, cv_requeue_counters,
-        hook_scope_value_is_registered, hooked_cond_registered, hooked_mutex_registered,
-        record_cv_drain_wake, record_cv_fallback_relock, record_cv_hint_published,
-        record_cv_requeue_fallback, record_cv_requeued, record_cv_route_relock,
-        record_cv_specialized_relock, record_cv_staged_high_water, record_cv_stranding_wake,
-        register_hooked_cond_addr, register_hooked_mutex_addr, register_thread_ctx_with_map,
+        AcquireMode, ThreadCtxMapOps, acquire_mode_for_cond_relock, cv_admission_counters,
+        cv_admission_counters_enabled, cv_requeue_counters, hook_scope_value_is_registered,
+        hooked_cond_registered, hooked_mutex_registered, record_cv_drain_wake,
+        record_cv_fallback_relock, record_cv_hint_published, record_cv_requeue_fallback,
+        record_cv_requeued, record_cv_route_relock, record_cv_specialized_relock,
+        record_cv_staged_high_water, record_cv_stranding_wake, register_hooked_cond_addr,
+        register_hooked_mutex_addr, register_thread_ctx_with_map,
         set_cv_admission_counters_enabled, unregister_hooked_cond_addr,
         unregister_hooked_mutex_addr, unregister_thread_ctx_with_map,
     };
+    use crate::admission;
+    use crate::condvar::CondRelock;
+
+    /// A managed class of its own, so the scope this opens is the outermost one
+    /// and the relock mapping sees the word it would see in a real wait.
+    const RELOCK_LOCK_ID: u32 = 5;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum MapCall {
@@ -1747,6 +1801,9 @@ mod tests {
         );
     }
 
+    /// The wait protocol is shared, and the hooks are supposed to delegate the
+    /// whole of it rather than keep a copy of the futex handshake. Nothing but
+    /// the source itself can show that a copy is absent, so this reads it.
     fn hook_implementation_source() -> &'static str {
         include_str!("mutex_hook.rs")
             .split_once("#[cfg(test)]")
@@ -1755,62 +1812,33 @@ mod tests {
     }
 
     #[test]
-    fn cond_wait_hooks_delegate_the_whole_wait_protocol() {
-        let implementation = hook_implementation_source();
-
+    fn the_wait_protocol_stays_in_the_shared_condvar_module() {
         assert!(
-            !implementation.contains("SYS_futex"),
+            !hook_implementation_source().contains("SYS_futex"),
             "the futex protocol belongs to the shared condvar module"
         );
-
-        for (name, hook, entry) in [
-            (
-                "cond wait",
-                "pub unsafe extern \"C\" fn pthread_cond_wait",
-                "$crate::condvar::wait(",
-            ),
-            (
-                "cond timedwait",
-                "pub unsafe extern \"C\" fn pthread_cond_timedwait",
-                "$crate::condvar::timedwait(",
-            ),
-        ] {
-            let body = implementation
-                .split_once(hook)
-                .map(|(_, body)| body)
-                .unwrap_or_else(|| panic!("the macro should define the {name} hook"));
-            let entry_pos = body
-                .find(entry)
-                .unwrap_or_else(|| panic!("{name} should run the shared wait protocol"));
-            let unlock_pos = body
-                .find("|| unlock_with_stats(")
-                .unwrap_or_else(|| panic!("{name} should release the mutex through the protocol"));
-            let relock_pos = body
-                .find("|relock| relock_after_cond_wait(")
-                .unwrap_or_else(|| panic!("{name} should relock in the mode the protocol picked"));
-
-            assert!(
-                entry_pos < unlock_pos && unlock_pos < relock_pos,
-                "{name} should hand the unlock and the relock to the protocol"
-            );
-        }
     }
 
+    /// A routed wakeup was admitted as it was enqueued, so its re-acquisition
+    /// enters on that decision without consulting the user word at all: a hint
+    /// left there belongs to some other re-acquisition and has to survive.
     #[test]
-    fn cond_relock_enters_without_re_requesting_admission() {
-        let implementation = hook_implementation_source();
+    fn a_routed_cond_relock_enters_without_re_requesting_admission() {
+        admission::reset_thread_depth_for_test();
+        let scope = admission::begin_lock_scope(RELOCK_LOCK_ID);
+        let before = admission::word_for_test();
 
-        let reacquire = implementation
-            .split_once("fn relock_after_cond_wait")
-            .and_then(|(_, rest)| rest.split_once("#[inline(always)]"))
-            .map(|(body, _)| body)
-            .expect("the macro should define the cond-specific reacquire");
-
-        assert!(reacquire.contains("CondRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted"));
-        assert!(reacquire.contains("take_cond_reacquire_pending_for_scope"));
-        assert!(
-            !reacquire.contains("yield_now"),
-            "the already-admitted arm should not notify admission again"
+        assert_eq!(
+            acquire_mode_for_cond_relock(CondRelock::AlreadyAdmitted, scope),
+            AcquireMode::AlreadyAdmitted
         );
+        assert_eq!(
+            admission::word_for_test(),
+            before,
+            "an already-admitted relock leaves the user word alone"
+        );
+
+        admission::finish_lock_scope(RELOCK_LOCK_ID);
+        admission::reset_thread_depth_for_test();
     }
 }

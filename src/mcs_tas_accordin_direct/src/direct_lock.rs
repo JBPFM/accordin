@@ -3,8 +3,11 @@
 use std::cell::{Cell, UnsafeCell};
 
 use accordin_shared::condvar::{CondMutex, CondRelock, CondStaging, CondState};
-use accordin_shared::mutex_hook::{LockBackendAdapter, MutexHookBackend};
-use accordin_shared::writer_event::{EventRelock, WakeReason, WriterEvent};
+use accordin_shared::mutex_hook::{
+    AcquireMode, LockBackendAdapter, MutexHookBackend, acquire_mode_for_cond_relock,
+    lock_scope_with_stats,
+};
+use accordin_shared::writer_event::{WriterEvent, checked_ref};
 
 type DirectBackend = LockBackendAdapter<crate::mcs_tas::McsTasLockRaw>;
 
@@ -82,69 +85,28 @@ fn ensure_registered() {
     });
 }
 
-/// Whether the acquire bracket still has to ask admission for a slot, or
-/// whether the caller already holds the routing decision.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AcquireMode {
-    Normal,
-    AlreadyAdmitted,
-}
-
 #[inline(always)]
 fn lock_with_stats(mutex: &mcs_tas_accordin_direct_mutex) {
     let scope = accordin_shared::admission::begin_lock_scope(mutex.lock_id);
-    lock_scope_with_stats(mutex, scope, AcquireMode::Normal);
+    acquire_in_scope(mutex, scope, AcquireMode::Normal);
 }
 
+/// Names the mutex's parts for the shared acquire bracket.
 #[inline(always)]
-fn lock_scope_with_stats(
+fn acquire_in_scope(
     mutex: &mcs_tas_accordin_direct_mutex,
     scope: accordin_shared::admission::LockAdmissionScope,
     mode: AcquireMode,
 ) {
-    let normal = mode == AcquireMode::Normal;
-
-    if normal
-        && !accordin_shared::admission::token_consumed_for_scope(scope)
-        && DirectBackend::try_lock(&mutex.lock)
-    {
-        accordin_shared::lock_stats::record_lock_acquired_for_scope(scope);
-        mutex.staging.handle().publish_hold();
-        return;
-    }
-
-    let wait_start = accordin_shared::lock_stats::record_wait_start();
-    if normal && accordin_shared::admission::mark_slow_path_pending_for_scope(scope) {
-        std::thread::yield_now();
-        accordin_shared::admission::clear_token_consumed_for_scope(scope);
-    }
-    DirectBackend::lock(&mutex.lock);
-    accordin_shared::lock_stats::record_wait_end(wait_start);
-    accordin_shared::lock_stats::record_lock_acquired_for_scope(scope);
-    mutex.staging.handle().publish_hold();
+    lock_scope_with_stats::<DirectBackend>(&mutex.lock, mutex.staging.handle(), scope, mode);
 }
 
 /// Reacquires the cond mutex after a wait, in the mode the wait protocol
-/// decided: a routed wakeup already carries the admission decision, and a
-/// published hint carries it in the user word, so both enter the lock without
-/// re-requesting admission.
+/// decided.
 #[inline(always)]
 fn relock_after_cond_wait(mutex: &mcs_tas_accordin_direct_mutex, relock: CondRelock) {
     let scope = accordin_shared::admission::begin_lock_scope(mutex.lock_id);
-    let mode = match relock {
-        CondRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
-        CondRelock::TakeHint
-            if accordin_shared::admission::take_cond_reacquire_pending_for_scope(scope) =>
-        {
-            accordin_shared::mutex_hook::record_cv_specialized_relock();
-            AcquireMode::AlreadyAdmitted
-        }
-        _ => {
-            accordin_shared::mutex_hook::record_cv_fallback_relock();
-            AcquireMode::Normal
-        }
-    };
-    lock_scope_with_stats(mutex, scope, mode);
+    acquire_in_scope(mutex, scope, acquire_mode_for_cond_relock(relock, scope));
 }
 
 /// Releases the lock and then hands the next staged cond waiter to the lock's
@@ -168,26 +130,6 @@ fn unlock_with_stats(mutex: &mcs_tas_accordin_direct_mutex) {
     staging.drain_one();
 }
 
-unsafe fn mutex_ref<'a>(
-    mutex: *mut mcs_tas_accordin_direct_mutex,
-) -> Result<&'a mcs_tas_accordin_direct_mutex, libc::c_int> {
-    if mutex.is_null() {
-        Err(libc::EINVAL)
-    } else {
-        Ok(unsafe { &*mutex })
-    }
-}
-
-unsafe fn cond_ref<'a>(
-    cond: *mut mcs_tas_accordin_direct_cond,
-) -> Result<&'a mcs_tas_accordin_direct_cond, libc::c_int> {
-    if cond.is_null() {
-        Err(libc::EINVAL)
-    } else {
-        Ok(unsafe { &*cond })
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn mcs_tas_accordin_direct_mutex_create() -> *mut mcs_tas_accordin_direct_mutex {
     Box::into_raw(Box::new(mcs_tas_accordin_direct_mutex::new()))
@@ -209,7 +151,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_destroy(
 pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_lock(
     mutex: *mut mcs_tas_accordin_direct_mutex,
 ) -> libc::c_int {
-    let mutex = match unsafe { mutex_ref(mutex) } {
+    let mutex = match unsafe { checked_ref(mutex) } {
         Ok(mutex) => mutex,
         Err(ret) => return ret,
     };
@@ -223,7 +165,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_lock(
 pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_trylock(
     mutex: *mut mcs_tas_accordin_direct_mutex,
 ) -> libc::c_int {
-    let mutex = match unsafe { mutex_ref(mutex) } {
+    let mutex = match unsafe { checked_ref(mutex) } {
         Ok(mutex) => mutex,
         Err(ret) => return ret,
     };
@@ -242,7 +184,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_trylock(
 pub unsafe extern "C" fn mcs_tas_accordin_direct_mutex_unlock(
     mutex: *mut mcs_tas_accordin_direct_mutex,
 ) -> libc::c_int {
-    let mutex = match unsafe { mutex_ref(mutex) } {
+    let mutex = match unsafe { checked_ref(mutex) } {
         Ok(mutex) => mutex,
         Err(ret) => return ret,
     };
@@ -275,11 +217,11 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_wait(
     cond: *mut mcs_tas_accordin_direct_cond,
     mutex: *mut mcs_tas_accordin_direct_mutex,
 ) -> libc::c_int {
-    let cond = match unsafe { cond_ref(cond) } {
+    let cond = match unsafe { checked_ref(cond) } {
         Ok(cond) => cond,
         Err(ret) => return ret,
     };
-    let mutex = match unsafe { mutex_ref(mutex) } {
+    let mutex = match unsafe { checked_ref(mutex) } {
         Ok(mutex) => mutex,
         Err(ret) => return ret,
     };
@@ -304,11 +246,11 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_timedwait(
         return libc::EINVAL;
     }
 
-    let cond = match unsafe { cond_ref(cond) } {
+    let cond = match unsafe { checked_ref(cond) } {
         Ok(cond) => cond,
         Err(ret) => return ret,
     };
-    let mutex = match unsafe { mutex_ref(mutex) } {
+    let mutex = match unsafe { checked_ref(mutex) } {
         Ok(mutex) => mutex,
         Err(ret) => return ret,
     };
@@ -327,7 +269,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_timedwait(
 pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_signal(
     cond: *mut mcs_tas_accordin_direct_cond,
 ) -> libc::c_int {
-    let cond = match unsafe { cond_ref(cond) } {
+    let cond = match unsafe { checked_ref(cond) } {
         Ok(cond) => cond,
         Err(ret) => return ret,
     };
@@ -340,7 +282,7 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_signal(
 pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_broadcast(
     cond: *mut mcs_tas_accordin_direct_cond,
 ) -> libc::c_int {
-    let cond = match unsafe { cond_ref(cond) } {
+    let cond = match unsafe { checked_ref(cond) } {
         Ok(cond) => cond,
         Err(ret) => return ret,
     };
@@ -349,42 +291,38 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_cond_broadcast(
     0
 }
 
-/// The writer event as the C API hands it out: the wake protocol plus the
-/// binding of the mutex it belongs to.
-///
-/// The whole object lives in caller-owned storage. The waiters this exists for
-/// are created per operation, and an allocation per operation is the cost the
-/// protocol is there to remove; for the same reason the binding is resolved
-/// once per mutex rather than once per waiter, so initializing one is a plain
-/// struct write.
-#[allow(non_camel_case_types)]
-#[repr(C)]
-pub struct mcs_tas_accordin_direct_writer_event {
-    event: WriterEvent,
-    mutex: *const mcs_tas_accordin_direct_mutex,
-}
-
+/// Re-acquires the mutex for a waiter a writer-event wait made leader.
 #[inline(always)]
-unsafe fn writer_event_ref<'a>(
-    event: *mut mcs_tas_accordin_direct_writer_event,
-) -> Result<&'a mcs_tas_accordin_direct_writer_event, libc::c_int> {
-    if event.is_null() {
-        Err(libc::EINVAL)
-    } else {
-        Ok(unsafe { &*event })
+fn relock_writer_event(mutex: &mcs_tas_accordin_direct_mutex, event: &WriterEvent) {
+    let scope = accordin_shared::admission::begin_lock_scope(mutex.lock_id);
+    let mode = AcquireMode::for_event_relock(event.take_relock_mode());
+    acquire_in_scope(mutex, scope, mode);
+}
+
+accordin_shared::export_writer_event_abi! {
+    /// The writer event as the C API hands it out: the wake protocol plus the
+    /// binding of the mutex it belongs to.
+    ///
+    /// The whole object lives in caller-owned storage. The waiters this exists
+    /// for are created per operation, and an allocation per operation is the
+    /// cost the protocol is there to remove; for the same reason the binding is
+    /// resolved once per mutex rather than once per waiter, so initializing one
+    /// is a plain struct write.
+    #[allow(non_camel_case_types)]
+    pub struct mcs_tas_accordin_direct_writer_event {
+        binding: mcs_tas_accordin_direct_mutex
     }
-}
-
-/// The storage a caller has to provide for one event.
-#[unsafe(no_mangle)]
-pub extern "C" fn mcs_tas_accordin_direct_writer_event_size() -> usize {
-    std::mem::size_of::<mcs_tas_accordin_direct_writer_event>()
-}
-
-/// The alignment that storage has to satisfy.
-#[unsafe(no_mangle)]
-pub extern "C" fn mcs_tas_accordin_direct_writer_event_align() -> usize {
-    std::mem::align_of::<mcs_tas_accordin_direct_writer_event>()
+    pointer = mcs_tas_accordin_direct_writer_event,
+    admission_scoped = <DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE,
+    relock = relock_writer_event,
+    size = mcs_tas_accordin_direct_writer_event_size,
+    align = mcs_tas_accordin_direct_writer_event_align,
+    init = mcs_tas_accordin_direct_writer_event_init,
+    arm = mcs_tas_accordin_direct_writer_event_arm,
+    wait = mcs_tas_accordin_direct_writer_event_wait,
+    relock_entry = mcs_tas_accordin_direct_writer_event_relock,
+    post_completed = mcs_tas_accordin_direct_writer_event_post_completed,
+    post_leader = mcs_tas_accordin_direct_writer_event_post_leader,
 }
 
 /// Resolves a mutex to the binding its events are initialized from, which is
@@ -407,126 +345,13 @@ pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_bind(
     0
 }
 
-/// Puts a fresh event into caller-owned storage, bound to what
-/// `mcs_tas_accordin_direct_writer_event_bind` resolved for its mutex.
-///
-/// This runs once per waiter, so it does no lookups of its own. The thread is
-/// already registered by then: a waiter arms while holding the mutex, and
-/// taking the mutex is what registers it.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_init(
-    event: *mut mcs_tas_accordin_direct_writer_event,
-    binding: *mut libc::c_void,
-) -> libc::c_int {
-    if event.is_null() || binding.is_null() {
-        return libc::EINVAL;
-    }
-
-    unsafe {
-        WriterEvent::init_in_place(std::ptr::addr_of_mut!((*event).event));
-        std::ptr::addr_of_mut!((*event).mutex)
-            .write(binding.cast::<mcs_tas_accordin_direct_mutex>());
-    }
-    0
-}
-
-/// Declares the waiter unreleased. The caller must still hold the mutex: past
-/// the release a poster may publish a reason at any moment, and one arriving
-/// first would be overwritten here.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_arm(
-    event: *mut mcs_tas_accordin_direct_writer_event,
-) -> libc::c_int {
-    let event = match unsafe { writer_event_ref(event) } {
-        Ok(event) => event,
-        Err(ret) => return ret,
-    };
-
-    event.event.arm();
-    0
-}
-
-/// Blocks until a poster publishes a reason and reports it: 0 for a waiter
-/// whose work is done, 1 for the new queue head. The caller must have released
-/// the mutex first.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_wait(
-    event: *mut mcs_tas_accordin_direct_writer_event,
-) -> libc::c_int {
-    let event = match unsafe { writer_event_ref(event) } {
-        Ok(event) => event,
-        Err(_) => return -1,
-    };
-
-    let lock_id = unsafe { (*event.mutex).lock_id };
-    match event.event.wait(
-        lock_id,
-        <DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE,
-    ) {
-        WakeReason::Completed => 0,
-        WakeReason::BecomeLeader => 1,
-    }
-}
-
-/// Re-acquires the mutex for a waiter the wait made leader, in the mode that
-/// wait decided: a routed wakeup already carries the admission decision and
-/// enters the lock without asking again.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_relock(
-    event: *mut mcs_tas_accordin_direct_writer_event,
-) -> libc::c_int {
-    let event = match unsafe { writer_event_ref(event) } {
-        Ok(event) => event,
-        Err(ret) => return ret,
-    };
-    let mutex = unsafe { &*event.mutex };
-
-    let scope = accordin_shared::admission::begin_lock_scope(mutex.lock_id);
-    let mode = match event.event.take_relock_mode() {
-        EventRelock::AlreadyAdmitted => AcquireMode::AlreadyAdmitted,
-        EventRelock::Normal => AcquireMode::Normal,
-    };
-    lock_scope_with_stats(mutex, scope, mode);
-    0
-}
-
-/// Releases a waiter whose work the caller already did. The caller must have
-/// published the result first, and must never touch the event again: the waiter
-/// may destroy it the instant the reason lands.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_post_completed(
-    event: *mut mcs_tas_accordin_direct_writer_event,
-) -> libc::c_int {
-    let event = match unsafe { writer_event_ref(event) } {
-        Ok(event) => event,
-        Err(ret) => return ret,
-    };
-
-    event.event.post_completed();
-    0
-}
-
-/// Hands the queue head to a waiter that still has work to do. As with a
-/// completed post, the event must not be touched again.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mcs_tas_accordin_direct_writer_event_post_leader(
-    event: *mut mcs_tas_accordin_direct_writer_event,
-) -> libc::c_int {
-    let event = match unsafe { writer_event_ref(event) } {
-        Ok(event) => event,
-        Err(ret) => return ret,
-    };
-
-    event.event.post_leader();
-    0
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
 
-    use accordin_shared::condvar::force_cv_requeue_for_thread;
+    use accordin_shared::test_support::{await_progress, deadline_in, waking_thread};
 
     use super::{
         mcs_tas_accordin_direct_cond, mcs_tas_accordin_direct_cond_broadcast,
@@ -571,19 +396,6 @@ mod tests {
                 assert_eq!(mcs_tas_accordin_direct_cond_destroy(self.cond), 0);
                 assert_eq!(mcs_tas_accordin_direct_mutex_destroy(self.mutex), 0);
             }
-        }
-    }
-
-    fn deadline_in(nanos: i64) -> libc::timespec {
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
-        let deadline_nsec = now.tv_nsec + nanos;
-        libc::timespec {
-            tv_sec: now.tv_sec + deadline_nsec / 1_000_000_000,
-            tv_nsec: deadline_nsec % 1_000_000_000,
         }
     }
 
@@ -683,60 +495,58 @@ mod tests {
         pair.destroy();
     }
 
-    #[test]
-    fn direct_cond_broadcast_releases_every_waiter() {
+    /// A broadcast has to release every waiter it finds, whether the waking
+    /// thread moves them onto the mutex's stage or wakes them where they sleep.
+    ///
+    /// Requeueing is what makes the release indirect: the waiters end up on a
+    /// lock they are then drained off one unlock at a time, so the count is
+    /// raised and the broadcaster settles longer before it fires to give every
+    /// waiter time to reach its sleep.
+    fn broadcast_releases_every_waiter(requeue: bool, waiters: u32, settle: Duration) {
         let pair = CondPair::create();
         let payload = Arc::new(AtomicU32::new(0));
+        let released = Arc::new(AtomicU32::new(0));
 
-        let waiters = (0..4)
+        let threads = (0..waiters)
             .map(|_| {
                 let payload = Arc::clone(&payload);
+                let released = Arc::clone(&released);
                 std::thread::spawn(move || unsafe {
                     let pair = pair;
                     assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
                     while payload.load(Ordering::Acquire) == 0 {
                         assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
                     }
+                    released.fetch_add(1, Ordering::Release);
                     assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
                 })
             })
             .collect::<Vec<_>>();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _guard = waking_thread(requeue);
+        std::thread::sleep(settle);
         unsafe {
             assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
             payload.store(1, Ordering::Release);
-            assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
             assert_eq!(mcs_tas_accordin_direct_cond_broadcast(pair.cond), 0);
+            assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
         }
 
-        for waiter in waiters {
-            waiter.join().expect("every waiter should finish");
+        await_progress(&released, waiters, "the broadcast");
+        for thread in threads {
+            thread.join().expect("every waiter should finish");
         }
         pair.destroy();
     }
 
-    /// The requeue switch belongs to the waking thread: a waiter's release
-    /// comes from the staged count, which the unlock drains either way.
-    struct RequeueGuard;
-
-    impl Drop for RequeueGuard {
-        fn drop(&mut self) {
-            force_cv_requeue_for_thread(None);
-        }
+    #[test]
+    fn direct_cond_broadcast_releases_every_waiter() {
+        broadcast_releases_every_waiter(false, 4, Duration::from_millis(50));
     }
 
-    fn waking_thread() -> RequeueGuard {
-        force_cv_requeue_for_thread(Some(true));
-        RequeueGuard
-    }
-
-    fn await_progress(counter: &AtomicU32, expected: u32, what: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while counter.load(Ordering::Acquire) < expected {
-            assert!(std::time::Instant::now() < deadline, "{what} stalled");
-            std::thread::yield_now();
-        }
+    #[test]
+    fn direct_cond_broadcast_releases_every_waiter_with_requeue() {
+        broadcast_releases_every_waiter(true, 8, Duration::from_millis(100));
     }
 
     /// The hand-off is a wake-one, which the staging switch leaves on the plain
@@ -754,7 +564,7 @@ mod tests {
             let rounds = Arc::clone(&rounds);
             std::thread::spawn(move || unsafe {
                 let pair = pair;
-                let _guard = waking_thread();
+                let _guard = waking_thread(true);
 
                 for _ in 0..ROUNDS {
                     assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
@@ -769,7 +579,7 @@ mod tests {
             })
         };
 
-        let _guard = waking_thread();
+        let _guard = waking_thread(true);
         for round in 0..ROUNDS {
             unsafe {
                 assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
@@ -785,46 +595,6 @@ mod tests {
 
         consumer.join().expect("the consumer should finish");
         assert_eq!(rounds.load(Ordering::Acquire), ROUNDS);
-        pair.destroy();
-    }
-
-    #[test]
-    fn direct_cond_broadcast_releases_every_waiter_with_requeue() {
-        const WAITERS: u32 = 8;
-
-        let pair = CondPair::create();
-        let payload = Arc::new(AtomicU32::new(0));
-        let released = Arc::new(AtomicU32::new(0));
-
-        let waiters = (0..WAITERS)
-            .map(|_| {
-                let payload = Arc::clone(&payload);
-                let released = Arc::clone(&released);
-                std::thread::spawn(move || unsafe {
-                    let pair = pair;
-                    assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
-                    while payload.load(Ordering::Acquire) == 0 {
-                        assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
-                    }
-                    released.fetch_add(1, Ordering::Release);
-                    assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let _guard = waking_thread();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        unsafe {
-            assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
-            payload.store(1, Ordering::Release);
-            assert_eq!(mcs_tas_accordin_direct_cond_broadcast(pair.cond), 0);
-            assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
-        }
-
-        await_progress(&released, WAITERS, "the broadcast");
-        for waiter in waiters {
-            waiter.join().expect("every waiter should finish");
-        }
         pair.destroy();
     }
 
@@ -850,7 +620,7 @@ mod tests {
             })
         };
 
-        let _guard = waking_thread();
+        let _guard = waking_thread(true);
         std::thread::sleep(std::time::Duration::from_millis(100));
         unsafe {
             assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
@@ -877,7 +647,7 @@ mod tests {
             let payload = Arc::clone(&payload);
             std::thread::spawn(move || unsafe {
                 let pair = pair;
-                let _guard = waking_thread();
+                let _guard = waking_thread(true);
                 assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
                 while payload.load(Ordering::Acquire) == 0 {
                     assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
@@ -886,7 +656,7 @@ mod tests {
             })
         };
 
-        let _guard = waking_thread();
+        let _guard = waking_thread(true);
         std::thread::sleep(std::time::Duration::from_millis(50));
         unsafe {
             assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);

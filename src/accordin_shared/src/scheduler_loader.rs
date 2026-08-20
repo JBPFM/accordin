@@ -36,10 +36,10 @@ macro_rules! define_scheduler_loader {
         const DEBUG_COUNTERS_ENV: &str = concat!($env_prefix, "_DEBUG_COUNTERS");
         const INACTIVE_PREVIOUS_LOCK_PERCENT_ENV: &str =
             concat!($env_prefix, "_INACTIVE_PREVIOUS_LOCK_PERCENT");
-        // Not prefixed: the mutex hook publishes the cond-sleep bit under the
-        // same variable, and the two sides have to agree whatever backend the
-        // preload happens to be.
-        const CV_ROUTE_ENV: &str = "ACCORDIN_CV_ROUTE";
+        // Taken from the wait protocol rather than spelled again: the mutex hook
+        // publishes the cond-sleep bit under the same variable, and the two
+        // sides have to agree whatever backend the preload happens to be.
+        const CV_ROUTE_ENV: &str = $crate::condvar::CV_ROUTE_ENV;
         const CV_PRIORITY_STREAK_ENV: &str = "ACCORDIN_CV_PRIO";
 
         // The scheduler reads the user admission word through the layout these
@@ -57,15 +57,11 @@ macro_rules! define_scheduler_loader {
             );
             assert!(crate::bpf_intf::MAX_LOCK_CLASSES == $crate::admission::MAX_LOCK_CLASSES);
             // The userspace mirror of the flag itself is private to the
-            // admission module, so the bit is pinned by position and by the
-            // two invariants the routing depends on: it lives inside the flag
-            // field, and it does not collide with the other three flags.
+            // admission module, so the bit is pinned by position, and by the
+            // one thing the position alone does not say: that no other flag
+            // claims it. That it lands inside the flag field follows from the
+            // position and the mask/shift relation below.
             assert!(crate::bpf_intf::USER_ADMISSION_CV_SLEEP == 1 << 3);
-            assert!(
-                crate::bpf_intf::USER_ADMISSION_CV_SLEEP
-                    & crate::bpf_intf::USER_ADMISSION_FLAG_MASK
-                    == crate::bpf_intf::USER_ADMISSION_CV_SLEEP
-            );
             assert!(
                 crate::bpf_intf::USER_ADMISSION_CV_SLEEP
                     & (crate::bpf_intf::USER_ADMISSION_IN_CRITICAL_SECTION

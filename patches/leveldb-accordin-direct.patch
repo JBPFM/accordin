@@ -66,10 +66,24 @@ index 429a61a..59a9c8e 100644
    return 0;
  }
 diff --git a/db/db_impl.cc b/db/db_impl.cc
-index 1a4e459..b0356de 100644
+index 1a4e459..c8cde4a 100644
 --- a/db/db_impl.cc
 +++ b/db/db_impl.cc
-@@ -42,15 +42,77 @@ const int kNumNonTableCacheFiles = 10;
+@@ -39,18 +39,90 @@ namespace leveldb {
+ 
+ const int kNumNonTableCacheFiles = 10;
+ 
++namespace {
++
++// The queue label is fixed, so it is interned once here instead of on every
++// writer, which the write path creates one of per call.
++port::CvLabelStats* WriterQueueCvStats() {
++  static port::CvLabelStats* const stats = port::CvLabelStatsFor("writer_queue");
++  return stats;
++}
++
++}  // namespace
++
  // Information kept for every waiting writer
  struct DBImpl::Writer {
    explicit Writer(port::Mutex* mu)
@@ -78,7 +92,7 @@ index 1a4e459..b0356de 100644
 +        sync(false),
 +        done(false),
 +        mu(mu),
-+        cv(mu, "writer_queue"),
++        cv(mu, WriterQueueCvStats()),
 +        event(mu) {}
 +
 +  // Blocks until this writer either heads the queue or has had its batch
@@ -94,11 +108,11 @@ index 1a4e459..b0356de 100644
 +  // published. REQUIRES: the caller holds mu and has removed this writer from
 +  // the queue. The caller must not touch this object again: the writer it
 +  // releases may return and destroy it as the wake lands.
-+  void PostCompleted();
++  void PostCompleted() { Post(port::WriterEvent::kCompleted); }
 +
 +  // Hands the head of the queue to this writer, which still has its batch to
 +  // write. The same last-touch rule applies.
-+  void PostLeader();
++  void PostLeader() { Post(port::WriterEvent::kBecomeLeader); }
  
    Status status;
    WriteBatch* batch;
@@ -109,6 +123,21 @@ index 1a4e459..b0356de 100644
 +  // Carries the wake when the event backend is available and the run asks for
 +  // it; inert otherwise, and then every wake goes through cv above.
 +  port::WriterEvent event;
++
++ private:
++  // The reason a wake carries is the event's to publish; the condition variable
++  // has no room for it and the waiter it releases re-reads the queue instead.
++  void Post(port::WriterEvent::WakeReason reason) {
++    if (!event.Active()) {
++      cv.Signal();
++      return;
++    }
++    if (reason == port::WriterEvent::kCompleted) {
++      event.PostCompleted();
++    } else {
++      event.PostLeader();
++    }
++  }
  };
  
 +bool DBImpl::Writer::AwaitTurn() NO_THREAD_SAFETY_ANALYSIS {
@@ -129,26 +158,10 @@ index 1a4e459..b0356de 100644
 +  return true;
 +}
 +
-+void DBImpl::Writer::PostCompleted() {
-+  if (event.Active()) {
-+    event.PostCompleted();
-+    return;
-+  }
-+  cv.Signal();
-+}
-+
-+void DBImpl::Writer::PostLeader() {
-+  if (event.Active()) {
-+    event.PostLeader();
-+    return;
-+  }
-+  cv.Signal();
-+}
-+
  struct DBImpl::CompactionState {
    // Files produced by compaction
    struct Output {
-@@ -135,7 +197,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+@@ -135,7 +207,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
        table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
        db_lock_(nullptr),
        shutting_down_(false),
@@ -157,7 +170,7 @@ index 1a4e459..b0356de 100644
        mem_(nullptr),
        imm_(nullptr),
        has_imm_(false),
-@@ -147,7 +209,12 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
+@@ -147,7 +219,12 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
        background_compaction_scheduled_(false),
        manual_compaction_(nullptr),
        versions_(new VersionSet(dbname_, &options_, table_cache_,
@@ -171,7 +184,7 @@ index 1a4e459..b0356de 100644
  
  DBImpl::~DBImpl() {
    // Wait for background work to finish.
-@@ -1197,16 +1264,60 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
+@@ -1197,16 +1274,60 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
    return DB::Delete(options, key);
  }
  
@@ -235,7 +248,7 @@ index 1a4e459..b0356de 100644
    }
    if (w.done) {
      return w.status;
-@@ -1257,14 +1368,18 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+@@ -1257,14 +1378,18 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
      if (ready != &w) {
        ready->status = status;
        ready->done = true;
@@ -257,10 +270,10 @@ index 1a4e459..b0356de 100644
  
    return status;
 diff --git a/port/port_stdcxx.h b/port/port_stdcxx.h
-index 2bda48d..3a4e77f 100644
+index 2bda48d..e125163 100644
 --- a/port/port_stdcxx.h
 +++ b/port/port_stdcxx.h
-@@ -29,60 +29,796 @@
+@@ -29,58 +29,897 @@
  #include <snappy.h>
  #endif  // HAVE_SNAPPY
  
@@ -523,7 +536,12 @@ index 2bda48d..3a4e77f 100644
 +
 +// Labels come from string literals, so the pointer comparison hits first; the
 +// string comparison only covers duplicated literals across translation units.
++// Returns nullptr when the run does not collect the counters, which is the one
++// answer every caller gates on, so the gate lives here.
 +inline CvLabelStats* CvLabelStatsFor(const char* label) {
++  if (!CvStatsEnabled()) {
++    return nullptr;
++  }
 +  if (label == nullptr) {
 +    label = "other";
 +  }
@@ -603,8 +621,147 @@ index 2bda48d..3a4e77f 100644
 +  }
 +  std::fflush(stdout);
 +}
++
++inline bool WriterEventEnabledByEnv() {
++  static const bool enabled = EnvFlagEnabled("ACCORDIN_WRITER_EVENT", false);
++  return enabled;
++}
++
++// The event lives inside the waiter, which is a stack object created per
++// operation, so its storage is reserved here rather than allocated. The library
++// reports its own size and alignment and one that does not fit leaves the
++// feature off, which keeps the layout out of this header.
++constexpr size_t kWriterEventStorageSize = 64;
++constexpr size_t kWriterEventStorageAlign = 16;
++
++// One writer-event backend. The two exporting families run the same protocol
++// against different mutex types, so a mutex picks its family once and the event
++// operations call through here instead of asking which family they are on.
++//
++// The entries are the forwarders below rather than the exported symbols: the
++// symbols are weak, and the address of a weak symbol written into a static
++// initializer is bound to zero by the static linker even when the preloaded
++// library defines it, while the same address taken in code is resolved at load
++// time. Whether a family is present is therefore decided in code, by the
++// predicates below, and a table only ever holds addresses this header defines.
++struct WriterEventOps {
++  int (*init)(void* event, void* binding);
++  int (*arm)(void* event);
++  int (*wait)(void* event);
++  int (*relock)(void* event);
++  int (*post_completed)(void* event);
++  int (*post_leader)(void* event);
++  int (*bind)(void* mutex, void** out_binding);
++};
++
++inline int HookWriterEventInit(void* event, void* binding) {
++  return accordin_writer_event_init(event, binding);
++}
++inline int HookWriterEventArm(void* event) {
++  return accordin_writer_event_arm(event);
++}
++inline int HookWriterEventWait(void* event) {
++  return accordin_writer_event_wait(event);
++}
++inline int HookWriterEventRelock(void* event) {
++  return accordin_writer_event_relock(event);
++}
++inline int HookWriterEventPostCompleted(void* event) {
++  return accordin_writer_event_post_completed(event);
++}
++inline int HookWriterEventPostLeader(void* event) {
++  return accordin_writer_event_post_leader(event);
++}
++inline int HookWriterEventBind(void* mutex, void** out_binding) {
++  return accordin_writer_event_bind(mutex, out_binding);
++}
++
++inline int DirectWriterEventInit(void* event, void* binding) {
++  return mcs_tas_accordin_direct_writer_event_init(event, binding);
++}
++inline int DirectWriterEventArm(void* event) {
++  return mcs_tas_accordin_direct_writer_event_arm(event);
++}
++inline int DirectWriterEventWait(void* event) {
++  return mcs_tas_accordin_direct_writer_event_wait(event);
++}
++inline int DirectWriterEventRelock(void* event) {
++  return mcs_tas_accordin_direct_writer_event_relock(event);
++}
++inline int DirectWriterEventPostCompleted(void* event) {
++  return mcs_tas_accordin_direct_writer_event_post_completed(event);
++}
++inline int DirectWriterEventPostLeader(void* event) {
++  return mcs_tas_accordin_direct_writer_event_post_leader(event);
++}
++// The direct family is the one that binds against a typed mutex.
++inline int DirectWriterEventBind(void* mutex, void** out_binding) {
++  return mcs_tas_accordin_direct_writer_event_bind(
++      static_cast<mcs_tas_accordin_direct_mutex*>(mutex), out_binding);
++}
  
 -// Thinly wraps std::mutex.
++// A family answers for a mutex when the run asked for the feature, the library
++// exports the whole protocol, and its event fits the storage reserved above.
++inline bool HookWriterEventUsable() {
++  return WriterEventEnabledByEnv() && accordin_writer_event_init != nullptr &&
++         accordin_writer_event_arm != nullptr &&
++         accordin_writer_event_wait != nullptr &&
++         accordin_writer_event_relock != nullptr &&
++         accordin_writer_event_post_completed != nullptr &&
++         accordin_writer_event_post_leader != nullptr &&
++         accordin_writer_event_bind != nullptr &&
++         accordin_writer_event_size != nullptr &&
++         accordin_writer_event_align != nullptr &&
++         accordin_writer_event_size() <= kWriterEventStorageSize &&
++         accordin_writer_event_align() <= kWriterEventStorageAlign;
++}
++
++inline bool DirectWriterEventUsable() {
++  return WriterEventEnabledByEnv() &&
++         mcs_tas_accordin_direct_writer_event_init != nullptr &&
++         mcs_tas_accordin_direct_writer_event_arm != nullptr &&
++         mcs_tas_accordin_direct_writer_event_wait != nullptr &&
++         mcs_tas_accordin_direct_writer_event_relock != nullptr &&
++         mcs_tas_accordin_direct_writer_event_post_completed != nullptr &&
++         mcs_tas_accordin_direct_writer_event_post_leader != nullptr &&
++         mcs_tas_accordin_direct_writer_event_bind != nullptr &&
++         mcs_tas_accordin_direct_writer_event_size != nullptr &&
++         mcs_tas_accordin_direct_writer_event_align != nullptr &&
++         mcs_tas_accordin_direct_writer_event_size() <=
++             kWriterEventStorageSize &&
++         mcs_tas_accordin_direct_writer_event_align() <=
++             kWriterEventStorageAlign;
++}
++
++// The backend a mutex of the given family binds writer events to, or nullptr
++// when it has none. Answered once per family.
++inline const WriterEventOps* ResolveWriterEventOps(bool direct) {
++  static const WriterEventOps direct_ops = {
++      DirectWriterEventInit,          DirectWriterEventArm,
++      DirectWriterEventWait,          DirectWriterEventRelock,
++      DirectWriterEventPostCompleted, DirectWriterEventPostLeader,
++      DirectWriterEventBind};
++  static const WriterEventOps hook_ops = {
++      HookWriterEventInit,          HookWriterEventArm,
++      HookWriterEventWait,          HookWriterEventRelock,
++      HookWriterEventPostCompleted, HookWriterEventPostLeader,
++      HookWriterEventBind};
++  static const WriterEventOps* const resolved_direct =
++      DirectWriterEventUsable() ? &direct_ops : nullptr;
++  static const WriterEventOps* const resolved_hook =
++      HookWriterEventUsable() ? &hook_ops : nullptr;
++  return direct ? resolved_direct : resolved_hook;
++}
++
++// What a mutex resolved for the writers that block on it: the backend to call,
++// and the binding every event on that mutex is initialized from. A null ops is
++// the only representation of "this mutex has no writer event".
++struct WriterEventBackend {
++  const WriterEventOps* ops;
++  void* binding;
++};
++
 +// Wraps std::mutex, with an opt-in mcs_tas_accordin_direct backend.
  class LOCKABLE Mutex {
   public:
@@ -669,12 +826,29 @@ index 2bda48d..3a4e77f 100644
 +  void unlock() UNLOCK_FUNCTION() { Unlock(); }
    void AssertHeld() ASSERT_EXCLUSIVE_LOCK() {}
  
-+  // The binding a writer event is initialized from, or nullptr when this mutex
-+  // has no event backend. Resolving it consults a process-wide registry, and
-+  // the answer never changes for a given mutex, so it is resolved on the first
-+  // ask and every writer after that pays one relaxed load. Defined below the
-+  // WriterEvent declarations, which own the backend selection.
-+  void* WriterEventBinding();
++  // The backend this mutex binds writer events to, with a null ops when it has
++  // none. Resolving it consults a process-wide registry keyed by mutex address,
++  // which is far too much work to repeat for every writer, and the answer is a
++  // property of the mutex that cannot change while it exists, so it is resolved
++  // at the first writer and every writer after that pays one acquire load.
++  const WriterEventBackend& WriterEventBinding() {
++    if (!writer_event_resolved_.load(std::memory_order_acquire)) {
++      std::call_once(writer_event_once_, [this]() {
++        const WriterEventOps* const ops = ResolveWriterEventOps(direct_ != nullptr);
++        void* const mutex = direct_ != nullptr
++                                ? static_cast<void*>(direct_)
++                                : static_cast<void*>(mu_.native_handle());
++        if (ops != nullptr &&
++            ops->bind(mutex, &writer_event_backend_.binding) == 0) {
++          writer_event_backend_.ops = ops;
++        } else {
++          writer_event_backend_.binding = nullptr;
++        }
++        writer_event_resolved_.store(true, std::memory_order_release);
++      });
++    }
++    return writer_event_backend_;
++  }
 +
   private:
    friend class CondVar;
@@ -701,7 +875,8 @@ index 2bda48d..3a4e77f 100644
 +  bool lock_timing_enabled_ = false;
 +  uint64_t lock_timing_hold_start_ns_ = 0;
 +  std::once_flag writer_event_once_;
-+  void* writer_event_binding_ = nullptr;
++  std::atomic<bool> writer_event_resolved_{false};
++  WriterEventBackend writer_event_backend_{nullptr, nullptr};
  };
  
 -// Thinly wraps std::condition_variable.
@@ -711,16 +886,20 @@ index 2bda48d..3a4e77f 100644
 -  explicit CondVar(Mutex* mu) : mu_(mu) { assert(mu != nullptr); }
 -  ~CondVar() = default;
 +  explicit CondVar(Mutex* mu, const char* label = nullptr)
-+      : mu_(mu),
-+        stats_(CvStatsEnabled() ? CvLabelStatsFor(label) : nullptr),
-+        waiters_(0) {
++      : CondVar(mu, CvLabelStatsFor(label)) {}
++  // Takes the label already interned, for sites that build a CondVar per
++  // operation and hoist the lookup out of that path.
++  CondVar(Mutex* mu, CvLabelStats* stats)
++      : mu_(mu), stats_(stats), waiters_(0) {
 +    assert(mu != nullptr);
 +  }
 +  ~CondVar() {
-+    if (direct_ == nullptr) {
++    mcs_tas_accordin_direct_cond* const cond =
++        direct_.load(std::memory_order_relaxed);
++    if (cond == nullptr) {
 +      return;
 +    }
-+    const int ret = mcs_tas_accordin_direct_cond_destroy(direct_);
++    const int ret = mcs_tas_accordin_direct_cond_destroy(cond);
 +    assert(ret == 0);
 +    (void)ret;
 +  }
@@ -735,11 +914,11 @@ index 2bda48d..3a4e77f 100644
 +    if (stats_ == nullptr) {
 +      WaitOnBackend();
 +    } else {
-+      waiters_.fetch_add(1, std::memory_order_acq_rel);
++      waiters_.fetch_add(1, std::memory_order_relaxed);
 +      const uint64_t wait_start_ns = LockTimingNowNs();
 +      WaitOnBackend();
 +      const uint64_t wait_end_ns = LockTimingNowNs();
-+      waiters_.fetch_sub(1, std::memory_order_acq_rel);
++      waiters_.fetch_sub(1, std::memory_order_relaxed);
 +      RecordCvWait(stats_, wait_end_ns - wait_start_ns);
 +    }
 +    mu_->StartLockTimingHold();
@@ -760,7 +939,7 @@ index 2bda48d..3a4e77f 100644
 +    if (stats_ != nullptr) {
 +      stats_->broadcast_count.fetch_add(1, std::memory_order_relaxed);
 +      stats_->broadcast_fanout.fetch_add(
-+          waiters_.load(std::memory_order_acquire), std::memory_order_relaxed);
++          waiters_.load(std::memory_order_relaxed), std::memory_order_relaxed);
 +    }
 +    if (mu_->direct_ != nullptr) {
 +      const int ret = mcs_tas_accordin_direct_cond_broadcast(DirectCond());
@@ -778,12 +957,18 @@ index 2bda48d..3a4e77f 100644
 +  // direct cond on first use instead of in the constructor is therefore the
 +  // only shape that sees the final backend, and std::call_once keeps the
 +  // creation single even though every CondVar operation already runs under the
-+  // cond mutex.
++  // cond mutex. Once the cond exists, reading it is one acquire load, so the
++  // creation check stays off the signal and wait paths.
 +  mcs_tas_accordin_direct_cond* DirectCond() {
++    mcs_tas_accordin_direct_cond* cond = direct_.load(std::memory_order_acquire);
++    if (cond != nullptr) {
++      return cond;
++    }
 +    std::call_once(direct_once_, [this]() {
-+      direct_ = mcs_tas_accordin_direct_cond_create();
++      direct_.store(mcs_tas_accordin_direct_cond_create(),
++                    std::memory_order_release);
 +    });
-+    return direct_;
++    return direct_.load(std::memory_order_relaxed);
 +  }
 +
 +  void WaitOnBackend() {
@@ -807,7 +992,7 @@ index 2bda48d..3a4e77f 100644
 +  CvLabelStats* const stats_;
 +  std::atomic<uint64_t> waiters_;
 +  std::once_flag direct_once_;
-+  mcs_tas_accordin_direct_cond* direct_ = nullptr;
++  std::atomic<mcs_tas_accordin_direct_cond*> direct_{nullptr};
 +};
 +
 +// Reason codes and posts, so a run can be read as one wake per waiter with the
@@ -821,56 +1006,18 @@ index 2bda48d..3a4e77f 100644
 +  std::atomic<uint64_t> leader_wakes;
 +  std::atomic<uint64_t> completed_posts;
 +  std::atomic<uint64_t> leader_posts;
- };
- 
++};
++
 +inline WriterEventStats& WriterEventStatsRef() {
 +  static WriterEventStats stats;
 +  return stats;
 +}
 +
-+inline bool WriterEventEnabledByEnv() {
-+  static const bool enabled = EnvFlagEnabled("ACCORDIN_WRITER_EVENT", false);
-+  return enabled;
-+}
-+
-+// The event lives inside the waiter, which is a stack object created per
-+// operation, so its storage is reserved here rather than allocated. The library
-+// reports its own size and alignment and one that does not fit leaves the
-+// feature off, which keeps the layout out of this header.
-+constexpr size_t kWriterEventStorageSize = 64;
-+constexpr size_t kWriterEventStorageAlign = 16;
-+
-+inline bool DirectWriterEventAvailable() {
-+  static const bool available =
-+      WriterEventEnabledByEnv() &&
-+      mcs_tas_accordin_direct_writer_event_size != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_align != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_bind != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_init != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_arm != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_wait != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_relock != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_post_completed != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_post_leader != nullptr &&
-+      mcs_tas_accordin_direct_writer_event_size() <= kWriterEventStorageSize &&
-+      mcs_tas_accordin_direct_writer_event_align() <= kWriterEventStorageAlign;
-+  return available;
-+}
-+
-+inline bool HookWriterEventAvailable() {
-+  static const bool available =
-+      WriterEventEnabledByEnv() && accordin_writer_event_size != nullptr &&
-+      accordin_writer_event_align != nullptr &&
-+      accordin_writer_event_bind != nullptr &&
-+      accordin_writer_event_init != nullptr &&
-+      accordin_writer_event_arm != nullptr &&
-+      accordin_writer_event_wait != nullptr &&
-+      accordin_writer_event_relock != nullptr &&
-+      accordin_writer_event_post_completed != nullptr &&
-+      accordin_writer_event_post_leader != nullptr &&
-+      accordin_writer_event_size() <= kWriterEventStorageSize &&
-+      accordin_writer_event_align() <= kWriterEventStorageAlign;
-+  return available;
++// The label is fixed, so it is interned once instead of on every event the
++// write path creates.
++inline CvLabelStats* WriterEventCvStats() {
++  static CvLabelStats* const stats = CvLabelStatsFor(kWriterEventCvLabel);
++  return stats;
 +}
 +
 +// Ends the process on a writer-event call that cannot fail and did. Every such
@@ -922,24 +1069,18 @@ index 2bda48d..3a4e77f 100644
 + public:
 +  enum WakeReason { kCompleted = 0, kBecomeLeader = 1 };
 +
-+  // Costs one flag test per construction when the feature is off, and one
-+  // relaxed load plus a struct write when it is on: the mutex answered which
-+  // backend it uses and what to bind to once, at its first writer.
++  // Costs one acquire load and a null test per construction when the feature is
++  // off, and a backend init when it is on: the mutex answered which backend it
++  // uses and what to bind to once, at its first writer.
 +  explicit WriterEvent(Mutex* mu) : mu_(mu) {
-+    if (!WriterEventEnabledByEnv()) {
++    const WriterEventBackend& backend = mu->WriterEventBinding();
++    if (backend.ops == nullptr ||
++        backend.ops->init(Storage(), backend.binding) != 0) {
 +      return;
 +    }
-+    void* binding = mu->WriterEventBinding();
-+    if (binding == nullptr) {
-+      return;
-+    }
-+    direct_ = mu->direct_ != nullptr;
-+    active_ = (direct_ ? mcs_tas_accordin_direct_writer_event_init(Storage(),
-+                                                                   binding)
-+                       : accordin_writer_event_init(Storage(), binding)) == 0;
-+    if (active_ && CvStatsEnabled()) {
-+      stats_ = CvLabelStatsFor(kWriterEventCvLabel);
-+    }
++    ops_ = backend.ops;
++    stats_ = WriterEventCvStats();
++    counters_ = CvStatsEnabled() ? &WriterEventStatsRef() : nullptr;
 +  }
 +
 +  // Nothing to release: the event lives in the storage below for exactly as
@@ -949,7 +1090,7 @@ index 2bda48d..3a4e77f 100644
 +  WriterEvent(const WriterEvent&) = delete;
 +  WriterEvent& operator=(const WriterEvent&) = delete;
 +
-+  bool Active() const { return active_; }
++  bool Active() const { return ops_ != nullptr; }
 +
 +  // Declares the waiter unreleased. REQUIRES: the mutex is held, so that no
 +  // post can land before the declaration and be overwritten by it.
@@ -957,8 +1098,7 @@ index 2bda48d..3a4e77f 100644
 +  // A failure here would leave the waiter about to block on a reason word it
 +  // never claimed, which no caller can recover from, so it is fatal.
 +  void Arm() {
-+    const int ret = direct_ ? mcs_tas_accordin_direct_writer_event_arm(Storage())
-+                            : accordin_writer_event_arm(Storage());
++    const int ret = ops_->arm(Storage());
 +    if (ret != 0) {
 +      WriterEventFatal("arm", ret);
 +    }
@@ -974,19 +1114,19 @@ index 2bda48d..3a4e77f 100644
 +  // immediately on the strength of that report, and if it was wrong it returns
 +  // a status nobody set for a batch nobody wrote.
 +  WakeReason Wait() {
-+    const uint64_t wait_start_ns = LockTimingNowNs();
-+    const int reason = direct_
-+                           ? mcs_tas_accordin_direct_writer_event_wait(Storage())
-+                           : accordin_writer_event_wait(Storage());
-+    if (stats_ != nullptr) {
++    int reason;
++    if (stats_ == nullptr) {
++      reason = ops_->wait(Storage());
++    } else {
++      const uint64_t wait_start_ns = LockTimingNowNs();
++      reason = ops_->wait(Storage());
 +      RecordCvWait(stats_, LockTimingNowNs() - wait_start_ns);
 +    }
-+    WriterEventStats& counters = WriterEventStatsRef();
 +    if (reason == kCompleted) {
-+      counters.completed_wakes.fetch_add(1, std::memory_order_relaxed);
++      Count(&WriterEventStats::completed_wakes);
 +      return kCompleted;
 +    }
-+    counters.leader_wakes.fetch_add(1, std::memory_order_relaxed);
++    Count(&WriterEventStats::leader_wakes);
 +    return kBecomeLeader;
 +  }
 +
@@ -997,9 +1137,7 @@ index 2bda48d..3a4e77f 100644
 +  // The caller runs the queue's critical section next, so a failure that left
 +  // the mutex unheld has no safe continuation and is fatal.
 +  void Relock() {
-+    const int ret = direct_
-+                        ? mcs_tas_accordin_direct_writer_event_relock(Storage())
-+                        : accordin_writer_event_relock(Storage());
++    const int ret = ops_->relock(Storage());
 +    if (ret != 0) {
 +      WriterEventFatal("relock", ret);
 +    }
@@ -1011,62 +1149,38 @@ index 2bda48d..3a4e77f 100644
 +  // REQUIRES: the result is already published. This is the caller's last access
 +  // to the event: the waiter may return and destroy it as the reason lands.
 +  void PostCompleted() {
-+    WriterEventStatsRef().completed_posts.fetch_add(1,
-+                                                    std::memory_order_relaxed);
-+    if (direct_) {
-+      mcs_tas_accordin_direct_writer_event_post_completed(Storage());
-+      return;
-+    }
-+    accordin_writer_event_post_completed(Storage());
++    Count(&WriterEventStats::completed_posts);
++    ops_->post_completed(Storage());
 +  }
 +
 +  // Hands the head of the queue over. As with a completed post, this is the
 +  // caller's last access to the event.
 +  void PostLeader() {
-+    WriterEventStatsRef().leader_posts.fetch_add(1, std::memory_order_relaxed);
-+    if (direct_) {
-+      mcs_tas_accordin_direct_writer_event_post_leader(Storage());
-+      return;
-+    }
-+    accordin_writer_event_post_leader(Storage());
++    Count(&WriterEventStats::leader_posts);
++    ops_->post_leader(Storage());
 +  }
 +
 + private:
 +  void* Storage() { return static_cast<void*>(storage_); }
 +
++  // The counters answer for the inert path the backend cannot see, so they are
++  // collected under the same gate that prints them and cost a null test on the
++  // wakes and inside the write critical section on the posts. Counting a post
++  // before making it keeps the post the caller's last touch of the event.
++  void Count(std::atomic<uint64_t> WriterEventStats::*counter) {
++    if (counters_ != nullptr) {
++      (counters_->*counter).fetch_add(1, std::memory_order_relaxed);
++    }
++  }
++
 +  Mutex* const mu_;
++  const WriterEventOps* ops_ = nullptr;
 +  CvLabelStats* stats_ = nullptr;
-+  bool active_ = false;
-+  bool direct_ = false;
++  WriterEventStats* counters_ = nullptr;
 +  alignas(kWriterEventStorageAlign) unsigned char storage_[kWriterEventStorageSize];
-+};
-+
-+// Resolving a binding consults a process-wide registry keyed by mutex address,
-+// which is far too much work to repeat for every writer, and the answer is a
-+// property of the mutex that cannot change while it exists. std::call_once
-+// makes the resolution single without putting a lock on the path that reads it.
-+inline void* Mutex::WriterEventBinding() {
-+  std::call_once(writer_event_once_, [this]() {
-+    if (direct_ != nullptr) {
-+      if (!DirectWriterEventAvailable() ||
-+          mcs_tas_accordin_direct_writer_event_bind(
-+              direct_, &writer_event_binding_) != 0) {
-+        writer_event_binding_ = nullptr;
-+      }
-+      return;
-+    }
-+    if (!HookWriterEventAvailable() ||
-+        accordin_writer_event_bind(mu_.native_handle(),
-+                                   &writer_event_binding_) != 0) {
-+      writer_event_binding_ = nullptr;
-+    }
-+  });
-+  return writer_event_binding_;
-+}
-+
+ };
+ 
  inline bool Snappy_Compress(const char* input, size_t length,
-                             std::string* output) {
- #if HAVE_SNAPPY
 diff --git a/util/env_posix.cc b/util/env_posix.cc
 index d84cd1e..f0be489 100644
 --- a/util/env_posix.cc

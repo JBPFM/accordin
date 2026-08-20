@@ -20,6 +20,9 @@ pub mod lock_stats;
 
 pub mod mutex_hook;
 
+#[doc(hidden)]
+pub mod test_support;
+
 pub mod timeslice_extension;
 
 pub mod width_control;

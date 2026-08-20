@@ -21,10 +21,10 @@
 //! waiters this exists for are created per operation, and a heap allocation per
 //! operation is the cost the design is trying to remove.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::admission::{self, CvSleepArm};
-use crate::condvar::{futex_wait, futex_wake};
+use crate::condvar::{CondRelock, futex_wait, futex_wake};
 use crate::mutex_hook::{
     record_writer_event_arm, record_writer_event_completed_misroute,
     record_writer_event_completed_post, record_writer_event_leader_post,
@@ -63,16 +63,6 @@ enum RouteTakeback {
     Lost,
 }
 
-/// How the new leader should re-acquire the mutex it released.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EventRelock {
-    /// Ordinary contended acquisition: it asks admission for a slot itself.
-    Normal,
-    /// The wakeup was routed by the scheduler, which granted the admission
-    /// token as it enqueued the waiter.
-    AlreadyAdmitted,
-}
-
 /// The state one waiter blocks on.
 ///
 /// `#[repr(C)]` with a fixed layout because the object is embedded in a caller
@@ -90,10 +80,16 @@ pub struct WriterEvent {
     /// published. Written last and read first, so a non-zero address always
     /// comes with the value that belongs to it.
     armed_word: AtomicUsize,
-    /// The re-acquisition mode the wait decided, read only by the waiter.
-    relock: AtomicU32,
-    _reserved: u32,
+    /// Whether the re-acquisition the wait decided already carries its
+    /// admission decision. Read only by the waiter.
+    relock_admitted: AtomicBool,
 }
+
+/// The C ABI asks for the size of this object and then initializes caller-owned
+/// storage in place, so the footprint is part of that contract. The trailing
+/// padding an eight-byte alignment leaves is what keeps a change to the fields
+/// from moving it.
+const _: () = assert!(std::mem::size_of::<WriterEvent>() == 24);
 
 impl Default for WriterEvent {
     fn default() -> Self {
@@ -107,8 +103,7 @@ impl WriterEvent {
             state: AtomicU32::new(WAITING),
             armed_value: AtomicU32::new(0),
             armed_word: AtomicUsize::new(0),
-            relock: AtomicU32::new(EventRelock::Normal as u32),
-            _reserved: 0,
+            relock_admitted: AtomicBool::new(false),
         }
     }
 
@@ -179,16 +174,22 @@ impl WriterEvent {
     /// still published, and records the re-acquisition mode.
     fn finish(&self, routed: bool, slept: bool) -> WakeReason {
         if self.state.load(Ordering::Acquire) == COMPLETED {
-            // Nothing is re-acquired, so the state is retired into a plain
-            // release rather than into the pending state a contender publishes.
-            // Finding one still published means this wake was routed for a
-            // re-acquisition that never happens, which is what the waker's
-            // takeback exists to prevent and what the count measures.
-            if admission::retire_cv_sleep_to_released() {
+            // Nothing is re-acquired, so the state this wait published is
+            // retired into a plain release rather than into the pending state a
+            // contender publishes. Finding one still published means this wake
+            // was routed for a re-acquisition that never happens, which is what
+            // the waker's takeback exists to prevent and what the count
+            // measures.
+            //
+            // A wait that published nothing has nothing of its own to retire:
+            // whatever the thread's word carries then was armed by some other
+            // wait, so retiring it would take back a state that does not belong
+            // here, and counting it would attribute another wait's routing to
+            // this one.
+            if routed && admission::retire_cv_sleep_to_released() {
                 record_writer_event_completed_misroute();
             }
-            self.relock
-                .store(EventRelock::Normal as u32, Ordering::Relaxed);
+            self.store_relock(CondRelock::Normal);
             return WakeReason::Completed;
         }
 
@@ -198,36 +199,47 @@ impl WriterEvent {
         // A wait that never blocked was never routed, so the re-acquisition
         // carries no decision and asks admission for one like any contender.
         let relock = if routed && slept {
-            EventRelock::AlreadyAdmitted
+            CondRelock::AlreadyAdmitted
         } else {
-            EventRelock::Normal
+            CondRelock::Normal
         };
-        self.relock.store(relock as u32, Ordering::Relaxed);
+        self.store_relock(relock);
         WakeReason::BecomeLeader
     }
 
     /// The mode the finished wait left for the re-acquisition.
+    ///
+    /// A wait decides the mode outright, so it reports one of the two decided
+    /// modes and never `TakeHint`: the event path publishes no hint to take.
     ///
     /// Accounted against counters of its own rather than the cond path's: those
     /// reconcile hints published against hints answered, and an event relock
     /// publishes no hint, so folding the two together would leave that
     /// reconciliation reading a surplus of answers.
     #[inline]
-    pub fn take_relock_mode(&self) -> EventRelock {
+    pub fn take_relock_mode(&self) -> CondRelock {
         let mode = self.relock_mode();
         match mode {
-            EventRelock::AlreadyAdmitted => record_writer_event_relock_admitted(),
-            EventRelock::Normal => record_writer_event_relock_normal(),
+            CondRelock::AlreadyAdmitted => record_writer_event_relock_admitted(),
+            _ => record_writer_event_relock_normal(),
         }
         mode
     }
 
     #[inline]
-    fn relock_mode(&self) -> EventRelock {
-        if self.relock.load(Ordering::Relaxed) == EventRelock::AlreadyAdmitted as u32 {
-            EventRelock::AlreadyAdmitted
+    fn store_relock(&self, relock: CondRelock) {
+        self.relock_admitted.store(
+            matches!(relock, CondRelock::AlreadyAdmitted),
+            Ordering::Relaxed,
+        );
+    }
+
+    #[inline]
+    fn relock_mode(&self) -> CondRelock {
+        if self.relock_admitted.load(Ordering::Relaxed) {
+            CondRelock::AlreadyAdmitted
         } else {
-            EventRelock::Normal
+            CondRelock::Normal
         }
     }
 
@@ -305,14 +317,194 @@ impl WriterEvent {
     }
 }
 
+/// Borrows an object a C caller owns, refusing a null pointer.
+///
+/// Every entry point of the writer-event ABI asks the same question before it
+/// may touch the object behind the pointer it was handed.
+///
+/// # Safety
+///
+/// A non-null `ptr` must point at a live, initialized `T` that outlives `'a`
+/// and that no other thread is mutating through a unique reference.
+#[doc(hidden)]
+#[inline(always)]
+pub unsafe fn checked_ref<'a, T>(ptr: *mut T) -> Result<&'a T, libc::c_int> {
+    if ptr.is_null() {
+        Err(libc::EINVAL)
+    } else {
+        Ok(unsafe { &*ptr })
+    }
+}
+
+/// Exports one backend's writer-event C ABI.
+///
+/// The wake protocol is the same for every backend; what differs is the prefix
+/// the symbols are published under, the type the header declares the event
+/// pointer as, and the lock the binding names. Resolving a mutex to that
+/// binding is the one step backends do differently enough to be worth writing
+/// out, so `bind` stays hand-written and is the only entry point this does not
+/// generate.
+///
+/// The event struct is generated too: its layout is the ABI the caller
+/// allocates against, and the size and alignment entry points are the only way
+/// a caller learns it.
+#[macro_export]
+macro_rules! export_writer_event_abi {
+    (
+        $(#[$event_meta:meta])*
+        $event_vis:vis struct $event:ident { binding: $binding:ty }
+        pointer = $ptr:ty,
+        admission_scoped = $scoped:expr,
+        relock = $relock:path,
+        size = $size_fn:ident,
+        align = $align_fn:ident,
+        init = $init_fn:ident,
+        arm = $arm_fn:ident,
+        wait = $wait_fn:ident,
+        relock_entry = $relock_fn:ident,
+        post_completed = $post_completed_fn:ident,
+        post_leader = $post_leader_fn:ident,
+    ) => {
+        $(#[$event_meta])*
+        #[repr(C)]
+        $event_vis struct $event {
+            event: $crate::writer_event::WriterEvent,
+            binding: *const $binding,
+        }
+
+        /// The storage a caller has to provide for one event.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $size_fn() -> usize {
+            ::std::mem::size_of::<$event>()
+        }
+
+        /// The alignment that storage has to satisfy.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $align_fn() -> usize {
+            ::std::mem::align_of::<$event>()
+        }
+
+        /// Puts a fresh event into caller-owned storage, bound to what the
+        /// backend's bind entry point resolved for its mutex.
+        ///
+        /// This runs once per waiter, so it does no lookups of its own. The
+        /// thread is already registered by then: a waiter arms while holding
+        /// the mutex, and taking the mutex is what registers it.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $init_fn(
+            event: *mut $ptr,
+            binding: *mut libc::c_void,
+        ) -> libc::c_int {
+            if event.is_null() || binding.is_null() {
+                return libc::EINVAL;
+            }
+
+            let event = event.cast::<$event>();
+            unsafe {
+                $crate::writer_event::WriterEvent::init_in_place(::std::ptr::addr_of_mut!(
+                    (*event).event
+                ));
+                ::std::ptr::addr_of_mut!((*event).binding)
+                    .write(binding.cast::<$binding>().cast_const());
+            }
+            0
+        }
+
+        /// Declares the waiter unreleased. The caller must still hold the
+        /// mutex: past the release a poster may publish a reason at any moment,
+        /// and one arriving first would be overwritten here.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $arm_fn(event: *mut $ptr) -> libc::c_int {
+            let event = match unsafe {
+                $crate::writer_event::checked_ref(event.cast::<$event>())
+            } {
+                Ok(event) => event,
+                Err(ret) => return ret,
+            };
+
+            event.event.arm();
+            0
+        }
+
+        /// Blocks until a poster publishes a reason and reports it: 0 for a
+        /// waiter whose work is done, 1 for the new queue head. The caller must
+        /// have released the mutex first.
+        ///
+        /// A refused call reports -1 rather than an errno, because both errno
+        /// values a caller could confuse it with are reason codes here.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $wait_fn(event: *mut $ptr) -> libc::c_int {
+            let event = match unsafe {
+                $crate::writer_event::checked_ref(event.cast::<$event>())
+            } {
+                Ok(event) => event,
+                Err(_) => return -1,
+            };
+
+            let lock_id = unsafe { (*event.binding).lock_id };
+            match event.event.wait(lock_id, $scoped) {
+                $crate::writer_event::WakeReason::Completed => 0,
+                $crate::writer_event::WakeReason::BecomeLeader => 1,
+            }
+        }
+
+        /// Re-acquires the mutex for a waiter the wait made leader, in the mode
+        /// that wait decided: a routed wakeup already carries the admission
+        /// decision and enters the lock without asking again.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $relock_fn(event: *mut $ptr) -> libc::c_int {
+            let event = match unsafe {
+                $crate::writer_event::checked_ref(event.cast::<$event>())
+            } {
+                Ok(event) => event,
+                Err(ret) => return ret,
+            };
+
+            $relock(unsafe { &*event.binding }, &event.event);
+            0
+        }
+
+        /// Releases a waiter whose work the caller already did. The caller must
+        /// have published the result first, and must never touch the event
+        /// again: the waiter may destroy it the instant the reason lands.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $post_completed_fn(event: *mut $ptr) -> libc::c_int {
+            let event = match unsafe {
+                $crate::writer_event::checked_ref(event.cast::<$event>())
+            } {
+                Ok(event) => event,
+                Err(ret) => return ret,
+            };
+
+            event.event.post_completed();
+            0
+        }
+
+        /// Hands the queue head to a waiter that still has work to do. As with
+        /// a completed post, the event must not be touched again.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $post_leader_fn(event: *mut $ptr) -> libc::c_int {
+            let event = match unsafe {
+                $crate::writer_event::checked_ref(event.cast::<$event>())
+            } {
+                Ok(event) => event,
+                Err(ret) => return ret,
+            };
+
+            event.event.post_leader();
+            0
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::{COMPLETED, EventRelock, LEADER, RouteTakeback, WAITING, WakeReason, WriterEvent};
+    use super::{COMPLETED, LEADER, RouteTakeback, WAITING, WakeReason, WriterEvent};
     use crate::admission;
-    use crate::condvar::futex_wake;
+    use crate::condvar::{CondRelock, futex_wake};
 
     const EVENT_LOCK_ID: u32 = 7;
 
@@ -361,7 +553,7 @@ mod tests {
         event.post_leader();
 
         assert_eq!(event.wait(EVENT_LOCK_ID, true), WakeReason::BecomeLeader);
-        assert_eq!(event.relock_mode(), EventRelock::Normal);
+        assert_eq!(event.relock_mode(), CondRelock::Normal);
         assert!(!admission::cv_sleep_set_for_test(EVENT_LOCK_ID));
     }
 
@@ -411,7 +603,7 @@ mod tests {
                 observed.store(
                     u32::from(
                         reason == WakeReason::BecomeLeader
-                            && event.take_relock_mode() == EventRelock::AlreadyAdmitted
+                            && event.take_relock_mode() == CondRelock::AlreadyAdmitted
                             && admission::slow_path_pending_set_for_test(EVENT_LOCK_ID)
                             && !admission::cv_sleep_set_for_test(EVENT_LOCK_ID),
                     ),

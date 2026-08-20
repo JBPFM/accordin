@@ -559,14 +559,6 @@ pub fn mark_cond_reacquire_pending_for_cond_mutex(lock_id: u32) -> bool {
     mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(lock_id, admission_enabled())
 }
 
-/// Reports whether the cv-sleep state was published, so a waiter knows whether
-/// the scheduler will route its wakeup or whether it has to fall back to the
-/// cond-reacquire hint.
-#[inline(always)]
-pub fn set_cv_sleep_for_lock(lock_id: u32) -> bool {
-    arm_cv_sleep_for_lock(lock_id).is_armed()
-}
-
 /// Publishes the cv-sleep state and hands back the handle another thread needs
 /// to retire it on this thread's behalf.
 #[inline(always)]
@@ -804,12 +796,6 @@ fn arm_cv_sleep_for_lock_with_admission_enabled(lock_id: u32, enabled: bool) -> 
     })
 }
 
-#[cfg(test)]
-#[inline(always)]
-fn set_cv_sleep_for_lock_with_admission_enabled(lock_id: u32, enabled: bool) -> bool {
-    arm_cv_sleep_for_lock_with_admission_enabled(lock_id, enabled).is_armed()
-}
-
 #[inline(always)]
 pub fn mark_critical_section_entered() {
     mark_critical_section_entered_with_admission_enabled(admission_enabled());
@@ -1014,22 +1000,30 @@ pub fn word_for_test() -> u32 {
     USER_ADMISSION_WORD.with(|word| word.load(Ordering::Relaxed))
 }
 
+/// The admission flags this thread publishes for `lock_id`, or none at all when
+/// the word describes a different class: a flag set for another class says
+/// nothing about this one.
 #[doc(hidden)]
-pub fn slow_path_pending_set_for_test(lock_id: u32) -> bool {
+pub fn admission_flags_for_test(lock_id: u32) -> u32 {
     let class = class_of(lock_id);
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
-        user_lock_id_for_value(value) == class && flags(value) & SLOW_PATH_PENDING != 0
+        if user_lock_id_for_value(value) == class {
+            flags(value)
+        } else {
+            0
+        }
     })
 }
 
 #[doc(hidden)]
+pub fn slow_path_pending_set_for_test(lock_id: u32) -> bool {
+    admission_flags_for_test(lock_id) & SLOW_PATH_PENDING != 0
+}
+
+#[doc(hidden)]
 pub fn cv_sleep_set_for_test(lock_id: u32) -> bool {
-    let class = class_of(lock_id);
-    USER_ADMISSION_WORD.with(|word| {
-        let value = word.load(Ordering::Relaxed);
-        user_lock_id_for_value(value) == class && flags(value) & CV_SLEEP != 0
-    })
+    admission_flags_for_test(lock_id) & CV_SLEEP != 0
 }
 
 #[doc(hidden)]
@@ -1105,7 +1099,6 @@ mod tests {
         merge_enabled_with, parse_lock_class_policy, reset_lock_id_allocator_for_test, reset_state,
         reset_thread_depth_for_test, reset_transient_state, reset_transitions_for_tests,
         reset_union_find_for_tests, retire_cv_sleep_to_pending, retire_cv_sleep_to_released,
-        set_cv_sleep_for_lock, set_cv_sleep_for_lock_with_admission_enabled,
         set_inactive_queue_seq_ptrs, slow_path_yield_required, take_classes_dirty,
         take_cond_reacquire_pending_for_scope, token_consumed_for_scope, transition_count_for_test,
         union_lock_classes, user_lock_id_for_value, user_word_addr, word_for_test,
@@ -1140,6 +1133,24 @@ mod tests {
             reset_transitions_for_tests();
             reset_thread_depth_for_test();
         }
+    }
+
+    /// The per-thread state a test starts from and hands back: the admission
+    /// word and the nesting depth. Both are thread-local, so a test that takes
+    /// this guard is isolated without serializing against anything.
+    struct ThreadStateTestGuard;
+
+    impl Drop for ThreadStateTestGuard {
+        fn drop(&mut self) {
+            reset_thread_depth_for_test();
+            reset_state();
+        }
+    }
+
+    fn isolate_thread_state() -> ThreadStateTestGuard {
+        reset_state();
+        reset_thread_depth_for_test();
+        ThreadStateTestGuard
     }
 
     struct AllocatorStateTestGuard {
@@ -1275,8 +1286,7 @@ mod tests {
 
     #[test]
     fn explicit_lock_scope_encodes_lock_id_and_preserves_it_on_exit() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let scope = begin_lock_scope(3);
         assert!(mark_slow_path_pending_for_scope(scope));
@@ -1294,8 +1304,7 @@ mod tests {
 
     #[test]
     fn unmanaged_scope_does_not_write_admission_bits() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let scope = begin_lock_scope(UNMANAGED_LOCK_ID);
         assert!(!mark_slow_path_pending_for_scope(scope));
@@ -1307,8 +1316,7 @@ mod tests {
 
     #[test]
     fn nested_managed_lock_does_not_replace_outer_lock_id() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let outer = begin_lock_scope(2);
         assert!(mark_slow_path_pending_for_scope(outer));
@@ -1378,8 +1386,7 @@ mod tests {
 
     #[test]
     fn out_of_order_unlock_publishes_the_exit_word_for_the_outer_lock() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let outer = begin_lock_scope(2);
         assert!(mark_slow_path_pending_for_scope(outer));
@@ -1395,14 +1402,11 @@ mod tests {
 
         finish_lock_scope(MAX_LOCK_CLASSES);
         assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn out_of_order_unlock_with_a_managed_inner_lock_publishes_both_exits() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let outer = begin_lock_scope(2);
         mark_critical_section_entered_for_scope(outer);
@@ -1415,14 +1419,11 @@ mod tests {
 
         finish_lock_scope(3);
         assert_eq!(word_for_test(), word_for(3, TOKEN_CONSUMED));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn next_slow_path_after_consuming_token_exposes_consumed_flag_until_yield() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let first = begin_lock_scope(4);
         assert!(mark_slow_path_pending_for_scope(first));
@@ -1441,14 +1442,11 @@ mod tests {
         clear_token_consumed_for_scope(second);
         assert!(!token_consumed_for_scope(second));
         assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn slow_path_for_different_lock_drops_consumed_token() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let first = begin_lock_scope(4);
         assert!(mark_slow_path_pending_for_scope(first));
@@ -1461,8 +1459,6 @@ mod tests {
         assert!(mark_slow_path_pending_for_scope(second));
 
         assert_eq!(word_for_test(), word_for(5, SLOW_PATH_PENDING));
-
-        reset_thread_depth_for_test();
     }
 
     fn release_managed_lock_for_test(lock_id: u32) {
@@ -1473,8 +1469,7 @@ mod tests {
 
     #[test]
     fn cond_reacquire_hint_drives_the_full_relock_transition() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         release_managed_lock_for_test(4);
         assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
@@ -1494,14 +1489,11 @@ mod tests {
 
         mark_critical_section_entered_for_scope(relock);
         assert_eq!(word_for_test(), word_for(4, IN_CRITICAL_SECTION));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn cond_reacquire_hint_is_skipped_for_another_lock_id() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         release_managed_lock_for_test(4);
 
@@ -1511,14 +1503,11 @@ mod tests {
         let other = begin_lock_scope(5);
         assert!(!take_cond_reacquire_pending_for_scope(other));
         assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn cond_reacquire_hint_is_skipped_while_an_outer_lock_stays_held() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let outer = begin_lock_scope(2);
         mark_critical_section_entered_for_scope(outer);
@@ -1528,20 +1517,16 @@ mod tests {
         assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
 
         finish_lock_scope(2);
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn disabled_admission_cond_reacquire_hint_leaves_flags_clear() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         release_managed_lock_for_test(4);
 
         assert!(!mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled(4, false));
         assert_eq!(word_for_test(), word_for(4, 0));
-
-        reset_thread_depth_for_test();
     }
 
     /// The handle is only usable if it names exactly what was published: the
@@ -1549,8 +1534,7 @@ mod tests {
     /// does not match the word retires nothing.
     #[test]
     fn an_arm_handle_names_the_word_and_the_exact_value_published() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let arm = arm_cv_sleep_for_lock(4);
 
@@ -1565,22 +1549,17 @@ mod tests {
             word_for(class_of(4), 0),
             "a retirement from either side lands on the released word"
         );
-
-        reset_thread_depth_for_test();
     }
 
     /// Only the first retirement takes the state, so a second waker cannot
     /// clear a state the owner published again afterwards.
     #[test]
     fn a_second_retirement_of_the_same_arm_reports_no_state_to_take() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let arm = arm_cv_sleep_for_lock(4);
         assert!(arm.retire());
         assert!(!arm.retire());
-
-        reset_thread_depth_for_test();
     }
 
     /// The owner is allowed to leave the sleep early and rewrite its own word.
@@ -1589,8 +1568,7 @@ mod tests {
     /// lost.
     #[test]
     fn a_retirement_that_loses_the_exchange_leaves_the_owners_word_alone() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let arm = arm_cv_sleep_for_lock(4);
         retire_cv_sleep_to_pending(true);
@@ -1599,14 +1577,11 @@ mod tests {
 
         assert!(!arm.retire());
         assert_eq!(word_for_test(), rewritten);
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn an_arm_handle_round_trips_through_its_parts() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let arm = arm_cv_sleep_for_lock(4);
         let rebuilt = CvSleepArm::from_parts(arm.word_addr(), arm.armed_value());
@@ -1614,16 +1589,13 @@ mod tests {
         assert!(rebuilt.is_armed());
         assert!(rebuilt.retire());
         assert_eq!(word_for_test(), word_for(class_of(4), 0));
-
-        reset_thread_depth_for_test();
     }
 
     /// Either side may be the one that retires a published sleep, and neither
     /// knows which got there first, so both have to leave the same word behind.
     #[test]
     fn both_sides_of_a_retirement_leave_the_same_word() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let arm = arm_cv_sleep_for_lock(4);
         assert!(arm.retire());
@@ -1634,8 +1606,6 @@ mod tests {
         retire_cv_sleep_to_released();
 
         assert_eq!(word_for_test(), by_the_waker);
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
@@ -1652,8 +1622,7 @@ mod tests {
     /// may hand out a handle a waker would act on.
     #[test]
     fn nothing_is_armed_when_the_sleep_state_is_not_published() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
         assert!(!arm_cv_sleep_for_lock(UNMANAGED_LOCK_ID).is_armed());
 
         let outer = begin_lock_scope(2);
@@ -1665,16 +1634,13 @@ mod tests {
         reset_thread_depth_for_test();
         assert!(!arm_cv_sleep_for_lock_with_admission_enabled(4, false).is_armed());
         assert_eq!(word_for_test(), word_for(class_of(4), 0));
-
-        reset_thread_depth_for_test();
     }
 
     /// A waiter that returns without re-acquiring the lock is done with it, and
     /// the class alone is what a thread done with a lock publishes.
     #[test]
     fn a_released_retirement_leaves_the_class_with_no_flag() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         arm_cv_sleep_for_lock(4);
         retire_cv_sleep_to_released();
@@ -1685,8 +1651,6 @@ mod tests {
         // Nothing is published any more, so a second retirement is inert.
         retire_cv_sleep_to_released();
         assert_eq!(word_for_test(), word_for(class_of(4), 0));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
@@ -1746,13 +1710,12 @@ mod tests {
 
     #[test]
     fn cv_sleep_names_the_lock_the_waiter_will_reacquire() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         release_managed_lock_for_test(4);
         assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
 
-        set_cv_sleep_for_lock(4);
+        arm_cv_sleep_for_lock(4);
         assert_eq!(word_for_test(), word_for(4, CV_SLEEP));
 
         retire_cv_sleep_to_pending(true);
@@ -1760,10 +1723,8 @@ mod tests {
 
         // The lock slept on and the lock re-acquired need not be the one the
         // word already carries.
-        set_cv_sleep_for_lock(5);
+        arm_cv_sleep_for_lock(5);
         assert_eq!(word_for_test(), word_for(5, CV_SLEEP));
-
-        reset_thread_depth_for_test();
     }
 
     /// The retire hands the class to the re-acquisition as an ordinary
@@ -1771,13 +1732,12 @@ mod tests {
     /// two are never published together.
     #[test]
     fn retiring_cv_sleep_publishes_the_pending_state_for_the_same_class() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         for class in [1, 4, MAX_LOCK_CLASSES - 1] {
             for slept in [true, false] {
                 reset_state();
-                set_cv_sleep_for_lock(class);
+                arm_cv_sleep_for_lock(class);
                 assert_eq!(word_for_test(), word_for(class, CV_SLEEP));
 
                 retire_cv_sleep_to_pending(slept);
@@ -1795,55 +1755,44 @@ mod tests {
                 );
             }
         }
-
-        reset_thread_depth_for_test();
     }
 
     /// The retire owns the whole flag field, so a word that never carried the
     /// sleep state is not turned into a pending one by it.
     #[test]
     fn retiring_without_a_published_cv_sleep_leaves_the_word_alone() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         release_managed_lock_for_test(4);
         assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
 
         retire_cv_sleep_to_pending(true);
         assert_eq!(word_for_test(), word_for(4, TOKEN_CONSUMED));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn cv_sleep_is_skipped_while_a_lock_stays_held() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         let outer = begin_lock_scope(2);
         mark_critical_section_entered_for_scope(outer);
 
-        set_cv_sleep_for_lock(3);
+        arm_cv_sleep_for_lock(3);
         assert_eq!(word_for_test(), word_for(2, IN_CRITICAL_SECTION));
 
         finish_lock_scope(2);
-        set_cv_sleep_for_lock(UNMANAGED_LOCK_ID);
+        arm_cv_sleep_for_lock(UNMANAGED_LOCK_ID);
         assert_eq!(word_for_test(), word_for(2, TOKEN_CONSUMED));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]
     fn disabled_admission_cv_sleep_leaves_flags_clear() {
-        reset_state();
-        reset_thread_depth_for_test();
+        let _thread_state = isolate_thread_state();
 
         release_managed_lock_for_test(4);
 
-        set_cv_sleep_for_lock_with_admission_enabled(4, false);
+        arm_cv_sleep_for_lock_with_admission_enabled(4, false);
         assert_eq!(word_for_test(), word_for(4, 0));
-
-        reset_thread_depth_for_test();
     }
 
     #[test]

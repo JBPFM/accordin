@@ -29,7 +29,11 @@ use crate::mutex_hook::{
 };
 
 const DISABLE_CV_ADMISSION_HINT_ENV: &str = "ACCORDIN_DISABLE_CV_ADMISSION_HINT";
-const CV_ROUTE_ENV: &str = "ACCORDIN_CV_ROUTE";
+/// Not prefixed by a backend name: the waiter publishes the cv-sleep state under
+/// this switch and the scheduler loader reads the same one, whichever backend is
+/// preloaded.
+#[doc(hidden)]
+pub const CV_ROUTE_ENV: &str = "ACCORDIN_CV_ROUTE";
 const CV_REQUEUE_ENV: &str = "ACCORDIN_CV_REQUEUE";
 
 const FUTEX_WAIT_PRIVATE: libc::c_int = 128;
@@ -60,8 +64,7 @@ thread_local! {
 /// without reaching for thread-local storage.
 static REQUEUE_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
 
-#[doc(hidden)]
-pub fn cv_admission_hint_enabled() -> bool {
+fn cv_admission_hint_enabled() -> bool {
     static CV_ADMISSION_HINT_ENABLED: OnceLock<bool> = OnceLock::new();
     *CV_ADMISSION_HINT_ENABLED.get_or_init(|| !crate::env::env_flag(DISABLE_CV_ADMISSION_HINT_ENV))
 }
@@ -120,6 +123,43 @@ fn cv_requeue_enabled() -> bool {
 pub fn force_cv_requeue_for_thread(forced: Option<bool>) {
     REQUEUE_OVERRIDDEN.store(true, Ordering::Relaxed);
     REQUEUE_FORCED.with(|requeue| requeue.set(forced));
+}
+
+/// Whether anything in this process can ever park a waiter on a stage, and so
+/// whether the lock brackets have to carry the staging bookkeeping at all.
+///
+/// A staged count only becomes nonzero through a broadcast that requeued, which
+/// needs requeueing to have been on at that broadcast. The environment switch is
+/// read once through a `OnceLock`, so off there is off for the whole run, and
+/// the per-thread override is the only other way to turn it on: it announces
+/// itself here before any broadcast can act on it, and never takes the
+/// announcement back.
+#[inline(always)]
+fn cv_requeue_possible() -> bool {
+    cv_requeue_env_enabled() || REQUEUE_OVERRIDDEN.load(Ordering::Relaxed)
+}
+
+/// Takes one release out of a counter of releases still owed, and reports
+/// whether this call is the one that took it.
+///
+/// Zero is the floor: a release that is not there is never handed out, which is
+/// what keeps a wakeup owed to exactly one waiter. Both the registered waiters
+/// of a cond and the waiters parked on a stage are counted this way.
+#[inline(always)]
+fn claim_one(counter: &AtomicU32) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    while current != 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+    false
 }
 
 /// The words a broadcast parks waiters on, one block per lock.
@@ -204,22 +244,12 @@ impl CondStagingBlock {
     /// at the rate the lock is being unlocked at.
     fn release_staged_waiter(&self) -> bool {
         let words = &self.words.0;
-        let mut staged = words.staged.load(Ordering::Acquire);
-        while staged != 0 {
-            match words.staged.compare_exchange_weak(
-                staged,
-                staged - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    unsafe { futex_wake(&words.stage, 1) };
-                    return true;
-                }
-                Err(current) => staged = current,
-            }
+        if !claim_one(&words.staged) {
+            return false;
         }
-        false
+
+        unsafe { futex_wake(&words.stage, 1) };
+        true
     }
 
     /// Gives up the pacing and releases everything at once, which is what a
@@ -273,12 +303,6 @@ impl CondStaging {
         Self {
             block: Arc::new(CondStagingBlock::new()),
         }
-    }
-
-    /// Releases one staged waiter on the unlock tail.
-    #[inline(always)]
-    pub fn drain_one(&self) {
-        self.block.drain_one();
     }
 
     /// The handle a cond wait binds to, naming the block a broadcast parks on.
@@ -350,8 +374,19 @@ impl CondStagingRef {
 
     /// Records the lock this handle belongs to as the one this thread holds,
     /// which a nested acquisition leaves to the lock it entered first.
+    ///
+    /// The record is read by nothing but a broadcast deciding who releases what
+    /// it parked, so a run that can never park anything keeps the thread-local
+    /// out of the lock bracket entirely.
     #[inline(always)]
     pub fn publish_hold(&self) {
+        if cv_requeue_possible() {
+            self.publish_hold_outlined();
+        }
+    }
+
+    #[inline(never)]
+    fn publish_hold_outlined(&self) {
         HELD_STAGING.with(|held| {
             if held.get().is_null() {
                 held.set(self.block);
@@ -361,8 +396,18 @@ impl CondStagingRef {
 
     /// Gives the record up on the release of the lock that took it. An inner
     /// lock releasing first finds a record that is not its own and leaves it.
+    ///
+    /// Gated with the publication it undoes: a run that never published one has
+    /// nothing to give up.
     #[inline(always)]
     pub fn clear_hold(&self) {
+        if cv_requeue_possible() {
+            self.clear_hold_outlined();
+        }
+    }
+
+    #[inline(never)]
+    fn clear_hold_outlined(&self) {
         HELD_STAGING.with(|held| {
             if std::ptr::eq(held.get(), self.block) {
                 held.set(std::ptr::null());
@@ -372,8 +417,19 @@ impl CondStagingRef {
 
     /// Releases one staged waiter through a handle the caller read while the
     /// lock still existed.
+    ///
+    /// A staged count can only be nonzero if requeueing was on at some broadcast
+    /// of this process, and the switch is read once through a `OnceLock`, so off
+    /// means off for the whole run; the per-thread override is the only other
+    /// way to turn it on and the same gate accounts for it. With the gate shut
+    /// the unlock tail therefore never follows the handle to a count that cannot
+    /// be nonzero, which saves a dependent pointer load and a second cache line.
     #[inline(always)]
     pub fn drain_one(&self) {
+        if !cv_requeue_possible() {
+            return;
+        }
+
         if let Some(block) = unsafe { self.block.as_ref() } {
             block.drain_one();
         }
@@ -647,41 +703,23 @@ impl CondState {
         }
     }
 
+    /// Takes one registration and breaks the sleep condition of whoever holds
+    /// it, which is the whole of a release on the cond word.
     #[inline(always)]
     fn take_waiter(&self) -> bool {
-        let mut current = self.waiters.load(Ordering::Acquire);
-        while current != 0 {
-            match self.waiters.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.seq.fetch_add(1, Ordering::Release);
-                    return true;
-                }
-                Err(next) => current = next,
-            }
+        if !self.cancel_waiter() {
+            return false;
         }
-        false
+
+        self.seq.fetch_add(1, Ordering::Release);
+        true
     }
 
+    /// Takes one registration and leaves the sequence alone, for a waiter
+    /// withdrawing its own rather than releasing somebody else's.
     #[inline(always)]
     fn cancel_waiter(&self) -> bool {
-        let mut current = self.waiters.load(Ordering::Acquire);
-        while current != 0 {
-            match self.waiters.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(next) => current = next,
-            }
-        }
-        false
+        claim_one(&self.waiters)
     }
 
     /// Withdraws the registration of a waiter whose deadline expired, and
@@ -785,20 +823,6 @@ pub enum CondRelock {
     AlreadyAdmitted,
 }
 
-/// What the waiter published before blocking, which decides how it re-acquires
-/// the cond mutex.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SleepPublication {
-    /// Nothing was published: the class stays outside admission, or the state
-    /// belongs to a lock this thread still holds.
-    None,
-    /// The user word carries the cond-reacquire hint.
-    Hint,
-    /// The user word carries the cv-sleep state, so the scheduler routes the
-    /// wakeup itself.
-    Routed,
-}
-
 /// Releases `mutex`, blocks until the condition variable is signalled, and
 /// re-acquires it through `relock` in the mode the wait protocol decided.
 #[inline]
@@ -807,32 +831,11 @@ where
     U: FnOnce(),
     R: FnOnce(CondRelock),
 {
-    cond.bind_staging(mutex.staging);
-    let seq = cond.seq.load(Ordering::Acquire);
-    cond.waiters.fetch_add(1, Ordering::AcqRel);
-    unlock();
-    let publication = publish_sleep_state(mutex);
-    // The mutex is released across the sleep, so the sleep lands in the
-    // released class's unlock-to-acquire gap. Bracketing it here covers both
-    // relock modes, which are chosen only after the sleep ends.
-    let cv_sleep_start = record_cv_sleep_start();
-    let mut slept = false;
-    // A broadcast may have moved this sleep onto the mutex staging, in which
-    // case the wait resumes from there. The loop does not care where it woke up:
-    // the sequence decides whether the wait is over, and a wake off the stage
-    // always follows a bump. Leaving the stage on anything but a claimed
-    // release leaves the staged count too high, which the drain absorbs as one
-    // empty wake.
-    while cond.seq.load(Ordering::Acquire) == seq {
-        let rc = unsafe { futex_wait(&cond.seq, seq) };
-        slept |= rc == 0 || rc == libc::EINTR;
-        if cond.seq.load(Ordering::Acquire) == seq {
-            cond.hand_on_stale_release();
-        }
-    }
-    retire_sleep_state(publication, slept);
-    record_cv_sleep_end(cv_sleep_start);
-    relock(relock_mode(publication, slept));
+    // An untimed wait never reports a deadline, so the expiry branch of the
+    // shared protocol is unreachable and its return value is always zero.
+    wait_inner(cond, mutex, unlock, relock, |seq| unsafe {
+        futex_wait(&cond.seq, seq)
+    });
 }
 
 /// Like `wait`, but gives up at `abstime` and then reports `ETIMEDOUT`.
@@ -848,60 +851,97 @@ where
     U: FnOnce(),
     R: FnOnce(CondRelock),
 {
+    wait_inner(cond, mutex, unlock, relock, |seq| unsafe {
+        futex_wait_until_realtime(&cond.seq, seq, abstime)
+    })
+}
+
+/// The wait protocol both entry points run, parameterised on the blocking call
+/// that sleeps on the cond sequence and reports its errno.
+///
+/// A requeue carries the armed deadline with the sleep, so a wait moved onto the
+/// staging still expires there. Expiring off the stage takes no claim with it
+/// and leaves the staged count too high, which is the same absorbed over-count a
+/// spurious wake leaves.
+#[inline]
+fn wait_inner<U, R, B>(
+    cond: &CondState,
+    mutex: CondMutex,
+    unlock: U,
+    relock: R,
+    mut block: B,
+) -> libc::c_int
+where
+    U: FnOnce(),
+    R: FnOnce(CondRelock),
+    B: FnMut(u32) -> libc::c_int,
+{
     cond.bind_staging(mutex.staging);
     let seq = cond.seq.load(Ordering::Acquire);
     let mut ret = 0;
     cond.waiters.fetch_add(1, Ordering::AcqRel);
     unlock();
-    let publication = publish_sleep_state(mutex);
+    let routed = publish_sleep_state(mutex);
+    // The mutex is released across the sleep, so the sleep lands in the
+    // released class's unlock-to-acquire gap. Bracketing it here covers both
+    // relock modes, which are chosen only after the sleep ends.
     let cv_sleep_start = record_cv_sleep_start();
     let mut slept = false;
-    // A requeue carries the armed deadline with the sleep, so a wait moved onto
-    // the staging still expires there. Expiring off the stage takes no claim
-    // with it and leaves the staged count too high, which is the same absorbed
-    // over-count an untimed wait leaves on a spurious wake.
-    while cond.seq.load(Ordering::Acquire) == seq {
-        let rc = unsafe { futex_wait_until_realtime(&cond.seq, seq, abstime) };
+    // A broadcast may have moved this sleep onto the mutex staging, in which
+    // case the wait resumes from there. The loop does not care where it woke up:
+    // the sequence decides whether the wait is over, and a wake off the stage
+    // always follows a bump. The sequence read that ends an iteration is the one
+    // the next iteration tests, so a stale wake costs a single load.
+    let mut current = cond.seq.load(Ordering::Acquire);
+    while current == seq {
+        let rc = block(seq);
         slept |= rc == 0 || rc == libc::EINTR || rc == libc::ETIMEDOUT;
+        current = cond.seq.load(Ordering::Acquire);
         if rc == libc::ETIMEDOUT {
-            if cond.seq.load(Ordering::Acquire) == seq {
+            if current == seq {
                 ret = cond.retire_expired_waiter(seq);
             }
             break;
         }
-        if cond.seq.load(Ordering::Acquire) == seq {
+        if current == seq {
             cond.hand_on_stale_release();
         }
     }
-    retire_sleep_state(publication, slept);
+    retire_sleep_state(routed, slept);
     record_cv_sleep_end(cv_sleep_start);
-    relock(relock_mode(publication, slept));
+    relock(relock_mode(routed, slept));
     ret
 }
 
-/// Publishes the state the waiter sleeps under. With routing on, the user word
-/// names the lock to re-acquire and carries the cv-sleep flag, which is what
-/// the scheduler routes the wakeup from; the cond-reacquire hint is published
-/// instead whenever that state cannot be taken, so a waiter that still holds a
-/// managed lock keeps the behaviour it has with routing off.
+/// Publishes the state the waiter sleeps under, and reports whether the
+/// scheduler will route the wakeup from it.
+///
+/// With routing on, the user word names the lock to re-acquire and carries the
+/// cv-sleep flag, which is what the scheduler routes the wakeup from; the
+/// cond-reacquire hint is published instead whenever that state cannot be taken,
+/// so a waiter that still holds a managed lock keeps the behaviour it has with
+/// routing off.
+///
+/// Only the routed case is reported. A published hint and no publication at all
+/// are the same thing to the re-acquisition: it looks for a hint in the word
+/// either way, and finding none is the fallback the unpublished case relies on.
 #[inline]
-fn publish_sleep_state(mutex: CondMutex) -> SleepPublication {
+fn publish_sleep_state(mutex: CondMutex) -> bool {
     if !mutex.admission_scoped {
-        return SleepPublication::None;
+        return false;
     }
 
-    if cv_route_enabled() && admission::set_cv_sleep_for_lock(mutex.lock_id) {
-        return SleepPublication::Routed;
+    if cv_route_enabled() && admission::arm_cv_sleep_for_lock(mutex.lock_id).is_armed() {
+        return true;
     }
 
     if cv_admission_hint_enabled()
         && admission::mark_cond_reacquire_pending_for_cond_mutex(mutex.lock_id)
     {
         record_cv_hint_published();
-        return SleepPublication::Hint;
     }
 
-    SleepPublication::None
+    false
 }
 
 /// Retires the cv-sleep state as soon as the wait stops blocking: from here on
@@ -911,8 +951,8 @@ fn publish_sleep_state(mutex: CondMutex) -> SleepPublication {
 /// that follows is described as the contention it is for its whole duration; the
 /// scheduler reads a bare class as a thread that has finished with the lock.
 #[inline]
-fn retire_sleep_state(publication: SleepPublication, slept: bool) {
-    if publication == SleepPublication::Routed {
+fn retire_sleep_state(routed: bool, slept: bool) {
+    if routed {
         admission::retire_cv_sleep_to_pending(slept);
     }
 }
@@ -920,18 +960,17 @@ fn retire_sleep_state(publication: SleepPublication, slept: bool) {
 /// A waiter that never blocked was never routed and never had a hint answered,
 /// so it re-acquires as an ordinary contender.
 #[inline]
-fn relock_mode(publication: SleepPublication, slept: bool) -> CondRelock {
+fn relock_mode(routed: bool, slept: bool) -> CondRelock {
     if !slept {
         return CondRelock::Normal;
     }
 
-    match publication {
-        SleepPublication::Routed => {
-            record_cv_route_relock();
-            CondRelock::AlreadyAdmitted
-        }
-        SleepPublication::Hint | SleepPublication::None => CondRelock::TakeHint,
+    if routed {
+        record_cv_route_relock();
+        return CondRelock::AlreadyAdmitted;
     }
+
+    CondRelock::TakeHint
 }
 
 /// Returns 0 when the wait completed, otherwise the errno reported by the
@@ -1032,15 +1071,16 @@ pub(crate) unsafe fn futex_wake(addr: *const AtomicU32, count: libc::c_int) -> l
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
     use super::{
         CondMutex, CondRelock, CondStaging, CondStagingBlock, CondStagingRef, CondState,
-        SleepPublication, force_cv_requeue_for_thread, force_cv_route_for_test, futex_wake,
-        publish_sleep_state, relock_mode, retire_sleep_state, timedwait, wait,
+        force_cv_requeue_for_thread, force_cv_route_for_test, futex_wake, publish_sleep_state,
+        relock_mode, retire_sleep_state, timedwait, wait,
     };
     use crate::admission;
     use crate::mutex_hook::{cv_requeue_counters, set_cv_admission_counters_enabled};
+    use crate::test_support::{await_progress, deadline_in_millis, waking_thread};
 
     const HINT_LOCK_ID: u32 = 4;
     const ROUTE_LOCK_ID: u32 = 5;
@@ -1075,21 +1115,6 @@ mod tests {
         RouteGuard
     }
 
-    /// A waker only needs the requeue switch: the drain is driven by the
-    /// staged count, and the admission state belongs to the waiting side.
-    struct RequeueGuard;
-
-    impl Drop for RequeueGuard {
-        fn drop(&mut self) {
-            force_cv_requeue_for_thread(None);
-        }
-    }
-
-    fn waking_thread(requeue: bool) -> RequeueGuard {
-        force_cv_requeue_for_thread(Some(requeue));
-        RequeueGuard
-    }
-
     fn word_lock_id() -> u32 {
         admission::word_for_test() >> admission::USER_ADMISSION_LOCK_ID_SHIFT
     }
@@ -1098,10 +1123,11 @@ mod tests {
     fn routing_off_publishes_the_cond_reacquire_hint() {
         let _guard = released_cond_mutex(HINT_LOCK_ID, false);
 
-        assert_eq!(
-            publish_sleep_state(CondMutex::new(HINT_LOCK_ID, true, CondStagingRef::none())),
-            SleepPublication::Hint
-        );
+        assert!(!publish_sleep_state(CondMutex::new(
+            HINT_LOCK_ID,
+            true,
+            CondStagingRef::none()
+        )));
         assert!(!admission::cv_sleep_set_for_test(HINT_LOCK_ID));
 
         let scope = admission::begin_lock_scope(HINT_LOCK_ID);
@@ -1113,9 +1139,9 @@ mod tests {
     fn routing_on_publishes_cv_sleep_and_retires_it_after_the_wait() {
         let _guard = released_cond_mutex(ROUTE_LOCK_ID, true);
 
-        let publication =
+        let routed =
             publish_sleep_state(CondMutex::new(ROUTE_LOCK_ID, true, CondStagingRef::none()));
-        assert_eq!(publication, SleepPublication::Routed);
+        assert!(routed);
         assert!(admission::cv_sleep_set_for_test(ROUTE_LOCK_ID));
         assert_eq!(word_lock_id(), admission::class_of(ROUTE_LOCK_ID));
 
@@ -1126,7 +1152,7 @@ mod tests {
         );
         admission::finish_lock_scope(ROUTE_LOCK_ID);
 
-        retire_sleep_state(publication, true);
+        retire_sleep_state(routed, true);
         assert!(!admission::cv_sleep_set_for_test(ROUTE_LOCK_ID));
         assert!(
             admission::slow_path_pending_set_for_test(ROUTE_LOCK_ID),
@@ -1143,11 +1169,17 @@ mod tests {
         admission::mark_critical_section_entered_for_scope(outer);
         admission::begin_lock_scope(HINT_LOCK_ID);
 
-        assert_eq!(
-            publish_sleep_state(CondMutex::new(HINT_LOCK_ID, true, CondStagingRef::none())),
-            SleepPublication::None
-        );
+        assert!(!publish_sleep_state(CondMutex::new(
+            HINT_LOCK_ID,
+            true,
+            CondStagingRef::none()
+        )));
         assert!(!admission::cv_sleep_set_for_test(HINT_LOCK_ID));
+        assert_eq!(
+            word_lock_id(),
+            admission::class_of(ROUTE_LOCK_ID),
+            "the held lock keeps the word it owns"
+        );
 
         admission::finish_lock_scope(HINT_LOCK_ID);
         admission::finish_lock_scope(ROUTE_LOCK_ID);
@@ -1157,34 +1189,21 @@ mod tests {
     fn an_unscoped_backend_publishes_nothing() {
         let _guard = released_cond_mutex(ROUTE_LOCK_ID, true);
 
-        assert_eq!(
-            publish_sleep_state(CondMutex::new(ROUTE_LOCK_ID, false, CondStagingRef::none())),
-            SleepPublication::None
-        );
+        assert!(!publish_sleep_state(CondMutex::new(
+            ROUTE_LOCK_ID,
+            false,
+            CondStagingRef::none()
+        )));
         assert!(!admission::cv_sleep_set_for_test(ROUTE_LOCK_ID));
     }
 
     #[test]
     fn only_a_routed_sleep_relocks_as_already_admitted() {
-        assert_eq!(
-            relock_mode(SleepPublication::Routed, true),
-            CondRelock::AlreadyAdmitted
-        );
-        assert_eq!(
-            relock_mode(SleepPublication::Hint, true),
-            CondRelock::TakeHint
-        );
-        assert_eq!(
-            relock_mode(SleepPublication::None, true),
-            CondRelock::TakeHint
-        );
+        assert_eq!(relock_mode(true, true), CondRelock::AlreadyAdmitted);
+        assert_eq!(relock_mode(false, true), CondRelock::TakeHint);
 
-        for publication in [
-            SleepPublication::Routed,
-            SleepPublication::Hint,
-            SleepPublication::None,
-        ] {
-            assert_eq!(relock_mode(publication, false), CondRelock::Normal);
+        for routed in [true, false] {
+            assert_eq!(relock_mode(routed, false), CondRelock::Normal);
         }
     }
 
@@ -1272,16 +1291,7 @@ mod tests {
         let _guard = released_cond_mutex(ROUTE_LOCK_ID, true);
 
         let cond = CondState::new();
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
-        let deadline_nsec = now.tv_nsec + 1_000_000;
-        let abstime = libc::timespec {
-            tv_sec: now.tv_sec + deadline_nsec / 1_000_000_000,
-            tv_nsec: deadline_nsec % 1_000_000_000,
-        };
+        let abstime = deadline_in_millis(1);
 
         let mut observed = None;
         let ret = timedwait(
@@ -1297,56 +1307,101 @@ mod tests {
         assert!(!admission::cv_sleep_set_for_test(ROUTE_LOCK_ID));
     }
 
-    /// The scheduler reads the published state while the waiter is off-CPU, so
-    /// the publication has to be in place before the futex wait and gone before
-    /// the thread contends for the mutex again.
+    /// The word a cv-sleep publication for `lock_id` leaves behind, taken from
+    /// the admission module rather than rebuilt from its bit layout.
+    fn armed_cv_sleep_word(lock_id: u32) -> u32 {
+        admission::reset_thread_depth_for_test();
+        admission::reset_state();
+        let armed = admission::arm_cv_sleep_for_lock(lock_id).armed_value();
+        admission::reset_state();
+
+        assert_ne!(armed, 0, "a published sleep state is never an empty word");
+        armed
+    }
+
+    /// The scheduler reads the published state through the waiter's admission
+    /// word while the waiter is off-CPU, so the state has to be in place before
+    /// the wait blocks and gone again as soon as it stops blocking.
+    ///
+    /// Both ends are observed from where the protocol runs: the waiter hands out
+    /// the address of its own word from inside the unlock bracket, the other
+    /// thread reads that word while the waiter is asleep, and the relock bracket
+    /// reports what the word carries before the mutex is taken again.
     #[test]
     fn the_sleep_state_brackets_the_futex_wait() {
-        let protocol = include_str!("condvar.rs")
-            .split_once("#[cfg(test)]\nmod tests")
-            .map(|(implementation, _)| implementation)
-            .expect("condvar.rs should contain a test module");
+        let shared = Shared::new();
+        let word_addr = Arc::new(AtomicUsize::new(0));
+        let parked = Arc::new(AtomicU32::new(0));
 
-        for (name, entry) in [
-            ("wait", "pub fn wait<U, R>"),
-            ("timedwait", "pub fn timedwait<U, R>"),
-        ] {
-            let body = protocol
-                .split_once(entry)
-                .map(|(_, body)| body)
-                .unwrap_or_else(|| panic!("the module should define {name}"));
-            let publish_pos = body
-                .find("publish_sleep_state(mutex)")
-                .unwrap_or_else(|| panic!("{name} should publish the sleep state"));
-            let sleep_start_pos = body
-                .find("record_cv_sleep_start()")
-                .unwrap_or_else(|| panic!("{name} should open the sleep bracket"));
-            let futex_pos = body
-                .find("futex_wait")
-                .unwrap_or_else(|| panic!("{name} should block on the futex"));
-            let retire_pos = body
-                .find("retire_sleep_state(publication, slept)")
-                .unwrap_or_else(|| panic!("{name} should retire the sleep state"));
-            let sleep_end_pos = body
-                .find("record_cv_sleep_end(cv_sleep_start)")
-                .unwrap_or_else(|| panic!("{name} should close the sleep bracket"));
-            let relock_pos = body
-                .find("relock(relock_mode(publication, slept))")
-                .unwrap_or_else(|| panic!("{name} should relock the cond mutex"));
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            let word_addr = Arc::clone(&word_addr);
+            let parked = Arc::clone(&parked);
+            std::thread::spawn(move || {
+                let _guard = released_cond_mutex(SMOKE_LOCK_ID, true);
+                let mutex = shared.mutex.cond_mutex(SMOKE_LOCK_ID);
+                let mut observed = None;
 
-            assert!(
-                publish_pos < sleep_start_pos && sleep_start_pos < futex_pos,
-                "{name} should publish before it blocks"
-            );
-            assert!(
-                futex_pos < retire_pos && retire_pos < sleep_end_pos,
-                "{name} should retire the state as soon as the wait stops blocking"
-            );
-            assert!(
-                sleep_end_pos < relock_pos,
-                "{name} should close the bracket before the relock mode is chosen"
-            );
+                shared.mutex.lock();
+                while shared.payload.load(Ordering::Acquire) == 0 {
+                    wait(
+                        &shared.cond,
+                        mutex,
+                        || {
+                            shared.mutex.unlock();
+                            assert!(
+                                !admission::cv_sleep_set_for_test(SMOKE_LOCK_ID),
+                                "nothing is published while the mutex is still being released"
+                            );
+                            word_addr
+                                .store(admission::user_word_addr() as usize, Ordering::Release);
+                            parked.fetch_add(1, Ordering::Release);
+                        },
+                        |relock| {
+                            observed =
+                                Some((relock, admission::cv_sleep_set_for_test(SMOKE_LOCK_ID)));
+                            shared.mutex.lock();
+                        },
+                    );
+                }
+                shared.mutex.unlock();
+                observed.expect("the waiter should have re-acquired the mutex")
+            })
+        };
+
+        await_progress(&parked, 1, "the waiter reaching its sleep");
+        let armed = armed_cv_sleep_word(SMOKE_LOCK_ID);
+        let sleeper_word = word_addr.load(Ordering::Acquire) as *const u32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut published = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { sleeper_word.read_volatile() } == armed {
+                published = true;
+                break;
+            }
+            std::thread::yield_now();
         }
+
+        // The state is published just before the futex call, so observing it
+        // says the waiter is about to block rather than that it already has.
+        // The release has to land on a waiter that is asleep for the relock to
+        // describe a routed wakeup.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        shared.mutex.lock();
+        shared.payload.store(1, Ordering::Release);
+        shared.cond.signal();
+        shared.mutex.unlock();
+
+        let (relock, cv_sleep) = waiter.join().expect("the waiter should finish");
+        assert!(
+            published,
+            "the sleep state should be readable while the waiter is blocked"
+        );
+        assert_eq!(relock, CondRelock::AlreadyAdmitted);
+        assert!(
+            !cv_sleep,
+            "the sleep state is retired as soon as the wait stops blocking"
+        );
     }
 
     /// Stands in for a hooked mutex: it keeps the same bracket the hook does,
@@ -1440,16 +1495,6 @@ mod tests {
         observed
     }
 
-    #[test]
-    fn routing_off_hands_a_signal_over_without_claiming_a_routed_token() {
-        assert_ne!(run_cond_handoff(false, false), CondRelock::AlreadyAdmitted);
-    }
-
-    #[test]
-    fn routing_on_hands_a_signal_over_without_consulting_the_hint() {
-        assert_ne!(run_cond_handoff(true, false), CondRelock::TakeHint);
-    }
-
     /// The scheduler grants the wake its admission while the word still names
     /// the cond sleep, and reads that word again while the re-acquisition is
     /// contending. The class has to be published as pending for that whole
@@ -1509,11 +1554,11 @@ mod tests {
         staging.block.stage_waiters(2);
         assert_eq!(staging.staged_count(), 2);
 
-        staging.drain_one();
-        staging.drain_one();
+        staging.block.drain_one();
+        staging.block.drain_one();
         assert_eq!(staging.staged_count(), 0);
 
-        staging.drain_one();
+        staging.block.drain_one();
         assert_eq!(staging.staged_count(), 0);
     }
 
@@ -1665,14 +1710,6 @@ mod tests {
                     assert_ne!(observed, CondRelock::AlreadyAdmitted);
                 }
             }
-        }
-    }
-
-    fn await_progress(counter: &AtomicU32, expected: u32, what: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while counter.load(Ordering::Acquire) < expected {
-            assert!(std::time::Instant::now() < deadline, "{what} stalled");
-            std::thread::yield_now();
         }
     }
 
@@ -2113,19 +2150,6 @@ mod tests {
             0,
             "the next drain spends the count on an empty wake"
         );
-    }
-
-    fn deadline_in_millis(millis: i64) -> libc::timespec {
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
-        let deadline_nsec = now.tv_nsec + millis * 1_000_000;
-        libc::timespec {
-            tv_sec: now.tv_sec + deadline_nsec / 1_000_000_000,
-            tv_nsec: deadline_nsec % 1_000_000_000,
-        }
     }
 
     #[test]

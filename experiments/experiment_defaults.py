@@ -162,6 +162,7 @@ LOCK_LABELS = {
     "mcs_accordin": "MCS Accordin",
     "mcs_tas_accordin": "Accordin",
     "mcs_tas_accordin_admission_only": "Accordin",
+    "mcs_tas_accordin_direct": "Accordin direct",
 }
 
 LOCK_ALIASES = {

@@ -62,8 +62,6 @@ MCS_TAS_ACCORDIN_DIRECT_LOCK = experiment_defaults.MCS_TAS_ACCORDIN_DIRECT_LOCK
 MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY = (
     REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
 )
-MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
-MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 MINIMAL_LOCKS = experiment_defaults.ACCORDIN_VARIANT_LOCKS
 FULL_LOCKS = tuple(
     dict.fromkeys(
@@ -448,8 +446,8 @@ def mcs_tas_accordin_direct_preload_env() -> dict[str, str | None]:
             ACCORDIN_HOOK_SCOPE_ENV: None,
             "ACCORDIN_DISABLE_ADMISSION": None,
             "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
-            MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF_ENV: None,
-            MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY_ENV: None,
+            "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF": None,
+            "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY": None,
         }
     )
     env.update(experiment_defaults.accordin_width_env())
@@ -459,12 +457,6 @@ def mcs_tas_accordin_direct_preload_env() -> dict[str, str | None]:
 def default_result_root() -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     return REPO_ROOT / "experiments" / "results" / f"experiment4_{timestamp}"
-
-
-def lock_label(lock: str) -> str:
-    if lock == MCS_TAS_ACCORDIN_DIRECT_LOCK:
-        return "Accordin direct"
-    return experiment_defaults.lock_label(lock)
 
 
 def lock_plot_color_key(lock: str) -> str:
@@ -632,24 +624,13 @@ def ensure_mcs_tas_accordin_direct_preload(
     build_missing: bool,
     logger: experiment_three.CommandLogger,
 ) -> None:
-    if MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY.is_file():
-        return
-    if not build_missing:
-        raise RuntimeError(
-            f"LD_PRELOAD helper is missing: {MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_tas_accordin_direct --release or rerun with --build-missing."
-        )
-
-    logger.run(
-        ["cargo", "build", "-p", "mcs_tas_accordin_direct", "--release"],
-        log_name="build_mcs_tas_accordin_direct.log",
-        cwd=REPO_ROOT,
-        timeout_seconds=0,
+    experiment_three.ensure_preload_library(
+        MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY,
+        "mcs_tas_accordin_direct",
+        "build_mcs_tas_accordin_direct.log",
+        build_missing=build_missing,
+        logger=logger,
     )
-    if not MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY.is_file():
-        raise RuntimeError(
-            f"LD_PRELOAD helper was not built: {MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY}"
-        )
 
 
 def ensure_lock_helpers(
@@ -1023,7 +1004,7 @@ def write_settings(
     )
     settings = {
         "benchmarks": [{"key": benchmark, "label": benchmark_label(benchmark)} for benchmark in benchmarks],
-        "locks": [{"key": lock, "label": lock_label(lock)} for lock in locks],
+        "locks": [{"key": lock, "label": experiment_defaults.lock_label(lock)} for lock in locks],
         "effective_locks": list(effective_locks),
         "lock_profile": lock_profile,
         "lock_profile_source": lock_profile_source,
@@ -1328,7 +1309,7 @@ def plot_ops(summary_rows: list[dict[str, str]], *, benchmark: str, output_path:
             markersize=4,
             markerfacecolor="white",
             markeredgewidth=1.4,
-            label=lock_label(lock),
+            label=experiment_defaults.lock_label(lock),
         )
 
     ax.set_title(

@@ -849,27 +849,46 @@ def invalid_interpose_helper_locks(locks: Iterable[str]) -> tuple[str, ...]:
     return tuple(invalid)
 
 
+# Every LD_PRELOAD helper is one cargo crate built into target/release, so a
+# missing one is either a build to run or the error that names the crate.
+def ensure_preload_library(
+    path: Path,
+    crate: str,
+    log_name: str,
+    *,
+    build_missing: bool,
+    logger: CommandLogger,
+) -> None:
+    if path.is_file():
+        return
+    if not build_missing:
+        raise RuntimeError(
+            f"LD_PRELOAD helper is missing: {path}. "
+            f"Run cargo build -p {crate} --release or rerun with --build-missing."
+        )
+
+    logger.run(
+        ["cargo", "build", "-p", crate, "--release"],
+        log_name=log_name,
+        cwd=REPO_ROOT,
+        timeout_seconds=0,
+    )
+    if not path.is_file():
+        raise RuntimeError(f"LD_PRELOAD helper was not built: {path}")
+
+
 def ensure_accordin_preload(
     *,
     build_missing: bool,
     logger: CommandLogger,
 ) -> None:
-    if ACCORDIN_PRELOAD_LIBRARY.is_file():
-        return
-    if not build_missing:
-        raise RuntimeError(
-            f"LD_PRELOAD helper is missing: {ACCORDIN_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_tas_accordin --release or rerun with --build-missing."
-        )
-
-    logger.run(
-        ["cargo", "build", "-p", "mcs_tas_accordin", "--release"],
-        log_name="build_mcs_tas_accordin.log",
-        cwd=REPO_ROOT,
-        timeout_seconds=0,
+    ensure_preload_library(
+        ACCORDIN_PRELOAD_LIBRARY,
+        "mcs_tas_accordin",
+        "build_mcs_tas_accordin.log",
+        build_missing=build_missing,
+        logger=logger,
     )
-    if not ACCORDIN_PRELOAD_LIBRARY.is_file():
-        raise RuntimeError(f"LD_PRELOAD helper was not built: {ACCORDIN_PRELOAD_LIBRARY}")
 
 
 def ensure_mcs_accordin_preload(
@@ -877,22 +896,13 @@ def ensure_mcs_accordin_preload(
     build_missing: bool,
     logger: CommandLogger,
 ) -> None:
-    if MCS_ACCORDIN_PRELOAD_LIBRARY.is_file():
-        return
-    if not build_missing:
-        raise RuntimeError(
-            f"LD_PRELOAD helper is missing: {MCS_ACCORDIN_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_accordin --release or rerun with --build-missing."
-        )
-
-    logger.run(
-        ["cargo", "build", "-p", "mcs_accordin", "--release"],
-        log_name="build_mcs_accordin.log",
-        cwd=REPO_ROOT,
-        timeout_seconds=0,
+    ensure_preload_library(
+        MCS_ACCORDIN_PRELOAD_LIBRARY,
+        "mcs_accordin",
+        "build_mcs_accordin.log",
+        build_missing=build_missing,
+        logger=logger,
     )
-    if not MCS_ACCORDIN_PRELOAD_LIBRARY.is_file():
-        raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_ACCORDIN_PRELOAD_LIBRARY}")
 
 
 def ensure_mcs_extension_preload(
@@ -900,22 +910,13 @@ def ensure_mcs_extension_preload(
     build_missing: bool,
     logger: CommandLogger,
 ) -> None:
-    if MCS_EXTENSION_PRELOAD_LIBRARY.is_file():
-        return
-    if not build_missing:
-        raise RuntimeError(
-            f"LD_PRELOAD helper is missing: {MCS_EXTENSION_PRELOAD_LIBRARY}. "
-            "Run cargo build -p mcs_tse --release or rerun with --build-missing."
-        )
-
-    logger.run(
-        ["cargo", "build", "-p", "mcs_tse", "--release"],
-        log_name="build_mcs_tse.log",
-        cwd=REPO_ROOT,
-        timeout_seconds=0,
+    ensure_preload_library(
+        MCS_EXTENSION_PRELOAD_LIBRARY,
+        "mcs_tse",
+        "build_mcs_tse.log",
+        build_missing=build_missing,
+        logger=logger,
     )
-    if not MCS_EXTENSION_PRELOAD_LIBRARY.is_file():
-        raise RuntimeError(f"LD_PRELOAD helper was not built: {MCS_EXTENSION_PRELOAD_LIBRARY}")
 
 
 def ensure_interpose_helpers(

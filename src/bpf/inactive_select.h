@@ -55,11 +55,12 @@ static __always_inline __u32 inactive_wrap_rank(__u32 rank, __u32 span) {
   return rank;
 }
 
-/* Start rank of the probe after the one starting at `rank`. Advancing by the
- * full window rather than by one keeps the sweep to span /
- * INACTIVE_DEFICIT_PROBE_WIDTH calls. `span` is never 0. */
-static __always_inline __u32 inactive_next_probe_rank(__u32 rank, __u32 span) {
-  return (rank + INACTIVE_DEFICIT_PROBE_WIDTH) % span;
+/* Start rank of the probe after the one starting at `rank`, for a probe of
+ * `width` ranks. Advancing by the full window rather than by one keeps a sweep
+ * to span / width calls. `span` is never 0. */
+static __always_inline __u32 next_probe_rank(__u32 rank, __u32 span,
+                                             __u32 width) {
+  return (rank + width) % span;
 }
 
 /* Managed classes one cvready selection examines. It shares the dispatch
@@ -71,12 +72,6 @@ static __always_inline __u32 inactive_next_probe_rank(__u32 rank, __u32 span) {
  * 14% at width 8 and 79% at width 16; a sweep of the whole class space is what
  * those figures rule out. */
 #define CVREADY_PROBE_WIDTH 4U
-
-/* Start rank of the cvready probe after the one starting at `rank`. `span` is
- * never 0. */
-static __always_inline __u32 cvready_next_probe_rank(__u32 rank, __u32 span) {
-  return (rank + CVREADY_PROBE_WIDTH) % span;
-}
 
 static __always_inline bool inactive_prefer_previous_lock(__u32 random,
                                                           __u32 percent) {

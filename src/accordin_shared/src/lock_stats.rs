@@ -592,46 +592,39 @@ pub fn print_process_stats(label: &str) {
     admission::dump_dependency_diagnostics();
 }
 
-/// Both groups print unconditionally once their gate is on, so a missing line
+/// Emits one counter family as `name=value` pairs in the order its name array
+/// gives.
+fn print_counter_line(group: &str, names: &[&str], values: &[u64]) {
+    let fields = names
+        .iter()
+        .zip(values)
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("[lock_stats] {group} {fields}");
+}
+
+/// Every group prints unconditionally once their gate is on, so a missing line
 /// means the evidence was disabled rather than observed as zero.
 fn print_cv_admission_counters() {
     if !mutex_hook::cv_admission_counters_enabled() {
         return;
     }
 
-    let counters = mutex_hook::cv_admission_counters();
-    eprintln!(
-        "[lock_stats] cv_admission hints_published={} specialized_relocks={} fallback_relocks={} route_relocks={}",
-        counters.hints_published,
-        counters.specialized_relocks,
-        counters.fallback_relocks,
-        counters.route_relocks
+    print_counter_line(
+        "cv_admission",
+        &mutex_hook::CV_ADMISSION_FIELD_NAMES,
+        &mutex_hook::cv_admission_field_values(),
     );
-
-    let requeue = mutex_hook::cv_requeue_counters();
-    eprintln!(
-        "[lock_stats] cv_requeue requeued={} fallbacks={} drain_wakes={} stranding_wakes={} staged_high_water={} binding_conflicts={}",
-        requeue.requeued,
-        requeue.fallbacks,
-        requeue.drain_wakes,
-        requeue.stranding_wakes,
-        requeue.staged_high_water,
-        requeue.binding_conflicts
+    print_counter_line(
+        "cv_requeue",
+        &mutex_hook::CV_REQUEUE_FIELD_NAMES,
+        &mutex_hook::cv_requeue_field_values(),
     );
-
-    let writer_event = mutex_hook::writer_event_counters();
-    eprintln!(
-        "[lock_stats] writer_event arms={} spurious_wakes={} completed_posts={} leader_posts={} route_takebacks={} route_takeback_unpublished={} route_takeback_lost={} completed_misroutes={} relocks_admitted={} relocks_normal={}",
-        writer_event.arms,
-        writer_event.spurious_wakes,
-        writer_event.completed_posts,
-        writer_event.leader_posts,
-        writer_event.route_takebacks,
-        writer_event.route_takeback_unpublished,
-        writer_event.route_takeback_lost,
-        writer_event.completed_misroutes,
-        writer_event.relocks_admitted,
-        writer_event.relocks_normal
+    print_counter_line(
+        "writer_event",
+        &mutex_hook::WRITER_EVENT_FIELD_NAMES,
+        &mutex_hook::writer_event_field_values(),
     );
 }
 
@@ -640,13 +633,7 @@ fn print_bpf_routing_counters() {
         return;
     };
 
-    let fields = bpf_counters::ROUTING_COUNTER_NAMES
-        .iter()
-        .zip(values.iter())
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    eprintln!("[lock_stats] bpf_routing {fields}");
+    print_counter_line("bpf_routing", &bpf_counters::ROUTING_COUNTER_NAMES, &values);
 }
 
 #[inline(always)]

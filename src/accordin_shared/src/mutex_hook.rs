@@ -90,24 +90,25 @@ pub fn cv_admission_counters() -> CvAdmissionCounters {
     }
 }
 
-/// Accounts the staging a cond signal parks its waiters on against the unlocks
-/// that release them.
+/// Accounts the staging a cond broadcast parks its waiters on against the
+/// unlocks that release them. Only broadcasts stage, so every count here is
+/// about a wake-all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CvRequeueCounters {
     /// Waiters the kernel moved from the cond sequence word to a lock's stage.
     pub requeued: u64,
-    /// Signals that gave up on the requeue and woke their waiters directly, so
-    /// the wakeup kept its correctness and lost its pacing.
+    /// Broadcasts that gave up on the requeue and woke their waiters directly,
+    /// so the wakeup kept its correctness and lost its pacing.
     pub fallbacks: u64,
     /// Staged waiters released by an unlock.
     pub drain_wakes: u64,
-    /// Staged waiters released by a signaler that found the lock free, which
+    /// Staged waiters released by a broadcaster that found the lock free, which
     /// leaves no unlock to start the drain chain.
     pub stranding_wakes: u64,
     /// Most waiters ever staged on one lock at once.
     pub staged_high_water: u64,
     /// Conds that were waited on with a second mutex and gave their binding
-    /// up over it, keeping their signals correct and losing the pacing. A
+    /// up over it, keeping their wakeups correct and losing the pacing. A
     /// cond re-associated with another mutex after its first association ended
     /// is counted here too: the two are indistinguishable from a binding.
     pub binding_conflicts: u64,

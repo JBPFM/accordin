@@ -18,7 +18,7 @@ const _: () = assert!(<DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE)
 pub struct mcs_tas_accordin_direct_mutex {
     lock: <DirectBackend as MutexHookBackend>::LockState,
     lock_id: u32,
-    /// Waiters a cond signal parked on this mutex, released one per unlock.
+    /// Waiters a cond broadcast parked on this mutex, released one per unlock.
     /// The staging is an owned handle to a shared block, so a cond still bound
     /// to this mutex after it is destroyed reads a retired block rather than
     /// freed memory.
@@ -537,7 +537,7 @@ mod tests {
         pair.destroy();
     }
 
-    /// The requeue switch belongs to the signalling thread: a waiter's release
+    /// The requeue switch belongs to the waking thread: a waiter's release
     /// comes from the staged count, which the unlock drains either way.
     struct RequeueGuard;
 
@@ -547,7 +547,7 @@ mod tests {
         }
     }
 
-    fn signalling_thread() -> RequeueGuard {
+    fn waking_thread() -> RequeueGuard {
         force_cv_requeue_for_thread(Some(true));
         RequeueGuard
     }
@@ -560,8 +560,10 @@ mod tests {
         }
     }
 
+    /// The hand-off is a wake-one, which the staging switch leaves on the plain
+    /// wake, so the rounds have to keep coming with the switch on.
     #[test]
-    fn direct_cond_ping_pong_makes_progress_with_requeue() {
+    fn direct_cond_ping_pong_makes_progress_with_the_switch_on() {
         const ROUNDS: u32 = 100;
 
         let pair = CondPair::create();
@@ -573,7 +575,7 @@ mod tests {
             let rounds = Arc::clone(&rounds);
             std::thread::spawn(move || unsafe {
                 let pair = pair;
-                let _guard = signalling_thread();
+                let _guard = waking_thread();
 
                 for _ in 0..ROUNDS {
                     assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
@@ -588,7 +590,7 @@ mod tests {
             })
         };
 
-        let _guard = signalling_thread();
+        let _guard = waking_thread();
         for round in 0..ROUNDS {
             unsafe {
                 assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
@@ -631,7 +633,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let _guard = signalling_thread();
+        let _guard = waking_thread();
         std::thread::sleep(std::time::Duration::from_millis(100));
         unsafe {
             assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
@@ -647,10 +649,10 @@ mod tests {
         pair.destroy();
     }
 
-    /// A signaller that holds nothing has no unlock coming to release the
-    /// waiter it staged, so the signal itself has to start the chain.
+    /// A broadcaster that holds nothing has no unlock coming to release the
+    /// waiter it staged, so the broadcast itself has to start the chain.
     #[test]
-    fn direct_cond_signal_without_the_mutex_releases_a_staged_waiter() {
+    fn direct_cond_broadcast_without_the_mutex_releases_a_staged_waiter() {
         let pair = CondPair::create();
         let payload = Arc::new(AtomicU32::new(0));
         let released = Arc::new(AtomicU32::new(0));
@@ -669,13 +671,13 @@ mod tests {
             })
         };
 
-        let _guard = signalling_thread();
+        let _guard = waking_thread();
         std::thread::sleep(std::time::Duration::from_millis(100));
         unsafe {
             assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
             payload.store(1, Ordering::Release);
             assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
-            assert_eq!(mcs_tas_accordin_direct_cond_signal(pair.cond), 0);
+            assert_eq!(mcs_tas_accordin_direct_cond_broadcast(pair.cond), 0);
         }
 
         await_progress(&released, 1, "the stranded waiter");
@@ -684,11 +686,11 @@ mod tests {
     }
 
     /// POSIX lets the mutex be destroyed before the cond, and lets a cond with
-    /// no waiter be signalled. The cond keeps its staging alive across the
-    /// destroy, so the signal reads a retired block rather than the memory the
-    /// mutex was freed from.
+    /// no waiter be woken. The cond keeps its staging alive across the destroy,
+    /// so the wakeup reads a retired block rather than the memory the mutex was
+    /// freed from.
     #[test]
-    fn direct_cond_signal_after_the_mutex_is_destroyed_is_safe() {
+    fn direct_cond_wakeup_after_the_mutex_is_destroyed_is_safe() {
         let pair = CondPair::create();
         let payload = Arc::new(AtomicU32::new(0));
 
@@ -696,7 +698,7 @@ mod tests {
             let payload = Arc::clone(&payload);
             std::thread::spawn(move || unsafe {
                 let pair = pair;
-                let _guard = signalling_thread();
+                let _guard = waking_thread();
                 assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
                 while payload.load(Ordering::Acquire) == 0 {
                     assert_eq!(mcs_tas_accordin_direct_cond_wait(pair.cond, pair.mutex), 0);
@@ -705,12 +707,13 @@ mod tests {
             })
         };
 
-        let _guard = signalling_thread();
+        let _guard = waking_thread();
         std::thread::sleep(std::time::Duration::from_millis(50));
         unsafe {
             assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
             payload.store(1, Ordering::Release);
-            assert_eq!(mcs_tas_accordin_direct_cond_signal(pair.cond), 0);
+            // A broadcast, so the staging carries a waiter before the destroy.
+            assert_eq!(mcs_tas_accordin_direct_cond_broadcast(pair.cond), 0);
             assert_eq!(mcs_tas_accordin_direct_mutex_unlock(pair.mutex), 0);
         }
         waiter.join().expect("the waiter should finish");

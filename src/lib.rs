@@ -5,15 +5,16 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
+pub use accordin_shared::admission;
 pub use accordin_shared::arch;
 pub use accordin_shared::cpu_affinity;
 pub use accordin_shared::env::env_flag;
 pub use accordin_shared::lock_backend;
 pub use accordin_shared::lock_stats;
-#[path = "mcs_tas_accordin/src/mcs_tas.rs"]
-mod mcs_tas;
+#[path = "mcs_accordin/src/mcs.rs"]
+mod mcs;
 mod mutex_hook;
 
-type AccordinRawLock = mcs_tas::McsTasLockRaw;
+type AccordinRawLock = mcs::McsLockRaw;
 
 accordin_shared::define_scheduler_loader!(scheduler_name = "accordin", env_prefix = "ACCORDIN",);

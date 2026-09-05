@@ -19,8 +19,13 @@ CNA_SOURCES := $(COMMON_SOURCES)
 .PHONY: all clean test leveldb_direct_gcr
 
 all: $(BUILD_DIR)/interpose_gcr.sh $(BUILD_DIR)/interpose_cna.sh
-test: $(BUILD_DIR)/gcr_mcs_empty_active_wakeup_test
-	$<
+TESTS := $(BUILD_DIR)/gcr_mcs_empty_active_release_test \
+	 $(BUILD_DIR)/gcr_mcs_rejoin_below_threshold_test \
+	 $(BUILD_DIR)/gcr_mcs_head_backoff_test \
+	 $(BUILD_DIR)/gcr_mcs_env_config_test
+
+test: $(TESTS)
+	@for t in $(TESTS); do echo "running $$t"; ./$$t || exit 1; done
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -33,8 +38,17 @@ $(BUILD_DIR)/leveldb_direct_gcr.so: $(GCR_LEVELDB_DIRECT_SOURCES) gcr_mcs.h | $(
 
 leveldb_direct_gcr: $(BUILD_DIR)/leveldb_direct_gcr.so
 
-$(BUILD_DIR)/gcr_mcs_empty_active_wakeup_test: tests/gcr_mcs_empty_active_wakeup_test.c gcr_mcs.c gcr_mcs.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gcr_mcs_empty_active_wakeup_test.c gcr_mcs.c -o $@ $(LDFLAGS) -pthread
+$(BUILD_DIR)/gcr_mcs_empty_active_release_test: tests/gcr_mcs_empty_active_release_test.c gcr_mcs.c gcr_mcs.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gcr_mcs_empty_active_release_test.c gcr_mcs.c -o $@ $(LDFLAGS) -pthread
+
+$(BUILD_DIR)/gcr_mcs_head_backoff_test: tests/gcr_mcs_head_backoff_test.c gcr_mcs.c gcr_mcs.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gcr_mcs_head_backoff_test.c gcr_mcs.c -o $@ $(LDFLAGS) -pthread
+
+$(BUILD_DIR)/gcr_mcs_rejoin_below_threshold_test: tests/gcr_mcs_rejoin_below_threshold_test.c gcr_mcs.c gcr_mcs.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gcr_mcs_rejoin_below_threshold_test.c gcr_mcs.c -o $@ $(LDFLAGS) -pthread
+
+$(BUILD_DIR)/gcr_mcs_env_config_test: tests/gcr_mcs_env_config_test.c gcr_mcs.c gcr_mcs.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gcr_mcs_env_config_test.c gcr_mcs.c -o $@ $(LDFLAGS) -pthread
 
 $(LIBVSYNC_DIR)/include/vsync/spinlock/cnalock.h:
 	mkdir -p $(dir $(LIBVSYNC_DIR))

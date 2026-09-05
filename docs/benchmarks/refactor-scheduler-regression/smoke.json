@@ -1,0 +1,183 @@
+{
+  "standard_checks": [
+    {
+      "backend": "mcs_accordin_direct",
+      "mode": "no_bpf",
+      "command": [
+        "sudo",
+        "-n",
+        "env",
+        "MCS_ACCORDIN_DIRECT_DISABLE_BPF=1",
+        "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1",
+        "MCS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "ACCORDIN_DISABLE_ADMISSION=0",
+        "taskset",
+        "-c",
+        "0-95",
+        "timeout",
+        "--kill-after=3s",
+        "30s",
+        "/mnt/sde/jz/accordin/target/regression-refactor/smoke/direct_api_smoke",
+        "/mnt/sde/jz/accordin/target/regression-refactor/variants/renew_clean/out/libmcs_accordin_direct.so",
+        "mcs_accordin_direct"
+      ],
+      "returncode": 0,
+      "output": "direct smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000\n"
+    },
+    {
+      "backend": "mcs_accordin_direct",
+      "mode": "single_cpu",
+      "command": [
+        "sudo",
+        "-n",
+        "env",
+        "MCS_ACCORDIN_DIRECT_DISABLE_BPF=0",
+        "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=0",
+        "MCS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "ACCORDIN_DISABLE_ADMISSION=0",
+        "taskset",
+        "-c",
+        "0",
+        "timeout",
+        "--kill-after=3s",
+        "30s",
+        "/mnt/sde/jz/accordin/target/regression-refactor/smoke/direct_api_smoke",
+        "/mnt/sde/jz/accordin/target/regression-refactor/variants/renew_clean/out/libmcs_accordin_direct.so",
+        "mcs_accordin_direct"
+      ],
+      "returncode": 0,
+      "output": "[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000\n"
+    },
+    {
+      "backend": "mcs_accordin_direct",
+      "mode": "migration",
+      "command": [
+        "sudo",
+        "-n",
+        "env",
+        "MCS_ACCORDIN_DIRECT_DISABLE_BPF=0",
+        "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=0",
+        "MCS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "ACCORDIN_DISABLE_ADMISSION=0",
+        "DIRECT_SMOKE_MIGRATE=1",
+        "taskset",
+        "-c",
+        "0-1",
+        "timeout",
+        "--kill-after=3s",
+        "30s",
+        "/mnt/sde/jz/accordin/target/regression-refactor/smoke/direct_api_smoke",
+        "/mnt/sde/jz/accordin/target/regression-refactor/variants/renew_clean/out/libmcs_accordin_direct.so",
+        "mcs_accordin_direct"
+      ],
+      "returncode": 0,
+      "output": "[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000\n"
+    },
+    {
+      "backend": "mcs_tas_accordin_direct",
+      "mode": "no_bpf",
+      "command": [
+        "sudo",
+        "-n",
+        "env",
+        "MCS_ACCORDIN_DIRECT_DISABLE_BPF=1",
+        "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1",
+        "MCS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "ACCORDIN_DISABLE_ADMISSION=0",
+        "taskset",
+        "-c",
+        "0-95",
+        "timeout",
+        "--kill-after=3s",
+        "30s",
+        "/mnt/sde/jz/accordin/target/regression-refactor/smoke/direct_api_smoke",
+        "/mnt/sde/jz/accordin/target/regression-refactor/variants/renew_clean/out/libmcs_tas_accordin_direct.so",
+        "mcs_tas_accordin_direct"
+      ],
+      "returncode": 0,
+      "output": "direct smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000\n"
+    },
+    {
+      "backend": "mcs_tas_accordin_direct",
+      "mode": "single_cpu",
+      "command": [
+        "sudo",
+        "-n",
+        "env",
+        "MCS_ACCORDIN_DIRECT_DISABLE_BPF=0",
+        "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=0",
+        "MCS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "ACCORDIN_DISABLE_ADMISSION=0",
+        "taskset",
+        "-c",
+        "0",
+        "timeout",
+        "--kill-after=3s",
+        "30s",
+        "/mnt/sde/jz/accordin/target/regression-refactor/smoke/direct_api_smoke",
+        "/mnt/sde/jz/accordin/target/regression-refactor/variants/renew_clean/out/libmcs_tas_accordin_direct.so",
+        "mcs_tas_accordin_direct"
+      ],
+      "returncode": 0,
+      "output": "[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000\n"
+    },
+    {
+      "backend": "mcs_tas_accordin_direct",
+      "mode": "migration",
+      "command": [
+        "sudo",
+        "-n",
+        "env",
+        "MCS_ACCORDIN_DIRECT_DISABLE_BPF=0",
+        "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=0",
+        "MCS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "ACCORDIN_DISABLE_ADMISSION=0",
+        "DIRECT_SMOKE_MIGRATE=1",
+        "taskset",
+        "-c",
+        "0-1",
+        "timeout",
+        "--kill-after=3s",
+        "30s",
+        "/mnt/sde/jz/accordin/target/regression-refactor/smoke/direct_api_smoke",
+        "/mnt/sde/jz/accordin/target/regression-refactor/variants/renew_clean/out/libmcs_tas_accordin_direct.so",
+        "mcs_tas_accordin_direct"
+      ],
+      "returncode": 0,
+      "output": "[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000\n"
+    }
+  ],
+  "additional_two_cpu_no_bpf_check": [
+    {
+      "backend": "mcs_accordin_direct",
+      "mode": "no_bpf",
+      "command": [
+        "sudo",
+        "-n",
+        "env",
+        "MCS_ACCORDIN_DIRECT_DISABLE_BPF=1",
+        "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1",
+        "MCS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0",
+        "ACCORDIN_DISABLE_ADMISSION=0",
+        "taskset",
+        "-c",
+        "0-1",
+        "timeout",
+        "--kill-after=3s",
+        "30s",
+        "/mnt/sde/jz/accordin/target/regression-refactor/smoke/direct_api_smoke",
+        "/mnt/sde/jz/accordin/target/regression-refactor/variants/renew_clean/out/libmcs_accordin_direct.so",
+        "mcs_accordin_direct"
+      ],
+      "returncode": 124,
+      "output": ""
+    }
+  ]
+}

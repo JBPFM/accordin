@@ -1,0 +1,10 @@
+{
+  "waits": 65343,
+  "yields": 30175036,
+  "zero": 39055,
+  "self": 30070638,
+  "other": 0,
+  "max_yields": 1535,
+  "yields_per_wait": 461.7944691856817,
+  "self_percent_of_failures": 99.87029093920022
+}

@@ -1,0 +1,64 @@
+[
+  {
+    "check": "check",
+    "command": [
+      "sudo",
+      "-n",
+      "make",
+      "check"
+    ],
+    "returncode": 0,
+    "elapsed_seconds": 0.4638866037130356,
+    "output": "bash scripts/check_direct_symbols.sh target/release\nBoth direct ABIs verified.\nDIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/release bash scripts/test_direct_api.sh --no-bpf\ndirect smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000\ndirect smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000\n",
+    "scheduler_after": "disabled"
+  },
+  {
+    "check": "check-bpf",
+    "command": [
+      "sudo",
+      "-n",
+      "make",
+      "check-bpf"
+    ],
+    "returncode": 0,
+    "elapsed_seconds": 0.6635819710791111,
+    "output": "DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/release bash scripts/test_direct_api.sh --bpf\n[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000\n[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000\n",
+    "scheduler_after": "disabled"
+  },
+  {
+    "check": "single-cpu",
+    "command": [
+      "sudo",
+      "-n",
+      "taskset",
+      "-c",
+      "0",
+      "bash",
+      "scripts/test_direct_api.sh",
+      "--bpf"
+    ],
+    "returncode": 0,
+    "elapsed_seconds": 4.816695569083095,
+    "output": "[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000\n[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000\n",
+    "scheduler_after": "disabled"
+  },
+  {
+    "check": "affinity",
+    "command": [
+      "sudo",
+      "-n",
+      "env",
+      "DIRECT_SMOKE_MIGRATE=1",
+      "taskset",
+      "-c",
+      "0,1",
+      "bash",
+      "scripts/test_direct_api.sh",
+      "--bpf"
+    ],
+    "returncode": 0,
+    "elapsed_seconds": 13.0280896499753,
+    "output": "[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000\n[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully\ndirect smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000\n",
+    "scheduler_after": "disabled"
+  }
+]

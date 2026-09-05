@@ -1,0 +1,38 @@
+{
+  "cases": {
+    "after": {
+      "library": "/mnt/sde/jz/accordin/target/local-owner-regression/after/libmcs_tas_accordin_direct.so"
+    },
+    "integrated_local": {
+      "library": "/mnt/sde/jz/accordin/target/release/libmcs_tas_accordin_direct.so",
+      "changes": [
+        "production source: local DSQ and renew own ticket at yield"
+      ]
+    }
+  },
+  "args": {
+    "label": "integrated-performance",
+    "cases": [
+      "after",
+      "integrated_local"
+    ],
+    "repeats": 3,
+    "duration": 5000,
+    "threads": 192,
+    "warmup": 1000,
+    "perf": false,
+    "record": false
+  },
+  "binary_sha256": "b3117c38f6f1a6782e4831fb429e7e429fa70e104e696616bc63bcf870ba54aa",
+  "libraries": {
+    "after": "bdc2e1a6044f7c6852a4155a332834b9b1f77fcacd213ad29cf9d49042e5f3e2",
+    "integrated_local": "c28d1b6627a5e8e898c0d45a58f693a53c8146785c249f910ceb598a7b12160a"
+  },
+  "uname": "Linux nku 6.14.0-37-generic #37-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 23:05:04 UTC 2025 aarch64 aarch64 aarch64 GNU/Linux\n",
+  "lscpu": "Architecture:                            aarch64\nCPU op-mode(s):                          64-bit\nByte Order:                              Little Endian\nCPU(s):                                  96\nOn-line CPU(s) list:                     0-95\nVendor ID:                               HiSilicon\nModel name:                              TaiShan-v110\nModel:                                   0\nThread(s) per core:                      1\nCore(s) per socket:                      48\nSocket(s):                               2\nStepping:                                0x1\nFrequency boost:                         disabled\nCPU(s) scaling MHz:                      100%\nCPU max MHz:                             2600.0000\nCPU min MHz:                             200.0000\nBogoMIPS:                                200.00\nFlags:                                   fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma dcpop asimddp asimdfhm\nL1d cache:                               6 MiB (96 instances)\nL1i cache:                               6 MiB (96 instances)\nL2 cache:                                48 MiB (96 instances)\nL3 cache:                                96 MiB (4 instances)\nNUMA node(s):                            4\nNUMA node0 CPU(s):                       0-23\nNUMA node1 CPU(s):                       24-47\nNUMA node2 CPU(s):                       48-71\nNUMA node3 CPU(s):                       72-95\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Not affected\nVulnerability Spectre v1:                Mitigation; __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; CSV2, but not BHB\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+  "final_library_hashes": {
+    "libmcs_accordin_direct.so": "46bbea8103623f56d1f397a552ce3d5679249846b0ebd8663f3e1a87302adec0",
+    "libmcs_tas_accordin_direct.so": "c28d1b6627a5e8e898c0d45a58f693a53c8146785c249f910ceb598a7b12160a"
+  },
+  "final_scheduler_state": "disabled"
+}

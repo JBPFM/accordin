@@ -1,0 +1,1047 @@
+CASE: ablations
+CASE: enq_last
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -78,6 +78,7 @@
+                "Failed to create thread cleanup key");
+     skel = SCX_OPS_OPEN(accordin_ops, accordin);
+     skel->bss->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
++    skel->struct_ops.accordin_ops->flags |= SCX_OPS_ENQ_LAST;
+     SCX_OPS_LOAD(skel, accordin_ops, accordin, uei);
+     thread_map_fd = bpf_map__fd(skel->maps.thread_ctx_addr_map);
+     scheduler_link = SCX_OPS_ATTACH(skel, accordin_ops, accordin);
+
+CASE: enqueue_grant
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -89,6 +89,15 @@
+       } else if (known && (state & USER_FLAGS) == USER_WAITING) {
+         tctx->ticket = request_ticket(p, state);
+         dsq = WAITING_DSQ;
++        /* Diagnostic: preserve ticket validation but grant on this CPU at enqueue. */
++        if (allowed(p, cpu)) {
++          volatile __u64 *owner = owner_slot(cpu);
++          if (owner && !__sync_val_compare_and_swap(owner, 0, tctx->ticket)) {
++            tctx->admission_cpu = cpu + 1;
++            dsq = SCX_DSQ_LOCAL_ON | cpu;
++          }
++        }
++
+       }
+     }
+   }
+
+CASE: force_slow
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -42,8 +42,17 @@
+            (len == 2 && !strncasecmp(value, "on", len));
+ }
+ 
++static _Atomic uint64_t waits, yields, zero, self, other, max_yields;
++
+ static void unregister_thread(void *value)
+ {
++    atomic_fetch_add(&waits, thread_state.waits);
++    atomic_fetch_add(&yields, thread_state.yields);
++    atomic_fetch_add(&zero, thread_state.zero);
++    atomic_fetch_add(&self, thread_state.self);
++    atomic_fetch_add(&other, thread_state.other);
++    uint64_t max = atomic_load(&max_yields);
++    while (max < thread_state.max_yields && !atomic_compare_exchange_weak(&max_yields, &max, thread_state.max_yields)) {}
+     uint32_t tid = (uintptr_t)value;
+     bpf_map_delete_elem(thread_map_fd, &tid);
+ }
+@@ -91,6 +100,7 @@
+         return;
+     if (UEI_EXITED(skel, uei))
+         UEI_REPORT(skel, uei);
++    fprintf(stderr, "DIAG waits=%lu yields=%lu zero=%lu self=%lu other=%lu max_yields=%lu\n", (unsigned long)waits, (unsigned long)yields, (unsigned long)zero, (unsigned long)self, (unsigned long)other, (unsigned long)max_yields);
+     scheduler_admission = NULL;
+     bpf_link__destroy(scheduler_link);
+     pthread_key_delete(registration_key);
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -13,6 +13,7 @@
+     uint32_t depth;
+     uint32_t tid;
+     bool registered;
++    uint64_t waits, yields, zero, self, other, max_yields;
+ };
+ 
+ extern _Thread_local struct thread_state thread_state;
+@@ -45,16 +46,24 @@
+     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+ 
++    uint64_t yields = 0;
++    thread_state.waits++;
+     /* A yield need not dispatch. Confirm this request, never an older grant. */
+     for (;;) {
+         sched_yield();
++        yields++;
+         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+             break;
+         unsigned int cpu = sched_getcpu();
+-        if (cpu < MAX_CPUS &&
+-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
++        uint64_t owner = cpu < MAX_CPUS ? __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) : 0;
++        if (owner == ticket)
+             break;
++        if (!owner) thread_state.zero++;
++        else if ((uint32_t)owner == thread_state.tid) thread_state.self++;
++        else thread_state.other++;
+     }
++    thread_state.yields += yields;
++    if (yields > thread_state.max_yields) thread_state.max_yields = yields;
+     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                           memory_order_relaxed);
+ }
+--- a/src/direct.c
++++ b/src/direct.c
+@@ -48,7 +48,7 @@
+         return EINVAL;
+     ensure_registered();
+     bool managed = admission_begin();
+-    if (!raw_trylock(&mutex->raw)) {
++    if (managed || !raw_trylock(&mutex->raw)) {
+         if (managed)
+             admission_wait();
+         raw_lock(&mutex->raw);
+
+CASE: guard_normal
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -127,7 +127,8 @@
+   (void)prev;
+   /* Serve ordinary work alongside the reserved waiter. This also lets an
+    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
+-  scx_bpf_dsq_move_to_local(NORMAL_DSQ);
++  if (scx_bpf_dsq_nr_queued(NORMAL_DSQ) > 0)
++    scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+   if (stats_only_mode || cpu < 0 || cpu >= MAX_CPUS)
+     return;
+   scx_bpf_dsq_move_to_local(OWNER_DSQ_BASE + (__u32)cpu);
+
+CASE: iter_running
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -96,30 +96,31 @@
+   scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+ }
+ 
+-/* Reserve both the task and this CPU before moving a candidate. Different CPUs
+- * may examine the same global queue concurrently; a failed move rolls back both
+- * reservations. There is no path that admits a new waiter onto an occupied CPU. */
++/* Diagnostic: keep the iterator, defer reservation until running. */
+ static __always_inline void admit_waiter(__u32 cpu) {
+   volatile __u64 *owner = owner_slot(cpu);
+   struct task_struct *p;
+-
+   if (!owner || *owner)
+     return;
+   bpf_for_each(scx_dsq, p, WAITING_DSQ, 0) {
+-    struct task_scx_ctx *tctx;
+-
+-    if (!allowed(p, cpu))
+-      continue;
+-    tctx = task_ctx(p);
+-    if (!tctx || __sync_val_compare_and_swap(&tctx->admission_cpu, 0, cpu + 1))
+-      continue;
+-    if (__sync_val_compare_and_swap(owner, 0, tctx->ticket)) {
+-      tctx->admission_cpu = 0;
++    if (allowed(p, cpu) && __COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
+       return;
++  }
++}
++
++void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
++  struct task_scx_ctx *tctx = task_ctx(p);
++  __u32 state, cpu = bpf_get_smp_processor_id();
++  volatile __u64 *owner = owner_slot(cpu);
++  if (stats_only_mode || !tctx || !owner || !user_state(p, &state))
++    return;
++  refresh_episode(p, tctx, state);
++  if (!tctx->admission_cpu && (state & USER_FLAGS) == USER_WAITING) {
++    __u64 ticket = request_ticket(p, state);
++    if (!__sync_val_compare_and_swap(owner, 0, ticket)) {
++      tctx->ticket = ticket;
++      tctx->admission_cpu = cpu + 1;
+     }
+-    if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
+-      return;
+-    release_slot(p, tctx);
+   }
+ }
+ 
+@@ -208,6 +209,7 @@
+                .select_cpu = (void *)accordin_select_cpu,
+                .enqueue = (void *)accordin_enqueue,
+                .dispatch = (void *)accordin_dispatch,
++               .running = (void *)accordin_running,
+                .tick = (void *)accordin_tick,
+                .stopping = (void *)accordin_stopping,
+                .exit_task = (void *)accordin_exit_task,
+
+CASE: local_both
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -85,10 +85,19 @@
+         refresh_episode(p, tctx, state);
+       if (tctx->admission_cpu) {
+         cpu = tctx->admission_cpu - 1;
+-        dsq = OWNER_DSQ_BASE + cpu;
++        dsq = SCX_DSQ_LOCAL_ON | cpu;
+       } else if (known && (state & USER_FLAGS) == USER_WAITING) {
+         tctx->ticket = request_ticket(p, state);
+         dsq = WAITING_DSQ;
++        /* Diagnostic: preserve ticket validation but grant on this CPU at enqueue. */
++        if (allowed(p, cpu)) {
++          volatile __u64 *owner = owner_slot(cpu);
++          if (owner && !__sync_val_compare_and_swap(owner, 0, tctx->ticket)) {
++            tctx->admission_cpu = cpu + 1;
++            dsq = SCX_DSQ_LOCAL_ON | cpu;
++          }
++        }
++
+       }
+     }
+   }
+
+CASE: local_both_yield
+--- a/src/raw_lock.h
++++ b/src/raw_lock.h
+@@ -23,7 +23,7 @@
+ {
+ #if defined(__aarch64__)
+     /* Match Rust's std::hint::spin_loop() on AArch64. */
+-    __asm__ volatile("isb" ::: "memory");
++    __asm__ volatile("yield" ::: "memory");
+ #elif defined(__arm__)
+     __asm__ volatile("yield" ::: "memory");
+ #elif defined(__x86_64__) || defined(__i386__)
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -85,10 +85,19 @@
+         refresh_episode(p, tctx, state);
+       if (tctx->admission_cpu) {
+         cpu = tctx->admission_cpu - 1;
+-        dsq = OWNER_DSQ_BASE + cpu;
++        dsq = SCX_DSQ_LOCAL_ON | cpu;
+       } else if (known && (state & USER_FLAGS) == USER_WAITING) {
+         tctx->ticket = request_ticket(p, state);
+         dsq = WAITING_DSQ;
++        /* Diagnostic: preserve ticket validation but grant on this CPU at enqueue. */
++        if (allowed(p, cpu)) {
++          volatile __u64 *owner = owner_slot(cpu);
++          if (owner && !__sync_val_compare_and_swap(owner, 0, tctx->ticket)) {
++            tctx->admission_cpu = cpu + 1;
++            dsq = SCX_DSQ_LOCAL_ON | cpu;
++          }
++        }
++
+       }
+     }
+   }
+
+CASE: local_owner
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -85,7 +85,7 @@
+         refresh_episode(p, tctx, state);
+       if (tctx->admission_cpu) {
+         cpu = tctx->admission_cpu - 1;
+-        dsq = OWNER_DSQ_BASE + cpu;
++        dsq = SCX_DSQ_LOCAL_ON | cpu;
+       } else if (known && (state & USER_FLAGS) == USER_WAITING) {
+         tctx->ticket = request_ticket(p, state);
+         dsq = WAITING_DSQ;
+
+CASE: native_running
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -96,30 +96,26 @@
+   scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+ }
+ 
+-/* Reserve both the task and this CPU before moving a candidate. Different CPUs
+- * may examine the same global queue concurrently; a failed move rolls back both
+- * reservations. There is no path that admits a new waiter onto an occupied CPU. */
++/* Diagnostic: use the kernel DSQ transfer and confirm the grant at running. */
+ static __always_inline void admit_waiter(__u32 cpu) {
+   volatile __u64 *owner = owner_slot(cpu);
+-  struct task_struct *p;
++  if (owner && !*owner)
++    scx_bpf_dsq_move_to_local(WAITING_DSQ);
++}
+ 
+-  if (!owner || *owner)
++void BPF_STRUCT_OPS(accordin_running, struct task_struct *p) {
++  struct task_scx_ctx *tctx = task_ctx(p);
++  __u32 state, cpu = bpf_get_smp_processor_id();
++  volatile __u64 *owner = owner_slot(cpu);
++  if (stats_only_mode || !tctx || !owner || !user_state(p, &state))
+     return;
+-  bpf_for_each(scx_dsq, p, WAITING_DSQ, 0) {
+-    struct task_scx_ctx *tctx;
+-
+-    if (!allowed(p, cpu))
+-      continue;
+-    tctx = task_ctx(p);
+-    if (!tctx || __sync_val_compare_and_swap(&tctx->admission_cpu, 0, cpu + 1))
+-      continue;
+-    if (__sync_val_compare_and_swap(owner, 0, tctx->ticket)) {
+-      tctx->admission_cpu = 0;
+-      return;
++  refresh_episode(p, tctx, state);
++  if (!tctx->admission_cpu && (state & USER_FLAGS) == USER_WAITING) {
++    __u64 ticket = request_ticket(p, state);
++    if (!__sync_val_compare_and_swap(owner, 0, ticket)) {
++      tctx->ticket = ticket;
++      tctx->admission_cpu = cpu + 1;
+     }
+-    if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
+-      return;
+-    release_slot(p, tctx);
+   }
+ }
+ 
+@@ -208,6 +204,7 @@
+                .select_cpu = (void *)accordin_select_cpu,
+                .enqueue = (void *)accordin_enqueue,
+                .dispatch = (void *)accordin_dispatch,
++               .running = (void *)accordin_running,
+                .tick = (void *)accordin_tick,
+                .stopping = (void *)accordin_stopping,
+                .exit_task = (void *)accordin_exit_task,
+
+CASE: refresh_prev
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -124,7 +124,12 @@
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
+-  (void)prev;
++  if (!stats_only_mode && prev) {
++    struct task_scx_ctx *tctx = task_ctx(prev);
++    __u32 state;
++    if (tctx && user_state(prev, &state))
++      refresh_episode(prev, tctx, state);
++  }
+   /* Serve ordinary work alongside the reserved waiter. This also lets an
+    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
+   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+
+CASE: refresh_prev_enq_last
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -78,6 +78,7 @@
+                "Failed to create thread cleanup key");
+     skel = SCX_OPS_OPEN(accordin_ops, accordin);
+     skel->bss->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
++    skel->struct_ops.accordin_ops->flags |= SCX_OPS_ENQ_LAST;
+     SCX_OPS_LOAD(skel, accordin_ops, accordin, uei);
+     thread_map_fd = bpf_map__fd(skel->maps.thread_ctx_addr_map);
+     scheduler_link = SCX_OPS_ATTACH(skel, accordin_ops, accordin);
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -124,7 +124,12 @@
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
+-  (void)prev;
++  if (!stats_only_mode && prev) {
++    struct task_scx_ctx *tctx = task_ctx(prev);
++    __u32 state;
++    if (tctx && user_state(prev, &state))
++      refresh_episode(prev, tctx, state);
++  }
+   /* Serve ordinary work alongside the reserved waiter. This also lets an
+    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
+   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+
+CASE: renew_self
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -42,8 +42,17 @@
+            (len == 2 && !strncasecmp(value, "on", len));
+ }
+ 
++static _Atomic uint64_t waits, yields, zero, self, other, max_yields;
++
+ static void unregister_thread(void *value)
+ {
++    atomic_fetch_add(&waits, thread_state.waits);
++    atomic_fetch_add(&yields, thread_state.yields);
++    atomic_fetch_add(&zero, thread_state.zero);
++    atomic_fetch_add(&self, thread_state.self);
++    atomic_fetch_add(&other, thread_state.other);
++    uint64_t max = atomic_load(&max_yields);
++    while (max < thread_state.max_yields && !atomic_compare_exchange_weak(&max_yields, &max, thread_state.max_yields)) {}
+     uint32_t tid = (uintptr_t)value;
+     bpf_map_delete_elem(thread_map_fd, &tid);
+ }
+@@ -91,6 +100,7 @@
+         return;
+     if (UEI_EXITED(skel, uei))
+         UEI_REPORT(skel, uei);
++    fprintf(stderr, "DIAG waits=%lu yields=%lu zero=%lu self=%lu other=%lu max_yields=%lu\n", (unsigned long)waits, (unsigned long)yields, (unsigned long)zero, (unsigned long)self, (unsigned long)other, (unsigned long)max_yields);
+     scheduler_admission = NULL;
+     bpf_link__destroy(scheduler_link);
+     pthread_key_delete(registration_key);
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -13,6 +13,7 @@
+     uint32_t depth;
+     uint32_t tid;
+     bool registered;
++    uint64_t waits, yields, zero, self, other, max_yields;
+ };
+ 
+ extern _Thread_local struct thread_state thread_state;
+@@ -45,16 +46,24 @@
+     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+ 
++    uint64_t yields = 0;
++    thread_state.waits++;
+     /* A yield need not dispatch. Confirm this request, never an older grant. */
+     for (;;) {
+         sched_yield();
++        yields++;
+         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+             break;
+         unsigned int cpu = sched_getcpu();
+-        if (cpu < MAX_CPUS &&
+-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
++        uint64_t owner = cpu < MAX_CPUS ? __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) : 0;
++        if (owner == ticket)
+             break;
++        if (!owner) thread_state.zero++;
++        else if ((uint32_t)owner == thread_state.tid) thread_state.self++;
++        else thread_state.other++;
+     }
++    thread_state.yields += yields;
++    if (yields > thread_state.max_yields) thread_state.max_yields = yields;
+     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                           memory_order_relaxed);
+ }
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -134,6 +134,20 @@
+   admit_waiter((__u32)cpu);
+ }
+ 
++bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
++  struct task_scx_ctx *tctx = task_ctx(from);
++  __u32 cpu = bpf_get_smp_processor_id(), state;
++  volatile __u64 *owner = owner_slot(cpu);
++  if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
++      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
++    __u64 next = request_ticket(from, state);
++    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++      tctx->ticket = next;
++  }
++  from->scx.slice = 0;
++  return false;
++}
++
+ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+@@ -208,6 +222,7 @@
+                .select_cpu = (void *)accordin_select_cpu,
+                .enqueue = (void *)accordin_enqueue,
+                .dispatch = (void *)accordin_dispatch,
++               .yield = (void *)accordin_yield,
+                .tick = (void *)accordin_tick,
+                .stopping = (void *)accordin_stopping,
+                .exit_task = (void *)accordin_exit_task,
+
+CASE: renew_self_force_slow
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -42,8 +42,17 @@
+            (len == 2 && !strncasecmp(value, "on", len));
+ }
+ 
++static _Atomic uint64_t waits, yields, zero, self, other, max_yields;
++
+ static void unregister_thread(void *value)
+ {
++    atomic_fetch_add(&waits, thread_state.waits);
++    atomic_fetch_add(&yields, thread_state.yields);
++    atomic_fetch_add(&zero, thread_state.zero);
++    atomic_fetch_add(&self, thread_state.self);
++    atomic_fetch_add(&other, thread_state.other);
++    uint64_t max = atomic_load(&max_yields);
++    while (max < thread_state.max_yields && !atomic_compare_exchange_weak(&max_yields, &max, thread_state.max_yields)) {}
+     uint32_t tid = (uintptr_t)value;
+     bpf_map_delete_elem(thread_map_fd, &tid);
+ }
+@@ -91,6 +100,7 @@
+         return;
+     if (UEI_EXITED(skel, uei))
+         UEI_REPORT(skel, uei);
++    fprintf(stderr, "DIAG waits=%lu yields=%lu zero=%lu self=%lu other=%lu max_yields=%lu\n", (unsigned long)waits, (unsigned long)yields, (unsigned long)zero, (unsigned long)self, (unsigned long)other, (unsigned long)max_yields);
+     scheduler_admission = NULL;
+     bpf_link__destroy(scheduler_link);
+     pthread_key_delete(registration_key);
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -13,6 +13,7 @@
+     uint32_t depth;
+     uint32_t tid;
+     bool registered;
++    uint64_t waits, yields, zero, self, other, max_yields;
+ };
+ 
+ extern _Thread_local struct thread_state thread_state;
+@@ -45,16 +46,24 @@
+     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+ 
++    uint64_t yields = 0;
++    thread_state.waits++;
+     /* A yield need not dispatch. Confirm this request, never an older grant. */
+     for (;;) {
+         sched_yield();
++        yields++;
+         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+             break;
+         unsigned int cpu = sched_getcpu();
+-        if (cpu < MAX_CPUS &&
+-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
++        uint64_t owner = cpu < MAX_CPUS ? __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) : 0;
++        if (owner == ticket)
+             break;
++        if (!owner) thread_state.zero++;
++        else if ((uint32_t)owner == thread_state.tid) thread_state.self++;
++        else thread_state.other++;
+     }
++    thread_state.yields += yields;
++    if (yields > thread_state.max_yields) thread_state.max_yields = yields;
+     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                           memory_order_relaxed);
+ }
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -134,6 +134,20 @@
+   admit_waiter((__u32)cpu);
+ }
+ 
++bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
++  struct task_scx_ctx *tctx = task_ctx(from);
++  __u32 cpu = bpf_get_smp_processor_id(), state;
++  volatile __u64 *owner = owner_slot(cpu);
++  if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
++      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
++    __u64 next = request_ticket(from, state);
++    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++      tctx->ticket = next;
++  }
++  from->scx.slice = 0;
++  return false;
++}
++
+ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+@@ -208,6 +222,7 @@
+                .select_cpu = (void *)accordin_select_cpu,
+                .enqueue = (void *)accordin_enqueue,
+                .dispatch = (void *)accordin_dispatch,
++               .yield = (void *)accordin_yield,
+                .tick = (void *)accordin_tick,
+                .stopping = (void *)accordin_stopping,
+                .exit_task = (void *)accordin_exit_task,
+--- a/src/direct.c
++++ b/src/direct.c
+@@ -48,7 +48,7 @@
+         return EINVAL;
+     ensure_registered();
+     bool managed = admission_begin();
+-    if (!raw_trylock(&mutex->raw)) {
++    if (managed || !raw_trylock(&mutex->raw)) {
+         if (managed)
+             admission_wait();
+         raw_lock(&mutex->raw);
+
+CASE: wake_kick_only
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -93,7 +93,8 @@
+     }
+   }
+   scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
+-  scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
++  if (enq_flags & SCX_ENQ_WAKEUP)
++    scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+ }
+ 
+ /* Reserve both the task and this CPU before moving a candidate. Different CPUs
+
+CASE: yield_hint
+--- a/src/raw_lock.h
++++ b/src/raw_lock.h
+@@ -23,7 +23,7 @@
+ {
+ #if defined(__aarch64__)
+     /* Match Rust's std::hint::spin_loop() on AArch64. */
+-    __asm__ volatile("isb" ::: "memory");
++    __asm__ volatile("yield" ::: "memory");
+ #elif defined(__arm__)
+     __asm__ volatile("yield" ::: "memory");
+ #elif defined(__x86_64__) || defined(__i386__)
+
+
+CASE: bpf_counters
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -42,8 +42,17 @@
+            (len == 2 && !strncasecmp(value, "on", len));
+ }
+ 
++static _Atomic uint64_t waits, yields, zero, self, other, max_yields;
++
+ static void unregister_thread(void *value)
+ {
++    atomic_fetch_add(&waits, thread_state.waits);
++    atomic_fetch_add(&yields, thread_state.yields);
++    atomic_fetch_add(&zero, thread_state.zero);
++    atomic_fetch_add(&self, thread_state.self);
++    atomic_fetch_add(&other, thread_state.other);
++    uint64_t max = atomic_load(&max_yields);
++    while (max < thread_state.max_yields && !atomic_compare_exchange_weak(&max_yields, &max, thread_state.max_yields)) {}
+     uint32_t tid = (uintptr_t)value;
+     bpf_map_delete_elem(thread_map_fd, &tid);
+ }
+@@ -91,8 +100,14 @@
+         return;
+     if (UEI_EXITED(skel, uei))
+         UEI_REPORT(skel, uei);
++    fprintf(stderr, "DIAG waits=%lu yields=%lu zero=%lu self=%lu other=%lu max_yields=%lu\n", (unsigned long)waits, (unsigned long)yields, (unsigned long)zero, (unsigned long)self, (unsigned long)other, (unsigned long)max_yields);
+     scheduler_admission = NULL;
+     bpf_link__destroy(scheduler_link);
++    for (unsigned event = 0; event < 12; event++) {
++      unsigned long sum = 0;
++      for (unsigned cpu = 0; cpu < 256; cpu++) sum += skel->bss->diag[cpu][event];
++      fprintf(stderr, "BPF_DIAG %u=%lu\n", event, sum);
++    }
+     pthread_key_delete(registration_key);
+     thread_map_fd = -1;
+     accordin__destroy(skel);
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -13,6 +13,7 @@
+     uint32_t depth;
+     uint32_t tid;
+     bool registered;
++    uint64_t waits, yields, zero, self, other, max_yields;
+ };
+ 
+ extern _Thread_local struct thread_state thread_state;
+@@ -45,16 +46,24 @@
+     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+ 
++    uint64_t yields = 0;
++    thread_state.waits++;
+     /* A yield need not dispatch. Confirm this request, never an older grant. */
+     for (;;) {
+         sched_yield();
++        yields++;
+         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+             break;
+         unsigned int cpu = sched_getcpu();
+-        if (cpu < MAX_CPUS &&
+-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
++        uint64_t owner = cpu < MAX_CPUS ? __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) : 0;
++        if (owner == ticket)
+             break;
++        if (!owner) thread_state.zero++;
++        else if ((uint32_t)owner == thread_state.tid) thread_state.self++;
++        else thread_state.other++;
+     }
++    thread_state.yields += yields;
++    if (yields > thread_state.max_yields) thread_state.max_yields = yields;
+     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                           memory_order_relaxed);
+ }
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -4,6 +4,11 @@
+ 
+ char _license[] SEC("license") = "GPL";
+ UEI_DEFINE(uei);
++__u64 diag[256][12];
++static __always_inline void count(__u32 event) {
++  __u32 cpu = bpf_get_smp_processor_id();
++  if (cpu < 256) diag[cpu][event]++;
++}
+ 
+ static __always_inline volatile __u64 *owner_slot(__u32 cpu) {
+   barrier_var(cpu);
+@@ -25,7 +30,9 @@
+   if (!address)
+     return true;
+   /* A failed read is not a release, and must not revoke a spinning waiter. */
+-  return !bpf_probe_read_user(state, sizeof(*state), (const void *)*address);
++  int ret = bpf_probe_read_user(state, sizeof(*state), (const void *)*address);
++  count(ret ? 1 : 0);
++  return !ret;
+ }
+ 
+ static __always_inline void release_slot(struct task_struct *p,
+@@ -52,6 +59,7 @@
+                                             struct task_scx_ctx *tctx,
+                                             __u32 state) {
+   if (!(state & USER_FLAGS) || tctx->ticket != request_ticket(p, state)) {
++    if (tctx->admission_cpu) count(2);
+     release_slot(p, tctx);
+   } else if (tctx->admission_cpu && !allowed(p, tctx->admission_cpu - 1)) {
+     release_slot(p, tctx);
+@@ -72,6 +80,7 @@
+ 
+ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
+   struct task_scx_ctx *tctx;
++  count(3);
+   __u64 dsq = NORMAL_DSQ;
+   __u32 cpu = scx_bpf_task_cpu(p);
+   __u32 state;
+@@ -103,8 +112,10 @@
+   volatile __u64 *owner = owner_slot(cpu);
+   struct task_struct *p;
+ 
+-  if (!owner || *owner)
++  if (!owner || *owner) {
++    count(4);
+     return;
++  }
+   bpf_for_each(scx_dsq, p, WAITING_DSQ, 0) {
+     struct task_scx_ctx *tctx;
+ 
+@@ -117,14 +128,21 @@
+       tctx->admission_cpu = 0;
+       return;
+     }
+-    if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
++    if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0)) {
++      count(5);
+       return;
++    }
+     release_slot(p, tctx);
+   }
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
+-  (void)prev;
++  count(6);
++  if (prev) {
++    struct task_scx_ctx *ctx = task_ctx(prev);
++    __u32 state;
++    if (ctx && user_state(prev, &state) && ctx->admission_cpu && ctx->ticket != request_ticket(prev, state)) count(7);
++  }
+   /* Serve ordinary work alongside the reserved waiter. This also lets an
+    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
+   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+@@ -135,6 +153,7 @@
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
++  count(8);
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+   if (!stats_only_mode && tctx && user_state(p, &state))
+@@ -142,6 +161,7 @@
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
++  count(9);
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+ 
+
+CASE: one_yield_unchecked
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -38,23 +38,12 @@
+     return managed;
+ }
+ 
++/* DIAGNOSTIC ONLY: deliberately skips ticket validation. */
+ static inline void admission_wait(void)
+ {
+     uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
+                                                memory_order_relaxed) & ~USER_FLAGS;
+-    uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+-    struct admission_state *state = scheduler_admission;
+-
+-    /* A yield need not dispatch. Confirm this request, never an older grant. */
+-    for (;;) {
+-        sched_yield();
+-        if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+-            break;
+-        unsigned int cpu = sched_getcpu();
+-        if (cpu < MAX_CPUS &&
+-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
+-            break;
+-    }
++    sched_yield();
+     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                           memory_order_relaxed);
+ }
+
+CASE: user_counters
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -42,8 +42,17 @@
+            (len == 2 && !strncasecmp(value, "on", len));
+ }
+ 
++static _Atomic uint64_t waits, yields, zero, self, other, max_yields;
++
+ static void unregister_thread(void *value)
+ {
++    atomic_fetch_add(&waits, thread_state.waits);
++    atomic_fetch_add(&yields, thread_state.yields);
++    atomic_fetch_add(&zero, thread_state.zero);
++    atomic_fetch_add(&self, thread_state.self);
++    atomic_fetch_add(&other, thread_state.other);
++    uint64_t max = atomic_load(&max_yields);
++    while (max < thread_state.max_yields && !atomic_compare_exchange_weak(&max_yields, &max, thread_state.max_yields)) {}
+     uint32_t tid = (uintptr_t)value;
+     bpf_map_delete_elem(thread_map_fd, &tid);
+ }
+@@ -91,6 +100,7 @@
+         return;
+     if (UEI_EXITED(skel, uei))
+         UEI_REPORT(skel, uei);
++    fprintf(stderr, "DIAG waits=%lu yields=%lu zero=%lu self=%lu other=%lu max_yields=%lu\n", (unsigned long)waits, (unsigned long)yields, (unsigned long)zero, (unsigned long)self, (unsigned long)other, (unsigned long)max_yields);
+     scheduler_admission = NULL;
+     bpf_link__destroy(scheduler_link);
+     pthread_key_delete(registration_key);
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -13,6 +13,7 @@
+     uint32_t depth;
+     uint32_t tid;
+     bool registered;
++    uint64_t waits, yields, zero, self, other, max_yields;
+ };
+ 
+ extern _Thread_local struct thread_state thread_state;
+@@ -45,16 +46,24 @@
+     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+ 
++    uint64_t yields = 0;
++    thread_state.waits++;
+     /* A yield need not dispatch. Confirm this request, never an older grant. */
+     for (;;) {
+         sched_yield();
++        yields++;
+         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+             break;
+         unsigned int cpu = sched_getcpu();
+-        if (cpu < MAX_CPUS &&
+-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
++        uint64_t owner = cpu < MAX_CPUS ? __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) : 0;
++        if (owner == ticket)
+             break;
++        if (!owner) thread_state.zero++;
++        else if ((uint32_t)owner == thread_state.tid) thread_state.self++;
++        else thread_state.other++;
+     }
++    thread_state.yields += yields;
++    if (yields > thread_state.max_yields) thread_state.max_yields = yields;
+     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                           memory_order_relaxed);
+ }
+
+CASE: yield_refresh
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -42,8 +42,17 @@
+            (len == 2 && !strncasecmp(value, "on", len));
+ }
+ 
++static _Atomic uint64_t waits, yields, zero, self, other, max_yields;
++
+ static void unregister_thread(void *value)
+ {
++    atomic_fetch_add(&waits, thread_state.waits);
++    atomic_fetch_add(&yields, thread_state.yields);
++    atomic_fetch_add(&zero, thread_state.zero);
++    atomic_fetch_add(&self, thread_state.self);
++    atomic_fetch_add(&other, thread_state.other);
++    uint64_t max = atomic_load(&max_yields);
++    while (max < thread_state.max_yields && !atomic_compare_exchange_weak(&max_yields, &max, thread_state.max_yields)) {}
+     uint32_t tid = (uintptr_t)value;
+     bpf_map_delete_elem(thread_map_fd, &tid);
+ }
+@@ -91,8 +100,14 @@
+         return;
+     if (UEI_EXITED(skel, uei))
+         UEI_REPORT(skel, uei);
++    fprintf(stderr, "DIAG waits=%lu yields=%lu zero=%lu self=%lu other=%lu max_yields=%lu\n", (unsigned long)waits, (unsigned long)yields, (unsigned long)zero, (unsigned long)self, (unsigned long)other, (unsigned long)max_yields);
+     scheduler_admission = NULL;
+     bpf_link__destroy(scheduler_link);
++    for (unsigned event = 0; event < 12; event++) {
++      unsigned long sum = 0;
++      for (unsigned cpu = 0; cpu < 256; cpu++) sum += skel->bss->diag[cpu][event];
++      fprintf(stderr, "BPF_DIAG %u=%lu\n", event, sum);
++    }
+     pthread_key_delete(registration_key);
+     thread_map_fd = -1;
+     accordin__destroy(skel);
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -13,6 +13,7 @@
+     uint32_t depth;
+     uint32_t tid;
+     bool registered;
++    uint64_t waits, yields, zero, self, other, max_yields;
+ };
+ 
+ extern _Thread_local struct thread_state thread_state;
+@@ -45,16 +46,24 @@
+     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+ 
++    uint64_t yields = 0;
++    thread_state.waits++;
+     /* A yield need not dispatch. Confirm this request, never an older grant. */
+     for (;;) {
+         sched_yield();
++        yields++;
+         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+             break;
+         unsigned int cpu = sched_getcpu();
+-        if (cpu < MAX_CPUS &&
+-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
++        uint64_t owner = cpu < MAX_CPUS ? __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) : 0;
++        if (owner == ticket)
+             break;
++        if (!owner) thread_state.zero++;
++        else if ((uint32_t)owner == thread_state.tid) thread_state.self++;
++        else thread_state.other++;
+     }
++    thread_state.yields += yields;
++    if (yields > thread_state.max_yields) thread_state.max_yields = yields;
+     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                           memory_order_relaxed);
+ }
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -4,6 +4,11 @@
+ 
+ char _license[] SEC("license") = "GPL";
+ UEI_DEFINE(uei);
++__u64 diag[256][12];
++static __always_inline void count(__u32 event) {
++  __u32 cpu = bpf_get_smp_processor_id();
++  if (cpu < 256) diag[cpu][event]++;
++}
+ 
+ static __always_inline volatile __u64 *owner_slot(__u32 cpu) {
+   barrier_var(cpu);
+@@ -25,7 +30,9 @@
+   if (!address)
+     return true;
+   /* A failed read is not a release, and must not revoke a spinning waiter. */
+-  return !bpf_probe_read_user(state, sizeof(*state), (const void *)*address);
++  int ret = bpf_probe_read_user(state, sizeof(*state), (const void *)*address);
++  count(ret ? 1 : 0);
++  return !ret;
+ }
+ 
+ static __always_inline void release_slot(struct task_struct *p,
+@@ -52,6 +59,7 @@
+                                             struct task_scx_ctx *tctx,
+                                             __u32 state) {
+   if (!(state & USER_FLAGS) || tctx->ticket != request_ticket(p, state)) {
++    if (tctx->admission_cpu) count(2);
+     release_slot(p, tctx);
+   } else if (tctx->admission_cpu && !allowed(p, tctx->admission_cpu - 1)) {
+     release_slot(p, tctx);
+@@ -72,6 +80,7 @@
+ 
+ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
+   struct task_scx_ctx *tctx;
++  count(3);
+   __u64 dsq = NORMAL_DSQ;
+   __u32 cpu = scx_bpf_task_cpu(p);
+   __u32 state;
+@@ -103,8 +112,10 @@
+   volatile __u64 *owner = owner_slot(cpu);
+   struct task_struct *p;
+ 
+-  if (!owner || *owner)
++  if (!owner || *owner) {
++    count(4);
+     return;
++  }
+   bpf_for_each(scx_dsq, p, WAITING_DSQ, 0) {
+     struct task_scx_ctx *tctx;
+ 
+@@ -117,14 +128,21 @@
+       tctx->admission_cpu = 0;
+       return;
+     }
+-    if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
++    if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0)) {
++      count(5);
+       return;
++    }
+     release_slot(p, tctx);
+   }
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
+-  (void)prev;
++  count(6);
++  if (prev) {
++    struct task_scx_ctx *ctx = task_ctx(prev);
++    __u32 state;
++    if (ctx && user_state(prev, &state) && ctx->admission_cpu && ctx->ticket != request_ticket(prev, state)) count(7);
++  }
+   /* Serve ordinary work alongside the reserved waiter. This also lets an
+    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
+   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+@@ -134,7 +152,18 @@
+   admit_waiter((__u32)cpu);
+ }
+ 
++bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
++  count(10);
++  struct task_scx_ctx *tctx = task_ctx(from);
++  __u32 state;
++  if (!stats_only_mode && tctx && user_state(from, &state))
++    refresh_episode(from, tctx, state);
++  from->scx.slice = 0;
++  return false;
++}
++
+ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
++  count(8);
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+   if (!stats_only_mode && tctx && user_state(p, &state))
+@@ -142,6 +171,7 @@
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
++  count(9);
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+ 
+@@ -208,6 +238,7 @@
+                .select_cpu = (void *)accordin_select_cpu,
+                .enqueue = (void *)accordin_enqueue,
+                .dispatch = (void *)accordin_dispatch,
++               .yield = (void *)accordin_yield,
+                .tick = (void *)accordin_tick,
+                .stopping = (void *)accordin_stopping,
+                .exit_task = (void *)accordin_exit_task,

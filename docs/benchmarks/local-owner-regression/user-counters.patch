@@ -1,0 +1,65 @@
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -42,8 +42,17 @@
+            (len == 2 && !strncasecmp(value, "on", len));
+ }
+ 
++static _Atomic uint64_t waits, yields, zero, self, other, max_yields;
++
+ static void unregister_thread(void *value)
+ {
++    atomic_fetch_add(&waits, thread_state.waits);
++    atomic_fetch_add(&yields, thread_state.yields);
++    atomic_fetch_add(&zero, thread_state.zero);
++    atomic_fetch_add(&self, thread_state.self);
++    atomic_fetch_add(&other, thread_state.other);
++    uint64_t max = atomic_load(&max_yields);
++    while (max < thread_state.max_yields && !atomic_compare_exchange_weak(&max_yields, &max, thread_state.max_yields)) {}
+     uint32_t tid = (uintptr_t)value;
+     bpf_map_delete_elem(thread_map_fd, &tid);
+ }
+@@ -91,6 +100,7 @@
+         return;
+     if (UEI_EXITED(skel, uei))
+         UEI_REPORT(skel, uei);
++    fprintf(stderr, "DIAG waits=%lu yields=%lu zero=%lu self=%lu other=%lu max_yields=%lu\n", (unsigned long)waits, (unsigned long)yields, (unsigned long)zero, (unsigned long)self, (unsigned long)other, (unsigned long)max_yields);
+     scheduler_admission = NULL;
+     bpf_link__destroy(scheduler_link);
+     pthread_key_delete(registration_key);
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -13,6 +13,7 @@
+     uint32_t depth;
+     uint32_t tid;
+     bool registered;
++    uint64_t waits, yields, zero, self, other, max_yields;
+ };
+ 
+ extern _Thread_local struct thread_state thread_state;
+@@ -45,16 +46,24 @@
+     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+ 
++    uint64_t yields = 0;
++    thread_state.waits++;
+     /* A yield need not dispatch. Confirm this request, never an older grant. */
+     for (;;) {
+         sched_yield();
++        yields++;
+         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+             break;
+         unsigned int cpu = sched_getcpu();
+-        if (cpu < MAX_CPUS &&
+-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
++        uint64_t owner = cpu < MAX_CPUS ? __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) : 0;
++        if (owner == ticket)
+             break;
++        if (!owner) thread_state.zero++;
++        else if ((uint32_t)owner == thread_state.tid) thread_state.self++;
++        else thread_state.other++;
+     }
++    thread_state.yields += yields;
++    if (yields > thread_state.max_yields) thread_state.max_yields = yields;
+     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                           memory_order_relaxed);
+ }

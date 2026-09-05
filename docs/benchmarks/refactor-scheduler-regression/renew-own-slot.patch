@@ -1,0 +1,31 @@
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -134,6 +134,20 @@
+   admit_waiter((__u32)cpu);
+ }
+ 
++bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
++  struct task_scx_ctx *tctx = task_ctx(from);
++  __u32 cpu = bpf_get_smp_processor_id(), state;
++  volatile __u64 *owner = owner_slot(cpu);
++  if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
++      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
++    __u64 next = request_ticket(from, state);
++    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++      tctx->ticket = next;
++  }
++  from->scx.slice = 0;
++  return false;
++}
++
+ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+@@ -208,6 +222,7 @@
+                .select_cpu = (void *)accordin_select_cpu,
+                .enqueue = (void *)accordin_enqueue,
+                .dispatch = (void *)accordin_dispatch,
++               .yield = (void *)accordin_yield,
+                .tick = (void *)accordin_tick,
+                .stopping = (void *)accordin_stopping,
+                .exit_task = (void *)accordin_exit_task,

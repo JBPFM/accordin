@@ -46,7 +46,7 @@ static __always_inline __u64 request_ticket(struct task_struct *p, __u32 state) 
   return ((__u64)(state & ~USER_FLAGS) << 32) | (__u32)p->pid;
 }
 
-/* A new request retires the old slot even if its unlock was never observed.
+/* Unless renewed at yield, a new request retires the old slot.
  * A changed affinity cannot park an existing MCS node behind its successor. */
 static __always_inline void refresh_episode(struct task_struct *p,
                                             struct task_scx_ctx *tctx,
@@ -85,7 +85,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
         refresh_episode(p, tctx, state);
       if (tctx->admission_cpu) {
         cpu = tctx->admission_cpu - 1;
-        dsq = OWNER_DSQ_BASE + cpu;
+        dsq = SCX_DSQ_LOCAL_ON | cpu;
       } else if (known && (state & USER_FLAGS) == USER_WAITING) {
         tctx->ticket = request_ticket(p, state);
         dsq = WAITING_DSQ;
@@ -130,8 +130,24 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
   if (stats_only_mode || cpu < 0 || cpu >= MAX_CPUS)
     return;
-  scx_bpf_dsq_move_to_local(OWNER_DSQ_BASE + (__u32)cpu);
   admit_waiter((__u32)cpu);
+}
+
+bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
+  struct task_scx_ctx *tctx = task_ctx(from);
+  __u32 cpu = bpf_get_smp_processor_id(), state;
+  volatile __u64 *owner = owner_slot(cpu);
+
+  (void)to;
+  /* Renew only our existing slot; userspace still confirms the new ticket. */
+  if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
+      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
+    __u64 next = request_ticket(from, state);
+    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
+      tctx->ticket = next;
+  }
+  from->scx.slice = 0;
+  return false;
 }
 
 void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
@@ -181,7 +197,6 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
-  __u32 cpu;
   s32 ret;
 
   ret = scx_bpf_create_dsq(NORMAL_DSQ, -1);
@@ -190,11 +205,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   ret = scx_bpf_create_dsq(WAITING_DSQ, -1);
   if (ret)
     return ret;
-  bpf_for(cpu, 0, MAX_CPUS) {
-    ret = scx_bpf_create_dsq(OWNER_DSQ_BASE + cpu, -1);
-    if (ret)
-      return ret;
-  }
   admission.enabled = !stats_only_mode;
   return 0;
 }
@@ -208,6 +218,7 @@ SCX_OPS_DEFINE(accordin_ops,
                .select_cpu = (void *)accordin_select_cpu,
                .enqueue = (void *)accordin_enqueue,
                .dispatch = (void *)accordin_dispatch,
+               .yield = (void *)accordin_yield,
                .tick = (void *)accordin_tick,
                .stopping = (void *)accordin_stopping,
                .exit_task = (void *)accordin_exit_task,

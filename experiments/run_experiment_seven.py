@@ -387,6 +387,9 @@ def run_one(
     logs_dir: Path,
 ) -> dict[str, str]:
     cmd, env, needs_sudo = mutexbench_command(lock, threads, critical_ns, args)
+    # Run the timeout with the benchmark's privileges so it can terminate all
+    # workers even when sudo is involved. Keep Python as a fallback watchdog.
+    cmd = ["timeout", "--kill-after=3s", f"{args.command_timeout_seconds}s", *cmd]
     run_cmd = experiment_six.env_command(cmd, env, needs_sudo=needs_sudo, sudo_mode=args.sudo_mode)
     log_path = logs_dir / f"{lock}_t{threads}_c{critical_ns}_r{repeat}.log"
 
@@ -399,19 +402,21 @@ def run_one(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=args.command_timeout_seconds,
+            timeout=args.command_timeout_seconds + 5,
         )
         output = completed.stdout
         status = completed.returncode
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
         status = 124
     end_ns = time.time_ns()
     bench_wall_seconds = (end_ns - start_ns) / 1_000_000_000.0
 
     log_path.write_text("$ " + shlex_join(run_cmd) + "\n\n" + output, encoding="utf-8")
     if status != 0:
-        raise RuntimeError(f"benchmark failed for lock={lock} threads={threads} critical_ns={critical_ns} repeat={repeat}; see {log_path}")
+        raise RuntimeError(f"benchmark failed with status={status} for lock={lock} threads={threads} critical_ns={critical_ns} repeat={repeat}; see {log_path}")
 
     metrics = experiment_six.parse_metrics(output)
     required_metrics = (

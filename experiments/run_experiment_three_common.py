@@ -126,11 +126,6 @@ ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tas_accord
 MCS_ACCORDIN_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_accordin.so"
 MCS_EXTENSION_PRELOAD_LIBRARY = REPO_ROOT / "target" / "release" / "libmcs_tse.so"
 BPF_INTERPOSE_LOCK_PREFIXES = ("flexguard",)
-ACCORDIN_ENV_PASSTHROUGH_PREFIXES = (
-    "ACCORDIN_",
-    "MCS_ACCORDIN_",
-    "MCS_TAS_ACCORDIN_",
-)
 ROOT_REQUIRED_PRELOAD_LOCKS = {
     lock
     for lock in experiment_defaults.ACCORDIN_VARIANT_LOCKS
@@ -566,6 +561,7 @@ def validate_locks(locks: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def combine_ld_preload(preload_library: Path) -> str:
+    experiment_defaults.require_available_preload(preload_library.name)
     existing = os.environ.get("LD_PRELOAD", "").strip()
     return f"{preload_library}:{existing}" if existing else str(preload_library)
 
@@ -573,10 +569,17 @@ def combine_ld_preload(preload_library: Path) -> str:
 def accordin_env_passthrough(env: dict[str, str | None]) -> dict[str, str | None]:
     # sudo -n env drops the caller environment, so accordin toggles must be forwarded
     # explicitly; entries the caller already pinned or unset keep precedence.
+    supported = {
+        "ACCORDIN_DISABLE_ADMISSION",
+        "MCS_ACCORDIN_DIRECT_DISABLE_BPF",
+        "MCS_ACCORDIN_DIRECT_STATS_ONLY",
+        "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF",
+        "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY",
+    }
     merged: dict[str, str | None] = {
         key: value
         for key, value in os.environ.items()
-        if key.startswith(ACCORDIN_ENV_PASSTHROUGH_PREFIXES) and key not in env
+        if key in supported and key not in env
     }
     merged.update(env)
     return merged
@@ -859,6 +862,7 @@ def ensure_preload_library(
     build_missing: bool,
     logger: CommandLogger,
 ) -> None:
+    experiment_defaults.require_available_core_backend(crate)
     if path.is_file():
         return
     if not build_missing:

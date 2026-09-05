@@ -28,6 +28,10 @@ collect_latest_build_out_dirs() {
             rel_path="${out_dir#$build_root/}"
             build_dir="${rel_path%%/*}"
             crate_name="${build_dir%-*}"
+            case "$crate_name" in
+                mcs_accordin_direct|mcs_tas_accordin_direct) ;;
+                *) continue ;;
+            esac
             key="$profile:$crate_name"
             mtime="$(stat -c %Y "$out_dir")"
 
@@ -83,10 +87,7 @@ detect_multiarch_include_dir() {
 
 emit_sources_for_target() {
     case "$1" in
-        mcs_accordin|mcs_tas_accordin|ttas_accordin)
-            printf '%s\n' "$SCRIPT_DIR/src/bpf/main.bpf.c"
-            ;;
-        reciprocating_accordin)
+        mcs_accordin_direct|mcs_tas_accordin_direct)
             printf '%s\n' "$SCRIPT_DIR/src/bpf/main.bpf.c"
             ;;
         *)

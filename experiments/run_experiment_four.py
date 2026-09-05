@@ -55,9 +55,8 @@ LEVELDB_UNSUPPORTED_LOCKS = frozenset(
         experiment_defaults.MCS_ACCORDIN_LOCK,
     }
 )
-# The direct lock is not interposed: LevelDB's port::Mutex resolves the direct C API
-# from the preloaded library itself, so the run carries no pthread hooking at all. It
-# stays opt-in through --locks, and the hook variants remain the profile defaults.
+# Historical direct backend label, retained for plotting existing results.
+# This integration requires removed CV/writer-event APIs and cannot run now.
 MCS_TAS_ACCORDIN_DIRECT_LOCK = experiment_defaults.MCS_TAS_ACCORDIN_DIRECT_LOCK
 MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY = (
     REPO_ROOT / "target" / "release" / "libmcs_tas_accordin_direct.so"
@@ -420,6 +419,9 @@ def merge_ld_preload_entries(*libraries: Path | None) -> str | None:
 
 
 def preload_env(*libraries: Path | None) -> dict[str, str] | None:
+    for library in libraries:
+        if library is not None:
+            experiment_defaults.require_available_preload(library.name)
     ld_preload = merge_ld_preload_entries(*libraries)
     if ld_preload is None:
         return None
@@ -433,25 +435,19 @@ def accordin_preload_env(
 ) -> dict[str, str | None]:
     env = experiment_three.accordin_preload_env(preload_library, lock=lock)
     env[ACCORDIN_HOOK_SCOPE_ENV] = ACCORDIN_LEVELDB_HOOK_SCOPE
-    env.update(experiment_defaults.accordin_width_env())
     return env
 
 
+def require_leveldb_runtime_locks(locks: Iterable[str]) -> None:
+    if any(normalize_leveldb_lock(lock) == MCS_TAS_ACCORDIN_DIRECT_LOCK for lock in locks):
+        mcs_tas_accordin_direct_preload_env()
+
+
 def mcs_tas_accordin_direct_preload_env() -> dict[str, str | None]:
-    env: dict[str, str | None] = dict(
-        preload_env(MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY) or {}
+    raise RuntimeError(
+        "The historical LevelDB direct backend requires the removed condition-variable "
+        "and writer-event APIs. Use a mutexbench direct experiment; see README.md."
     )
-    env.update(
-        {
-            ACCORDIN_HOOK_SCOPE_ENV: None,
-            "ACCORDIN_DISABLE_ADMISSION": None,
-            "MCS_TAS_ACCORDIN_DISABLE_BPF": None,
-            "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF": None,
-            "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY": None,
-        }
-    )
-    env.update(experiment_defaults.accordin_width_env())
-    return experiment_three.accordin_env_passthrough(env)
 
 
 def default_result_root() -> Path:
@@ -624,13 +620,7 @@ def ensure_mcs_tas_accordin_direct_preload(
     build_missing: bool,
     logger: experiment_three.CommandLogger,
 ) -> None:
-    experiment_three.ensure_preload_library(
-        MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY,
-        "mcs_tas_accordin_direct",
-        "build_mcs_tas_accordin_direct.log",
-        build_missing=build_missing,
-        logger=logger,
-    )
+    require_leveldb_runtime_locks((MCS_TAS_ACCORDIN_DIRECT_LOCK,))
 
 
 def ensure_lock_helpers(
@@ -639,6 +629,7 @@ def ensure_lock_helpers(
     build_missing: bool,
     logger: experiment_three.CommandLogger,
 ) -> None:
+    require_leveldb_runtime_locks(locks)
     interpose_locks = tuple(
         lock
         for lock in locks
@@ -1036,7 +1027,6 @@ def write_settings(
         "init_existing_benchmarks": list(init_existing_benchmarks),
         "accordin_hook_scope_env": ACCORDIN_HOOK_SCOPE_ENV,
         "accordin_hook_scope": ACCORDIN_LEVELDB_HOOK_SCOPE if uses_mutex_hook_accordin else None,
-        "accordin_width_env": experiment_defaults.accordin_width_env(),
         "leveldb_accordin_mutex_hook_variants": list(experiment_defaults.ACCORDIN_VARIANT_LOCKS),
         "mcs_tas_accordin_mutex_hook_preload": str(experiment_three.ACCORDIN_PRELOAD_LIBRARY),
         "mcs_tas_accordin_direct_preload": str(MCS_TAS_ACCORDIN_DIRECT_PRELOAD_LIBRARY),
@@ -1385,6 +1375,7 @@ def main() -> int:
             print_outputs(result_root, raw_path, summary_path, plot_paths)
             return 0
 
+        require_leveldb_runtime_locks(locks)
         result_root = resolve_path(args.output_root) if args.output_root is not None else default_result_root()
         experiment_three.ensure_output_root(result_root, args.force)
         logger = experiment_three.CommandLogger(

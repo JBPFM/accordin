@@ -568,6 +568,7 @@ def relative_to_root(path: Path, root: Path) -> str:
 
 
 def resolve_mcs_tse_library() -> Path:
+    experiment_defaults.require_available_core_backend("mcs_tse")
     env_path = os.environ.get("MCS_TSE_LIB")
     if env_path:
         candidate = Path(env_path).expanduser()

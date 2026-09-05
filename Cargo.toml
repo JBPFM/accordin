@@ -1,54 +1,11 @@
-[package]
-name = "accordin"
-version = "0.1.0"
-edition = "2024"
-license = "GPL-2.0-only"
-build = "build.rs"
-
-[lib]
-name = "accordin"
-crate-type = ["cdylib"]
-
 [workspace]
 resolver = "3"
 members = [
     "src/accordin_shared",
-    "src/mcs_accordin",
     "src/mcs_accordin_direct",
-    "src/mcs_tas_accordin",
     "src/mcs_tas_accordin_direct",
-    "src/mcs_tse",
-    "src/ttas_accordin",
-    "src/reciprocating_accordin",
-]
-default-members = [
-    ".",
-    "src/accordin_shared",
-    "src/mcs_accordin",
-    "src/mcs_accordin_direct",
-    "src/mcs_tas_accordin",
-    "src/mcs_tas_accordin_direct",
-    "src/mcs_tse",
-    "src/ttas_accordin",
-    "src/reciprocating_accordin",
 ]
 exclude = ["bench/mutexbench_rust"]
-
-[dependencies]
-anyhow = "1.0.65"
-accordin_shared = { path = "src/accordin_shared" }
-libbpf-rs = "=0.26.0-beta.1"
-libc = "0.2.177"
-log = "0.4.17"
-scx_utils = { version = "1.0.22", features = ["autopower"] }
-simplelog = "0.12"
-
-[build-dependencies]
-scx_cargo = { version = "1.0.22" }
-
-[features]
-enable_backtrace = []
-perf-symbols = []
 
 [profile.release]
 debug = 1

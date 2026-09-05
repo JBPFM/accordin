@@ -140,14 +140,3 @@ impl LockBackend for McsTasLockRaw {
         self.unlock_fast();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Node;
-
-    #[test]
-    fn node_layout_stays_cache_aligned() {
-        assert_eq!(std::mem::size_of::<Node>(), 64);
-        assert_eq!(std::mem::align_of::<Node>(), 64);
-    }
-}

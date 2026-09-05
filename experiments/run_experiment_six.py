@@ -34,8 +34,6 @@ ACCORDIN_DIRECT_DISABLE_BPF_ENV = "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF"
 ACCORDIN_DIRECT_STATS_ONLY_ENV = "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY"
 ACCORDIN_DIRECT_ENV_PREFIX = "MCS_TAS_ACCORDIN_DIRECT_"
 MCS_ACCORDIN_LOCK = experiment_defaults.MCS_ACCORDIN_LOCK
-MCS_ACCORDIN_PACKAGE = "mcs_accordin"
-MCS_ACCORDIN_RELEASE_LIB = experiment_three.MCS_ACCORDIN_RELEASE_LIB
 MCS_ACCORDIN_DIRECT_PACKAGE = experiment_three.MCS_ACCORDIN_DIRECT_PACKAGE
 MCS_ACCORDIN_DIRECT_LOCK_KIND = experiment_three.MCS_ACCORDIN_DIRECT_LOCK_KIND
 MCS_ACCORDIN_DIRECT_RELEASE_LIB = experiment_three.MCS_ACCORDIN_DIRECT_RELEASE_LIB
@@ -348,7 +346,6 @@ def accordin_env(lock: str) -> dict[str, str | None]:
     for key, value in os.environ.items():
         if key.startswith(ACCORDIN_DIRECT_ENV_PREFIX):
             env[key] = value
-    env.update(experiment_defaults.accordin_width_env())
     env[ACCORDIN_DIRECT_LIB_ENV] = str(ACCORDIN_DIRECT_RELEASE_LIB)
     if experiment_defaults.accordin_disables_admission(lock):
         env["ACCORDIN_DISABLE_ADMISSION"] = "1"
@@ -358,7 +355,6 @@ def accordin_env(lock: str) -> dict[str, str | None]:
 
 def mcs_accordin_env() -> dict[str, str | None]:
     env = experiment_three.mcs_accordin_direct_env()
-    env.update(experiment_defaults.accordin_width_env())
     return env
 
 
@@ -597,7 +593,6 @@ def write_settings(root: Path, args: argparse.Namespace) -> None:
         "warmup_duration_ms": args.warmup_duration_ms,
         "repeats": args.repeats,
         "mcs_accordin_taskset_cpus": args.mcs_accordin_taskset_cpus,
-        "accordin_width_env": experiment_defaults.accordin_width_env(),
         "cases": [case.__dict__ for case in CASES],
     }
     (root / "settings.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")

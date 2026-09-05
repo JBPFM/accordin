@@ -1,7 +1,6 @@
-if [ "$(id -u)" -eq 0 ]; then
-  SUDO=""
-else
-  SUDO="sudo"
-fi
+#!/usr/bin/env bash
+# Historical pthread-hook LevelDB entrypoint, retained for reference.
+set -euo pipefail
 
-$SUDO K=2 LD_PRELOAD="./target/release/libaccordin.so" ~/Projects/tests/leveldb/build/db_bench --benchmarks=readrandom --threads=256 --num=$1
+echo "This libaccordin.so preload entrypoint has been removed. Use the mutexbench direct experiments; see README.md." >&2
+exit 1

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from typing import Iterable, Mapping
+from typing import Iterable
 
 try:
     from machine_config import (
@@ -42,21 +41,25 @@ ACCORDIN_VARIANT_LOCKS = (
 ACCORDIN_ADMISSION_DISABLED_LOCKS: tuple[str, ...] = ()
 ACCORDIN_TASKSET_LOCKS: tuple[str, ...] = ()
 
-# Per-class width-control knobs read by accordin_shared. Benchmark drivers run Accordin
-# locks through sudo, which drops the ambient environment, so these have to be restated
-# inside the constructed `env` command instead of being inherited.
-ACCORDIN_WIDTH_ENV_KEYS = (
-    "ACCORDIN_WIDTH_CONTROL",
-    "ACCORDIN_FIXED_WIDTH",
-    "ACCORDIN_WIDTH_CLASS_MAP",
-    "ACCORDIN_WIDTH_MERGE",
-    "ACCORDIN_WIDTH_OVERFLOW_POLICY",
-    "ACCORDIN_WIDTH_HOLDOFF_WINDOWS",
-    "ACCORDIN_WIDTH_DEADZONE",
-    "ACCORDIN_WIDTH_MAX",
-    "ACCORDIN_WIDTH_MIN",
-    "ACCORDIN_DUMP_DEPENDENCY",
-)
+# Kept for historical experiment entrypoints. Fail before loading stale artifacts.
+REMOVED_CORE_BACKENDS = frozenset({
+    "accordin", "mcs_accordin", "mcs_tas_accordin", "ttas_accordin",
+    "reciprocating_accordin", "mcs_tse",
+})
+
+
+def require_available_core_backend(crate: str) -> None:
+    if crate in REMOVED_CORE_BACKENDS:
+        raise RuntimeError(
+            f"{crate} has been removed from the admission-direct workspace. "
+            "This historical preload entrypoint is disabled, including with an existing library. "
+            "Use mcs_accordin_direct or mcs_tas_accordin_direct with a direct-API benchmark."
+        )
+
+
+def require_available_preload(library_name: str) -> None:
+    if library_name.startswith("lib") and library_name.endswith(".so"):
+        require_available_core_backend(library_name[3:-3])
 
 
 def _cpu_list_count(cpu_list: str) -> int:
@@ -323,11 +326,6 @@ def lock_sort_key(lock: str) -> tuple[int, str]:
     if lock in LOCK_ORDER:
         return (LOCK_ORDER.index(lock), lock)
     return (len(LOCK_ORDER), lock)
-
-
-def accordin_width_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    source = os.environ if environ is None else environ
-    return {key: source[key] for key in ACCORDIN_WIDTH_ENV_KEYS if key in source}
 
 
 def is_accordin_lock(lock: str) -> bool:

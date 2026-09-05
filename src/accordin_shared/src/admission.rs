@@ -51,6 +51,13 @@ thread_local! {
     static THREAD_HELD_DEPTH: Cell<u32> = const { Cell::new(0) };
     static THREAD_OUTER_LOCK_ID: Cell<u32> = const { Cell::new(UNMANAGED_LOCK_ID) };
     static THREAD_PREV_OUTERMOST_CLASS: Cell<u32> = const { Cell::new(UNMANAGED_LOCK_ID) };
+    /// A class this thread drew for a lock that never came into existence,
+    /// kept for the next lock this thread creates.
+    ///
+    /// One slot is enough: a thread only ends up with an unused class by losing
+    /// a race to install a lock's state, and it holds no other lock's state
+    /// half-built while it does that.
+    static PARKED_LOCK_CLASS: Cell<u32> = const { Cell::new(UNMANAGED_LOCK_ID) };
 }
 
 #[cfg(test)]
@@ -391,6 +398,13 @@ fn allocate_lock_id() -> u32 {
 /// whole life: nothing here maps a lock back to an id, so no later allocation
 /// can renumber a lock that already exists.
 pub fn allocate_lock_class() -> u32 {
+    // A class this thread already drew and did not use is spent before the
+    // pool is touched again. It was counted and published when it was drawn,
+    // so taking it here neither draws nor publishes anything.
+    if let Some(parked) = take_parked_lock_class() {
+        return parked;
+    }
+
     let lock_id = allocate_lock_id();
     // The probe span follows the ids handed out. Publishing it here rather
     // than from the controller tick covers the fixed-width mode, where the
@@ -404,6 +418,45 @@ pub fn allocate_lock_class() -> u32 {
         LockClassPolicy::Fold => fold_overflow_lock_id(),
         LockClassPolicy::Unmanaged => UNMANAGED_LOCK_ID,
     }
+}
+
+/// Keeps a class whose lock never came into existence for the next lock this
+/// thread creates.
+///
+/// Locks are created by racing to publish their state, and every racer but one
+/// frees the state it built. Without this the losers would each spend a class
+/// out of a pool of `MAX_LOCK_CLASSES`, which a workload whose threads meet at
+/// a barrier burns by construction: the first touch of a shared lock is as
+/// many-way as the barrier is wide. The classes stay dense instead, and
+/// `allocated_class_count()` keeps counting the locks that exist rather than
+/// the attempts that were made to create them.
+///
+/// Only a class the pool still owns is worth keeping. Past the limit every id
+/// is shared already, and handing a shared one on would bias the round-robin
+/// the overflow policy deals them by.
+pub fn release_unused_lock_class(lock_id: u32) {
+    if !managed_lock_id(lock_id) || NEXT_LOCK_ID.load(Ordering::Relaxed) >= MAX_LOCK_CLASSES {
+        return;
+    }
+
+    PARKED_LOCK_CLASS.with(|parked| {
+        if parked.get() == UNMANAGED_LOCK_ID {
+            parked.set(lock_id);
+        }
+    });
+}
+
+/// Spends the parked class, if this thread has one.
+fn take_parked_lock_class() -> Option<u32> {
+    PARKED_LOCK_CLASS.with(|parked| {
+        let lock_id = parked.get();
+        if lock_id == UNMANAGED_LOCK_ID {
+            return None;
+        }
+
+        parked.set(UNMANAGED_LOCK_ID);
+        Some(lock_id)
+    })
 }
 
 /// Managed lock ids handed out so far. Ids are dense from 1 upward and an
@@ -1036,6 +1089,9 @@ pub fn reset_thread_depth_for_test() {
 pub fn reset_lock_id_allocator_for_test() {
     NEXT_LOCK_ID.store(1, Ordering::Relaxed);
     NEXT_OVERFLOW_INDEX.store(0, Ordering::Relaxed);
+    // A class parked from before the reset belongs to the pool that was just
+    // thrown away, so the next allocation draws rather than spends it.
+    PARKED_LOCK_CLASS.with(|parked| parked.set(UNMANAGED_LOCK_ID));
 }
 
 /// Merging and dump gating are forced per thread so that a test never changes
@@ -1096,13 +1152,13 @@ mod tests {
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
-        merge_enabled_with, parse_lock_class_policy, reset_lock_id_allocator_for_test, reset_state,
-        reset_thread_depth_for_test, reset_transient_state, reset_transitions_for_tests,
-        reset_union_find_for_tests, retire_cv_sleep_to_pending, retire_cv_sleep_to_released,
-        set_inactive_queue_seq_ptrs, slow_path_yield_required, take_classes_dirty,
-        take_cond_reacquire_pending_for_scope, token_consumed_for_scope, transition_count_for_test,
-        union_lock_classes, user_lock_id_for_value, user_word_addr, word_for_test,
-        word_with_lock_id,
+        merge_enabled_with, parse_lock_class_policy, release_unused_lock_class,
+        reset_lock_id_allocator_for_test, reset_state, reset_thread_depth_for_test,
+        reset_transient_state, reset_transitions_for_tests, reset_union_find_for_tests,
+        retire_cv_sleep_to_pending, retire_cv_sleep_to_released, set_inactive_queue_seq_ptrs,
+        slow_path_yield_required, take_classes_dirty, take_cond_reacquire_pending_for_scope,
+        token_consumed_for_scope, transition_count_for_test, union_lock_classes,
+        user_lock_id_for_value, user_word_addr, word_for_test, word_with_lock_id,
     };
 
     static INACTIVE_QUEUE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1902,6 +1958,75 @@ mod tests {
         // so the count stops at the managed space.
         allocate_lock_classes(MAX_LOCK_CLASSES as usize + 8);
         assert_eq!(allocated_class_count(), MAX_LOCK_CLASSES - 1);
+    }
+
+    /// A lock that never came into existence gives its class back, and the next
+    /// lock this thread creates spends it instead of drawing another. The pool
+    /// therefore pays for the locks that exist rather than for the attempts at
+    /// creating them, which is what keeps a many-way first touch from eating
+    /// the classes a barrier-wide workload needs.
+    #[test]
+    fn a_class_given_back_unused_is_spent_by_the_next_lock() {
+        let _allocator = isolate_allocator_state(Some(LockClassPolicy::Fold));
+
+        let first = allocate_lock_class();
+        let unused = allocate_lock_class();
+        assert_ne!(first, unused);
+        assert_eq!(allocated_class_count(), 2);
+
+        release_unused_lock_class(unused);
+        assert_eq!(
+            allocated_class_count(),
+            2,
+            "giving a class back neither draws nor unpublishes one"
+        );
+
+        assert_eq!(
+            allocate_lock_class(),
+            unused,
+            "the next lock takes the class that was given back"
+        );
+        assert_eq!(
+            allocated_class_count(),
+            2,
+            "spending the class that was given back draws nothing new"
+        );
+
+        assert_ne!(allocate_lock_class(), unused);
+        assert_eq!(allocated_class_count(), 3);
+    }
+
+    /// Only one class is ever kept, and only a class the pool still owns.
+    /// Everything past the limit is shared already, so keeping one would bias
+    /// the round-robin the overflow policy deals them by rather than save
+    /// anything.
+    #[test]
+    fn only_one_owned_class_is_ever_kept_back() {
+        let _allocator = isolate_allocator_state(Some(LockClassPolicy::Fold));
+
+        let first = allocate_lock_class();
+        let second = allocate_lock_class();
+        release_unused_lock_class(first);
+        release_unused_lock_class(second);
+        assert_eq!(allocate_lock_class(), first);
+        assert_ne!(
+            allocate_lock_class(),
+            second,
+            "the second class given back was dropped rather than queued"
+        );
+
+        release_unused_lock_class(UNMANAGED_LOCK_ID);
+        let before_unmanaged = allocate_lock_class();
+        assert_ne!(before_unmanaged, UNMANAGED_LOCK_ID);
+
+        allocate_lock_classes(MAX_LOCK_CLASSES as usize);
+        let folded = allocate_lock_class();
+        release_unused_lock_class(folded);
+        assert_ne!(
+            allocate_lock_class(),
+            folded,
+            "a shared class is not kept back, so the fold keeps dealing in turn"
+        );
     }
 
     #[test]

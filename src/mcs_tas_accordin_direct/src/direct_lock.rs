@@ -23,9 +23,10 @@ pub struct mcs_tas_accordin_direct_mutex {
     lock: <DirectBackend as MutexHookBackend>::LockState,
     lock_id: u32,
     /// Waiters a cond broadcast parked on this mutex, released one per unlock.
-    /// The staging is an owned handle to a shared block, so a cond still bound
-    /// to this mutex after it is destroyed reads a retired block rather than
-    /// freed memory.
+    /// The staging is created by the first cond wait on this mutex and is an
+    /// owned handle to a shared block from then on, so a cond still bound to
+    /// this mutex after it is destroyed reads a retired block rather than freed
+    /// memory.
     staging: CondStaging,
 }
 
@@ -38,12 +39,14 @@ impl mcs_tas_accordin_direct_mutex {
         }
     }
 
+    /// The mutex as a cond wait sees it, which is the one path that gives the
+    /// mutex a staging block. Every other path reads the staging it finds.
     #[inline(always)]
     fn cond_mutex(&self) -> CondMutex {
         CondMutex::new(
             self.lock_id,
             <DirectBackend as MutexHookBackend>::USES_ADMISSION_SCOPE,
-            self.staging.handle(),
+            self.staging.binding_handle(),
         )
     }
 }
@@ -351,6 +354,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
+    use accordin_shared::mutex_hook::{cv_requeue_counters, set_cv_admission_counters_enabled};
     use accordin_shared::test_support::{await_progress, deadline_in, waking_thread};
 
     use super::{
@@ -507,6 +511,11 @@ mod tests {
         let payload = Arc::new(AtomicU32::new(0));
         let released = Arc::new(AtomicU32::new(0));
 
+        // Chosen before the waiters start: the staging a broadcast parks on is
+        // created by the first wait, and only a run that can requeue creates
+        // one at all.
+        let _guard = waking_thread(requeue);
+
         let threads = (0..waiters)
             .map(|_| {
                 let payload = Arc::clone(&payload);
@@ -523,7 +532,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let _guard = waking_thread(requeue);
         std::thread::sleep(settle);
         unsafe {
             assert_eq!(mcs_tas_accordin_direct_mutex_lock(pair.mutex), 0);
@@ -536,6 +544,10 @@ mod tests {
         for thread in threads {
             thread.join().expect("every waiter should finish");
         }
+        assert!(
+            unsafe { (*pair.mutex).staging.block_created() },
+            "the waits should have given the mutex the stage a broadcast parks on"
+        );
         pair.destroy();
     }
 
@@ -544,9 +556,25 @@ mod tests {
         broadcast_releases_every_waiter(false, 4, Duration::from_millis(50));
     }
 
+    /// The requeue arm has to reach the staging rather than pass through it:
+    /// the waiters are counted onto the mutex's stage, which is what turns the
+    /// broadcast from a wake-all into a paced release.
+    ///
+    /// The per-mutex check inside the shared body is what guards the binding;
+    /// the count below is process-wide and says only that some broadcast of
+    /// this process parked waiters, so it corroborates rather than proves.
     #[test]
     fn direct_cond_broadcast_releases_every_waiter_with_requeue() {
+        set_cv_admission_counters_enabled(true);
+        let before = cv_requeue_counters().requeued;
         broadcast_releases_every_waiter(true, 8, Duration::from_millis(100));
+        let after = cv_requeue_counters().requeued;
+        set_cv_admission_counters_enabled(false);
+
+        assert!(
+            after > before,
+            "the broadcast should have parked its waiters on the mutex staging"
+        );
     }
 
     /// The hand-off is a wake-one, which the staging switch leaves on the plain

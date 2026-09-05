@@ -715,10 +715,15 @@ macro_rules! export_mutex_hooks {
 
             struct HookState {
                 lock: <Backend as MutexHookBackend>::LockState,
+                /// The managed class this lock is admitted through, claimed
+                /// when the state is installed. Installation happens on the
+                /// first acquisition, so the managed classes go to the locks a
+                /// run takes first rather than to the ones it creates first.
                 lock_id: u32,
                 /// Waiters a cond signal parked on this lock, released one per
-                /// unlock. Most hooked mutexes never carry a cond, so the state
-                /// stays on its own cache line and the unlock reads it once.
+                /// unlock. Most hooked mutexes never carry a cond, so the
+                /// staging stays empty here and only a first cond wait gives it
+                /// a cache line of its own.
                 staging: CondStaging,
             }
 
@@ -735,12 +740,14 @@ macro_rules! export_mutex_hooks {
                     }
                 }
 
+                /// The mutex as a cond wait sees it, which is the one path that
+                /// gives the lock a staging block.
                 #[inline(always)]
                 fn cond_mutex(&self) -> CondMutex {
                     CondMutex::new(
                         self.lock_id,
                         Backend::USES_ADMISSION_SCOPE,
-                        self.staging.handle(),
+                        self.staging.binding_handle(),
                     )
                 }
             }
@@ -844,7 +851,18 @@ macro_rules! export_mutex_hooks {
                 staging.drain_one();
             }
 
-            const SENTINEL: usize = 1;
+            /// The value a word holds before its state is installed, which is
+            /// what a zeroed mutex, a `PTHREAD_MUTEX_INITIALIZER` static and a
+            /// destroyed mutex all read as. Anything else in a mutex word is
+            /// the state pointer: a mutex publishes its state in one exchange
+            /// and is never seen part-way through an install.
+            const NO_STATE: usize = 0;
+
+            /// The value a cond word holds while its state is being installed.
+            /// Only the cond word ever takes it, and reading a word against it
+            /// separates an installed state from both an empty word and an
+            /// install in progress.
+            const COND_INSTALLING: usize = 1;
 
             type PthreadMutexInitFn = unsafe extern "C" fn(
                 *mut libc::pthread_mutex_t,
@@ -1067,21 +1085,25 @@ macro_rules! export_mutex_hooks {
                     || $crate::mutex_hook::hooked_mutex_registered(mutex)
             }
 
-            unsafe fn initialize_hook_state(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
+            /// Leaves the mutex in the state a `PTHREAD_MUTEX_INITIALIZER`
+            /// static is already in, so that both kinds of mutex reach their
+            /// first acquisition the same way and that acquisition installs the
+            /// hook state.
+            ///
+            /// A process may create far more mutexes than it ever locks, and one
+            /// that is only ever created then costs its own storage and nothing
+            /// else.
+            unsafe fn clear_hook_state(mutex: *mut libc::pthread_mutex_t) -> libc::c_int {
                 unsafe {
                     if mutex.is_null() {
                         return libc::EINVAL;
                     }
-
-                    let state = Box::new(HookState::new());
-                    let ptr = Box::into_raw(state);
 
                     std::ptr::write_bytes(
                         mutex as *mut u8,
                         0,
                         std::mem::size_of::<libc::pthread_mutex_t>(),
                     );
-                    (*(mutex as *mut usize)) = ptr as usize;
                     0
                 }
             }
@@ -1116,44 +1138,43 @@ macro_rules! export_mutex_hooks {
                 }
 
                 let val = unsafe { state_atomic(mutex) }.load(Ordering::Acquire);
-                if likely(val > SENTINEL) {
+                if likely(val != NO_STATE) {
                     return Ok(val as *mut HookState);
                 }
-                unsafe { ensure_state_slow(mutex, val) }
+                unsafe { ensure_state_slow(mutex) }
             }
 
+            /// Installs the state of a mutex that has none, which every mutex
+            /// reaches once: a static one because it was never created through
+            /// the hook, and a created one because creating it only zeroed it.
+            ///
+            /// Every contender builds a state of its own and races to publish
+            /// it, and the losers free theirs and take the one that landed.
+            /// Nothing here waits on another thread's allocation, so a first
+            /// touch never blocks and `pthread_mutex_trylock` keeps its promise
+            /// of returning either way. A loser gives its managed class back for
+            /// the next lock this thread creates, so racing to create a lock
+            /// costs no more classes than creating it alone would.
             #[cold]
             #[inline(never)]
             unsafe fn ensure_state_slow(
                 mutex: *mut libc::pthread_mutex_t,
-                initial: usize,
             ) -> Result<*mut HookState, libc::c_int> {
                 let atomic = unsafe { state_atomic(mutex) };
-                let mut val = initial;
-                loop {
-                    if val > SENTINEL {
-                        return Ok(val as *mut HookState);
+                let candidate = Box::into_raw(Box::new(HookState::new()));
+                match atomic.compare_exchange(
+                    NO_STATE,
+                    candidate as usize,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => Ok(candidate),
+                    Err(published) => {
+                        let candidate = unsafe { Box::from_raw(candidate) };
+                        $crate::admission::release_unused_lock_class(candidate.lock_id);
+                        drop(candidate);
+                        Ok(published as *mut HookState)
                     }
-
-                    if val == SENTINEL {
-                        spin_loop();
-                        val = atomic.load(Ordering::Acquire);
-                        continue;
-                    }
-
-                    if atomic
-                        .compare_exchange(0, SENTINEL, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        val = atomic.load(Ordering::Acquire);
-                        continue;
-                    }
-
-                    let state = Box::new(HookState::new());
-                    let ptr = Box::into_raw(state);
-
-                    atomic.store(ptr as usize, Ordering::Release);
-                    return Ok(ptr);
                 }
             }
 
@@ -1166,7 +1187,7 @@ macro_rules! export_mutex_hooks {
                 }
 
                 let val = unsafe { cond_atomic(cond) }.load(Ordering::Acquire);
-                if likely(val > SENTINEL) {
+                if likely(val > COND_INSTALLING) {
                     return Ok(val as *mut CondState);
                 }
                 unsafe { ensure_cond_state_slow(cond, val) }
@@ -1181,18 +1202,18 @@ macro_rules! export_mutex_hooks {
                 let atomic = unsafe { cond_atomic(cond) };
                 let mut val = initial;
                 loop {
-                    if val > SENTINEL {
+                    if val > COND_INSTALLING {
                         return Ok(val as *mut CondState);
                     }
 
-                    if val == SENTINEL {
+                    if val == COND_INSTALLING {
                         spin_loop();
                         val = atomic.load(Ordering::Acquire);
                         continue;
                     }
 
                     if atomic
-                        .compare_exchange(0, SENTINEL, Ordering::AcqRel, Ordering::Acquire)
+                        .compare_exchange(0, COND_INSTALLING, Ordering::AcqRel, Ordering::Acquire)
                         .is_err()
                     {
                         val = atomic.load(Ordering::Acquire);
@@ -1230,7 +1251,7 @@ macro_rules! export_mutex_hooks {
                     if $crate::mutex_hook::registered_hook_scope_enabled() {
                         return real_pthread_mutex_init(mutex, attr);
                     }
-                    initialize_hook_state(mutex)
+                    clear_hook_state(mutex)
                 }
             }
 
@@ -1244,16 +1265,11 @@ macro_rules! export_mutex_hooks {
                     }
 
                     let mutex = mutex.cast::<libc::pthread_mutex_t>();
-                    let val = state_atomic(mutex).load(Ordering::Acquire);
-                    if val > SENTINEL {
+                    if state_atomic(mutex).load(Ordering::Acquire) != NO_STATE {
                         if $crate::mutex_hook::registered_hook_scope_enabled() {
                             $crate::mutex_hook::register_hooked_mutex_addr(mutex);
                         }
                         return 0;
-                    }
-
-                    if val == SENTINEL {
-                        return libc::EBUSY;
                     }
 
                     if $crate::mutex_hook::registered_hook_scope_enabled() {
@@ -1263,7 +1279,7 @@ macro_rules! export_mutex_hooks {
                         }
                     }
 
-                    let ret = initialize_hook_state(mutex);
+                    let ret = clear_hook_state(mutex);
                     if ret == 0 && $crate::mutex_hook::registered_hook_scope_enabled() {
                         $crate::mutex_hook::register_hooked_mutex_addr(mutex);
                     }
@@ -1287,9 +1303,9 @@ macro_rules! export_mutex_hooks {
 
                     let atomic = state_atomic(mutex);
                     let val = atomic.load(Ordering::Acquire);
-                    if val > SENTINEL {
+                    if val != NO_STATE {
                         drop(Box::from_raw(val as *mut HookState));
-                        atomic.store(0, Ordering::Release);
+                        atomic.store(NO_STATE, Ordering::Release);
                     }
                     0
                 }
@@ -1314,10 +1330,10 @@ macro_rules! export_mutex_hooks {
 
                     let atomic = state_atomic(mutex);
                     let val = atomic.load(Ordering::Acquire);
-                    if val > SENTINEL {
+                    if val != NO_STATE {
                         let ptr = val as *mut HookState;
                         drop(Box::from_raw(ptr));
-                        atomic.store(0, Ordering::Release);
+                        atomic.store(NO_STATE, Ordering::Release);
                     }
                     0
                 }
@@ -1383,7 +1399,7 @@ macro_rules! export_mutex_hooks {
 
                     let atomic = state_atomic(mutex);
                     let val = atomic.load(Ordering::Acquire);
-                    if val > SENTINEL {
+                    if val != NO_STATE {
                         let state = &*(val as *mut HookState);
                         unlock_with_stats(state);
                         return 0;
@@ -1426,7 +1442,7 @@ macro_rules! export_mutex_hooks {
 
                     let atomic = cond_atomic(cond);
                     let val = atomic.load(Ordering::Acquire);
-                    if val > SENTINEL {
+                    if val > COND_INSTALLING {
                         drop(Box::from_raw(val as *mut CondState));
                         atomic.store(0, Ordering::Release);
                     }

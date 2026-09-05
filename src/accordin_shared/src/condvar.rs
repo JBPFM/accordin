@@ -16,7 +16,7 @@
 //! at once. A signal releases a single waiter and always wakes it. Both forms
 //! are private futex operations on the same words.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::admission;
@@ -121,8 +121,19 @@ fn cv_requeue_enabled() -> bool {
 /// choosing a mode never changes what threads outside it see.
 #[doc(hidden)]
 pub fn force_cv_requeue_for_thread(forced: Option<bool>) {
-    REQUEUE_OVERRIDDEN.store(true, Ordering::Relaxed);
+    announce_cv_requeue_override();
     REQUEUE_FORCED.with(|requeue| requeue.set(forced));
+}
+
+/// Announces that some thread of this process may turn requeueing on, without
+/// deciding for any thread whether it does.
+///
+/// A test that stages waiters by hand needs the staging to be creatable before
+/// it has chosen a mode, and a test that chose one must not have that choice
+/// taken back.
+#[doc(hidden)]
+pub fn announce_cv_requeue_override() {
+    REQUEUE_OVERRIDDEN.store(true, Ordering::Relaxed);
 }
 
 /// Whether anything in this process can ever park a waiter on a stage, and so
@@ -190,12 +201,23 @@ struct StagingWords {
 }
 
 impl CondStagingBlock {
-    fn new() -> Self {
+    const fn new() -> Self {
+        Self::in_state(true)
+    }
+
+    /// The block every destroyed lock leaves in its own word, dead from the
+    /// start. It parks nothing and owes nothing, so it needs no storage of its
+    /// own and every retired lock shares the one.
+    const fn retired() -> Self {
+        Self::in_state(false)
+    }
+
+    const fn in_state(alive: bool) -> Self {
         Self {
             words: CacheAligned(StagingWords {
                 stage: AtomicU32::new(0),
                 staged: AtomicU32::new(0),
-                alive: AtomicBool::new(true),
+                alive: AtomicBool::new(alive),
             }),
         }
     }
@@ -285,11 +307,53 @@ impl CondStagingBlock {
 
 /// The staging a lock owns.
 ///
+/// The block is only reachable through a cond, so a lock no cond ever waits on
+/// has none: the word stays null until a first wait binds one, and every lock
+/// bracket of such a lock reads that null and stops. Most hooked mutexes are
+/// never paired with a cond at all, and the block is a cache line of its own,
+/// so creating one per mutex would spend the larger part of the hook's memory
+/// on locks that can never park anything. A run that can never requeue creates
+/// none at all: nothing would ever park on them.
+///
+/// The block is only ever created by a thread holding the lock, because the
+/// only path that creates one is a cond wait and a cond wait holds the mutex it
+/// is about to release. The drain accounting rests on that: a broadcaster asks
+/// whether an unlock of the bound lock is still coming by asking what this
+/// thread holds, and a block that could appear under a lock this thread does
+/// not hold would make that question unanswerable.
+///
 /// The lock holds the block through this, and dropping it retires the block:
 /// the memory stays for as long as some cond is still bound to it, but nothing
-/// is parked there again.
+/// is parked there again. The destroy leaves the retired block behind in the
+/// word rather than emptying it, so a first binding racing the destroy loses
+/// against a block that is already dead instead of publishing one that no
+/// unlock would ever drain.
+///
+/// A lock that gains its block inside a critical section is not recorded as the
+/// stage the holder holds, because the acquisition that took it read no block.
+/// That is the case a broadcaster does not recognise the lock in, and it costs
+/// one release handed out early, which the drain chain is defined to absorb.
 pub struct CondStaging {
-    block: Arc<CondStagingBlock>,
+    block: AtomicPtr<CondStagingBlock>,
+}
+
+/// The block a destroyed lock publishes in place of its own.
+static RETIRED_STAGING: CondStagingBlock = CondStagingBlock::retired();
+
+/// The published value that stands for a lock whose destroy has already run.
+#[inline(always)]
+fn retired_staging() -> *mut CondStagingBlock {
+    &raw const RETIRED_STAGING as *mut CondStagingBlock
+}
+
+/// The block a binding may use, which a retired lock has none of.
+#[inline(always)]
+fn usable_block(block: *mut CondStagingBlock) -> *const CondStagingBlock {
+    if std::ptr::eq(block, retired_staging()) {
+        return std::ptr::null();
+    }
+
+    block
 }
 
 impl Default for CondStaging {
@@ -299,34 +363,133 @@ impl Default for CondStaging {
 }
 
 impl CondStaging {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            block: Arc::new(CondStagingBlock::new()),
+            block: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
-    /// The handle a cond wait binds to, naming the block a broadcast parks on.
+    /// The handle the lock brackets carry, which names no block until a cond
+    /// has bound one.
     ///
     /// An unlock reads the handle out before it releases the lock, so the
     /// pointer it drains through is one it read while the lock still existed.
+    /// A word left by a destroy names the retired block, which parks nothing
+    /// and drains to nothing, so the brackets need no check of their own for
+    /// the one case that cannot reach them in a correct program anyway.
     #[inline(always)]
     pub fn handle(&self) -> CondStagingRef {
         CondStagingRef {
-            block: Arc::as_ptr(&self.block),
+            block: self.block.load(Ordering::Acquire),
         }
     }
 
+    /// The handle a cond wait binds to, which creates the block if this is the
+    /// first wait to reach the lock and the run can requeue at all.
+    ///
+    /// A cond and its mutex are only ever seen together here, so this is both
+    /// the first point that can tell the lock will carry cond waiters and the
+    /// only path that needs the block to exist.
+    #[inline]
+    pub fn binding_handle(&self) -> CondStagingRef {
+        CondStagingRef {
+            block: self.ensure_block(cv_requeue_possible()),
+        }
+    }
+
+    /// The block, if some cond has bound to this lock and the lock still
+    /// exists.
+    #[inline(always)]
+    fn block(&self) -> Option<&CondStagingBlock> {
+        unsafe { usable_block(self.block.load(Ordering::Acquire)).as_ref() }
+    }
+
+    /// The block to bind to, created on the first binding.
+    ///
+    /// A block only ever exists to be parked on, so a run whose broadcasts can
+    /// never requeue creates none: the binding then names nothing, and the cond
+    /// wakes its waiters as it does with no binding at all.
+    fn ensure_block(&self, requeue_possible: bool) -> *const CondStagingBlock {
+        if !requeue_possible {
+            return std::ptr::null();
+        }
+
+        let block = self.block.load(Ordering::Acquire);
+        if !block.is_null() {
+            return usable_block(block);
+        }
+
+        self.install_block()
+    }
+
+    /// Publishes a block for the lock, keeping whatever a racing first waiter
+    /// published instead if it lost. The reference the loser created is given
+    /// back here, so exactly one block is ever owned per lock.
+    ///
+    /// A destroy publishes the retired block through the same word, so a
+    /// binding that loses to one is told there is no staging rather than
+    /// installing a block into a lock that is already gone.
+    #[cold]
+    #[inline(never)]
+    fn install_block(&self) -> *const CondStagingBlock {
+        let candidate = Arc::into_raw(Arc::new(CondStagingBlock::new())).cast_mut();
+        match self.block.compare_exchange(
+            std::ptr::null_mut(),
+            candidate,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => candidate,
+            Err(published) => {
+                unsafe { drop(Arc::from_raw(candidate.cast_const())) };
+                usable_block(published)
+            }
+        }
+    }
+
+    /// Whether a cond has bound to this lock, which the backend tests read to
+    /// check that a wait reached the staging at all.
+    #[doc(hidden)]
+    pub fn block_created(&self) -> bool {
+        self.block().is_some()
+    }
+
     /// Waiters parked on the stage that no release has claimed yet, which the
-    /// staging tests account against the wakes they expect.
+    /// staging tests account against the wakes they expect. A lock with no
+    /// block has nothing parked on it and never had.
     #[doc(hidden)]
     pub fn staged_count(&self) -> u32 {
-        self.block.staged_count()
+        self.block().map_or(0, CondStagingBlock::staged_count)
+    }
+
+    /// A reference of the caller's own to the block, for tests that account the
+    /// references a binding takes and gives back.
+    #[cfg(test)]
+    fn block_arc(&self) -> Arc<CondStagingBlock> {
+        let block = self.ensure_block(true);
+        assert!(!block.is_null(), "the lock should still be able to bind");
+        unsafe {
+            Arc::increment_strong_count(block);
+            Arc::from_raw(block)
+        }
     }
 }
 
 impl Drop for CondStaging {
+    /// Takes the block out of the word and puts the retired one in its place,
+    /// in one exchange: a first binding running concurrently either published
+    /// before this and is retired here, or finds the retired block and binds to
+    /// nothing. Neither order leaves a live block behind a destroyed lock.
     fn drop(&mut self) {
-        self.block.retire();
+        let block = self.block.swap(retired_staging(), Ordering::AcqRel);
+        if usable_block(block).is_null() {
+            return;
+        }
+
+        unsafe {
+            (*block).retire();
+            drop(Arc::from_raw(block.cast_const()));
+        }
     }
 }
 
@@ -340,10 +503,15 @@ thread_local! {
     /// let a broadcaster leave the release to an unlock of the other lock,
     /// which never drains this one.
     ///
-    /// Only the outermost hold is published. A broadcaster holding an inner lock
-    /// reads whatever it entered first, does not recognise the block, and
-    /// releases one waiter early, which costs the pacing of that one release
-    /// and nothing else.
+    /// The outermost hold that has a block to name is the one published, which
+    /// is the outermost hold of all whenever it carries a stage. Locks with no
+    /// staging pass the record on rather than claiming it, so a thread holding
+    /// one of those outside a lock that does carry a stage publishes the inner
+    /// block; that is the block a broadcast of theirs could park on, so the
+    /// record still answers the question it is read for. A broadcaster holding
+    /// an inner lock whose outer one also has a block reads the outer one, does
+    /// not recognise the inner block, and releases one waiter early, which
+    /// costs the pacing of that one release and nothing else.
     static HELD_STAGING: std::cell::Cell<*const CondStagingBlock> =
         const { std::cell::Cell::new(std::ptr::null()) };
 }
@@ -358,6 +526,10 @@ thread_local! {
 /// wait and keeps it; rebinding to a different mutex is unsupported and costs
 /// the cond its staging rather than parking a waiter on a lock that waiter
 /// never releases.
+///
+/// The handle names no block at all for a lock no cond has waited on, which is
+/// what every bracket of such a lock reads. Each of the three operations below
+/// is then the gate and a null pointer.
 #[derive(Clone, Copy)]
 pub struct CondStagingRef {
     block: *const CondStagingBlock,
@@ -387,6 +559,10 @@ impl CondStagingRef {
 
     #[inline(never)]
     fn publish_hold_outlined(&self) {
+        if self.block.is_null() {
+            return;
+        }
+
         HELD_STAGING.with(|held| {
             if held.get().is_null() {
                 held.set(self.block);
@@ -408,6 +584,10 @@ impl CondStagingRef {
 
     #[inline(never)]
     fn clear_hold_outlined(&self) {
+        if self.block.is_null() {
+            return;
+        }
+
         HELD_STAGING.with(|held| {
             if std::ptr::eq(held.get(), self.block) {
                 held.set(std::ptr::null());
@@ -1075,8 +1255,8 @@ mod tests {
 
     use super::{
         CondMutex, CondRelock, CondStaging, CondStagingBlock, CondStagingRef, CondState,
-        force_cv_requeue_for_thread, force_cv_route_for_test, futex_wake, publish_sleep_state,
-        relock_mode, retire_sleep_state, timedwait, wait,
+        announce_cv_requeue_override, force_cv_requeue_for_thread, force_cv_route_for_test,
+        futex_wake, publish_sleep_state, relock_mode, retire_sleep_state, timedwait, wait,
     };
     use crate::admission;
     use crate::mutex_hook::{cv_requeue_counters, set_cv_admission_counters_enabled};
@@ -1413,7 +1593,11 @@ mod tests {
     }
 
     impl SpinMutex {
+        /// Every lock here stands in for one a broadcast may park on, so the
+        /// announcement that makes a stage creatable is part of creating one.
+        /// It leaves the mode each test chooses for itself alone.
         fn new() -> Self {
+            announce_cv_requeue_override();
             Self {
                 locked: AtomicBool::new(false),
                 staging: CondStaging::new(),
@@ -1435,7 +1619,16 @@ mod tests {
         }
 
         fn cond_mutex(&self, lock_id: u32) -> CondMutex {
-            CondMutex::new(lock_id, true, self.staging.handle())
+            CondMutex::new(lock_id, true, self.staging.binding_handle())
+        }
+
+        /// The staging block of this lock, created as a first cond wait would
+        /// create it, so that a test can stage waiters without one.
+        fn block(&self) -> &CondStagingBlock {
+            self.staging.binding_handle();
+            self.staging
+                .block()
+                .expect("binding the staging creates the block")
         }
     }
 
@@ -1551,14 +1744,16 @@ mod tests {
     #[test]
     fn a_staged_count_left_too_high_costs_empty_wakes_and_nothing_else() {
         let staging = CondStaging::new();
-        staging.block.stage_waiters(2);
+        staging.ensure_block(true);
+        let block = staging.block().expect("the binding creates the block");
+        block.stage_waiters(2);
         assert_eq!(staging.staged_count(), 2);
 
-        staging.block.drain_one();
-        staging.block.drain_one();
+        block.drain_one();
+        block.drain_one();
         assert_eq!(staging.staged_count(), 0);
 
-        staging.block.drain_one();
+        block.drain_one();
         assert_eq!(staging.staged_count(), 0);
     }
 
@@ -1569,6 +1764,174 @@ mod tests {
     fn staging_words_keep_their_own_cache_line() {
         assert_eq!(std::mem::align_of::<CondStagingBlock>(), 64);
         assert_eq!(std::mem::size_of::<CondStagingBlock>(), 64);
+    }
+
+    /// A lock only ever parks waiters that some cond hands it, so the block is
+    /// worth its cache line only once a cond has waited on the lock. Ordinary
+    /// acquisitions leave it uncreated however many of them run.
+    #[test]
+    fn a_lock_creates_its_staging_on_the_first_cond_binding() {
+        let mutex = SpinMutex::new();
+        let cond = CondState::new();
+        let _guard = waking_thread(true);
+
+        mutex.lock();
+        mutex.unlock();
+        assert!(
+            mutex.staging.block().is_none(),
+            "a lock no cond waits on never carries a stage"
+        );
+
+        cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+        let block = mutex
+            .staging
+            .block()
+            .expect("the first binding creates the block");
+
+        let other = CondState::new();
+        other.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+        assert!(
+            std::ptr::eq(
+                mutex
+                    .staging
+                    .block()
+                    .expect("the block outlives the first binding"),
+                block
+            ),
+            "every cond of a lock binds to the one block the lock owns"
+        );
+        assert!(std::ptr::eq(
+            cond.bound
+                .parking_target()
+                .expect("the first cond stays bound"),
+            other
+                .bound
+                .parking_target()
+                .expect("the second cond binds to the same lock")
+        ));
+    }
+
+    /// A block exists to be parked on, so a run whose broadcasts can never
+    /// requeue never creates one, however many conds wait on the lock.
+    #[test]
+    fn a_run_that_can_never_requeue_creates_no_staging() {
+        let staging = CondStaging::new();
+
+        assert!(staging.ensure_block(false).is_null());
+        assert!(
+            !staging.block_created(),
+            "a wait that can never be parked leaves the lock without a stage"
+        );
+
+        assert!(!staging.ensure_block(true).is_null());
+        assert!(staging.block_created());
+    }
+
+    /// A lock's destroy and a first binding on it can race. The destroy leaves
+    /// the retired block in the word rather than emptying it, so the binding
+    /// always loses: a block published after the destroy would take waiters
+    /// that no unlock is left to release.
+    #[test]
+    fn a_binding_that_arrives_after_the_destroy_finds_no_staging() {
+        announce_cv_requeue_override();
+        let mut staging = std::mem::ManuallyDrop::new(CondStaging::new());
+        // The destroy of the lock, with the word it leaves behind still
+        // readable by the binding that lost to it.
+        unsafe { std::ptr::drop_in_place(&mut *staging) };
+
+        assert!(
+            staging.ensure_block(true).is_null(),
+            "a destroyed lock never gains a stage"
+        );
+        assert!(!staging.block_created());
+
+        let cond = CondState::new();
+        cond.bind_staging(staging.binding_handle());
+        assert!(
+            cond.bound.parking_target().is_none(),
+            "a cond that binds after the destroy wakes its waiters instead"
+        );
+    }
+
+    /// The block of a lock whose first cond wait happens inside a critical
+    /// section is created while the lock is held, so the acquisition that took
+    /// it recorded no stage and a broadcast from inside that same section does
+    /// not recognise the lock it holds. The release it hands out early is the
+    /// fallback the drain chain absorbs: nothing stays parked.
+    #[test]
+    fn a_stage_created_inside_the_critical_section_costs_one_early_release() {
+        let mutex = SpinMutex::new();
+        let cond = CondState::new();
+        let _guard = waking_thread(true);
+
+        mutex.lock();
+        assert!(
+            mutex.staging.block().is_none(),
+            "the acquisition reads a lock with no stage"
+        );
+
+        cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+        mutex
+            .staging
+            .block()
+            .expect("the wait creates the stage under the held lock")
+            .stage_waiters(1);
+
+        cond.waiters.fetch_add(1, Ordering::AcqRel);
+        cond.broadcast();
+        assert_eq!(
+            mutex.staging.staged_count(),
+            0,
+            "the broadcaster does not recognise the stage it gave the lock and releases the waiter itself"
+        );
+
+        mutex.unlock();
+        assert_eq!(mutex.staging.staged_count(), 0);
+    }
+
+    /// The first waits of two conds on one lock can be concurrent, and the
+    /// stage they park on has to be the same block: two blocks would leave the
+    /// unlock draining one of them and the other's waiters unreleased.
+    #[test]
+    fn racing_first_bindings_converge_on_one_block() {
+        const BINDERS: usize = 8;
+
+        let mutex = Arc::new(SpinMutex::new());
+        let barrier = Arc::new(std::sync::Barrier::new(BINDERS));
+
+        let binders = (0..BINDERS)
+            .map(|_| {
+                let mutex = Arc::clone(&mutex);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let cond = CondState::new();
+                    cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
+                    cond.bound
+                        .parking_target()
+                        .expect("every binder binds to the lock")
+                        as *const CondStagingBlock as usize
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let bound = binders
+            .into_iter()
+            .map(|binder| binder.join().expect("every binder should finish"))
+            .collect::<Vec<_>>();
+
+        let block = mutex.staging.block().expect("the lock has its block") as *const _ as usize;
+        for observed in bound {
+            assert_eq!(
+                observed, block,
+                "the losers of the install take the block that won"
+            );
+        }
+        assert_eq!(
+            Arc::strong_count(&mutex.staging.block_arc()),
+            2,
+            "the blocks the losers created are given back, leaving the lock's own"
+        );
     }
 
     #[test]
@@ -1584,10 +1947,7 @@ mod tests {
             .bound
             .parking_target()
             .expect("the wait should have bound");
-        assert!(std::ptr::eq(
-            bound,
-            std::sync::Arc::as_ptr(&mutex.staging.block)
-        ));
+        assert!(std::ptr::eq(bound, mutex.block()));
     }
 
     #[test]
@@ -1656,7 +2016,7 @@ mod tests {
     fn a_conflicting_binding_still_releases_its_reference() {
         let first = SpinMutex::new();
         let second = SpinMutex::new();
-        let block = std::sync::Arc::clone(&first.staging.block);
+        let block = first.staging.block_arc();
 
         {
             let cond = CondState::new();
@@ -1682,7 +2042,7 @@ mod tests {
         let cond = CondState::new();
 
         cond.bind_staging(first.cond_mutex(SMOKE_LOCK_ID).staging);
-        first.staging.block.stage_waiters(1);
+        first.block().stage_waiters(1);
         cond.bind_staging(second.cond_mutex(SMOKE_LOCK_ID).staging);
         assert!(
             cond.bound.parking_target().is_none(),
@@ -1957,7 +2317,7 @@ mod tests {
 
         // Past the unlock, so the drain it ran cannot spend the release below.
         await_progress(&parked, 1, "the waiter reaching its sleep");
-        shared.mutex.staging.block.stage_waiters(1);
+        shared.mutex.block().stage_waiters(1);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while shared.mutex.staging.staged_count() != 0 {
@@ -1987,7 +2347,7 @@ mod tests {
         let _guard = waking_thread(true);
 
         cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
-        mutex.staging.block.stage_waiters(1);
+        mutex.block().stage_waiters(1);
 
         // A registration with no sleeper behind it: the requeue finds nothing
         // to move, so the staged waiter is all this broadcast can release.
@@ -2011,7 +2371,7 @@ mod tests {
         let _guard = waking_thread(true);
 
         cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
-        mutex.staging.block.stage_waiters(1);
+        mutex.block().stage_waiters(1);
 
         mutex.lock();
         cond.waiters.fetch_add(1, Ordering::AcqRel);
@@ -2039,7 +2399,7 @@ mod tests {
         let _guard = waking_thread(true);
 
         cond.bind_staging(bound.cond_mutex(SMOKE_LOCK_ID).staging);
-        bound.staging.block.stage_waiters(1);
+        bound.block().stage_waiters(1);
 
         // Both locks carry SMOKE_LOCK_ID, which is what folding does to them.
         class_mate.lock();
@@ -2062,7 +2422,7 @@ mod tests {
         let block = {
             let mutex = SpinMutex::new();
             cond.bind_staging(mutex.cond_mutex(SMOKE_LOCK_ID).staging);
-            let block = Arc::clone(&mutex.staging.block);
+            let block = mutex.staging.block_arc();
             assert!(block.alive());
             block
         };
@@ -2087,7 +2447,7 @@ mod tests {
     #[test]
     fn destroying_a_mutex_releases_what_is_staged_on_it() {
         let mutex = SpinMutex::new();
-        let block = Arc::clone(&mutex.staging.block);
+        let block = mutex.staging.block_arc();
         block.stage_waiters(2);
 
         drop(mutex);

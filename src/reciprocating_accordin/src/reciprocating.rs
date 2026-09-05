@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::admission::{
     mark_critical_section_entered, mark_critical_section_exit, mark_slow_path_pending,
+    wait_for_slow_path_admission,
 };
 use crate::arch::{CacheAligned, pause};
 use crate::lock_backend::LockBackend;
@@ -102,10 +103,13 @@ impl ReciprocatingLockRaw {
         ((ptr as usize) & !1usize) as *mut WaitElement
     }
 
+    /// The acquisition that follows swaps this thread's element into the tail,
+    /// so the wait for a grant belongs here: nothing may be published into the
+    /// queue before the scheduler has admitted the thread that publishes it.
     #[inline(always)]
     fn ensure_slow_path_admission(&self) {
         mark_slow_path_pending();
-        std::thread::yield_now();
+        wait_for_slow_path_admission();
     }
 
     #[cfg_attr(feature = "perf-symbols", inline(never))]

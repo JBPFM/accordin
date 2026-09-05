@@ -626,6 +626,16 @@ fn print_cv_admission_counters() {
         &mutex_hook::WRITER_EVENT_FIELD_NAMES,
         &mutex_hook::writer_event_field_values(),
     );
+    print_counter_line(
+        "admission_marks",
+        &mutex_hook::ADMISSION_MARK_FIELD_NAMES,
+        &mutex_hook::admission_mark_field_values(),
+    );
+    print_counter_line(
+        "admission_gate",
+        &mutex_hook::ADMISSION_GATE_FIELD_NAMES,
+        &mutex_hook::admission_gate_field_values(),
+    );
 }
 
 fn print_bpf_routing_counters() {

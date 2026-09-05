@@ -1,7 +1,9 @@
 use std::cell::Cell;
 use std::sync::Mutex;
+use std::sync::Once;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 const IN_CRITICAL_SECTION: u32 = 1 << 0;
 const SLOW_PATH_PENDING: u32 = 1 << 1;
@@ -27,6 +29,22 @@ pub const USER_ADMISSION_LOCK_ID_SHIFT: u32 = 4;
 pub const MAX_LOCK_CLASSES: u32 = 64;
 pub const UNMANAGED_LOCK_ID: u32 = 0;
 pub const DISABLE_ADMISSION_ENV: &str = "ACCORDIN_DISABLE_ADMISSION";
+/// Turns the cross-class token preservation experiment on. Not prefixed by a
+/// backend name: every hook library shares this admission word, and a run
+/// compares the two arms by setting the one switch.
+pub const PRESERVE_CROSS_CLASS_TOKEN_ENV: &str = "ACCORDIN_PRESERVE_CROSS_CLASS_TOKEN";
+/// Holds a managed slow path back until the scheduler admits it, so that a
+/// thread only ever publishes a queue node while it is on a CPU the scheduler
+/// granted it. Default on; `0` turns it off for the comparison arm.
+const ADMISSION_GATE_ENV: &str = "ACCORDIN_ADMISSION_GATE";
+/// Longest a gated thread waits for a grant before it publishes unadmitted.
+const ADMISSION_GATE_TIMEOUT_MS_ENV: &str = "ACCORDIN_ADMISSION_GATE_TIMEOUT_MS";
+const ADMISSION_GATE_TIMEOUT_DEFAULT_MS: u32 = 1000;
+/// Gate iterations between two clock reads. The wait is a yield loop, so the
+/// timeout only has to be observed within a scheduling round rather than
+/// exactly, and reading the clock once per iteration would cost more than the
+/// iteration it guards.
+const ADMISSION_GATE_TIMEOUT_CHECK_INTERVAL: u32 = 64;
 const WIDTH_MERGE_ENV: &str = "ACCORDIN_WIDTH_MERGE";
 const DUMP_DEPENDENCY_ENV: &str = "ACCORDIN_DUMP_DEPENDENCY";
 const WIDTH_OVERFLOW_POLICY_ENV: &str = "ACCORDIN_WIDTH_OVERFLOW_POLICY";
@@ -39,12 +57,25 @@ static NEXT_LOCK_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_OVERFLOW_INDEX: AtomicU32 = AtomicU32::new(0);
 static INACTIVE_ENQUEUE_SEQ_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
 static INACTIVE_EMPTY_SEQ_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
+/// The scheduler's per-CPU admission owner slots: slot `cpu` names the tid the
+/// scheduler granted that CPU to, and a granted task always runs on the CPU its
+/// grant names. Reading `slots[sched_getcpu()]` is therefore how a thread asks
+/// whether it is admitted right now.
+static CPU_OWNER_SLOTS_PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
+static CPU_OWNER_SLOTS_LEN: AtomicUsize = AtomicUsize::new(0);
 
 static LOCK_CLASS_PARENT: [AtomicU8; CLASS_COUNT] = identity_lock_classes();
 static LOCK_CLASS_MERGE_LOCK: Mutex<()> = Mutex::new(());
 static CLASSES_DIRTY: AtomicBool = AtomicBool::new(false);
 static TRANSITION_COUNTS: [[AtomicU32; CLASS_COUNT]; CLASS_COUNT] =
     [const { [const { AtomicU32::new(0) }; CLASS_COUNT] }; CLASS_COUNT];
+
+#[cfg(test)]
+thread_local! {
+    static PRESERVE_CROSS_CLASS_TOKEN_FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+    static ADMISSION_GATE_FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+    static ADMISSION_GATE_TIMEOUT_FORCED: Cell<Option<Duration>> = const { Cell::new(None) };
+}
 
 thread_local! {
     static USER_ADMISSION_WORD: AtomicU32 = const { AtomicU32::new(0) };
@@ -58,6 +89,24 @@ thread_local! {
     /// a race to install a lock's state, and it holds no other lock's state
     /// half-built while it does that.
     static PARKED_LOCK_CLASS: Cell<u32> = const { Cell::new(UNMANAGED_LOCK_ID) };
+    /// This thread's kernel tid, which the gate compares an owner slot against.
+    /// A tid never changes for the life of a thread and is never 0, so 0 stands
+    /// for "not looked up yet".
+    static CACHED_TID: Cell<u32> = const { Cell::new(0) };
+    /// Whether this thread's admission word reached the scheduler's thread map.
+    /// The scheduler cannot grant to a thread it cannot read, so a thread whose
+    /// registration failed must never be held at the gate.
+    static SCHEDULER_REGISTERED: Cell<bool> = const { Cell::new(false) };
+    /// Set by a gate wait that expired, and cleared by the next grant this
+    /// thread is observed to hold.
+    ///
+    /// An ejected scheduler is invisible from userspace: the owner slots stay
+    /// mapped and readable, and nothing withdraws the pointer, so a wait that
+    /// keeps expiring is the only signal that grants have stopped. Left ungated
+    /// for that, every contended acquisition would pay the whole timeout. While
+    /// this is set the gate probes once and lets the caller through, and only a
+    /// grant actually observed puts the thread back under the gate.
+    static GATE_DISARMED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -91,6 +140,99 @@ fn admission_enabled() -> bool {
     static ADMISSION_ENABLED: OnceLock<bool> = OnceLock::new();
 
     *ADMISSION_ENABLED.get_or_init(|| !crate::env::env_flag(DISABLE_ADMISSION_ENV))
+}
+
+fn preserve_cross_class_token_env_enabled() -> bool {
+    static PRESERVE_CROSS_CLASS_TOKEN: OnceLock<bool> = OnceLock::new();
+
+    *PRESERVE_CROSS_CLASS_TOKEN.get_or_init(|| crate::env::env_flag(PRESERVE_CROSS_CLASS_TOKEN_ENV))
+}
+
+/// Whether a slow-path mark carries a consumed token across a change of lock
+/// class. The arm is chosen per thread in tests so that a test picking one
+/// never changes what concurrently running tests see.
+#[cfg(test)]
+#[inline(always)]
+fn preserve_cross_class_token_enabled() -> bool {
+    PRESERVE_CROSS_CLASS_TOKEN_FORCED
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(preserve_cross_class_token_env_enabled)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn preserve_cross_class_token_enabled() -> bool {
+    preserve_cross_class_token_env_enabled()
+}
+
+#[cfg(test)]
+fn force_preserve_cross_class_token_for_test(forced: Option<bool>) {
+    PRESERVE_CROSS_CLASS_TOKEN_FORCED.with(|preserve| preserve.set(forced));
+}
+
+fn gate_env_enabled() -> bool {
+    static GATE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *GATE_ENABLED.get_or_init(|| crate::env::env_flag_default_on(ADMISSION_GATE_ENV))
+}
+
+/// Whether a managed slow path waits for its grant before it publishes. The arm
+/// is chosen per thread in tests so that a test picking one never changes what
+/// concurrently running tests see.
+#[cfg(test)]
+#[inline(always)]
+fn gate_enabled() -> bool {
+    ADMISSION_GATE_FORCED
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(gate_env_enabled)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn gate_enabled() -> bool {
+    gate_env_enabled()
+}
+
+#[cfg(test)]
+fn force_gate_for_test(forced: Option<bool>) {
+    ADMISSION_GATE_FORCED.with(|gate| gate.set(forced));
+}
+
+fn gate_timeout_env() -> Duration {
+    static GATE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
+    *GATE_TIMEOUT.get_or_init(|| {
+        Duration::from_millis(u64::from(crate::env::env_u32_clamped(
+            ADMISSION_GATE_TIMEOUT_MS_ENV,
+            ADMISSION_GATE_TIMEOUT_DEFAULT_MS,
+            0,
+            u32::MAX,
+        )))
+    })
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn gate_timeout() -> Duration {
+    ADMISSION_GATE_TIMEOUT_FORCED
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(gate_timeout_env)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn gate_timeout() -> Duration {
+    gate_timeout_env()
+}
+
+#[cfg(test)]
+fn force_gate_timeout_for_test(forced: Option<Duration>) {
+    ADMISSION_GATE_TIMEOUT_FORCED.with(|timeout| timeout.set(forced));
+}
+
+#[cfg(test)]
+fn rearm_gate_for_test() {
+    GATE_DISARMED.with(|disarmed| disarmed.set(false));
 }
 
 #[inline(always)]
@@ -481,6 +623,207 @@ pub fn set_inactive_queue_seq_ptrs(enqueue_seq: *mut u32, empty_seq: *mut u32) {
     INACTIVE_EMPTY_SEQ_PTR.store(empty_seq, Ordering::Release);
 }
 
+/// Installs the scheduler's per-CPU owner slots. The length is published before
+/// the pointer and withdrawn after it, so a reader that finds a pointer always
+/// finds the length that belongs to it.
+#[doc(hidden)]
+pub fn set_cpu_owner_slots(ptr: *mut u32, len: usize) {
+    if ptr.is_null() {
+        CPU_OWNER_SLOTS_PTR.store(ptr, Ordering::Release);
+        CPU_OWNER_SLOTS_LEN.store(len, Ordering::Release);
+        return;
+    }
+
+    CPU_OWNER_SLOTS_LEN.store(len, Ordering::Release);
+    CPU_OWNER_SLOTS_PTR.store(ptr, Ordering::Release);
+}
+
+/// Drops everything this thread believes about its own identity in the
+/// scheduler. A fork keeps the owner slots mapped and the caches filled while
+/// giving the child a tid of its own, so a child that kept them would compare
+/// every slot against its parent's tid and never match.
+extern "C" fn forget_scheduler_identity_after_fork() {
+    CACHED_TID.with(|cached| cached.set(0));
+    SCHEDULER_REGISTERED.with(|registered| registered.set(false));
+    GATE_DISARMED.with(|disarmed| disarmed.set(false));
+}
+
+fn arm_fork_handler() {
+    static FORK_HANDLER: Once = Once::new();
+
+    FORK_HANDLER.call_once(|| {
+        unsafe {
+            libc::pthread_atfork(None, None, Some(forget_scheduler_identity_after_fork));
+        };
+    });
+}
+
+#[inline(always)]
+fn cached_tid() -> u32 {
+    CACHED_TID.with(|cached| {
+        let tid = cached.get();
+        if tid != 0 {
+            return tid;
+        }
+
+        // Only the forking thread survives into the child, so a handler that
+        // clears this cache is enough to cover every thread the child has.
+        arm_fork_handler();
+        let tid = crate::mutex_hook::current_tid();
+        cached.set(tid);
+        tid
+    })
+}
+
+/// Records whether this thread's admission word reached the scheduler.
+#[doc(hidden)]
+pub fn set_scheduler_registered(registered: bool) {
+    SCHEDULER_REGISTERED.with(|flag| flag.set(registered));
+}
+
+#[inline(always)]
+fn scheduler_registered() -> bool {
+    SCHEDULER_REGISTERED.with(std::cell::Cell::get)
+}
+
+/// Whether the scheduler currently holds a grant for this thread on the CPU it
+/// is running on, or `None` when nothing could grant one here.
+///
+/// A thread the scheduler never took into its map is `None` for the same reason
+/// an absent pointer is: it is outside what the scheduler decides about, so a
+/// grant for it is never coming.
+///
+/// Both races this read can lose are safe. A migration between the CPU query and
+/// the slot read reads another CPU's slot and costs one more yield; a read that
+/// misses a concurrent release reports a grant that has just gone, which
+/// degrades to the unadmitted publish that happened before the gate existed.
+#[inline(always)]
+fn admitted_on_current_cpu() -> Option<bool> {
+    let slots = CPU_OWNER_SLOTS_PTR.load(Ordering::Acquire);
+    if slots.is_null() || !scheduler_registered() {
+        return None;
+    }
+
+    let len = CPU_OWNER_SLOTS_LEN.load(Ordering::Acquire);
+    let cpu = unsafe { libc::sched_getcpu() };
+    if cpu < 0 || cpu as usize >= len {
+        return None;
+    }
+
+    let owner = unsafe { slots.add(cpu as usize).read_volatile() };
+    Some(owner == cached_tid())
+}
+
+/// Whether the gate can hold a slow path: admission is in play, the gate is
+/// switched on, and the scheduler has published the slots a grant would show up
+/// in.
+#[inline(always)]
+fn gate_armed() -> bool {
+    admission_enabled() && gate_enabled() && !CPU_OWNER_SLOTS_PTR.load(Ordering::Acquire).is_null()
+}
+
+/// How a gate wait ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateOutcome {
+    /// The gate is switched off, so the caller publishes as it did without it.
+    Disabled,
+    /// Nothing grants for this thread on this CPU, so a wait here could never
+    /// end.
+    Bypassed,
+    Admitted,
+    /// The grant never arrived. Publishing unadmitted is the liveness guard: a
+    /// thread that waits forever holds up the lock it is queueing for as surely
+    /// as an off-CPU queue head does.
+    TimedOut,
+    /// An earlier wait expired, so this thread only probed and went on. See
+    /// `GATE_DISARMED`.
+    Disarmed,
+}
+
+/// Holds a managed slow path until the scheduler admits this thread.
+///
+/// Taking the backend lock publishes this thread's node into the lock's queue,
+/// and a thread the scheduler has not admitted may be sitting in an inactive
+/// DSQ: its node would then hold the queue head off-CPU for as long as that DSQ
+/// goes unserved. Waiting for the grant first keeps every published node on a
+/// thread the scheduler is running.
+///
+/// Three things end a wait short of a grant, and all three are bounded by the
+/// timeout and the disarm that follows it:
+/// - a spinner that blocks involuntarily — a page fault, a signal — gives its
+///   grant back at the stop and may be parked once when it wakes, which the
+///   wake path and the running-hook grant retry recover from;
+/// - a grant made for one CPU while the thread runs on another, which the
+///   cpumask and offline races can leave behind;
+/// - a scheduler that stopped granting altogether, which userspace cannot see
+///   any other way.
+///
+/// Re-acquisitions that enter as `AlreadyAdmitted` carry their decision in the
+/// user word rather than in an owner slot and never reach here, so they stay
+/// outside the invariant this enforces.
+fn wait_for_admission_grant() -> GateOutcome {
+    if !admission_enabled() || !gate_enabled() {
+        return GateOutcome::Disabled;
+    }
+
+    let disarmed = GATE_DISARMED.with(std::cell::Cell::get);
+    let mut waiting_since = None;
+    let mut iterations: u32 = 0;
+    loop {
+        match admitted_on_current_cpu() {
+            None => {
+                crate::mutex_hook::record_admission_gate_bypass();
+                return GateOutcome::Bypassed;
+            }
+            Some(true) => {
+                if disarmed {
+                    GATE_DISARMED.with(|flag| flag.set(false));
+                }
+                return GateOutcome::Admitted;
+            }
+            Some(false) => {}
+        }
+
+        // One probe is all a disarmed thread pays, and a grant it happens to
+        // see is what puts it back under the gate.
+        if disarmed {
+            return GateOutcome::Disarmed;
+        }
+
+        let since = *waiting_since.get_or_insert_with(Instant::now);
+        iterations = iterations.wrapping_add(1);
+        crate::mutex_hook::record_admission_gate_wait_loop();
+        if iterations.is_multiple_of(ADMISSION_GATE_TIMEOUT_CHECK_INTERVAL)
+            && since.elapsed() >= gate_timeout()
+        {
+            GATE_DISARMED.with(|flag| flag.set(true));
+            crate::mutex_hook::record_admission_gate_timeout();
+            return GateOutcome::TimedOut;
+        }
+
+        std::thread::yield_now();
+    }
+}
+
+/// Prepares a marked slow path for the acquisition that follows it: the yield
+/// that gives the scheduler a chance to act on the mark, the token release that
+/// the yield makes safe, and the wait for the grant.
+#[inline(always)]
+pub fn wait_for_slow_path_admission_for_scope(scope: LockAdmissionScope) {
+    std::thread::yield_now();
+    clear_token_consumed_for_scope(scope);
+    wait_for_admission_grant();
+}
+
+/// The same preparation for a backend that publishes one admission word for
+/// every lock rather than one per lock class.
+#[inline(always)]
+pub fn wait_for_slow_path_admission() {
+    std::thread::yield_now();
+    clear_token_consumed();
+    wait_for_admission_grant();
+}
+
 #[inline(always)]
 fn inactive_queue_idle() -> Option<bool> {
     let enqueue_seq = INACTIVE_ENQUEUE_SEQ_PTR.load(Ordering::Acquire);
@@ -496,6 +839,15 @@ fn inactive_queue_idle() -> Option<bool> {
 
 #[inline(always)]
 fn slow_path_yield_required(token_consumed: bool) -> bool {
+    // The skip below publishes with the consumed token still in the word, and
+    // that word is what the scheduler reclaims a slot from: the thread can be
+    // parked with its node already in the queue, which is the state the gate
+    // exists to rule out. So the skip only stands while the gate is not armed,
+    // which also keeps the two arms comparable through the one switch.
+    if gate_armed() {
+        return true;
+    }
+
     if token_consumed && inactive_queue_idle().is_some_and(|idle| idle) {
         return false;
     }
@@ -537,8 +889,7 @@ pub fn mark_slow_path_pending_for_scope(scope: LockAdmissionScope) -> bool {
 pub fn prepare_slow_path_admission() {
     let consumed = token_consumed();
     if mark_slow_path_pending() && slow_path_yield_required(consumed) {
-        std::thread::yield_now();
-        clear_token_consumed();
+        wait_for_slow_path_admission();
     }
 }
 
@@ -546,8 +897,7 @@ pub fn prepare_slow_path_admission() {
 pub fn prepare_slow_path_admission_for_scope(scope: LockAdmissionScope) {
     let consumed = token_consumed_for_scope(scope);
     if mark_slow_path_pending_for_scope(scope) && slow_path_yield_required(consumed) {
-        std::thread::yield_now();
-        clear_token_consumed_for_scope(scope);
+        wait_for_slow_path_admission_for_scope(scope);
     }
 }
 
@@ -691,18 +1041,52 @@ fn mark_slow_path_pending_for_lock_with_admission_enabled(lock_id: u32, enabled:
     USER_ADMISSION_WORD.with(|word| {
         let value = word.load(Ordering::Relaxed);
         let next = if enabled {
-            let preserved_flags = if user_lock_id_for_value(value) == class {
-                flags(value) & TOKEN_CONSUMED
-            } else {
-                0
-            };
-            word_with_lock_id(class, preserved_flags | SLOW_PATH_PENDING)
+            word_with_lock_id(
+                class,
+                preserved_pending_flags(class, value) | SLOW_PATH_PENDING,
+            )
         } else {
             cleared_flags_word(class, value)
         };
         word.store(next, Ordering::Relaxed);
     });
     enabled
+}
+
+/// The flags a slow-path mark carries over from the word it replaces.
+///
+/// A mark naming the class the word already names keeps the consumed token: the
+/// thread is contending for the class it was last admitted to, and the token it
+/// holds is the one that acquisition will spend. A mark naming another class
+/// drops it, which is what leaves the word showing `SLOW_PATH_PENDING` without
+/// `TOKEN_CONSUMED` and lets the scheduler hand the per-CPU owner slot the old
+/// class held to someone else.
+///
+/// Under `ACCORDIN_PRESERVE_CROSS_CLASS_TOKEN` the token crosses the class
+/// change instead, so a run can measure what that release is worth. The switch
+/// only widens the window in which the word claims a token: every caller of the
+/// mark clears the token again once its yield has run, so the word a blocking
+/// acquisition finally waits under is the same in both arms.
+///
+/// What the off arm still pays: a class change that carries a token reads the
+/// switch to find it off, so it takes the `OnceLock` load on every such mark.
+/// Only a class change with no token to preserve short-circuits ahead of the
+/// read. Both arms also take the counters' enabled-flag load per mark.
+#[inline(always)]
+fn preserved_pending_flags(class: u32, value: u32) -> u32 {
+    let token = flags(value) & TOKEN_CONSUMED;
+    if user_lock_id_for_value(value) == class {
+        crate::mutex_hook::record_admission_mark_same_class();
+        return token;
+    }
+
+    crate::mutex_hook::record_admission_mark_cross_class();
+    if token == 0 || !preserve_cross_class_token_enabled() {
+        return 0;
+    }
+
+    crate::mutex_hook::record_admission_mark_cross_class_token_kept();
+    token
 }
 
 /// Publishes the cond-reacquire hint only while the word still describes the
@@ -1137,44 +1521,138 @@ fn transition_count_for_test(prev: u32, next: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
 
-    use super::cv_sleep_set_for_test;
+    use crate::test_support::DebugCounterMeasurement;
+
+    use super::GATE_DISARMED;
     use super::{
-        CV_SLEEP, CvSleepArm, IN_CRITICAL_SECTION, LockClassPolicy, MAX_LOCK_CLASSES,
+        CV_SLEEP, CvSleepArm, GateOutcome, IN_CRITICAL_SECTION, LockClassPolicy, MAX_LOCK_CLASSES,
         SLOW_PATH_PENDING, TOKEN_CONSUMED, UNMANAGED_LOCK_ID, USER_ADMISSION_FLAG_MASK,
         USER_ADMISSION_LOCK_ID_SHIFT, allocate_lock_class, allocate_lock_id, allocated_class_count,
         arm_cv_sleep_for_lock, arm_cv_sleep_for_lock_with_admission_enabled, begin_lock_scope,
         class_of, clear_token_consumed_for_scope, cleared_flags_word, exit_word, finish_lock_scope,
-        flags, force_dump_for_test, force_lock_class_policy_for_test, force_merge_for_test,
-        lock_class_policy, managed_lock_id, mark_cond_reacquire_pending_for_cond_mutex,
+        flags, force_dump_for_test, force_gate_for_test, force_gate_timeout_for_test,
+        force_lock_class_policy_for_test, force_merge_for_test,
+        force_preserve_cross_class_token_for_test, lock_class_policy, managed_lock_id,
+        mark_cond_reacquire_pending_for_cond_mutex,
         mark_cond_reacquire_pending_for_cond_mutex_with_admission_enabled,
         mark_critical_section_entered, mark_critical_section_entered_for_scope,
         mark_critical_section_entered_with_admission_enabled, mark_critical_section_exit,
         mark_critical_section_exit_with_admission_enabled, mark_slow_path_pending,
         mark_slow_path_pending_for_scope, mark_slow_path_pending_with_admission_enabled,
-        merge_enabled_with, parse_lock_class_policy, release_unused_lock_class,
-        reset_lock_id_allocator_for_test, reset_state, reset_thread_depth_for_test,
-        reset_transient_state, reset_transitions_for_tests, reset_union_find_for_tests,
-        retire_cv_sleep_to_pending, retire_cv_sleep_to_released, set_inactive_queue_seq_ptrs,
+        merge_enabled_with, parse_lock_class_policy, rearm_gate_for_test,
+        release_unused_lock_class, reset_lock_id_allocator_for_test, reset_state,
+        reset_thread_depth_for_test, reset_transient_state, reset_transitions_for_tests,
+        reset_union_find_for_tests, retire_cv_sleep_to_pending, retire_cv_sleep_to_released,
+        set_cpu_owner_slots, set_inactive_queue_seq_ptrs, set_scheduler_registered,
         slow_path_yield_required, take_classes_dirty, take_cond_reacquire_pending_for_scope,
         token_consumed_for_scope, transition_count_for_test, union_lock_classes,
-        user_lock_id_for_value, user_word_addr, word_for_test, word_with_lock_id,
+        user_lock_id_for_value, user_word_addr, wait_for_admission_grant, word_for_test,
+        word_with_lock_id,
     };
+    use super::{cached_tid, cv_sleep_set_for_test};
+    use super::{forget_scheduler_identity_after_fork, scheduler_registered};
 
-    static INACTIVE_QUEUE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static SHARED_SCHEDULER_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static DEPENDENCY_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static ALLOCATOR_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static mut TEST_INACTIVE_ENQUEUE_SEQ: u32 = 0;
     static mut TEST_INACTIVE_EMPTY_SEQ: u32 = 0;
 
-    struct InactiveQueueStateTestGuard {
+    /// An owner value no thread can carry: tids are bounded well below this, so
+    /// a slot holding it never names anyone.
+    const NO_OWNER_TID: u32 = u32::MAX;
+
+    /// The pointer channels the scheduler loader installs, plus the gate arms
+    /// that depend on them. Every one of them is process-wide, so a test that
+    /// fakes any of them takes this guard and holds it while they stay installed.
+    struct SharedSchedulerStateTestGuard {
         _guard: MutexGuard<'static, ()>,
+        cpu_owner_slots: Option<Box<[u32]>>,
     }
 
-    impl Drop for InactiveQueueStateTestGuard {
+    impl SharedSchedulerStateTestGuard {
+        fn install_inactive_queue(&mut self, enqueue_seq: u32, empty_seq: u32) -> &mut Self {
+            unsafe {
+                TEST_INACTIVE_ENQUEUE_SEQ = enqueue_seq;
+                TEST_INACTIVE_EMPTY_SEQ = empty_seq;
+            }
+            set_inactive_queue_seq_ptrs(
+                &raw mut TEST_INACTIVE_ENQUEUE_SEQ,
+                &raw mut TEST_INACTIVE_EMPTY_SEQ,
+            );
+            self
+        }
+
+        /// Publishes one slot per configured CPU, all naming `owner`, so the
+        /// verdict does not depend on which CPU the test thread runs on. The
+        /// calling thread also stands in for a registered one, which is the
+        /// other half of what makes a grant reachable.
+        fn install_cpu_owner_slots(&mut self, owner: u32) -> &mut Self {
+            set_scheduler_registered(true);
+            // Withdraw before the previous allocation is freed, so no reader can
+            // reach a slot that has already gone.
+            set_cpu_owner_slots(std::ptr::null_mut(), 0);
+            let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) }.max(1) as usize;
+            let slots = self
+                .cpu_owner_slots
+                .insert(vec![owner; cpus].into_boxed_slice());
+            set_cpu_owner_slots(slots.as_mut_ptr(), slots.len());
+            self
+        }
+
+        fn cpu_owner_slots_addr(&self) -> usize {
+            self.cpu_owner_slots
+                .as_ref()
+                .map_or(0, |slots| slots.as_ptr() as usize)
+        }
+
+        fn cpu_owner_slots_len(&self) -> usize {
+            self.cpu_owner_slots.as_ref().map_or(0, |slots| slots.len())
+        }
+
+        fn force_gate(&mut self, enabled: bool) -> &mut Self {
+            force_gate_for_test(Some(enabled));
+            self
+        }
+
+        fn force_gate_timeout(&mut self, timeout: Duration) -> &mut Self {
+            force_gate_timeout_for_test(Some(timeout));
+            self
+        }
+
+        fn unregister_from_scheduler(&mut self) -> &mut Self {
+            set_scheduler_registered(false);
+            self
+        }
+    }
+
+    impl Drop for SharedSchedulerStateTestGuard {
         fn drop(&mut self) {
             set_inactive_queue_seq_ptrs(std::ptr::null_mut(), std::ptr::null_mut());
+            set_cpu_owner_slots(std::ptr::null_mut(), 0);
+            set_scheduler_registered(false);
+            rearm_gate_for_test();
+            force_gate_for_test(None);
+            force_gate_timeout_for_test(None);
         }
+    }
+
+    fn isolate_shared_scheduler_state() -> SharedSchedulerStateTestGuard {
+        let guard = SHARED_SCHEDULER_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        SharedSchedulerStateTestGuard {
+            _guard: guard,
+            cpu_owner_slots: None,
+        }
+    }
+
+    fn enable_debug_counters_for_test() -> DebugCounterMeasurement {
+        let measurement = crate::test_support::measure_debug_counters();
+        measurement.enable();
+        measurement
     }
 
     struct DependencyStateTestGuard {
@@ -1192,12 +1670,14 @@ mod tests {
     }
 
     /// The per-thread state a test starts from and hands back: the admission
-    /// word and the nesting depth. Both are thread-local, so a test that takes
-    /// this guard is isolated without serializing against anything.
+    /// word, the nesting depth and the cross-class token arm. All three are
+    /// thread-local, so a test that takes this guard is isolated without
+    /// serializing against anything.
     struct ThreadStateTestGuard;
 
     impl Drop for ThreadStateTestGuard {
         fn drop(&mut self) {
+            force_preserve_cross_class_token_for_test(None);
             reset_thread_depth_for_test();
             reset_state();
         }
@@ -1206,7 +1686,17 @@ mod tests {
     fn isolate_thread_state() -> ThreadStateTestGuard {
         reset_state();
         reset_thread_depth_for_test();
+        force_preserve_cross_class_token_for_test(Some(false));
         ThreadStateTestGuard
+    }
+
+    /// Starts a test from a clean thread state with the cross-class token
+    /// experiment pinned to one arm, so the run's environment never decides
+    /// which transition the test observes.
+    fn isolate_thread_state_preserving_cross_class_token(preserve: bool) -> ThreadStateTestGuard {
+        let guard = isolate_thread_state();
+        force_preserve_cross_class_token_for_test(Some(preserve));
+        guard
     }
 
     struct AllocatorStateTestGuard {
@@ -1262,19 +1752,10 @@ mod tests {
     fn install_inactive_queue_state(
         enqueue_seq: u32,
         empty_seq: u32,
-    ) -> InactiveQueueStateTestGuard {
-        let guard = INACTIVE_QUEUE_STATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        unsafe {
-            TEST_INACTIVE_ENQUEUE_SEQ = enqueue_seq;
-            TEST_INACTIVE_EMPTY_SEQ = empty_seq;
-        }
-        set_inactive_queue_seq_ptrs(
-            &raw mut TEST_INACTIVE_ENQUEUE_SEQ,
-            &raw mut TEST_INACTIVE_EMPTY_SEQ,
-        );
-        InactiveQueueStateTestGuard { _guard: guard }
+    ) -> SharedSchedulerStateTestGuard {
+        let mut state = isolate_shared_scheduler_state();
+        state.install_inactive_queue(enqueue_seq, empty_seq);
+        state
     }
 
     #[test]
@@ -1515,6 +1996,130 @@ mod tests {
         assert!(mark_slow_path_pending_for_scope(second));
 
         assert_eq!(word_for_test(), word_for(5, SLOW_PATH_PENDING));
+    }
+
+    /// Leaves the word holding a consumed token for `lock_id` and hands back
+    /// the scope a caller can go on marking with.
+    fn consume_token_for_test(lock_id: u32) {
+        let scope = begin_lock_scope(lock_id);
+        assert!(mark_slow_path_pending_for_scope(scope));
+        mark_critical_section_entered_for_scope(scope);
+        finish_lock_scope(lock_id);
+        assert_eq!(word_for_test(), word_for(class_of(lock_id), TOKEN_CONSUMED));
+    }
+
+    #[test]
+    fn slow_path_for_different_lock_keeps_consumed_token_under_the_switch() {
+        let _thread_state = isolate_thread_state_preserving_cross_class_token(true);
+
+        consume_token_for_test(4);
+
+        let second = begin_lock_scope(5);
+        assert!(!token_consumed_for_scope(second));
+        assert!(mark_slow_path_pending_for_scope(second));
+
+        assert_eq!(
+            word_for_test(),
+            word_for(5, SLOW_PATH_PENDING | TOKEN_CONSUMED)
+        );
+
+        clear_token_consumed_for_scope(second);
+        assert_eq!(word_for_test(), word_for(5, SLOW_PATH_PENDING));
+    }
+
+    /// A class change with nothing to preserve must land on the same word in
+    /// both arms: the switch only ever carries a token that was already there.
+    #[test]
+    fn slow_path_for_different_lock_without_a_token_is_arm_independent() {
+        for preserve in [false, true] {
+            let _thread_state = isolate_thread_state_preserving_cross_class_token(preserve);
+
+            let first = begin_lock_scope(4);
+            assert!(mark_slow_path_pending_for_scope(first));
+            finish_lock_scope(4);
+            // Releasing the class is what leaves the token behind, so the
+            // no-token state has to be reached by dropping it again.
+            clear_token_consumed_for_scope(first);
+            assert_eq!(word_for_test(), word_for(4, SLOW_PATH_PENDING));
+
+            let second = begin_lock_scope(5);
+            assert!(mark_slow_path_pending_for_scope(second));
+
+            assert_eq!(word_for_test(), word_for(5, SLOW_PATH_PENDING));
+        }
+    }
+
+    /// A mark for the class the word already names is outside what the switch
+    /// decides, so both arms keep the token exactly as the same-class rule
+    /// always did.
+    #[test]
+    fn slow_path_for_the_same_lock_keeps_the_token_in_both_arms() {
+        for preserve in [false, true] {
+            let _thread_state = isolate_thread_state_preserving_cross_class_token(preserve);
+
+            consume_token_for_test(4);
+
+            let second = begin_lock_scope(4);
+            assert!(token_consumed_for_scope(second));
+            assert!(mark_slow_path_pending_for_scope(second));
+
+            assert_eq!(
+                word_for_test(),
+                word_for(4, SLOW_PATH_PENDING | TOKEN_CONSUMED)
+            );
+        }
+    }
+
+    /// The next acquisition of the class the switch marked has to reach the
+    /// same word as the unswitched run once the mark's yield has cleared the
+    /// token, which is what every caller of the mark does.
+    #[test]
+    fn cleared_cross_class_token_rejoins_the_unswitched_transition() {
+        for preserve in [false, true] {
+            let _thread_state = isolate_thread_state_preserving_cross_class_token(preserve);
+
+            consume_token_for_test(4);
+
+            let second = begin_lock_scope(5);
+            assert!(mark_slow_path_pending_for_scope(second));
+            clear_token_consumed_for_scope(second);
+            assert_eq!(word_for_test(), word_for(5, SLOW_PATH_PENDING));
+
+            mark_critical_section_entered_for_scope(second);
+            assert_eq!(word_for_test(), word_for(5, IN_CRITICAL_SECTION));
+
+            finish_lock_scope(5);
+            assert_eq!(word_for_test(), word_for(5, TOKEN_CONSUMED));
+
+            let third = begin_lock_scope(5);
+            assert!(token_consumed_for_scope(third));
+            finish_lock_scope(5);
+        }
+    }
+
+    /// The counters are process-wide and every test that marks a slow path
+    /// bumps them, so the deltas are lower bounds rather than equalities.
+    #[test]
+    fn admission_mark_counters_separate_the_class_transitions() {
+        let _thread_state = isolate_thread_state_preserving_cross_class_token(true);
+
+        let _counters = enable_debug_counters_for_test();
+        let baseline = crate::mutex_hook::admission_mark_counters();
+
+        consume_token_for_test(4);
+        let same = begin_lock_scope(4);
+        assert!(mark_slow_path_pending_for_scope(same));
+        finish_lock_scope(4);
+
+        let cross = begin_lock_scope(5);
+        assert!(mark_slow_path_pending_for_scope(cross));
+        finish_lock_scope(5);
+
+        let counters = crate::mutex_hook::admission_mark_counters();
+
+        assert!(counters.pending_same_class > baseline.pending_same_class);
+        assert!(counters.pending_cross_class > baseline.pending_cross_class);
+        assert!(counters.pending_cross_class_token_kept > baseline.pending_cross_class_token_kept);
     }
 
     fn release_managed_lock_for_test(lock_id: u32) {
@@ -1870,6 +2475,205 @@ mod tests {
         let _queue_state = install_inactive_queue_state(8, 7);
 
         assert!(slow_path_yield_required(true));
+    }
+
+    /// How long a gate test waits for the other side of a hand-off before it
+    /// calls the wait stalled rather than hanging.
+    const GATE_PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// A timeout no gate test can reach, so that a slow machine never turns a
+    /// wait into a timeout escape.
+    const GATE_TIMEOUT_OUT_OF_REACH: Duration = Duration::from_secs(600);
+
+    /// The gate holds the caller until the slot for the CPU it runs on names it,
+    /// which is the whole invariant: nothing is published before the grant.
+    #[test]
+    fn the_gate_holds_a_slow_path_until_a_grant_names_this_thread() {
+        let mut state = isolate_shared_scheduler_state();
+        state
+            .force_gate(true)
+            .force_gate_timeout(GATE_TIMEOUT_OUT_OF_REACH)
+            .install_cpu_owner_slots(NO_OWNER_TID);
+
+        // The wait-loop counter is the hand-off: the granter writes the slot
+        // only once the waiter has been round the loop, so the test covers the
+        // wait rather than the first probe.
+        let _counters = enable_debug_counters_for_test();
+        let spins_before = crate::mutex_hook::admission_gate_counters().gate_wait_loops;
+
+        let tid = crate::mutex_hook::current_tid();
+        let slots = state.cpu_owner_slots_addr();
+        let len = state.cpu_owner_slots_len();
+        let granter = std::thread::spawn(move || {
+            let deadline = Instant::now() + GATE_PROGRESS_TIMEOUT;
+            while crate::mutex_hook::admission_gate_counters().gate_wait_loops == spins_before {
+                assert!(Instant::now() < deadline, "the gate never entered its wait");
+                std::thread::yield_now();
+            }
+
+            let slots = slots as *mut u32;
+            for slot in 0..len {
+                unsafe { slots.add(slot).write_volatile(tid) };
+            }
+        });
+
+        assert_eq!(wait_for_admission_grant(), GateOutcome::Admitted);
+        granter.join().expect("granter thread");
+    }
+
+    /// A thread the scheduler never took into its map is never granted, so the
+    /// gate has to let it through rather than hold it for a decision that is
+    /// not coming.
+    #[test]
+    fn the_gate_lets_an_unregistered_thread_through() {
+        let mut state = isolate_shared_scheduler_state();
+        let tid = crate::mutex_hook::current_tid();
+        state
+            .force_gate(true)
+            .install_cpu_owner_slots(tid)
+            .unregister_from_scheduler();
+
+        assert_eq!(wait_for_admission_grant(), GateOutcome::Bypassed);
+    }
+
+    /// A fork keeps the owner slots mapped and every cache filled while giving
+    /// the child a tid of its own, so the child has to be made to look itself
+    /// up again rather than compare slots against its parent.
+    #[test]
+    fn a_fork_child_forgets_the_identity_it_inherited() {
+        let mut state = isolate_shared_scheduler_state();
+        state
+            .force_gate(true)
+            .force_gate_timeout(Duration::ZERO)
+            .install_cpu_owner_slots(NO_OWNER_TID);
+
+        let tid = cached_tid();
+        assert_eq!(wait_for_admission_grant(), GateOutcome::TimedOut);
+
+        forget_scheduler_identity_after_fork();
+
+        assert!(!scheduler_registered());
+        assert!(!GATE_DISARMED.with(std::cell::Cell::get));
+        assert_eq!(cached_tid(), tid, "the same thread looks up the same tid");
+    }
+
+    /// A grant already in place is the common case and costs no wait at all.
+    #[test]
+    fn the_gate_returns_at_once_when_the_grant_is_already_held() {
+        let mut state = isolate_shared_scheduler_state();
+        let tid = crate::mutex_hook::current_tid();
+        state.force_gate(true).install_cpu_owner_slots(tid);
+
+        assert_eq!(wait_for_admission_grant(), GateOutcome::Admitted);
+    }
+
+    /// With no scheduler behind the slots nothing would ever grant, so the gate
+    /// has to let the caller through instead of waiting for something that
+    /// cannot happen.
+    #[test]
+    fn the_gate_lets_a_slow_path_through_when_no_scheduler_published_slots() {
+        let mut state = isolate_shared_scheduler_state();
+        state.force_gate(true);
+
+        let _counters = enable_debug_counters_for_test();
+        let baseline = crate::mutex_hook::admission_gate_counters();
+
+        assert_eq!(wait_for_admission_grant(), GateOutcome::Bypassed);
+
+        let counters = crate::mutex_hook::admission_gate_counters();
+        assert!(counters.gate_bypass_ungrantable > baseline.gate_bypass_ungrantable);
+    }
+
+    /// The switch has to leave the caller on exactly the path it took before the
+    /// gate existed, which is what makes the two arms comparable.
+    #[test]
+    fn a_disabled_gate_never_waits_even_with_slots_published() {
+        let mut state = isolate_shared_scheduler_state();
+        state
+            .force_gate(false)
+            .install_cpu_owner_slots(NO_OWNER_TID);
+
+        assert_eq!(wait_for_admission_grant(), GateOutcome::Disabled);
+    }
+
+    /// The escape a starved waiter takes: it publishes unadmitted rather than
+    /// waiting out a grant that is not coming.
+    #[test]
+    fn the_gate_publishes_unadmitted_once_the_wait_times_out() {
+        let mut state = isolate_shared_scheduler_state();
+        state
+            .force_gate(true)
+            .force_gate_timeout(Duration::ZERO)
+            .install_cpu_owner_slots(NO_OWNER_TID);
+
+        let _counters = enable_debug_counters_for_test();
+        let baseline = crate::mutex_hook::admission_gate_counters();
+
+        assert_eq!(wait_for_admission_grant(), GateOutcome::TimedOut);
+
+        let counters = crate::mutex_hook::admission_gate_counters();
+        assert!(counters.gate_timeouts > baseline.gate_timeouts);
+        assert!(counters.gate_wait_loops > baseline.gate_wait_loops);
+    }
+
+    /// An ejected scheduler leaves its owner slots mapped and readable, so a
+    /// wait that keeps expiring is all userspace ever learns about it. One
+    /// expiry therefore takes the thread out of the wait for good, and only a
+    /// grant it actually observes puts it back.
+    #[test]
+    fn a_timed_out_wait_disarms_the_gate_until_a_grant_is_observed() {
+        let mut state = isolate_shared_scheduler_state();
+        state
+            .force_gate(true)
+            .force_gate_timeout(Duration::ZERO)
+            .install_cpu_owner_slots(NO_OWNER_TID);
+
+        assert_eq!(wait_for_admission_grant(), GateOutcome::TimedOut);
+        assert_eq!(
+            wait_for_admission_grant(),
+            GateOutcome::Disarmed,
+            "a second wait would cost another timeout"
+        );
+
+        state.install_cpu_owner_slots(crate::mutex_hook::current_tid());
+        assert_eq!(
+            wait_for_admission_grant(),
+            GateOutcome::Admitted,
+            "the probe a disarmed thread still takes is what re-arms it"
+        );
+        assert_eq!(wait_for_admission_grant(), GateOutcome::Admitted);
+
+        // Back under the gate, an unowned slot waits again rather than passing.
+        state
+            .force_gate_timeout(GATE_TIMEOUT_OUT_OF_REACH)
+            .install_cpu_owner_slots(NO_OWNER_TID);
+        assert!(
+            !GATE_DISARMED.with(std::cell::Cell::get),
+            "the grant observed above rearmed the gate"
+        );
+    }
+
+    /// The idle-relock skip publishes with the consumed token still in the word,
+    /// which is the state a thread can be parked out of with its node already in
+    /// the queue. An armed gate therefore has to outrank the skip.
+    #[test]
+    fn an_armed_gate_outranks_the_idle_relock_skip() {
+        let mut state = isolate_shared_scheduler_state();
+        state.install_inactive_queue(7, 7).force_gate(false);
+
+        assert!(!slow_path_yield_required(true));
+
+        state.force_gate(true);
+        assert!(
+            !slow_path_yield_required(true),
+            "the gate is not armed until the slots are published"
+        );
+
+        state.install_cpu_owner_slots(NO_OWNER_TID);
+        assert!(slow_path_yield_required(true));
+
+        state.force_gate(false);
+        assert!(!slow_path_yield_required(true));
     }
 
     #[test]

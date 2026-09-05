@@ -51,8 +51,7 @@ fn lock_with_stats(lock: &crate::mcs::McsLockRaw, lock_id: u32) {
 
     let wait_start = accordin_shared::lock_stats::record_wait_start();
     if accordin_shared::admission::mark_slow_path_pending_for_scope(scope) {
-        std::thread::yield_now();
-        accordin_shared::admission::clear_token_consumed_for_scope(scope);
+        accordin_shared::admission::wait_for_slow_path_admission_for_scope(scope);
     }
     lock.lock();
     accordin_shared::lock_stats::record_wait_end(wait_start);

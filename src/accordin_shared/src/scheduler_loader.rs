@@ -136,6 +136,17 @@ macro_rules! define_scheduler_loader {
                     bss.class_inactive_depth_peak.as_mut_ptr(),
                     &mut bss.inactive_probe_span as *mut u32,
                 );
+                // A stats-only run never grants, so a gate reading these slots
+                // would find no owner on any CPU and every contender would
+                // spend its whole timeout before publishing. Leaving the
+                // channel closed keeps that run on the ungated path.
+                if !stats_only {
+                    let owner_slot_count = bss.cpu_admission_owner.len();
+                    $crate::admission::set_cpu_owner_slots(
+                        bss.cpu_admission_owner.as_mut_ptr(),
+                        owner_slot_count,
+                    );
+                }
                 if debug_counters {
                     $crate::bpf_counters::set_routing_counter_ptrs([
                         &mut bss.select_local_direct as *mut u64,
@@ -169,6 +180,7 @@ macro_rules! define_scheduler_loader {
         impl Drop for SchedulerState {
             fn drop(&mut self) {
                 $crate::mutex_hook::set_registered_thread_count_ptr(::std::ptr::null_mut());
+                $crate::admission::set_cpu_owner_slots(::std::ptr::null_mut(), 0);
                 $crate::width_control::clear_class_state_ptrs();
                 $crate::bpf_counters::clear_routing_counter_ptrs();
                 let _ = self._link.take();

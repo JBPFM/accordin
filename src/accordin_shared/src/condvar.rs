@@ -1259,7 +1259,7 @@ mod tests {
         futex_wake, publish_sleep_state, relock_mode, retire_sleep_state, timedwait, wait,
     };
     use crate::admission;
-    use crate::mutex_hook::{cv_requeue_counters, set_cv_admission_counters_enabled};
+    use crate::mutex_hook::cv_requeue_counters;
     use crate::test_support::{await_progress, deadline_in_millis, waking_thread};
 
     const HINT_LOCK_ID: u32 = 4;
@@ -1998,12 +1998,13 @@ mod tests {
         let second = SpinMutex::new();
         let cond = CondState::new();
 
-        set_cv_admission_counters_enabled(true);
+        let measurement = crate::test_support::measure_debug_counters();
+        measurement.enable();
         let before = cv_requeue_counters().binding_conflicts;
         cond.bind_staging(first.cond_mutex(SMOKE_LOCK_ID).staging);
         cond.bind_staging(second.cond_mutex(SMOKE_LOCK_ID).staging);
         let after = cv_requeue_counters().binding_conflicts;
-        set_cv_admission_counters_enabled(false);
+        drop(measurement);
 
         assert_eq!(after, before + 1);
         assert!(cond.bound.parking_target().is_none());

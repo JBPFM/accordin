@@ -7,6 +7,7 @@
 //! is not visible. Nothing here is part of the supported surface.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::condvar::force_cv_requeue_for_thread;
@@ -47,6 +48,40 @@ pub fn deadline_in(nanos: i64) -> libc::timespec {
 #[doc(hidden)]
 pub fn deadline_in_millis(millis: i64) -> libc::timespec {
     deadline_in(millis * 1_000_000)
+}
+
+/// Serializes the tests that read a delta out of the debug counters. Those
+/// counters are one process-wide array behind one process-wide enable flag, so
+/// two tests measuring at the same time measure each other as well.
+static DEBUG_COUNTER_MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds the debug-counter measurement slot, and leaves the counters off when
+/// it is dropped whichever way the test left them.
+#[doc(hidden)]
+pub struct DebugCounterMeasurement {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl DebugCounterMeasurement {
+    /// Starts counting. Kept apart from taking the slot so that a test can also
+    /// observe the counters standing still while they are off.
+    pub fn enable(&self) {
+        crate::mutex_hook::set_cv_admission_counters_enabled(true);
+    }
+}
+
+impl Drop for DebugCounterMeasurement {
+    fn drop(&mut self) {
+        crate::mutex_hook::set_cv_admission_counters_enabled(false);
+    }
+}
+
+#[doc(hidden)]
+pub fn measure_debug_counters() -> DebugCounterMeasurement {
+    let guard = DEBUG_COUNTER_MEASUREMENT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    DebugCounterMeasurement { _guard: guard }
 }
 
 /// Restores the requeue switch of the thread that took it.

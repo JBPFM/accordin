@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 use crate::admission::LockAdmissionScope;
+use crate::arch::CacheAligned;
 use crate::condvar::{CondRelock, CondStagingRef};
 use crate::lock_backend::LockBackend;
 use crate::lock_stats::{record_lock_acquired_for_scope, record_wait_end, record_wait_start};
@@ -124,8 +125,7 @@ pub fn lock_scope_with_stats<B>(
 
     let wait_start = record_wait_start();
     if normal && crate::admission::mark_slow_path_pending_for_scope(scope) {
-        std::thread::yield_now();
-        crate::admission::clear_token_consumed_for_scope(scope);
+        crate::admission::wait_for_slow_path_admission_for_scope(scope);
     }
     B::lock(lock);
     record_wait_end(wait_start);
@@ -218,6 +218,47 @@ pub(crate) const WRITER_EVENT_FIELD_NAMES: [&str; WRITER_EVENT_FIELD_COUNT] = [
     "relocks_admitted",
     "relocks_normal",
 ];
+
+enum AdmissionMarkCounter {
+    SameClass,
+    CrossClass,
+    CrossClassTokenKept,
+}
+
+const ADMISSION_MARK_FIELD_COUNT: usize = 3;
+
+pub(crate) const ADMISSION_MARK_FIELD_NAMES: [&str; ADMISSION_MARK_FIELD_COUNT] = [
+    "pending_same_class",
+    "pending_cross_class",
+    "pending_cross_class_token_kept",
+];
+
+/// This family sits alone on its cache line: a mark is taken on every
+/// contended acquisition, which is orders of magnitude more often than any
+/// other family here counts, and sharing a line with them would let this one
+/// dominate their cost the moment debug counters are on.
+static ADMISSION_MARK_COUNTERS: CacheAligned<[AtomicU64; ADMISSION_MARK_FIELD_COUNT]> =
+    CacheAligned([const { AtomicU64::new(0) }; ADMISSION_MARK_FIELD_COUNT]);
+
+enum AdmissionGateCounter {
+    WaitLoops,
+    Timeouts,
+    BypassUngrantable,
+}
+
+const ADMISSION_GATE_FIELD_COUNT: usize = 3;
+
+pub(crate) const ADMISSION_GATE_FIELD_NAMES: [&str; ADMISSION_GATE_FIELD_COUNT] = [
+    "gate_wait_loops",
+    "gate_timeouts",
+    "gate_bypass_ungrantable",
+];
+
+/// Kept on a line of its own for the same reason the marks above are: the loop
+/// field moves once per spin of a gated wait, which is the densest write any
+/// family here makes.
+static ADMISSION_GATE_COUNTERS: CacheAligned<[AtomicU64; ADMISSION_GATE_FIELD_COUNT]> =
+    CacheAligned([const { AtomicU64::new(0) }; ADMISSION_GATE_FIELD_COUNT]);
 
 fn load_counters<const N: usize>(counters: &[AtomicU64; N]) -> [u64; N] {
     std::array::from_fn(|index| counters[index].load(Ordering::Relaxed))
@@ -356,6 +397,69 @@ pub(crate) fn writer_event_field_values() -> [u64; WRITER_EVENT_FIELD_COUNT] {
     ]
 }
 
+/// Accounts how a slow-path mark related to the class the admission word
+/// already named, which is what decides whether the mark keeps a consumed
+/// token or releases it.
+///
+/// Only marks that reached the word are counted: a run with admission disabled
+/// rewrites the word without deciding anything about a token, and leaves every
+/// field here at zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionMarkCounters {
+    /// Marks for the class the word already named, which always keep whatever
+    /// token the word carried.
+    pub pending_same_class: u64,
+    /// Marks that changed the class the word names.
+    pub pending_cross_class: u64,
+    /// Class-changing marks that carried a consumed token over, which only
+    /// happens under `ACCORDIN_PRESERVE_CROSS_CLASS_TOKEN` and only when the
+    /// word actually held one.
+    pub pending_cross_class_token_kept: u64,
+}
+
+pub fn admission_mark_counters() -> AdmissionMarkCounters {
+    let values = admission_mark_field_values();
+    AdmissionMarkCounters {
+        pending_same_class: values[AdmissionMarkCounter::SameClass as usize],
+        pending_cross_class: values[AdmissionMarkCounter::CrossClass as usize],
+        pending_cross_class_token_kept: values[AdmissionMarkCounter::CrossClassTokenKept as usize],
+    }
+}
+
+pub(crate) fn admission_mark_field_values() -> [u64; ADMISSION_MARK_FIELD_COUNT] {
+    load_counters(&ADMISSION_MARK_COUNTERS.0)
+}
+
+/// Accounts what the admission gate does to a managed slow path between its
+/// pending mark and the acquisition that publishes its queue node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionGateCounters {
+    /// Iterations a gated thread spent waiting for its grant, over and above
+    /// the yield every slow path takes.
+    pub gate_wait_loops: u64,
+    /// Waits that gave up and published unadmitted, which is the liveness
+    /// escape rather than an expected outcome.
+    pub gate_timeouts: u64,
+    /// Waits that found nothing able to grant them, so the gate let the caller
+    /// through unchanged: no slots published, a CPU outside the published
+    /// range, or a thread the scheduler never took into its map. None of the
+    /// three can produce a grant, so waiting for one would never end.
+    pub gate_bypass_ungrantable: u64,
+}
+
+pub fn admission_gate_counters() -> AdmissionGateCounters {
+    let values = admission_gate_field_values();
+    AdmissionGateCounters {
+        gate_wait_loops: values[AdmissionGateCounter::WaitLoops as usize],
+        gate_timeouts: values[AdmissionGateCounter::Timeouts as usize],
+        gate_bypass_ungrantable: values[AdmissionGateCounter::BypassUngrantable as usize],
+    }
+}
+
+pub(crate) fn admission_gate_field_values() -> [u64; ADMISSION_GATE_FIELD_COUNT] {
+    load_counters(&ADMISSION_GATE_COUNTERS.0)
+}
+
 /// The counters share cache lines across every hooked thread, so they stay off
 /// unless the run explicitly asks for debug counters.
 #[inline]
@@ -404,6 +508,52 @@ fn bump_cv_requeue(counter: CvRequeueCounter) {
 #[inline(always)]
 fn bump_writer_event(counter: WriterEventCounter) {
     bump_cv_counter(&WRITER_EVENT_COUNTERS[counter as usize]);
+}
+
+#[inline(always)]
+fn bump_admission_mark(counter: AdmissionMarkCounter) {
+    bump_cv_counter(&ADMISSION_MARK_COUNTERS.0[counter as usize]);
+}
+
+#[inline(always)]
+fn bump_admission_gate(counter: AdmissionGateCounter) {
+    bump_cv_counter(&ADMISSION_GATE_COUNTERS.0[counter as usize]);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_admission_gate_wait_loop() {
+    bump_admission_gate(AdmissionGateCounter::WaitLoops);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_admission_gate_timeout() {
+    bump_admission_gate(AdmissionGateCounter::Timeouts);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_admission_gate_bypass() {
+    bump_admission_gate(AdmissionGateCounter::BypassUngrantable);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_admission_mark_same_class() {
+    bump_admission_mark(AdmissionMarkCounter::SameClass);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_admission_mark_cross_class() {
+    bump_admission_mark(AdmissionMarkCounter::CrossClass);
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn record_admission_mark_cross_class_token_kept() {
+    bump_admission_mark(AdmissionMarkCounter::CrossClassTokenKept);
 }
 
 #[doc(hidden)]
@@ -669,6 +819,10 @@ pub fn register_current_thread() -> bool {
     let tid = current_tid();
     let admission_word_ptr = crate::admission::user_word_addr() as u64;
     let registered = register_thread_ctx_with_map(map, tid, admission_word_ptr);
+    // Published from here rather than from the callers: every hook discards the
+    // result, and a thread the scheduler cannot read must not be held waiting
+    // for a grant it will never be given.
+    crate::admission::set_scheduler_registered(registered);
     if registered {
         let count = REGISTERED_THREAD_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         sync_registered_thread_count_to_bpf(count);
@@ -678,6 +832,7 @@ pub fn register_current_thread() -> bool {
 
 #[doc(hidden)]
 pub fn unregister_current_thread() {
+    crate::admission::set_scheduler_registered(false);
     let Some(map) = THREAD_CTX_MAP.get() else {
         return;
     };
@@ -1646,8 +1801,7 @@ mod tests {
         record_cv_fallback_relock, record_cv_hint_published, record_cv_requeue_fallback,
         record_cv_requeued, record_cv_route_relock, record_cv_specialized_relock,
         record_cv_staged_high_water, record_cv_stranding_wake, register_hooked_cond_addr,
-        register_hooked_mutex_addr, register_thread_ctx_with_map,
-        set_cv_admission_counters_enabled, unregister_hooked_cond_addr,
+        register_hooked_mutex_addr, register_thread_ctx_with_map, unregister_hooked_cond_addr,
         unregister_hooked_mutex_addr, unregister_thread_ctx_with_map,
     };
     use crate::admission;
@@ -1769,6 +1923,7 @@ mod tests {
 
     #[test]
     fn cv_admission_counters_only_count_while_enabled() {
+        let measurement = crate::test_support::measure_debug_counters();
         assert!(!cv_admission_counters_enabled());
 
         let baseline = cv_admission_counters();
@@ -1781,7 +1936,7 @@ mod tests {
         assert_eq!(cv_admission_counters(), baseline);
         assert_eq!(cv_requeue_counters(), requeue_baseline);
 
-        set_cv_admission_counters_enabled(true);
+        measurement.enable();
         record_cv_hint_published();
         record_cv_specialized_relock();
         record_cv_fallback_relock();
@@ -1791,7 +1946,7 @@ mod tests {
         record_cv_drain_wake();
         record_cv_stranding_wake();
         record_cv_staged_high_water(requeue_baseline.staged_high_water + 3);
-        set_cv_admission_counters_enabled(false);
+        drop(measurement);
 
         let counters = cv_admission_counters();
         assert_eq!(counters.hints_published, baseline.hints_published + 1);

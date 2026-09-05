@@ -36,6 +36,12 @@ macro_rules! define_mcs_lock {
             tail: CacheAligned<AtomicPtr<Node>>,
         }
 
+        impl Default for McsLockRaw {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
         struct ThreadNodes {
             nodes: [Node; MAX_THREAD_NODES],
             lock_owners: [*const McsLockRaw; MAX_THREAD_NODES],
@@ -63,6 +69,13 @@ macro_rules! define_mcs_lock {
                 Self {
                     tail: CacheAligned(AtomicPtr::new(ptr::null_mut())),
                 }
+            }
+
+            /// Whether this thread already holds every node its pool has, so
+            /// no further acquisition on this thread can be given one.
+            #[inline(always)]
+            fn thread_node_pool_exhausted() -> bool {
+                THREAD_NODES.with(|nodes| unsafe { (*nodes.get()).depth == MAX_THREAD_NODES })
             }
 
             #[inline(always)]
@@ -152,6 +165,16 @@ macro_rules! define_mcs_lock {
             #[cfg_attr(feature = "perf-symbols", inline(never))]
             #[cfg_attr(not(feature = "perf-symbols"), inline(always))]
             fn try_lock_fast(&self) -> bool {
+                // A try that cannot draw a node reports the lock busy rather
+                // than taking the blocking path's panic: reporting busy is
+                // always a legal answer, and this runs under
+                // `pthread_mutex_trylock`, whose contract leaves no room for
+                // an unwind. The blocking path keeps the panic, where a
+                // depth overrun has no legal answer to give.
+                if Self::thread_node_pool_exhausted() {
+                    return false;
+                }
+
                 let my_node = self.acquire_thread_node(false);
                 let locked = self
                     .tail

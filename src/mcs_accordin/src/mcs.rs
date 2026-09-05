@@ -109,6 +109,26 @@ mod tests {
     }
 
     #[test]
+    fn try_lock_at_max_nesting_depth_reports_busy() {
+        let locks: [McsLockRaw; 4] = std::array::from_fn(|_| McsLockRaw::new());
+        let extra = McsLockRaw::new();
+
+        for lock in &locks {
+            lock.lock();
+        }
+
+        assert!(!extra.try_lock());
+
+        locks[3].unlock();
+        assert!(extra.try_lock());
+        extra.unlock();
+
+        for lock in locks[..3].iter().rev() {
+            lock.unlock();
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "McsLockRaw nested lock depth exceeded 4")]
     fn fifth_nested_lock_panics() {
         let locks: [McsLockRaw; 5] = std::array::from_fn(|_| McsLockRaw::new());

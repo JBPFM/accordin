@@ -212,7 +212,7 @@ def ensure_builds(locks: Iterable[str], *, dry_run: bool) -> None:
         dry_run=dry_run,
     )
     if any(is_legacy_mcs_accordin_lock(lock) for lock in lock_list):
-        build_cmd = ["cargo", "build", "-p", LEGACY_MCS_ACCORDIN_PACKAGE, "--release"]
+        build_cmd = ["make", LEGACY_MCS_ACCORDIN_PACKAGE]
         if dry_run:
             print(shlex_join(build_cmd))
         else:

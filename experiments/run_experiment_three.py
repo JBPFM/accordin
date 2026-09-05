@@ -482,7 +482,7 @@ def ensure_multi_lock_helpers(locks: Iterable[str], logger: CommandLogger) -> No
 def ensure_accordin_direct_library(logger: CommandLogger) -> None:  # type: ignore[name-defined]
     if not ACCORDIN_DIRECT_RELEASE_LIB.is_file():
         logger.run(
-            ["cargo", "build", "-p", ACCORDIN_DIRECT_PACKAGE, "--release"],
+            ["make", ACCORDIN_DIRECT_PACKAGE],
             log_name=f"build_{ACCORDIN_DIRECT_PACKAGE}.log",
             timeout_seconds=0,
         )
@@ -493,7 +493,7 @@ def ensure_accordin_direct_library(logger: CommandLogger) -> None:  # type: igno
 def ensure_mcs_accordin_direct_library(logger: CommandLogger) -> None:  # type: ignore[name-defined]
     if not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
         logger.run(
-            ["cargo", "build", "-p", MCS_ACCORDIN_DIRECT_PACKAGE, "--release"],
+            ["make", MCS_ACCORDIN_DIRECT_PACKAGE],
             log_name=f"build_{MCS_ACCORDIN_DIRECT_PACKAGE}.log",
             timeout_seconds=0,
         )

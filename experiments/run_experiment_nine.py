@@ -695,9 +695,9 @@ def ensure_inputs(locks: tuple[str, ...], *, build_missing: bool, logger: Comman
             ):
                 build_otherlocks_interpose(lock, logger)
         if build_missing and ACCORDIN_LOCK in locks and not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
-            print(shlex_join(["cargo", "build", "-p", MCS_TAS_ACCORDIN_DIRECT_PACKAGE, "--release"]))
+            print(shlex_join(["make", MCS_TAS_ACCORDIN_DIRECT_PACKAGE]))
         if build_missing and MCS_ACCORDIN_LOCK in locks and not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
-            print(shlex_join(["cargo", "build", "-p", MCS_ACCORDIN_DIRECT_PACKAGE, "--release"]))
+            print(shlex_join(["make", MCS_ACCORDIN_DIRECT_PACKAGE]))
         return
 
     if not MULTILOCKBENCH_BINARY.is_file() or not os.access(MULTILOCKBENCH_BINARY, os.X_OK):
@@ -724,7 +724,7 @@ def ensure_inputs(locks: tuple[str, ...], *, build_missing: bool, logger: Comman
                 missing.append(f"{lock} interpose artifacts are missing: {script}, {library}")
     if ACCORDIN_LOCK in locks and not MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
         if build_missing:
-            build_cmd = ["cargo", "build", "-p", MCS_TAS_ACCORDIN_DIRECT_PACKAGE, "--release"]
+            build_cmd = ["make", MCS_TAS_ACCORDIN_DIRECT_PACKAGE]
             if logger is None:
                 print(shlex_join(build_cmd))
             else:
@@ -738,7 +738,7 @@ def ensure_inputs(locks: tuple[str, ...], *, build_missing: bool, logger: Comman
             missing.append(f"mcs_tas_accordin_direct library is missing: {MCS_TAS_ACCORDIN_DIRECT_RELEASE_LIB}")
     if MCS_ACCORDIN_LOCK in locks and not MCS_ACCORDIN_DIRECT_RELEASE_LIB.is_file():
         if build_missing:
-            build_cmd = ["cargo", "build", "-p", MCS_ACCORDIN_DIRECT_PACKAGE, "--release"]
+            build_cmd = ["make", MCS_ACCORDIN_DIRECT_PACKAGE]
             if logger is None:
                 print(shlex_join(build_cmd))
             else:

@@ -581,24 +581,8 @@ def resolve_mcs_tse_library() -> Path:
 
 
 def ensure_mcs_tse_library(logger: CommandLogger, *, build_missing: bool, dry_run: bool) -> Path:
-    library = resolve_mcs_tse_library()
-    if library.is_file() or dry_run:
-        return library
-    if not build_missing:
-        raise RuntimeError(
-            f"mcs_tse preload library is missing: {library}. "
-            "Run cargo build -p mcs_tse --release or rerun with --build-missing."
-        )
-    logger.run(
-        ["cargo", "build", "-p", "mcs_tse", "--release"],
-        log_name="build_mcs_tse.log",
-        cwd=REPO_ROOT,
-        timeout_seconds=0,
-    )
-    library = resolve_mcs_tse_library()
-    if not library.is_file():
-        raise RuntimeError(f"mcs_tse preload library was not built: {library}")
-    return library
+    # resolve_mcs_tse_library rejects this removed historical backend.
+    return resolve_mcs_tse_library()
 
 
 def normalize_lock_key(key: str) -> str:

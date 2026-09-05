@@ -22,5 +22,5 @@ for backend in mcs_accordin_direct mcs_tas_accordin_direct; do
     MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
     MCS_ACCORDIN_DIRECT_STATS_ONLY=0 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0 \
     ACCORDIN_DISABLE_ADMISSION=0 \
-    "$root/target/direct_api_smoke" "$root/target/release/lib${backend}.so" "$backend"
+    "$root/target/direct_api_smoke" "${DIRECT_LIB_DIR:-$root/target/release}/lib${backend}.so" "$backend"
 done

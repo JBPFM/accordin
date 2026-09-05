@@ -1,9 +1,0 @@
-[package]
-name = "accordin_shared"
-version = "0.1.0"
-edition = "2024"
-license = "GPL-2.0-only"
-
-[dependencies]
-libbpf-rs = "=0.26.0-beta.1"
-libc = "0.2.177"

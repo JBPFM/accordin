@@ -466,7 +466,7 @@ def ensure_builds(locks: Iterable[str], *, dry_run: bool) -> None:
     run_build_command(["make", "-C", str(MUTEXBENCH_DIR), "mutex_bench"], dry_run=dry_run)
 
     if any(is_accordin_direct_lock(lock) for lock in locks):
-        build_cmd = ["cargo", "build", "-p", ACCORDIN_DIRECT_PACKAGE, "--release"]
+        build_cmd = ["make", ACCORDIN_DIRECT_PACKAGE]
         if dry_run:
             print(shlex_join(build_cmd))
         else:
@@ -474,7 +474,7 @@ def ensure_builds(locks: Iterable[str], *, dry_run: bool) -> None:
             if not ACCORDIN_DIRECT_RELEASE_LIB.is_file():
                 raise RuntimeError(f"{ACCORDIN_DIRECT_PACKAGE} library was not produced: {ACCORDIN_DIRECT_RELEASE_LIB}")
     if any(is_mcs_accordin_lock(lock) for lock in locks):
-        build_cmd = ["cargo", "build", "-p", MCS_ACCORDIN_DIRECT_PACKAGE, "--release"]
+        build_cmd = ["make", MCS_ACCORDIN_DIRECT_PACKAGE]
         if dry_run:
             print(shlex_join(build_cmd))
         else:

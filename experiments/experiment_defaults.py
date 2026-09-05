@@ -51,7 +51,7 @@ REMOVED_CORE_BACKENDS = frozenset({
 def require_available_core_backend(crate: str) -> None:
     if crate in REMOVED_CORE_BACKENDS:
         raise RuntimeError(
-            f"{crate} has been removed from the admission-direct workspace. "
+            f"{crate} has been removed from the admission-direct project. "
             "This historical preload entrypoint is disabled, including with an existing library. "
             "Use mcs_accordin_direct or mcs_tas_accordin_direct with a direct-API benchmark."
         )

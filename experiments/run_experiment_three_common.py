@@ -852,8 +852,7 @@ def invalid_interpose_helper_locks(locks: Iterable[str]) -> tuple[str, ...]:
     return tuple(invalid)
 
 
-# Every LD_PRELOAD helper is one cargo crate built into target/release, so a
-# missing one is either a build to run or the error that names the crate.
+# Reject removed preload backends before considering existing build artifacts.
 def ensure_preload_library(
     path: Path,
     crate: str,
@@ -868,11 +867,11 @@ def ensure_preload_library(
     if not build_missing:
         raise RuntimeError(
             f"LD_PRELOAD helper is missing: {path}. "
-            f"Run cargo build -p {crate} --release or rerun with --build-missing."
+            f"Run make {crate} or rerun with --build-missing."
         )
 
     logger.run(
-        ["cargo", "build", "-p", crate, "--release"],
+        ["make", crate],
         log_name=log_name,
         cwd=REPO_ROOT,
         timeout_seconds=0,

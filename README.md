@@ -1,6 +1,6 @@
 # Accordin Admission Direct
 
-Accordin 将用户态锁与 Linux eBPF `sched_ext` admission 调度器结合。当前核心仅保留两个显式 C API 后端：
+Accordin 将用户态锁与 Linux eBPF `sched_ext` admission 调度器结合。核心由 C11 锁运行时和 scx C/libbpf 加载器组成，仅保留两个显式 C API 后端：
 
 | 动态库 | 接口 |
 | --- | --- |
@@ -12,17 +12,20 @@ Accordin 将用户态锁与 Linux eBPF `sched_ext` admission 调度器结合。�
 ## 构建与验证
 
 ```sh
-cargo build --release
-cargo test --workspace
-cargo build --release --features perf-symbols
-bash scripts/check_direct_symbols.sh
-bash scripts/test_direct_api.sh --no-bpf
-sudo bash scripts/test_direct_api.sh --bpf
+make -j
+make check
+sudo make check-bpf
+# 将原始锁函数保留为独立的 perf 符号：
+make OUT=target/perf PERF_SYMBOLS=1
 # 至少允许两个 CPU 时，额外测试等待期间更改 affinity：
 sudo env DIRECT_SMOKE_MIGRATE=1 bash scripts/test_direct_api.sh --bpf
 ```
 
-默认 workspace 只构建 `accordin_shared` 和两个 direct 库。BPF 构建需要 Clang、libbpf 相关开发依赖；实际调度需要支持 `sched_ext` 的 Linux 内核和 BPF 权限。`--bpf` 验证会短时启动调度器，仅在当前没有其他 sched_ext 调度器时运行；可在命令前加 `taskset -c <CPU列表>` 验证受限 affinity。
+构建需要 Clang（包含 BPF target）、bpftool、pkg-config 和 libbpf 开发包（建议 libbpf 1.5+）。例如 Ubuntu 上安装 `clang bpftool libbpf-dev libelf-dev zlib1g-dev pkg-config make`。无需 Rust 或 Cargo。两个库仍输出到 `target/release/`，也可用 `make mcs_accordin_direct` 或 `make mcs_tas_accordin_direct` 单独构建。
+
+scx C 头文件固定在 `third_party/scx/`。构建时从 `/sys/kernel/btf/vmlinux` 生成 `vmlinux.h`，可用 `VMLINUX_BTF=/path/to/vmlinux.btf` 指定其他 BTF。实际调度需要支持 `sched_ext` 的 Linux 内核和 BPF 权限。`check-bpf` 会短时启动调度器，仅在当前没有其他 sched_ext 调度器时运行；可在命令前加 `taskset -c <CPU列表>` 验证受限 affinity。`bash gen-compile-commands.sh` 根据 Makefile 生成 clangd 编译数据库。
+
+应用应在退出所有使用 direct API 的线程后再卸载动态库。MCS 后端保持每线程最多同时持有 4 把锁；调度器支持最多 256 个逻辑 CPU。
 
 C 头文件位于 `include/mcs_accordin_direct.h` 和 `include/mcs_tas_accordin_direct.h`。例如：
 
@@ -75,6 +78,8 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 旧 CV、width、固定 width、依赖图、动态 CPU 和采样环境变量已不再解析。CV/writer-event 和动态 CPU 控制的 C 符号及旧时间统计输出已移除。旧 `DEBUG_COUNTERS`、`INACTIVE_PREVIOUS_LOCK_PERCENT` 参数和 `[lock_stats]` 计数输出也已移除。调度异常时，BPF dump 保留队列长度和 CPU owner 信息。
 
 ## 实验与历史入口
+
+192 线程下的 Rust → C 迁移性能对比、原始日志和复现命令见 [测量报告](docs/benchmarks/c-migration-192/README.md)。
 
 实验、benchmark 子模块、第三方源码、结果和历史设计文档保留。mutexbench 的 direct 实验 1、3、6–9 继续使用原库名和 mutex C ABI。实验 4 的 LevelDB direct 选项依赖已移除的 CV/writer-event API，因此已停用；普通 mutex 等外部基线选项和历史结果绘图仍可使用。`patches/leveldb-accordin-direct.patch` 仅保留作历史参考。
 

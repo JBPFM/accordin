@@ -733,7 +733,7 @@ def run_multi_lock_sweeps(
 def ensure_accordin_direct_library(logger: CommandLogger) -> None:
     if not ACCORDIN_DIRECT_RELEASE_LIB.is_file():
         logger.run(
-            ["cargo", "build", "-p", ACCORDIN_DIRECT_PACKAGE, "--release"],
+            ["make", ACCORDIN_DIRECT_PACKAGE],
             log_name=f"build_{ACCORDIN_DIRECT_PACKAGE}.log",
             timeout_seconds=0,
         )

@@ -1,0 +1,29 @@
+{
+  "date_utc": "2026-09-05T03:34:26.029338+00:00",
+  "config": {
+    "rust_lib_dir": "target/c-migration-192/rust",
+    "c_lib_dir": "target/release",
+    "output": "target/c-migration-192/results",
+    "threads": 192,
+    "cpus": "0-95",
+    "critical_ns": 300,
+    "outside_ns": 3000,
+    "duration_ms": 5000,
+    "warmup_ms": 1000,
+    "repeats": 5
+  },
+  "sha256": {
+    "/mnt/sde/jz/accordin/bench/mutexbench/mutex_bench": "33d7c52b92043825822336db2316f8c5c1e80df18c698170553a14c59b558a5b",
+    "/mnt/sde/jz/accordin/target/c-migration-192/rust/libmcs_accordin_direct.so": "6c6be78bd48b35cc7b47da6813e8ceee9c67bee0a5fecb1cc88661a453de1c79",
+    "/mnt/sde/jz/accordin/target/c-migration-192/rust/libmcs_tas_accordin_direct.so": "fc1d3c4c127c731bd4417fcf1666f2e9befeecdffebe10e102aa9acc9d3cff78",
+    "/mnt/sde/jz/accordin/target/release/libmcs_accordin_direct.so": "e2700b52cb836d81495cafd8dd53041ce8eadad7f85893f0b9c97d09292cda6e",
+    "/mnt/sde/jz/accordin/target/release/libmcs_tas_accordin_direct.so": "c1c502e3ac4228eec37c070efaa2b7778bd843a559fabe8447aa109a5ec04af1"
+  },
+  "uname -a": "Linux nku 6.14.0-37-generic #37-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 23:05:04 UTC 2025 aarch64 aarch64 aarch64 GNU/Linux",
+  "lscpu": "Architecture:                            aarch64\nCPU op-mode(s):                          64-bit\nByte Order:                              Little Endian\nCPU(s):                                  96\nOn-line CPU(s) list:                     0-95\nVendor ID:                               HiSilicon\nModel name:                              TaiShan-v110\nModel:                                   0\nThread(s) per core:                      1\nCore(s) per socket:                      48\nSocket(s):                               2\nStepping:                                0x1\nFrequency boost:                         disabled\nCPU(s) scaling MHz:                      100%\nCPU max MHz:                             2600.0000\nCPU min MHz:                             200.0000\nBogoMIPS:                                200.00\nFlags:                                   fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma dcpop asimddp asimdfhm\nL1d cache:                               6 MiB (96 instances)\nL1i cache:                               6 MiB (96 instances)\nL2 cache:                                48 MiB (96 instances)\nL3 cache:                                96 MiB (4 instances)\nNUMA node(s):                            4\nNUMA node0 CPU(s):                       0-23\nNUMA node1 CPU(s):                       24-47\nNUMA node2 CPU(s):                       48-71\nNUMA node3 CPU(s):                       72-95\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Not affected\nVulnerability Spectre v1:                Mitigation; __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; CSV2, but not BHB\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+  "clang --version": "Ubuntu clang version 19.1.7 (3ubuntu1)\nTarget: aarch64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/lib/llvm-19/bin",
+  "pkg-config --modversion libbpf": "1.5.0",
+  "bpftool version": "bpftool v7.6.0\nusing libbpf v1.6\nfeatures:",
+  "git rev-parse HEAD": "695c873d1228f12c526e1fe3096bf12169851237",
+  "git -C bench/mutexbench rev-parse HEAD": "98904ce1e143dd2ac36aa0d87ebc625ec4d940bb"
+}

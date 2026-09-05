@@ -1,0 +1,136 @@
+diff --git a/locks/clh.hpp b/locks/clh.hpp
+index b7bc3ec..9bfd6fa 100644
+--- a/locks/clh.hpp
++++ b/locks/clh.hpp
+@@ -67,6 +67,8 @@ private:
+   static inline void Pause() {
+ #if defined(__x86_64__) || defined(__i386__)
+     _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++    asm volatile("yield" ::: "memory");
+ #else
+     std::this_thread::yield();
+ #endif
+diff --git a/locks/hapax.hpp b/locks/hapax.hpp
+index 5ab12cd..30fd8d7 100644
+--- a/locks/hapax.hpp
++++ b/locks/hapax.hpp
+@@ -55,6 +55,9 @@ struct HapaxVW {
+   static inline void Pause(std::uint32_t spin_count) {
+ #if defined(__x86_64__) || defined(__i386__)
+     _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++    (void)spin_count;
++    asm volatile("yield" ::: "memory");
+ #else
+     if ((spin_count & 0xFFu) == 0) {
+       std::this_thread::yield();
+diff --git a/locks/mcs.hpp b/locks/mcs.hpp
+index 20709ae..b7063f2 100644
+--- a/locks/mcs.hpp
++++ b/locks/mcs.hpp
+@@ -29,6 +29,8 @@ struct McsLock {
+       while (my_node.locked.load(std::memory_order_acquire)) {
+ #if defined(__x86_64__) || defined(__i386__)
+         _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++        asm volatile("yield" ::: "memory");
+ #else
+         std::this_thread::yield();
+ #endif
+@@ -53,6 +55,8 @@ struct McsLock {
+       while ((succ = node->next.load(std::memory_order_acquire)) == nullptr) {
+ #if defined(__x86_64__) || defined(__i386__)
+         _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++        asm volatile("yield" ::: "memory");
+ #else
+         std::this_thread::yield();
+ #endif
+diff --git a/locks/mcs_tas.hpp b/locks/mcs_tas.hpp
+index cee2896..7c12802 100644
+--- a/locks/mcs_tas.hpp
++++ b/locks/mcs_tas.hpp
+@@ -73,6 +73,8 @@ private:
+   static inline void Pause() {
+ #if defined(__x86_64__) || defined(__i386__)
+     _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++    asm volatile("yield" ::: "memory");
+ #else
+     std::this_thread::yield();
+ #endif
+diff --git a/locks/mcs_tas_tse.hpp b/locks/mcs_tas_tse.hpp
+index 5374d3b..cabf646 100644
+--- a/locks/mcs_tas_tse.hpp
++++ b/locks/mcs_tas_tse.hpp
+@@ -98,6 +98,8 @@ private:
+   static inline void Pause() {
+ #if defined(__x86_64__) || defined(__i386__)
+     _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++    asm volatile("yield" ::: "memory");
+ #else
+     std::this_thread::yield();
+ #endif
+diff --git a/locks/mcstas_next.hpp b/locks/mcstas_next.hpp
+index da5095a..8a893f5 100644
+--- a/locks/mcstas_next.hpp
++++ b/locks/mcstas_next.hpp
+@@ -98,6 +98,8 @@ private:
+   static inline void Pause() {
+ #if defined(__x86_64__) || defined(__i386__)
+     _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++    asm volatile("yield" ::: "memory");
+ #else
+     std::this_thread::yield();
+ #endif
+diff --git a/locks/mcstas_next_tse.hpp b/locks/mcstas_next_tse.hpp
+index 5f76559..375d1b8 100644
+--- a/locks/mcstas_next_tse.hpp
++++ b/locks/mcstas_next_tse.hpp
+@@ -137,6 +137,8 @@ private:
+   static inline void Pause() {
+ #if defined(__x86_64__) || defined(__i386__)
+     _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++    asm volatile("yield" ::: "memory");
+ #else
+     std::this_thread::yield();
+ #endif
+diff --git a/locks/twa.hpp b/locks/twa.hpp
+index f3c03a0..a97f2f9 100644
+--- a/locks/twa.hpp
++++ b/locks/twa.hpp
+@@ -40,6 +40,8 @@ struct TwaLock {
+   static inline void Pause() {
+ #if defined(__x86_64__) || defined(__i386__)
+     _mm_pause();
++#elif defined(__aarch64__) || defined(__arm__)
++    asm volatile("yield" ::: "memory");
+ #else
+     std::this_thread::yield();
+ #endif
+diff --git a/mutex_bench.cpp b/mutex_bench.cpp
+index 29e66b0..907a1a1 100644
+--- a/mutex_bench.cpp
++++ b/mutex_bench.cpp
+@@ -462,7 +462,7 @@ template <typename LockBenchT> int RunSingleLockBenchmarkForLock(const Config &c
+ 
+       workers_ready.fetch_add(1, std::memory_order_release);
+       while (!warmup_start.load(std::memory_order_acquire)) {
+-        std::this_thread::yield();
++        SpinPause();
+       }
+ 
+       if (cfg.warmup_duration_ms > 0) {
+@@ -649,7 +649,7 @@ template <typename LockBenchT> int RunTwoLockBenchmarkForLock(const Config &cfg)
+ 
+         workers_ready.fetch_add(1, std::memory_order_release);
+         while (!warmup_start.load(std::memory_order_acquire)) {
+-          std::this_thread::yield();
++          SpinPause();
+         }
+ 
+         if (cfg.warmup_duration_ms > 0) {

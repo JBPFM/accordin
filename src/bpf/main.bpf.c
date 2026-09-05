@@ -78,14 +78,25 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 
   if (!stats_only_mode) {
     bool known = user_state(p, &state);
+    bool holder = known && (state & USER_FLAGS) == USER_HELD;
     tctx = bpf_task_storage_get(&task_ctx_map, p, 0,
                               BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (tctx) {
       if (known)
         refresh_episode(p, tctx, state);
+      /* Where the task runs next, decided once: an admitted task returns to
+       * its reserved CPU, a holder preempts whatever occupies the CPU it is
+       * bound to, because a holder left in the global queue stalls every
+       * spinner that wants its lock, and a new waiter joins the admission
+       * queue. */
       if (tctx->admission_cpu) {
         cpu = tctx->admission_cpu - 1;
         dsq = SCX_DSQ_LOCAL_ON | cpu;
+        if (holder)
+          enq_flags |= SCX_ENQ_PREEMPT;
+      } else if (holder && allowed(p, cpu)) {
+        dsq = SCX_DSQ_LOCAL_ON | cpu;
+        enq_flags |= SCX_ENQ_PREEMPT;
       } else if (known && (state & USER_FLAGS) == USER_WAITING) {
         tctx->ticket = request_ticket(p, state);
         dsq = WAITING_DSQ;
@@ -153,8 +164,19 @@ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct
 void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
   struct task_scx_ctx *tctx = task_ctx(p);
   __u32 state;
-  if (!stats_only_mode && tctx && user_state(p, &state))
-    refresh_episode(p, tctx, state);
+
+  if (stats_only_mode || !tctx || !user_state(p, &state))
+    return;
+  refresh_episode(p, tctx, state);
+  /* An admitted thread that spins never empties its CPU, so ops.dispatch is
+   * never called there and the global queue is never consumed. Ending the
+   * slice hands the CPU to one queued ordinary task; the spinner keeps its
+   * slot and is re-enqueued behind it. */
+  if (tctx->admission_cpu &&
+      ((state & USER_FLAGS) == USER_WAITING ||
+       (state & USER_FLAGS) == USER_SPINNING) &&
+      scx_bpf_dsq_nr_queued(NORMAL_DSQ))
+    p->scx.slice = 0;
 }
 
 void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {

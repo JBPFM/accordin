@@ -1,14 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <errno.h>
 #include <string.h>
-#include "runtime.h"
+#include "lock_ops.h"
 
 #ifdef MCS_TAS
-#include "mcs_tas.h"
 #include "mcs_tas_accordin_direct.h"
 #define MUTEX mcs_tas_accordin_direct_mutex
 #else
-#include "mcs.h"
 #include "mcs_accordin_direct.h"
 #define MUTEX mcs_accordin_direct_mutex
 #endif
@@ -46,14 +44,7 @@ EXPORT int API(lock)(struct MUTEX *mutex)
 {
     if (!mutex)
         return EINVAL;
-    ensure_registered();
-    bool managed = admission_begin();
-    if (!raw_trylock(&mutex->raw)) {
-        if (managed)
-            admission_wait();
-        raw_lock(&mutex->raw);
-    }
-    admission_enter(managed);
+    lock_ops_lock(&mutex->raw, NULL);
     return 0;
 }
 
@@ -61,11 +52,8 @@ EXPORT int API(trylock)(struct MUTEX *mutex)
 {
     if (!mutex)
         return EINVAL;
-    ensure_registered();
-    /* Failure leaves an existing admission episode untouched. */
-    if (!raw_trylock(&mutex->raw))
+    if (!lock_ops_trylock(&mutex->raw))
         return EBUSY;
-    admission_enter(admission_begin());
     return 0;
 }
 
@@ -73,8 +61,7 @@ EXPORT int API(unlock)(struct MUTEX *mutex)
 {
     if (!mutex)
         return EINVAL;
-    raw_unlock(&mutex->raw);
-    admission_finish();
+    lock_ops_unlock(&mutex->raw);
     return 0;
 }
 

@@ -14,6 +14,17 @@
 #define RAW_FN static inline __attribute__((always_inline))
 #endif
 
+/* The interposer stores a raw lock inside a 40-byte pthread_mutex_t, so it
+ * drops the cache-line padding and accepts sharing a line, and it sizes the
+ * MCS node pool for an unmodified program whose nesting depth is unknown. */
+#ifdef ACCORDIN_FULLHOOK
+#define RAW_LOCK_ALIGN 8
+#define MCS_POOL_SIZE 8
+#else
+#define RAW_LOCK_ALIGN 64
+#define MCS_POOL_SIZE 4
+#endif
+
 struct __attribute__((aligned(64))) node {
     _Atomic(struct node *) next;
     _Atomic bool waiting;

@@ -6,8 +6,10 @@ Accordin 将用户态锁与 Linux eBPF `sched_ext` admission 调度器结合。�
 | --- | --- |
 | `libmcs_accordin_direct.so` | MCS mutex；保留 `mcs_tas_accordin_direct_mutex_*` 兼容别名 |
 | `libmcs_tas_accordin_direct.so` | MCS-TAS mutex |
+| `libmcs_accordin_fullhook.so` | MCS 后端的 pthread 拦截库（`LD_PRELOAD`） |
+| `libmcs_tas_accordin_fullhook.so` | MCS-TAS 后端的 pthread 拦截库（`LD_PRELOAD`） |
 
-应用通过链接或 `dlopen` 调用 direct API。动态库加载时初始化调度器；它们不导出 `pthread_mutex_*` 或 `pthread_cond_*`，仅设置 `LD_PRELOAD` 无法替换普通程序的 pthread 锁。
+应用通过链接或 `dlopen` 调用 direct API。动态库加载时初始化调度器；direct 库不导出 `pthread_mutex_*` 或 `pthread_cond_*`，仅设置 `LD_PRELOAD` 无法替换普通程序的 pthread 锁。需要在不修改源码的前提下接管普通程序时，改用下文的 fullhook 拦截库。
 
 ## 构建与验证
 
@@ -21,11 +23,11 @@ make OUT=target/perf PERF_SYMBOLS=1
 sudo env DIRECT_SMOKE_MIGRATE=1 bash scripts/test_direct_api.sh --bpf
 ```
 
-构建需要 Clang（包含 BPF target）、bpftool、pkg-config 和 libbpf 开发包（建议 libbpf 1.5+）。例如 Ubuntu 上安装 `clang bpftool libbpf-dev libelf-dev zlib1g-dev pkg-config make`。无需 Rust 或 Cargo。两个库仍输出到 `target/release/`，也可用 `make mcs_accordin_direct` 或 `make mcs_tas_accordin_direct` 单独构建。
+构建需要 Clang（包含 BPF target）、bpftool、pkg-config 和 libbpf 开发包（建议 libbpf 1.5+）。例如 Ubuntu 上安装 `clang bpftool libbpf-dev libelf-dev zlib1g-dev pkg-config make`。无需 Rust 或 Cargo。四个库都输出到 `target/release/`，也可用 `make mcs_accordin_direct`、`make mcs_tas_accordin_direct`、`make mcs_accordin_fullhook` 或 `make mcs_tas_accordin_fullhook` 单独构建。`make check` 同时校验 direct 与 fullhook 的导出符号并运行两组冒烟测试。
 
 scx C 头文件固定在 `third_party/scx/`。构建时从 `/sys/kernel/btf/vmlinux` 生成 `vmlinux.h`，可用 `VMLINUX_BTF=/path/to/vmlinux.btf` 指定其他 BTF。实际调度需要支持 `sched_ext` 的 Linux 内核和 BPF 权限。`check-bpf` 会短时启动调度器，仅在当前没有其他 sched_ext 调度器时运行；可在命令前加 `taskset -c <CPU列表>` 验证受限 affinity。`bash gen-compile-commands.sh` 根据 Makefile 生成 clangd 编译数据库。
 
-应用应在退出所有使用 direct API 的线程后再卸载动态库。MCS 后端保持每线程最多同时持有 4 把锁；调度器支持最多 256 个逻辑 CPU。
+应用应在退出所有使用 direct API 的线程后再卸载动态库。MCS 后端在 direct 库中保持每线程最多同时持有 4 把锁，在 fullhook 库中为 8 把；调度器支持最多 256 个逻辑 CPU。
 
 C 头文件位于 `include/mcs_accordin_direct.h` 和 `include/mcs_tas_accordin_direct.h`。例如：
 
@@ -50,6 +52,57 @@ sudo ./example
 MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 ```
 
+## pthread 全量拦截（fullhook）
+
+fullhook 库用 `LD_PRELOAD` 接管程序的 pthread 锁，使未修改的二进制（例如 LevelDB `db_bench`）也走同一套 admission 运行时。库被映射时即加载调度器，线程在首次加锁时注册。
+
+被拦截的符号只有 `pthread_mutex_init`、`pthread_mutex_destroy`、`pthread_mutex_lock`、`pthread_mutex_trylock`、`pthread_mutex_unlock`、`pthread_mutex_timedlock`、`pthread_cond_init`、`pthread_cond_destroy`、`pthread_cond_wait`、`pthread_cond_timedwait`、`pthread_cond_signal`、`pthread_cond_broadcast`。
+
+原始锁直接存放在调用方的 `pthread_mutex_t` 内部，不做任何堆分配：`kind` 字段与 glibc 的 `__data.__kind` 对齐在偏移 16，因此 `PTHREAD_MUTEX_INITIALIZER` 的全零对象是未加锁的普通 mutex，`PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP` 无需 init 调用即为递归 mutex；递归持有只占用一次原始加锁，也只对应一次 admission。条件变量则是 `pthread_cond_t` 内的一个 futex 序号，signal/broadcast 递增序号后唤醒等待者，等待返回后按普通外层加锁重新获取 mutex。
+
+限制：
+
+- 只支持普通与递归 mutex；errorcheck、robust、优先级继承等属性按普通 mutex 处理，`pthread_mutex_timedlock` 直接报错并 `abort()`。
+- 条件变量忽略 `pthread_condattr_t`，超时始终按 `CLOCK_REALTIME` 解释，等待不是取消点；`pthread_cond_clockwait` 未被拦截，不要在拦截下使用。
+- 只有走 PLT 的调用会被替换；glibc 内部锁以及 `pthread_spin_*`、`pthread_rwlock_*`、`pthread_barrier_*` 不受影响。
+- MCS-TAS 的紧凑布局让 `tail` 与 `locked` 共享一个 cache line。
+- MCS 后端要求解锁线程即为加锁线程。
+
+运行方式：
+
+```sh
+sudo env LD_PRELOAD=$PWD/target/release/libmcs_tas_accordin_fullhook.so ./program
+# 无 BPF 的锁正确性检查：
+LD_PRELOAD=$PWD/target/release/libmcs_tas_accordin_fullhook.so \
+  MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./program
+# 冒烟测试（C 与 C++ 各一个程序，含拦截生效校验）：
+bash scripts/test_fullhook.sh --no-bpf
+sudo bash scripts/test_fullhook.sh --bpf
+```
+
+`scripts/build_leveldb_stock.sh` 从 `third_party/leveldb-1.23` 的 HEAD 导出未打补丁的源码，构建 `target/leveldb-stock/build/db_bench`（工作区里的 LevelDB 带补丁，不要直接构建）。该二进制配合 fullhook 即可测量未改源码的 LevelDB：
+
+```sh
+bash scripts/build_leveldb_stock.sh
+sudo env LD_PRELOAD=$PWD/target/release/libmcs_tas_accordin_fullhook.so \
+  target/leveldb-stock/build/db_bench --benchmarks=fillseq,readrandom \
+  --num=20000 --threads=8 --db=/tmp/accordin-fullhook-smoke
+```
+
+环境变量与 direct 库相同：MCS 后端用 `MCS_ACCORDIN_DIRECT_*`，MCS-TAS 后端用 `MCS_TAS_ACCORDIN_DIRECT_*`，`ACCORDIN_DISABLE_ADMISSION` 对两者通用。
+
+### 按锁统计等待来源
+
+`ACCORDIN_HOOK_STATS=1` 打开按 mutex 地址归因的统计，用来区分 LevelDB 里哪些锁走了慢路径、等待时间花在 admission 还是原始锁自旋上。默认关闭，此时加解锁走的是与 direct 库相同的获取函数，只在入口多一次恒定的分支判断，统计代码全部落在冷路径上。
+
+每线程记录最多 64 个地址（第 65 个起并入 `addr=overflow` 行），线程退出与进程退出时合并到全局表，最后按 `admission_ns + spin_ns` 降序输出到 stderr，最多 40 行加上溢出行与合计行：
+
+```
+[hook_stats] addr=0x... acq=N fast=N slow=N waits=N yields=N admission_ms=X spin_ms=X hold_ms=X max_hold_us=X cond_waits=N
+```
+
+`acq` 是加锁与成功 trylock 的总次数，`fast` 是 `pthread_mutex_lock` 中 trylock 直接成功的次数，`slow` 是进入慢路径的次数，`waits`/`yields` 是进入 admission 等待的次数与其中的 yield 轮数，`cond_waits` 是这把锁被 `pthread_cond_wait` 释放的次数。
+
 ## Admission 行为
 
 核心规则：**每个逻辑 CPU 只为一个线程保留锁等待名额**。锁本身不再分配 ID，也没有锁数量上限。
@@ -58,6 +111,8 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 2. 外层加锁进入慢路径时，发布 WAITING 并 yield。若线程仍拥有当前 CPU 的名额，BPF 用 CAS 将旧 ticket 更新为本次请求；否则进入全局 FIFO 等待队列。
 3. CPU 有空闲名额时，从队列中取一个 affinity 允许的线程，先保留名额；用户态确认名额属于本次请求后，才进入原始锁的自旋队列。
 4. 每次外层加锁使用递增的请求编号，用户态始终校验本次 ticket。解锁清除用户态状态，调度器观察到释放或未续用的新请求时回收名额，无需额外解锁 syscall；若下一次慢路径赶在回收前进入 yield，可以更新并续用自己的名额。
+5. 处于 USER_HELD 的线程入队时直接进入其 CPU 的 local 队列并带上抢占标志，避免持锁线程排在普通队列里，而等这把锁的自旋线程正占满 CPU。
+6. 已获准线程在自旋等待期间不会让 CPU 变空，`ops.dispatch` 因此不会被调用，普通队列无人消费；tick 时若普通队列非空，就把该线程的时间片清零，让出一次调度给普通队列中的任务，自身保留名额并排到其后。普通队列为空时该路径不做任何事。
 
 等待队列按 FIFO 扫描；已有名额的线程可以连续续用，因此不保证严格 FIFO 或有界等待。
 
@@ -76,6 +131,7 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 | `<PREFIX>_DISABLE_BPF` | 默认关闭；设为 `1` 时不加载 BPF。 |
 | `ACCORDIN_DISABLE_ADMISSION` | 默认关闭；设为 `1` 时不发布 admission 标志。 |
 | `<PREFIX>_STATS_ONLY` | 保留历史名称的对照模式；设为 `1` 时加载普通 sched_ext 调度，不进行锁感知路由，也不采样锁时间。 |
+| `ACCORDIN_HOOK_STATS` | 仅 fullhook 库解析；默认关闭，设为 `1` 时按 mutex 地址统计等待来源并在进程退出时输出 `[hook_stats]`。 |
 
 旧 CV、width、固定 width、依赖图、动态 CPU 和采样环境变量已不再解析。CV/writer-event 和动态 CPU 控制的 C 符号及旧时间统计输出已移除。旧 `DEBUG_COUNTERS`、`INACTIVE_PREVIOUS_LOCK_PERCENT` 参数和 `[lock_stats]` 计数输出也已移除。调度异常时，BPF dump 保留队列长度和 CPU owner 信息。
 

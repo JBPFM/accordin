@@ -2,18 +2,18 @@
 #include "raw_lock.h"
 
 struct raw_lock {
-    _Alignas(64) _Atomic(struct node *) tail;
+    _Alignas(RAW_LOCK_ALIGN) _Atomic(struct node *) tail;
 };
 
-/* A node stays live until unlock; four simultaneously held MCS locks per thread. */
+/* A node stays live until unlock; MCS_POOL_SIZE MCS locks held at once per thread. */
 static _Thread_local struct {
-    struct node nodes[4];
-    struct raw_lock *owners[4];
+    struct node nodes[MCS_POOL_SIZE];
+    struct raw_lock *owners[MCS_POOL_SIZE];
 } pool;
 
 static inline struct node *node_acquire(struct raw_lock *lock, bool waiting)
 {
-    for (unsigned int i = 0; i < 4; i++) {
+    for (unsigned int i = 0; i < MCS_POOL_SIZE; i++) {
         if (!pool.owners[i]) {
             pool.owners[i] = lock;
             atomic_store_explicit(&pool.nodes[i].next, NULL, memory_order_relaxed);
@@ -53,7 +53,7 @@ RAW_FN void raw_lock(struct raw_lock *lock)
 
 RAW_FN void raw_unlock(struct raw_lock *lock)
 {
-    for (unsigned int i = 0; i < 4; i++) {
+    for (unsigned int i = 0; i < MCS_POOL_SIZE; i++) {
         if (pool.owners[i] == lock) {
             queue_release(&lock->tail, &pool.nodes[i]);
             node_release(&pool.nodes[i]);

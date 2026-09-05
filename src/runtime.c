@@ -1,13 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#include <ctype.h>
 #include <pthread.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <scx/common.h>
+#include "env_flag.h"
 #include "runtime.h"
 #include "accordin.skel.h"
 
@@ -25,22 +24,7 @@ static struct bpf_link *scheduler_link;
 static int thread_map_fd = -1;
 static pthread_key_t registration_key;
 static libbpf_print_fn_t previous_log;
-
-static bool env_flag(const char *name)
-{
-    const char *value = getenv(name);
-    if (!value)
-        return false;
-    while (isspace((unsigned char)*value))
-        value++;
-    size_t len = strlen(value);
-    while (len && isspace((unsigned char)value[len - 1]))
-        len--;
-    return (len == 1 && *value == '1') ||
-           (len == 4 && !strncasecmp(value, "true", len)) ||
-           (len == 3 && !strncasecmp(value, "yes", len)) ||
-           (len == 2 && !strncasecmp(value, "on", len));
-}
+static bool runtime_ready;
 
 static void unregister_thread(void *value)
 {
@@ -50,7 +34,12 @@ static void unregister_thread(void *value)
 
 void register_thread(void)
 {
-    thread_state.tid = syscall(SYS_gettid);
+    if (!thread_state.tid)
+        thread_state.tid = syscall(SYS_gettid);
+    /* A lock taken before the loader finishes has nowhere to publish the
+     * admission word, so the thread stays unregistered and retries later. */
+    if (!runtime_ready)
+        return;
     if (thread_map_fd >= 0) {
         uint64_t address = (uintptr_t)&thread_state.word;
         SCX_BUG_ON(bpf_map_update_elem(thread_map_fd, &thread_state.tid, &address, BPF_ANY),
@@ -69,20 +58,21 @@ static int libbpf_log(enum libbpf_print_level level, const char *fmt, va_list ar
 __attribute__((constructor)) static void scheduler_start(void)
 {
     admission_enabled = !env_flag("ACCORDIN_DISABLE_ADMISSION");
-    if (env_flag(PREFIX "_DISABLE_BPF"))
-        return;
-    previous_log = libbpf_set_print(libbpf_log);
-    SCX_BUG_ON(libbpf_num_possible_cpus() > (int)MAX_CPUS,
-               "Admission supports at most %u CPUs", MAX_CPUS);
-    SCX_BUG_ON(pthread_key_create(&registration_key, unregister_thread),
-               "Failed to create thread cleanup key");
-    skel = SCX_OPS_OPEN(accordin_ops, accordin);
-    skel->bss->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
-    SCX_OPS_LOAD(skel, accordin_ops, accordin, uei);
-    thread_map_fd = bpf_map__fd(skel->maps.thread_ctx_addr_map);
-    scheduler_link = SCX_OPS_ATTACH(skel, accordin_ops, accordin);
-    scheduler_admission = &skel->bss->admission;
-    fprintf(stderr, "[%s] eBPF scheduler loaded successfully\n", PREFIX);
+    if (!env_flag(PREFIX "_DISABLE_BPF")) {
+        previous_log = libbpf_set_print(libbpf_log);
+        SCX_BUG_ON(libbpf_num_possible_cpus() > (int)MAX_CPUS,
+                   "Admission supports at most %u CPUs", MAX_CPUS);
+        SCX_BUG_ON(pthread_key_create(&registration_key, unregister_thread),
+                   "Failed to create thread cleanup key");
+        skel = SCX_OPS_OPEN(accordin_ops, accordin);
+        skel->bss->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
+        SCX_OPS_LOAD(skel, accordin_ops, accordin, uei);
+        thread_map_fd = bpf_map__fd(skel->maps.thread_ctx_addr_map);
+        scheduler_link = SCX_OPS_ATTACH(skel, accordin_ops, accordin);
+        scheduler_admission = &skel->bss->admission;
+        fprintf(stderr, "[%s] eBPF scheduler loaded successfully\n", PREFIX);
+    }
+    runtime_ready = true;
 }
 
 __attribute__((destructor)) static void scheduler_stop(void)

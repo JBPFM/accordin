@@ -17,7 +17,7 @@ commands = subprocess.check_output(
 entries = []
 for line in commands.splitlines():
     args = shlex.split(line)
-    sources = [arg for arg in args if arg in ('src/direct.c', 'src/runtime.c', 'src/bpf/main.bpf.c')]
+    sources = [arg for arg in args if arg in ('src/direct.c', 'src/fullhook.c', 'src/runtime.c', 'src/bpf/main.bpf.c')]
     if not sources or not any(arg in args for arg in ('-c', '-shared')):
         continue
     flags = []

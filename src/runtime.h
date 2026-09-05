@@ -38,7 +38,8 @@ static inline bool admission_begin(void)
     return managed;
 }
 
-static inline void admission_wait(void)
+/* Counts the yields the grant took when the caller asks for them. */
+static inline void admission_wait(unsigned int *yields)
 {
     uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
                                                memory_order_relaxed) & ~USER_FLAGS;
@@ -48,6 +49,8 @@ static inline void admission_wait(void)
     /* A yield need not dispatch. Confirm this request, never an older grant. */
     for (;;) {
         sched_yield();
+        if (yields)
+            ++*yields;
         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
             break;
         unsigned int cpu = sched_getcpu();

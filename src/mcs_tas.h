@@ -2,8 +2,8 @@
 #include "raw_lock.h"
 
 struct raw_lock {
-    _Alignas(64) _Atomic(struct node *) tail;
-    _Alignas(64) _Atomic bool locked;
+    _Alignas(RAW_LOCK_ALIGN) _Atomic(struct node *) tail;
+    _Alignas(RAW_LOCK_ALIGN) _Atomic bool locked;
 };
 
 static _Thread_local struct node thread_node;
@@ -27,7 +27,10 @@ RAW_FN void raw_lock(struct raw_lock *lock)
         while (atomic_load_explicit(&node->waiting, memory_order_acquire))
             spin_pause();
     }
-    while (atomic_exchange_explicit(&lock->locked, true, memory_order_acquire))
+    /* Test before test-and-set: a queued waiter reads the line shared until
+     * the holder releases it. */
+    while (atomic_load_explicit(&lock->locked, memory_order_relaxed) ||
+           atomic_exchange_explicit(&lock->locked, true, memory_order_acquire))
         spin_pause();
     /* This node is reusable as soon as acquisition finishes, before unlock. */
     queue_release(&lock->tail, node);

@@ -224,7 +224,19 @@ pub fn pause() {
         std::hint::spin_loop();
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+    {
+        // Use a CPU spin-wait hint instead of yielding to the OS scheduler.
+        // SAFETY: YIELD does not access memory or modify the stack or flags.
+        unsafe { core::arch::asm!("yield", options(nomem, nostack, preserves_flags)) };
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm"
+    )))]
     {
         std::thread::yield_now();
     }

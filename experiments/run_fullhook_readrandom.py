@@ -124,6 +124,32 @@ def resolve_path(value: str) -> Path:
     return path if path.is_absolute() else (REPO_ROOT / path)
 
 
+def parse_preload_arms(
+    parser: argparse.ArgumentParser, values: list[str]
+) -> dict[str, Path]:
+    """Turn every --preload-arm NAME=PATH pair into a named preload library.
+
+    The names extend the built-in arm table for one invocation only, so an
+    extra arm runs solely when --arms lists it.
+    """
+    libraries: dict[str, Path] = {}
+    for value in values:
+        name, separator, raw_path = value.partition("=")
+        if not separator or not name or not raw_path:
+            parser.error(f"--preload-arm expects NAME=PATH, got {value!r}")
+        if not name.isidentifier():
+            parser.error(f"--preload-arm name must be a plain identifier, got {name!r}")
+        if name in ARMS_BY_NAME:
+            parser.error(f"--preload-arm name {name!r} clashes with a built-in arm")
+        if name in libraries:
+            parser.error(f"--preload-arm name {name!r} is defined twice")
+        path = resolve_path(raw_path)
+        if not path.is_file():
+            parser.error(f"--preload-arm library not found: {path}")
+        libraries[name] = path
+    return libraries
+
+
 def read_text(path: Path) -> str:
     try:
         return path.read_text().strip()
@@ -404,6 +430,7 @@ def write_metadata(args: argparse.Namespace, arms: tuple[str, ...]) -> None:
         "db_bench_sha256": sha256_of(args.db_bench),
         "lib_dir": str(args.lib_dir),
         "flexguard_lib": str(args.flexguard_lib),
+        "preload_arms": dict(args.preload_arms),
         "db_dir": str(args.db_dir),
         "benchmark": args.benchmark,
         "arms": list(arms),
@@ -546,6 +573,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--db-bench", default="target/leveldb-stock/build/db_bench")
     parser.add_argument("--benchmark", choices=BENCHMARKS, default=READ_BENCHMARK)
     parser.add_argument("--arms", default=",".join(DEFAULT_ARMS))
+    parser.add_argument(
+        "--preload-arm",
+        dest="preload_arms",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "define an extra arm NAME that preloads PATH as root; repeatable, "
+            "and measured only when --arms lists NAME"
+        ),
+    )
     parser.add_argument("--threads", default="48,96,192")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--num", type=int, default=500000)
@@ -561,11 +599,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
+    preload_libraries = parse_preload_arms(parser, args.preload_arms)
+    # An extra preload arm behaves like the fullhook arms: it runs as root and
+    # keeps the sched_ext settle and dmesg probes around the measured command.
+    args.arms_by_name = dict(ARMS_BY_NAME)
+    args.arms_by_name.update(
+        (name, Arm(name=name, sudo=True, uses_bpf=True)) for name in preload_libraries
+    )
+    args.preload_arms = {name: str(path) for name, path in preload_libraries.items()}
+
     names = split_csv(args.arms)
-    unknown = [name for name in names if name not in ARMS_BY_NAME]
+    unknown = [name for name in names if name not in args.arms_by_name]
     if unknown:
         parser.error(
-            f"Unknown arm {unknown[0]!r}. Supported arms: {', '.join(ARMS_BY_NAME)}"
+            f"Unknown arm {unknown[0]!r}. Supported arms: {', '.join(args.arms_by_name)}"
         )
     if not names:
         parser.error("--arms must list at least one arm")
@@ -592,19 +639,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.out = resolve_path(args.out)
     args.lib_dir = resolve_path(args.lib_dir)
     args.flexguard_lib = resolve_path(args.flexguard_lib)
-    # Preload paths resolved once: arms name a file inside --lib-dir, and the
-    # flexguard interposer comes from its own option.
+    # Preload paths resolved once: arms name a file inside --lib-dir, the
+    # flexguard interposer comes from its own option, and each --preload-arm
+    # carries the path it was defined with.
     args.libraries = {
         arm.name: args.lib_dir / arm.library for arm in ARMS if arm.library
     }
     args.libraries["flexguard"] = args.flexguard_lib
+    args.libraries.update(preload_libraries)
     return args
 
 
 def build_plan(args: argparse.Namespace) -> tuple[Run, ...]:
     """Every measured run, in execution order."""
     return tuple(
-        Run(arm=ARMS_BY_NAME[name], threads=threads, repeat=repeat)
+        Run(arm=args.arms_by_name[name], threads=threads, repeat=repeat)
         for repeat in range(1, args.repeats + 1)
         for threads in args.threads
         for name in args.arms

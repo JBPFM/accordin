@@ -50,6 +50,8 @@ _Static_assert(offsetof(struct hook_mutex, kind) == 16,
 struct hook_cond {
     _Atomic uint32_t seq;
     _Atomic uint32_t parked;
+    /* Saturating score of recent spin outcomes on this condition variable. */
+    _Atomic uint32_t spin_fail;
 };
 
 _Static_assert(sizeof(struct hook_cond) <= sizeof(pthread_cond_t),
@@ -94,6 +96,11 @@ struct stats_frame {
 
 /* Microseconds a condition-variable waiter may spin before parking. */
 #define CV_SPIN_US_DEFAULT 1000
+/* A spin that pays off lowers the score by one, one that runs out raises it by
+ * two, so a condition variable settles into parking after a few failed waits
+ * and needs a run of successes to earn the CPU back. */
+#define SPIN_FAIL_PARK 3
+#define SPIN_FAIL_MAX 8
 
 static uint64_t cv_spin_ns;
 static bool stats_enabled;
@@ -504,13 +511,15 @@ static uint64_t cv_spin_deadline(const struct timespec *abstime)
  * watch the sequence directly instead of sleeping. Returns whether the
  * sequence moved, in which case no futex wait is needed at all. */
 static bool cv_spin(struct hook_cond *state, uint32_t seq,
-                    const struct timespec *abstime)
+                    const struct timespec *abstime, bool demand_breaks)
 {
     bool moved = false;
+    uint64_t ticket;
 
     admission_begin();
-    if (admission_try_once(USER_CV)) {
+    if (admission_try_once(USER_CV, &ticket)) {
         uint64_t deadline = cv_spin_deadline(abstime);
+        uint32_t score;
 
         admission_publish_spinning(USER_CV);
         for (unsigned int spins = 0;; spins++) {
@@ -519,10 +528,23 @@ static bool cv_spin(struct hook_cond *state, uint32_t seq,
                 break;
             }
             spin_pause();
-            /* Reading the clock every iteration would cost more than the spin. */
-            if (!(spins & 63) && lock_ops_now_ns() >= deadline)
+            /* Reading the clock every iteration would cost more than the
+             * spin. The waiter always stops at the budget or once a preemption
+             * has taken this CPU's slot away; the queue length the scheduler
+             * publishes is decisive only for a condition variable whose waits
+             * have been outlasting the budget, so one whose spins pay off may
+             * still borrow a CPU others are queued for. */
+            if (!(spins & 63) &&
+                ((demand_breaks && admission_demand()) ||
+                 lock_ops_now_ns() >= deadline || !admission_slot_held(ticket)))
                 break;
         }
+        score = atomic_load_explicit(&state->spin_fail, memory_order_relaxed);
+        if (moved)
+            score = score ? score - 1 : 0;
+        else
+            score = score + 2 > SPIN_FAIL_MAX ? SPIN_FAIL_MAX : score + 2;
+        atomic_store_explicit(&state->spin_fail, score, memory_order_relaxed);
     }
     admission_finish();
     return moved;
@@ -535,6 +557,7 @@ static int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex,
     int op = abstime ? (FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME)
                      : FUTEX_WAIT_PRIVATE;
     int result = 0;
+    bool moved = false;
     uint32_t seq;
 
     if (stats_enabled) {
@@ -545,7 +568,15 @@ static int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex,
     seq = atomic_load_explicit(&state->seq, memory_order_seq_cst);
     hook_unlock(mutex);
 
-    if (!(cv_spin_allowed() && cv_spin(state, seq, abstime))) {
+    if (cv_spin_allowed()) {
+        /* A condition variable whose recent spins ran out of budget yields to
+         * anything queued; one whose spins keep succeeding does not. */
+        bool demand_breaks = atomic_load_explicit(&state->spin_fail,
+                                                  memory_order_relaxed) >= SPIN_FAIL_PARK;
+        if (!demand_breaks || !admission_demand())
+            moved = cv_spin(state, seq, abstime, demand_breaks);
+    }
+    if (!moved) {
         /* Joining the census and re-reading the sequence pairs sequentially
          * with cond_wake's bump and census read, so a signal that misses the
          * census here is one this thread observes before it sleeps. */

@@ -60,7 +60,7 @@ fullhook 库用 `LD_PRELOAD` 接管程序的 pthread 锁，使未修改的二进
 
 原始锁直接存放在调用方的 `pthread_mutex_t` 内部，不做任何堆分配：`kind` 字段与 glibc 的 `__data.__kind` 对齐在偏移 16，因此 `PTHREAD_MUTEX_INITIALIZER` 的全零对象是未加锁的普通 mutex，`PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP` 无需 init 调用即为递归 mutex；递归持有只占用一次原始加锁，也只对应一次 admission。条件变量则是 `pthread_cond_t` 内的一个 futex 序号，signal/broadcast 递增序号后唤醒等待者，等待返回后按普通外层加锁重新获取 mutex。
 
-条件变量的等待先尝试自旋：解锁后若本线程没有持有其他被拦截的锁、admission 已启用且调度器已加载，就开一次 admission，带 `USER_CV` 标志发布 WAITING 并 yield 一次；拿到本 CPU 名额时改发布 SPINNING 并直接轮询序号，最长 `ACCORDIN_CV_SPIN_US` 微秒（默认 1000，设为 `0` 关闭自旋，启动时解析一次）。序号在此期间变化就无需任何 syscall；没拿到名额或超出预算则立即按原路 park 到 futex 上。自旋中的等待者不计入 parked 计数，因此唤醒它不需要 syscall。
+条件变量的等待先尝试自旋：解锁后若本线程没有持有其他被拦截的锁、admission 已启用且调度器已加载，就开一次 admission，带 `USER_CV` 标志发布 WAITING 并 yield 一次；拿到本 CPU 名额时改发布 SPINNING 并直接轮询序号，最长 `ACCORDIN_CV_SPIN_US` 微秒（默认 1000，设为 `0` 关闭自旋，启动时解析一次）。序号在此期间变化就无需任何 syscall；没拿到名额或超出预算则立即按原路 park 到 futex 上。自旋中的等待者不计入 parked 计数，因此唤醒它不需要 syscall。每个条件变量记一个饱和的自旋成绩：序号在预算内变化就减 1，用尽预算、名额被收回或因排队让出则加 2（上限 8）。成绩低于 3 时照常自旋；到达 3 以后，调度器发布的 demand（普通队列与等待队列长度之和）非零就直接 park。自旋中每 64 圈检查一次预算、名额是否仍在，以及（成绩已达 3 时）demand，任一条件满足即停止自旋并 park。这样 barrier 式的条件变量会稳定地 park，而唤醒确实很快的条件变量仍可短暂借用 CPU。
 
 限制：
 

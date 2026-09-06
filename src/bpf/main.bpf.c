@@ -58,6 +58,13 @@ static __always_inline void refresh_episode(struct task_struct *p,
   }
 }
 
+/* Userspace spins only while this is zero, so it is refreshed wherever the
+ * scheduler touches the queues. */
+static __always_inline void publish_demand(void) {
+  admission.demand = scx_bpf_dsq_nr_queued(NORMAL_DSQ) +
+                     scx_bpf_dsq_nr_queued(WAITING_DSQ);
+}
+
 s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
   struct task_scx_ctx *tctx = task_ctx(p);
@@ -115,6 +122,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   }
   scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
   scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+  publish_demand();
 }
 
 /* Reserve both the task and this CPU before moving a candidate. Different CPUs
@@ -149,9 +157,9 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   /* Serve ordinary work alongside the reserved waiter. This also lets an
    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
-  if (stats_only_mode || cpu < 0 || cpu >= MAX_CPUS)
-    return;
-  admit_waiter((__u32)cpu);
+  if (!stats_only_mode && cpu >= 0 && cpu < MAX_CPUS)
+    admit_waiter((__u32)cpu);
+  publish_demand();
 }
 
 bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
@@ -185,6 +193,7 @@ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
   struct task_scx_ctx *tctx = task_ctx(p);
   __u32 state;
 
+  publish_demand();
   if (stats_only_mode || !tctx || !user_state(p, &state))
     return;
   refresh_episode(p, tctx, state);
@@ -206,9 +215,16 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   if (stats_only_mode || !tctx || !user_state(p, &state))
     return;
   refresh_episode(p, tctx, state);
-  /* A holder or an existing raw-lock node must be allowed to resume. */
-  if (!runnable && (state & USER_FLAGS) != USER_HELD &&
-      (state & USER_FLAGS) != USER_SPINNING)
+  /* A condition-variable spinner that is preempted gives its slot back: the
+   * scheduler wanted this CPU, and the waiter can park instead of returning
+   * as an admitted spinner. A holder or a thread already queued on a raw lock
+   * must be allowed to resume, so blocking leaves their slot in place. */
+  if (runnable) {
+    if ((state & USER_FLAGS) == USER_SPINNING && (state & USER_CV))
+      release_slot(p, tctx);
+    return;
+  }
+  if ((state & USER_FLAGS) != USER_HELD && (state & USER_FLAGS) != USER_SPINNING)
     release_slot(p, tctx);
 }
 

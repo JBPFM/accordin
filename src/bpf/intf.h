@@ -19,6 +19,9 @@
 /* Mapped read-only by the direct runtime to confirm admission after yielding. */
 struct admission_state {
   unsigned int enabled;
+  /* Runnable threads queued for a CPU or a slot; advisory, published by the
+   * scheduler whenever it touches those queues. */
+  unsigned int demand;
   unsigned long long owners[MAX_CPUS];
 };
 

@@ -62,24 +62,40 @@ static inline void admission_wait(unsigned int *yields)
                           memory_order_relaxed);
 }
 
-/* One admission attempt for callers that park instead of queueing: publish
- * this request as a waiter, yield once, and report whether the current CPU's
- * slot came back carrying this request's ticket. */
-static inline bool admission_try_once(uint32_t extra_flags)
+/* How many runnable threads are waiting for a CPU or a slot right now. */
+static inline unsigned int admission_demand(void)
 {
-    uint32_t request = atomic_fetch_or_explicit(&thread_state.word,
-                                                USER_WAITING | extra_flags,
-                                                memory_order_relaxed) & ~USER_META;
-    uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+    struct admission_state *state = scheduler_admission;
+
+    return state ? __atomic_load_n(&state->demand, __ATOMIC_RELAXED) : 0;
+}
+
+/* Whether the current CPU's admission slot still carries this ticket. */
+static inline bool admission_slot_held(uint64_t ticket)
+{
     struct admission_state *state = scheduler_admission;
     unsigned int cpu;
 
-    sched_yield();
     if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
         return false;
     cpu = sched_getcpu();
     return cpu < MAX_CPUS &&
            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket;
+}
+
+/* One admission attempt for callers that park instead of queueing: publish
+ * this request as a waiter, yield once, and report whether the current CPU's
+ * slot came back carrying this request's ticket. The ticket is handed back so
+ * the caller can notice the slot being taken away again. */
+static inline bool admission_try_once(uint32_t extra_flags, uint64_t *ticket)
+{
+    uint32_t request = atomic_fetch_or_explicit(&thread_state.word,
+                                                USER_WAITING | extra_flags,
+                                                memory_order_relaxed) & ~USER_META;
+
+    *ticket = ((uint64_t)request << 32) | thread_state.tid;
+    sched_yield();
+    return admission_slot_held(*ticket);
 }
 
 static inline void admission_publish_spinning(uint32_t extra_flags)

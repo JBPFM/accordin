@@ -110,7 +110,8 @@ static void park_test(int scheduled) {
     assert(mutex_relock(primary, &request) == 0);
     assert(mutex_unlock(primary) == 0);
 
-    assert(cv_flush(0, CV_FLUSH_EXPIRE) >= 0);
+    /* Both passes run here: neither has a wait of this thread's to release. */
+    assert(cv_flush(0, CV_FLUSH_MOVE | CV_FLUSH_EXPIRE) >= 0);
     printf("direct park ok: custody %s, notified request skips the park\n",
            scheduled ? "expired" : "unavailable");
 }

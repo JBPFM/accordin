@@ -12,9 +12,11 @@
 #include <unistd.h>
 #include <accordin-internal.h>
 
-/* Notification removes a waiter from the condition queue and transfers it to
- * the mutex's parking queue. Its private futex becomes runnable only when that
- * queue hands it the relock baton; the notification itself is never deferred. */
+/* Notification removes a waiter from the condition queue. A waiter the
+ * scheduler holds is released by the notifier's batched flush; any other waiter
+ * transfers to the mutex's parking queue, and its private futex becomes
+ * runnable only when that queue hands it the relock baton. Either way the
+ * notification itself is never deferred. */
 struct cond_waiter {
     struct cond_waiter *prev, *next;
     struct accordin_park_waiter park;
@@ -130,19 +132,25 @@ static int wait_on_cond(pthread_cond_t *cond, pthread_mutex_t *mutex,
     accordin_wait_arm(&cleanup.waiter.park);
 
     /* An untimed, outermost wait is handed to the scheduler instead of sleeping
-     * on the futex straight away. The park returns once the wait is notified or
-     * its custody ends, and the futex loop below re-checks either way. The
-     * seq_cst pair with the notifier leaves neither side able to miss the
-     * other. Cancellation stays disabled: the park is not a cancellation
-     * point, and a held wait takes the signal when it next runs. */
-    if (!ts && !cleanup.waiter.park.request.nested) {
+     * on the futex straight away, and only when the scheduler can hold it: a
+     * wait that keeps its place in the mutex's parking queue must stay
+     * invisible to the notifier's direct release. A request without an
+     * admission word has no state the scheduler can read, so it keeps that
+     * place too. The park returns once the wait is notified or its custody
+     * ends, and the futex loop below re-checks either way. The seq_cst pairs
+     * with the notifier leave neither side able to miss the other.
+     * Cancellation stays disabled: the park is not a cancellation point, and a
+     * held wait takes the signal when it next runs. */
+    if (!ts && !cleanup.waiter.park.request.nested &&
+        cleanup.waiter.park.request.word &&
+        ACCORDIN_DIRECT(cv_custody_ready)()) {
         atomic_store_explicit(&cleanup.waiter.park.mode, PARK_CUSTODY,
                               memory_order_seq_cst);
         if (!__atomic_load_n(&cleanup.waiter.park.wake, __ATOMIC_SEQ_CST))
             ACCORDIN_DIRECT(relock_park)(&cleanup.waiter.park.request);
+        atomic_store_explicit(&cleanup.waiter.park.mode, PARK_FUTEX,
+                              memory_order_seq_cst);
     }
-    atomic_store_explicit(&cleanup.waiter.park.mode, PARK_FUTEX,
-                          memory_order_seq_cst);
 
     /* syscall(SYS_futex) is not a libc cancellation point. Enable asynchronous
      * cancellation only around the resource-free futex wait loop, with the
@@ -150,7 +158,7 @@ static int wait_on_cond(pthread_cond_t *cond, pthread_mutex_t *mutex,
      * The adapter is linked with -z now, avoiding lazy PLT binding here. */
     cond_require(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old_type));
     cond_require(pthread_setcancelstate(old_state, NULL));
-    while (!__atomic_load_n(&cleanup.waiter.park.wake, __ATOMIC_ACQUIRE)) {
+    while (!__atomic_load_n(&cleanup.waiter.park.wake, __ATOMIC_SEQ_CST)) {
         int error = 0;
         int op = FUTEX_WAIT_BITSET_PRIVATE;
         if (clock == CLOCK_REALTIME)
@@ -239,6 +247,8 @@ int accordin_cond_signal(pthread_cond_t *cond) {
     queue_lock(state);
     wake_first(state, 1);
     queue_unlock(state);
+    /* Notifying with the mutex held leaves the release to its unlock. */
+    accordin_wait_flush_idle();
     return 0;
 }
 
@@ -248,6 +258,7 @@ int accordin_cond_broadcast(pthread_cond_t *cond) {
     while (state->head)
         wake_first(state, 0);
     queue_unlock(state);
+    accordin_wait_flush_idle();
     return 0;
 }
 

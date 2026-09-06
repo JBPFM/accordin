@@ -9,7 +9,7 @@ for backend in mcs_accordin_direct mcs_tas_accordin_direct; do
     prefixes+=(mcs_tas_accordin_direct)
   fi
   for prefix in "${prefixes[@]}"; do
-    for op in create destroy lock trylock unlock relock_prepare relock_wake relock relock_park cv_flush; do
+    for op in create destroy lock trylock unlock relock_prepare relock_wake relock relock_park cv_custody_ready cv_flush; do
       symbol="${prefix}_mutex_${op}"
       if ! grep -Fxq "$symbol" <<< "$symbols"; then
         echo "missing direct ABI symbol in $backend: $symbol" >&2

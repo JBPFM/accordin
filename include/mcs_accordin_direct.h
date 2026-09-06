@@ -21,6 +21,9 @@ void mcs_accordin_direct_mutex_relock_wake(accordin_relock_request_t *request);
  * when the request is already notified or custody is unavailable, and
  * leaves the word in the waiting state in either case. */
 int mcs_accordin_direct_mutex_relock_park(accordin_relock_request_t *request);
+/* True while the scheduler can hold a wait instead of letting it sleep, so a
+ * caller can decide up front which wakeup path a wait will need. */
+int mcs_accordin_direct_mutex_cv_custody_ready(void);
 /* Hand parked, notified requests back to lock admission. Returns how many
  * moved, zero without a scheduler, or -1 on error. */
 int mcs_accordin_direct_mutex_cv_flush(unsigned int width, unsigned int flags);

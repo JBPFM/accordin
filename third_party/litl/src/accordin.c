@@ -46,8 +46,8 @@ static void park_remove(struct accordin_mutex *mutex,
  * before returning: neither the futex nor its TLS request can disappear. */
 static void park_wake(struct accordin_park_waiter *waiter) {
     ACCORDIN_DIRECT(relock_wake)(&waiter->request);
-    /* Sequenced against the waiter's mode store and wake load, so at least one
-     * of the two sides observes the other. */
+    /* Stored before the syscall, so a waiter that checks it never sleeps and
+     * one that already slept is woken. */
     (void)__atomic_exchange_n(&waiter->wake, 1, __ATOMIC_SEQ_CST);
     if (syscall(SYS_futex, &waiter->wake, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0) < 0)
         abort();
@@ -61,6 +61,29 @@ static void park_start(struct accordin_mutex *mutex) {
     }
     __atomic_store_n(&mutex->park_pending, mutex->head || mutex->relock_owned,
                      __ATOMIC_RELEASE);
+}
+
+/* Waits the scheduler holds are released in one batch, so a notifier only
+ * records that it owes a release and issues it as soon as it holds no mutex of
+ * its own. The depth tracks this thread's LiTL mutexes, which is what decides
+ * whether a notification is already outside every critical section. */
+static _Thread_local unsigned int lock_depth;
+static _Thread_local unsigned int flush_pending;
+
+static void flush_notified(void) {
+    if (!flush_pending || lock_depth)
+        return;
+    /* Cleared first, so a notification landing during the release arms the
+     * next one instead of being absorbed by this one. A release that could not
+     * take the whole batch re-arms it, and this thread retries at its next
+     * unlock or notification; custody expiry remains the backstop. */
+    flush_pending = 0;
+    if (ACCORDIN_DIRECT(cv_flush)(0, 0) < 0)
+        flush_pending = 1;
+}
+
+void accordin_wait_flush_idle(void) {
+    flush_notified();
 }
 
 /* All-zero PTHREAD_MUTEX_INITIALIZER is lazily replaced with this pointer.
@@ -134,20 +157,29 @@ static int acquire_mutex(struct accordin_mutex *impl, int trylock) {
 
 int accordin_mutex_lock(pthread_mutex_t *mutex, void *context) {
     struct accordin_mutex *impl = get_mutex(mutex);
-    return impl ? acquire_mutex(impl, 0) : ENOMEM;
+    int ret = impl ? acquire_mutex(impl, 0) : ENOMEM;
+    if (!ret)
+        lock_depth++;
+    return ret;
 }
 
 int accordin_mutex_trylock(pthread_mutex_t *mutex, void *context) {
     struct accordin_mutex *impl = get_mutex(mutex);
-    return impl ? acquire_mutex(impl, 1) : ENOMEM;
+    int ret = impl ? acquire_mutex(impl, 1) : ENOMEM;
+    if (!ret)
+        lock_depth++;
+    return ret;
 }
 
 void accordin_mutex_unlock(pthread_mutex_t *mutex, void *context) {
     struct accordin_mutex *impl = get_mutex(mutex);
     if (!impl)
         abort();
+    if (lock_depth)
+        lock_depth--;
     if (!__atomic_load_n(&impl->park_pending, __ATOMIC_ACQUIRE)) {
         require_success(ACCORDIN_DIRECT(unlock)(impl->direct));
+        flush_notified();
         return;
     }
     /* Serialize baton release with the successor's acquisition. A notification
@@ -158,6 +190,9 @@ void accordin_mutex_unlock(pthread_mutex_t *mutex, void *context) {
     require_success(ACCORDIN_DIRECT(unlock)(impl->direct));
     park_start(impl);
     park_unlock(impl);
+    /* Outside the guard: the release runs a scheduler program and hands the
+     * waits it frees to threads that will immediately want this guard. */
+    flush_notified();
 }
 
 void accordin_wait_init(pthread_mutex_t *mutex, struct accordin_park_waiter *waiter) {
@@ -173,11 +208,20 @@ void accordin_wait_arm(struct accordin_park_waiter *waiter) {
      * have its request cleared by admission_finish on the old acquisition. */
     ACCORDIN_DIRECT(relock_prepare)(&waiter->request);
     waiter->armed = 1;
-    if (waiter->queued && waiter->request.nested) {
-        /* A wait retaining other mutexes retains its outer admission episode.
-         * Do not delay its wake behind the serialized relock baton. */
-        park_remove(mutex, waiter);
-        park_wake(waiter);
+    if (waiter->queued) {
+        /* Notified before the request existed, so the notification could not be
+         * published into it. Publishing it now also keeps the wait out of
+         * scheduler custody: its wakeup belongs to the queue it is already on,
+         * and a held wait would stall the baton behind it. Without custody
+         * there is no such wait, and the queue alone owns the wakeup. */
+        if (ACCORDIN_DIRECT(cv_custody_ready)())
+            ACCORDIN_DIRECT(relock_wake)(&waiter->request);
+        if (waiter->request.nested) {
+            /* A wait retaining other mutexes retains its outer admission
+             * episode. Do not delay its wake behind the serialized baton. */
+            park_remove(mutex, waiter);
+            park_wake(waiter);
+        }
     }
     park_start(mutex);
     park_unlock(mutex);
@@ -185,8 +229,30 @@ void accordin_wait_arm(struct accordin_park_waiter *waiter) {
 
 void accordin_wait_notify(struct accordin_park_waiter *waiter) {
     struct accordin_mutex *mutex = waiter->mutex;
+    /* Without custody no waiter leaves PARK_NONE, and the parking queue is the
+     * only path to a wakeup, exactly as it is without a scheduler at all. */
+    int custody = ACCORDIN_DIRECT(cv_custody_ready)();
+
     park_lock(mutex);
-    if (waiter->armed && waiter->request.nested) {
+    /* Publishing the grant before reading how the waiter sleeps decides the
+     * race with a waiter entering custody: it either takes the grant and stays
+     * out, in which case the queue below owns its wakeup, or it is already in
+     * custody and reads as such here, in which case no queue can reach it. */
+    if (custody)
+        ACCORDIN_DIRECT(relock_wake)(&waiter->request);
+    if (custody &&
+        atomic_load_explicit(&waiter->mode, memory_order_seq_cst) != PARK_NONE) {
+        /* Release such a waiter in place. The store below and the second read
+         * are sequenced against the waiter's own store and check, so a waiter
+         * that reaches its futex gets the syscall and one that is still held
+         * gets the batch: it never sleeps on a futex nobody will wake. */
+        (void)__atomic_exchange_n(&waiter->wake, 1, __ATOMIC_SEQ_CST);
+        if (atomic_load_explicit(&waiter->mode, memory_order_seq_cst) == PARK_CUSTODY)
+            flush_pending = 1;
+        else if (syscall(SYS_futex, &waiter->wake, FUTEX_WAKE_PRIVATE, 1, NULL,
+                         NULL, 0) < 0)
+            abort();
+    } else if (waiter->armed && waiter->request.nested) {
         park_wake(waiter);
     } else {
         waiter->prev = mutex->tail;
@@ -217,6 +283,7 @@ void accordin_wait_cancel(struct accordin_park_waiter *waiter) {
 void accordin_wait_relock(struct accordin_park_waiter *waiter) {
     struct accordin_mutex *mutex = waiter->mutex;
     require_success(ACCORDIN_DIRECT(relock)(mutex->direct, &waiter->request));
+    lock_depth++;
     park_lock(mutex);
     if (waiter->queued) {
         if (mutex->selected != waiter || mutex->relock_owned)

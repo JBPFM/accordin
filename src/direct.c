@@ -90,11 +90,14 @@ EXPORT void API(relock_prepare)(accordin_relock_request_t *request)
     }
 }
 
+/* Sequenced against the park that follows: a waiter which has not entered
+ * custody yet fails to enter it once the grant is published, so the notifier
+ * and the waiter never disagree about who owns the wakeup. */
 EXPORT void API(relock_wake)(accordin_relock_request_t *request)
 {
     if (request->word)
         atomic_store_explicit((_Atomic uint32_t *)request->word,
-                              request->epoch | USER_WAITING, memory_order_release);
+                              request->epoch | USER_WAITING, memory_order_seq_cst);
 }
 
 /* Enter scheduler custody for one prepared request. The scheduler holds the
@@ -117,6 +120,11 @@ EXPORT int API(relock_park)(accordin_relock_request_t *request)
     atomic_store_explicit((_Atomic uint32_t *)request->word,
                           request->epoch | USER_WAITING, memory_order_relaxed);
     return 1;
+}
+
+EXPORT int API(cv_custody_ready)(void)
+{
+    return accordin_cv_custody_ready();
 }
 
 EXPORT int API(cv_flush)(unsigned int width, unsigned int flags)
@@ -156,5 +164,6 @@ TAS_ALIAS(relock_prepare)
 TAS_ALIAS(relock_wake)
 TAS_ALIAS(relock_park)
 TAS_ALIAS(relock)
+TAS_ALIAS(cv_custody_ready)
 TAS_ALIAS(cv_flush)
 #endif

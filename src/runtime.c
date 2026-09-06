@@ -28,6 +28,7 @@ static pthread_key_t registration_key;
 static libbpf_print_fn_t previous_log;
 static int cv_flush_prog_fd = -1;
 static int cv_flush_running;
+static unsigned int cv_flush_requests;
 static unsigned int cv_flush_width, cv_flush_flags;
 static bool cv_custody_on, cv_counters_on;
 /* Set once the scheduler is attached and cleared before it goes away, so a
@@ -101,6 +102,32 @@ bool accordin_cv_custody_ready(void)
     return state && __atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE);
 }
 
+/* A child of fork() inherits the transfer state of a process that may have been
+ * mid-flush in another thread, and no thread to finish it. */
+static void forget_flush(void)
+{
+    __atomic_store_n(&cv_flush_running, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&cv_flush_requests, 0, __ATOMIC_RELAXED);
+}
+
+static bool claim_flush(void)
+{
+    int idle = 0;
+
+    return __atomic_compare_exchange_n(&cv_flush_running, &idle, 1, false,
+                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
+/* A flushing thread also serves the requests that arrive while it runs, but
+ * only for a bounded number of passes: a steady stream of notifications must
+ * not pin one thread to the transfer. */
+#define CV_FLUSH_MAX_PASSES 3
+
+/* Returns the waits released, or a negative value when this call did not carry
+ * the caller's batch through: another thread owns the transfer, the pass cap
+ * was reached with work left, or the program failed. The caller keeps its
+ * pending mark and retries at its next release point; custody expiry remains
+ * the backstop. */
 int accordin_cv_flush_now(unsigned int width, unsigned int flags)
 {
     struct cv_flush_ctx ctx = {
@@ -110,19 +137,36 @@ int accordin_cv_flush_now(unsigned int width, unsigned int flags)
     /* A syscall program rejects ctx_out and writes its results back through
      * ctx_in instead. */
     LIBBPF_OPTS(bpf_test_run_opts, opts, .ctx_in = &ctx, .ctx_size_in = sizeof(ctx));
-    int idle = 0;
-    int result;
+    unsigned int passes = 0;
+    int moved = 0;
 
     if (cv_flush_prog_fd < 0)
         return 0;
-    /* One transfer at a time: a concurrent notifier's work is already covered
-     * by the flush in flight, or by the next one. */
-    if (!__atomic_compare_exchange_n(&cv_flush_running, &idle, 1, false,
-                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
-        return 0;
-    result = bpf_prog_test_run_opts(cv_flush_prog_fd, &opts);
-    __atomic_store_n(&cv_flush_running, 0, __ATOMIC_RELEASE);
-    return result ? -1 : (int)ctx.moved;
+    /* Counted after the notification it belongs to is published, so a pass
+     * that begins after reading this count carries that notification. */
+    __atomic_fetch_add(&cv_flush_requests, 1, __ATOMIC_SEQ_CST);
+    /* One transfer at a time. */
+    if (!claim_flush())
+        return -1;
+    for (;;) {
+        unsigned int seen = __atomic_load_n(&cv_flush_requests, __ATOMIC_SEQ_CST);
+        int result = bpf_prog_test_run_opts(cv_flush_prog_fd, &opts);
+        bool complete;
+
+        passes++;
+        /* A width-bounded pass leaves a tail parked, and a notification that
+         * landed during the pass may not have been covered by it. */
+        complete = !result && !ctx.pending;
+        __atomic_store_n(&cv_flush_running, 0, __ATOMIC_SEQ_CST);
+        if (result)
+            return -1;
+        moved += (int)ctx.moved;
+        if (complete &&
+            __atomic_load_n(&cv_flush_requests, __ATOMIC_SEQ_CST) == seen)
+            return moved;
+        if (passes >= CV_FLUSH_MAX_PASSES || !claim_flush())
+            return -1;
+    }
 }
 
 static void unregister_thread(void *value)
@@ -223,7 +267,13 @@ __attribute__((constructor)) static void scheduler_start(void)
     cv_custody_on = env_allowed("ACCORDIN_CV_CUSTODY");
     cv_counters_on = env_flag("ACCORDIN_CV_COUNTERS");
     cv_flush_width = env_u32("ACCORDIN_CV_FLUSH_WIDTH", 0);
-    cv_flush_flags = env_u32("ACCORDIN_CV_FLUSH_FLAGS", CV_FLUSH_EXPIRE);
+    /* Notified waits leave custody through the flush; the timer keeps expiry.
+     * Reverse iteration pairs with the flush's head insertion to hand the waits
+     * over in the order they parked. */
+    cv_flush_flags = env_u32("ACCORDIN_CV_FLUSH_FLAGS",
+                             CV_FLUSH_MOVE | CV_FLUSH_REV);
+    SCX_BUG_ON(pthread_atfork(NULL, NULL, forget_flush),
+               "Failed to register fork cleanup");
     skel = SCX_OPS_OPEN(accordin_ops, accordin);
     skel->bss->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
     skel->bss->cv_custody_enabled = cv_custody_on;

@@ -17,14 +17,29 @@ mkdir -p obj/tests
 root="${ACCORDIN_ROOT:-$(cd ../.. && pwd)}"
 libdir="${ACCORDIN_LIB_DIR:-$root/target/release}"
 
-# Under the scheduler every untimed wait is held until its custody expires, so
-# the shortest limit keeps the ping-pong tests inside the suite timeout.
+# Under the scheduler an untimed wait is held until it is notified or its
+# custody expires. The short limit keeps expiry close enough to cover whatever
+# the flush does not reach; the long one puts expiry out of reach, so the
+# release deadlines the suite asserts can only be met by the flush itself.
 if [[ "$disable" == 0 ]]; then
-    custody_ms="${ACCORDIN_CV_CUSTODY_MS:-1}"
     counters="${ACCORDIN_CV_COUNTERS:-1}"
+    if [[ -n "${ACCORDIN_CV_CUSTODY_MS:-}" ]]; then
+        custody_limits=("$ACCORDIN_CV_CUSTODY_MS")
+    else
+        custody_limits=(1 1000)
+    fi
 else
-    custody_ms="${ACCORDIN_CV_CUSTODY_MS:-}"
     counters="${ACCORDIN_CV_COUNTERS:-}"
+    custody_limits=("${ACCORDIN_CV_CUSTODY_MS:-}")
+fi
+custody_ms="${custody_limits[0]}"
+
+# Admission carries the request the scheduler reads, so no wait can be held
+# without it.
+if [[ "${ACCORDIN_DISABLE_ADMISSION:-0}" =~ ^([1]|[Tt]rue|[Yy]es|[Oo]n|TRUE|YES|ON)$ ]]; then
+    admission=0
+else
+    admission=1
 fi
 
 # The runtime reads custody as enabled unless it is explicitly denied.
@@ -44,10 +59,12 @@ run_case() {
         MCS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
         MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
         MCS_ACCORDIN_DIRECT_STATS_ONLY=0 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0 \
-        ACCORDIN_DISABLE_ADMISSION=0 \
+        ACCORDIN_DISABLE_ADMISSION="$((1 - admission))" \
         ACCORDIN_CV_CUSTODY="${ACCORDIN_CV_CUSTODY:-}" \
         ACCORDIN_CV_CUSTODY_MS="$custody_ms" \
         ACCORDIN_CV_COUNTERS="$counters" \
+        ACCORDIN_CV_FLUSH_FLAGS="${ACCORDIN_CV_FLUSH_FLAGS:-}" \
+        ACCORDIN_CV_FLUSH_WIDTH="${ACCORDIN_CV_FLUSH_WIDTH:-}" \
         "$@" >"$log" 2>&1
     status=$?
     set -e
@@ -60,6 +77,8 @@ run_case() {
 check_counters() {
     [[ "$disable" == 0 && "$counters" == 1 ]] || return 0
     local least="${1:-0}" line
+    # A run without admission publishes no request for the scheduler to read.
+    [[ "$admission" == 1 ]] || least=0
     line="$(grep -m1 '^\[accordin_cv\]' "$log" || true)"
     if [[ -z "$line" ]]; then
         echo "missing [accordin_cv] counters" >&2
@@ -87,10 +106,10 @@ check_counters() {
             printf "no wait reached custody: %s\n", line > "/dev/stderr";
             exit 1;
         }
-        # Notification still goes through the relock baton, so nothing leaves
-        # custody through a flush yet.
-        if (value["flushed"] != 0) {
-            printf "unexpected flush release: %s\n", line > "/dev/stderr";
+        # Notification hands the wait to the flush, so a case that parks at all
+        # must release through it rather than through expiry alone.
+        if (least > 0 && value["flushed"] < 1) {
+            printf "no wait left custody through a flush: %s\n", line > "/dev/stderr";
             exit 1;
         }
     }'
@@ -101,9 +120,15 @@ ${CXX:-c++} -std=c++17 -O2 -Wall -Werror tests/condition-variable.cpp -pthread \
     -o obj/tests/condition-variable
 for backend in mcsaccordin_original mcstasaccordin_original; do
     echo "Testing $backend ($mode)"
-    run_case bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
-        "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
-    check_counters 1
+    for custody_ms in "${custody_limits[@]}"; do
+        if [[ "$disable" == 0 ]]; then
+            echo "  custody limit ${custody_ms} ms"
+        fi
+        run_case bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
+            "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
+        check_counters 1
+    done
+    custody_ms="${custody_limits[0]}"
     # A single worker may find its predicate already true and never wait, so
     # this case only has to balance.
     run_case bash "./lib${backend}.sh" ./obj/tests/condition-variable

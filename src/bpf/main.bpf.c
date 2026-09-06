@@ -84,9 +84,9 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       if (known)
         refresh_episode(p, tctx, state);
       /* A task entering enqueue is queued nowhere, so a custody mark left on it
-       * belongs to a wait the core has already taken out of the queue. */
-      if (tctx->parked_at) {
-        tctx->parked_at = 0;
+       * belongs to a wait the core has already taken out of the queue. Clearing
+       * the mark claims the wait, the same way a scan claims one. */
+      if (tctx->parked_at && __sync_lock_test_and_set(&tctx->parked_at, 0)) {
         __sync_fetch_and_add(&cv_drained, 1);
         __sync_fetch_and_sub(&cv_parked_now, 1);
       }
@@ -99,7 +99,9 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
         /* A condvar wait is held until it is notified or its custody expires,
          * never admitted onto a CPU slot. */
         tctx->ticket = request_ticket(p, state);
-        tctx->parked_at = scx_bpf_now();
+        /* The low bit keeps the mark non-zero whatever the clock reads, so an
+         * unset mark is the only way to read as unparked. */
+        tctx->parked_at = scx_bpf_now() | 1;
         dsq = WAITFORSIGNAL_DSQ;
         __sync_fetch_and_add(&cv_parked, 1);
         __sync_fetch_and_add(&cv_parked_now, 1);
@@ -151,8 +153,13 @@ static __always_inline void admit_waiter(__u32 cpu) {
 /* Withdraw custody from every wait that outlived its limit and hand it back to
  * the ordinary queue. Shared by the periodic scan and the flush program; both
  * run without an rq lock, the only contexts a queue-to-queue move is legal in.
- * The custody mark is the claim: whoever clears it owns the wait, and a refused
- * move means the wait already left the queue by another path. */
+ * The custody mark is the claim: whoever clears it owns the wait. A refused
+ * move leaves the wait where it is, so the claim is put back and the wait is
+ * scanned again; only a claim that cannot be put back means the wait already
+ * left the queue by another path and was counted there. Every park is
+ * accounted exactly once that way, which is why the count is never restated
+ * from the queue depth: that depth is read while an enqueue may be publishing
+ * the next park. */
 __noinline int cv_expire_parked(__u64 now) {
   struct task_struct *p;
   int expired = 0;
@@ -167,7 +174,9 @@ __noinline int cv_expire_parked(__u64 now) {
     if (!tctx)
       continue;
     parked = tctx->parked_at;
-    if (!parked || now - parked <= cv_custody_limit_ns)
+    /* The clock is per-CPU: a wait parked on a CPU running slightly ahead of
+     * this one must not read as older than any limit. */
+    if (!parked || (__s64)(now - parked) <= (__s64)cv_custody_limit_ns)
       continue;
     if (!__sync_bool_compare_and_swap(&tctx->parked_at, parked, 0))
       continue;
@@ -176,12 +185,13 @@ __noinline int cv_expire_parked(__u64 now) {
     if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, NORMAL_DSQ, 0)) {
       __sync_fetch_and_add(&cv_expired, 1);
       expired++;
+    } else if (__sync_bool_compare_and_swap(&tctx->parked_at, 0, parked)) {
+      __sync_fetch_and_add(&cv_parked_now, 1);
     } else {
       __sync_fetch_and_add(&cv_drained, 1);
     }
   }
   bpf_rcu_read_unlock();
-  cv_parked_now = scx_bpf_dsq_nr_queued(WAITFORSIGNAL_DSQ);
   return expired;
 }
 
@@ -282,8 +292,7 @@ void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
   if (tctx) {
     release_slot(p, tctx);
     /* A wait that leaves without a flush or an expiry still leaves custody. */
-    if (tctx->parked_at) {
-      tctx->parked_at = 0;
+    if (tctx->parked_at && __sync_lock_test_and_set(&tctx->parked_at, 0)) {
       __sync_fetch_and_add(&cv_drained, 1);
       __sync_fetch_and_sub(&cv_parked_now, 1);
     }
@@ -402,6 +411,7 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       struct task_scx_ctx *tctx;
       __u64 target = WAITING_DSQ;
       __u64 move_flags = enq_flags;
+      __u64 parked;
       __u32 state;
 
       if (p->tgid != tgid)
@@ -422,16 +432,22 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       }
       /* Clearing the custody mark claims the wait; an already cleared mark
        * means the wait belongs to someone else. */
-      if (!__sync_lock_test_and_set(&tctx->parked_at, 0))
+      parked = __sync_lock_test_and_set(&tctx->parked_at, 0);
+      if (!parked)
         continue;
       if (target == NORMAL_DSQ)
         tctx->custody_denied = tctx->ticket;
       else
         tctx->ticket = request_ticket(p, state);
       __sync_fetch_and_sub(&cv_parked_now, 1);
-      /* A refused move means the wait already left the queue by another path. */
+      /* A move can be refused while the wait is still queued, so put the claim
+       * back and leave it to the next pass. Only a claim that cannot be put
+       * back means the wait left the queue by another path, which counted it. */
       if (!__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, target, move_flags)) {
-        __sync_fetch_and_add(&cv_drained, 1);
+        if (__sync_bool_compare_and_swap(&tctx->parked_at, 0, parked))
+          __sync_fetch_and_add(&cv_parked_now, 1);
+        else
+          __sync_fetch_and_add(&cv_drained, 1);
       } else if (target == NORMAL_DSQ) {
         __sync_fetch_and_add(&cv_expired, 1);
         tally->expired++;
@@ -452,7 +468,6 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
   ctx->expired = tally->expired;
   ctx->pending = tally->pending;
   ctx->queued = scx_bpf_dsq_nr_queued(WAITFORSIGNAL_DSQ);
-  cv_parked_now = ctx->queued;
   return tally->moved;
 }
 

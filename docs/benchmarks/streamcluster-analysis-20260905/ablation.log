@@ -1,0 +1,12 @@
+START ablation-bulk-mcs_accordin
+{"id": "ablation-bulk-mcs_accordin", "backend": "mcs_accordin", "threads": 192, "rounds": 100, "bulk_cond": true, "admission_disabled": false, "returncode": 0, "timeout": false, "wall": 2.5240567941218615, "seq_before": "713", "seq_after": "714", "scx_observed": true}
+START ablation-bulk-mcs_tas_accordin
+{"id": "ablation-bulk-mcs_tas_accordin", "backend": "mcs_tas_accordin", "threads": 192, "rounds": 100, "bulk_cond": true, "admission_disabled": false, "returncode": 0, "timeout": false, "wall": 2.625466000288725, "seq_before": "714", "seq_after": "715", "scx_observed": true}
+START ablation-no-admission-mcs_accordin
+{"id": "ablation-no-admission-mcs_accordin", "backend": "mcs_accordin", "threads": 192, "rounds": 100, "bulk_cond": false, "admission_disabled": true, "returncode": 0, "timeout": false, "wall": 0.7139058373868465, "seq_before": "715", "seq_after": "716", "scx_observed": true}
+START ablation-no-admission-mcs_tas_accordin
+{"id": "ablation-no-admission-mcs_tas_accordin", "backend": "mcs_tas_accordin", "threads": 192, "rounds": 100, "bulk_cond": false, "admission_disabled": true, "returncode": 0, "timeout": false, "wall": 0.7357996478676796, "seq_before": "716", "seq_after": "717", "scx_observed": true}
+START ablation-bulk-no-admission-mcs_accordin
+{"id": "ablation-bulk-no-admission-mcs_accordin", "backend": "mcs_accordin", "threads": 192, "rounds": 100, "bulk_cond": true, "admission_disabled": true, "returncode": 0, "timeout": false, "wall": 0.690172141417861, "seq_before": "717", "seq_after": "718", "scx_observed": true}
+START ablation-bulk-no-admission-mcs_tas_accordin
+{"id": "ablation-bulk-no-admission-mcs_tas_accordin", "backend": "mcs_tas_accordin", "threads": 192, "rounds": 100, "bulk_cond": true, "admission_disabled": true, "returncode": 0, "timeout": false, "wall": 0.6683847513049841, "seq_before": "718", "seq_after": "719", "scx_observed": true}

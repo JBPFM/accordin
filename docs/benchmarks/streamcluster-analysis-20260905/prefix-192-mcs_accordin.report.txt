@@ -1,0 +1,45 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 163K of event 'cpu-clock'
+# Event count (approx.): 1647636347160
+#
+# Overhead  Command        Shared Object               Symbol                                                          
+# ........  .............  ..........................  ................................................................
+#
+    44.15%  streamcluster  libmcs_accordin_direct.so   [.] mcs_tas_accordin_direct_mutex_lock
+    17.39%  streamcluster  [kernel.kallsyms]           [k] finish_task_switch.isra.0
+    11.13%  streamcluster  [kernel.kallsyms]           [k] __schedule
+     2.71%  streamcluster  libmcs_accordin_direct.so   [.] __aarch64_cas8_acq_rel
+     2.21%  streamcluster  streamcluster               [.] pgain(long, Points*, double, long*, int, parsec_barrier_t*)
+     1.41%  streamcluster  libmcsaccordin_original.so  [.] __aarch64_swp4_acq
+     1.34%  streamcluster  libmcsaccordin_original.so  [.] wait_on_cond
+     1.27%  streamcluster  libmcs_accordin_direct.so   [.] __aarch64_swp8_acq_rel
+     1.23%  streamcluster  [kernel.kallsyms]           [k] do_sched_yield
+     1.22%  streamcluster  [kernel.kallsyms]           [k] futex_q_lock
+     1.13%  streamcluster  [kernel.kallsyms]           [k] fpsimd_restore_current_state
+     1.05%  streamcluster  libc.so.6                   [.] __aarch64_cas4_acq
+     1.05%  streamcluster  [kernel.kallsyms]           [k] do_notify_resume
+     0.92%  streamcluster  [kernel.kallsyms]           [k] uaccess_ttbr0_disable.isra.0
+     0.65%  streamcluster  [kernel.kallsyms]           [k] el0_svc_common.constprop.0
+     0.65%  streamcluster  [kernel.kallsyms]           [k] el0_svc
+     0.65%  streamcluster  libc.so.6                   [.] __sched_yield
+     0.57%  streamcluster  libc.so.6                   [.] sched_getcpu
+     0.56%  streamcluster  libmcsaccordin_original.so  [.] __pthread_unregister_cancel@plt
+     0.56%  streamcluster  [kernel.kallsyms]           [k] invoke_syscall
+     0.47%  streamcluster  [kernel.kallsyms]           [k] perf_trace_buf_update
+     0.44%  streamcluster  [kernel.kallsyms]           [k] _raw_spin_unlock_irqrestore
+     0.41%  streamcluster  libc.so.6                   [.] syscall
+     0.39%  streamcluster  [kernel.kallsyms]           [k] syscall_trace_exit
+     0.38%  streamcluster  [kernel.kallsyms]           [k] futex_wait
+     0.35%  streamcluster  [kernel.kallsyms]           [k] fpsimd_load_state
+     0.34%  streamcluster  libc.so.6                   [.] __GI___pthread_setcancelstate
+     0.32%  streamcluster  [kernel.kallsyms]           [k] get_random_u16
+     0.31%  streamcluster  libmcsaccordin_original.so  [.] accordin_mutex_lock
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

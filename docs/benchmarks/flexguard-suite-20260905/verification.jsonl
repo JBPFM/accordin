@@ -1,0 +1,6 @@
+{"id": "performance-dedup-96-mcs_accordin-r1", "dedup_round_trip": true, "returncode": 0}
+{"id": "performance-dedup-96-mcs_tas_accordin-r1", "dedup_round_trip": true, "returncode": 0}
+{"id": "performance-dedup-96-flexguard-r1", "dedup_round_trip": true, "returncode": 0}
+{"id": "performance-dedup-192-mcs_accordin-r1", "dedup_round_trip": true, "returncode": 0}
+{"id": "performance-dedup-192-mcs_tas_accordin-r1", "dedup_round_trip": true, "returncode": 0}
+{"id": "performance-dedup-192-flexguard-r1", "dedup_round_trip": true, "returncode": 0}

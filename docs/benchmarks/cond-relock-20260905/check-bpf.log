@@ -1,0 +1,61 @@
+DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/release bash scripts/test_direct_api.sh --bpf
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+direct smoke ok: mcs_accordin_direct acquisitions=176000 nested=4000
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+direct smoke ok: mcs_tas_accordin_direct acquisitions=176000 nested=4000
+make -C third_party/litl ACCORDIN_ROOT=/mnt/sde/jz/accordin ACCORDIN_LIB_DIR=/mnt/sde/jz/accordin/target/release ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
+make[1]: Entering directory '/mnt/sde/jz/accordin/third_party/litl'
+make -C /mnt/sde/jz/accordin OUT=/mnt/sde/jz/accordin/target/release all
+make[2]: Entering directory '/mnt/sde/jz/accordin'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/mnt/sde/jz/accordin'
+mkdir -p lib/ obj/mcsaccordin_original
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcsaccordin_original.so
+make[2]: Entering directory '/mnt/sde/jz/accordin/third_party/litl/src'
+make[2]: Leaving directory '/mnt/sde/jz/accordin/third_party/litl/src'
+mkdir -p lib/ obj/mcstasaccordin_original
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcstasaccordin_original.so
+make[2]: Entering directory '/mnt/sde/jz/accordin/third_party/litl/src'
+make[2]: Leaving directory '/mnt/sde/jz/accordin/third_party/litl/src'
+make[1]: Leaving directory '/mnt/sde/jz/accordin/third_party/litl'
+cd third_party/litl && ACCORDIN_ROOT=/mnt/sde/jz/accordin ACCORDIN_LIB_DIR=/mnt/sde/jz/accordin/target/release bash tests/run.sh --bpf
+Testing mcsaccordin_original (--bpf)
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-Accordin with waiting WAITING_ORIGINAL
+PASS interposition: libmcsaccordin_original.so
+PASS counter/static initialization: 8 threads, 80000 operations
+PASS explicit initialization, reuse, nested locks, busy trylock
+PASS native spinlock/rwlock passthrough
+PASS first condvar wait with competing lock/trylock: 8 threads, 32 fresh mutexes
+PASS condvar signal: 1000 round trips
+PASS condvar broadcast/timed wakeups: 8 waiters, 50 rounds
+PASS timeout/error returns with mutex held (realtime and monotonic)
+PASS cancellation restores mutex before caller cleanup
+PASS cancel/signal race transfers notification, busy destroy: 32 rounds
+PASS condvar attributes, no stored notifications, negative deadline, cancellation mode
+PASS clockwait: both glibc symbol versions, explicit clocks, held mutex on return
+PASS all LiTL Accordin tests
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-Accordin with waiting WAITING_ORIGINAL
+PASS std::condition_variable wait, wait_for, wait_until, notification
+Testing mcstasaccordin_original (--bpf)
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-TAS-Accordin with waiting WAITING_ORIGINAL
+PASS interposition: libmcstasaccordin_original.so
+PASS counter/static initialization: 8 threads, 80000 operations
+PASS explicit initialization, reuse, nested locks, busy trylock
+PASS native spinlock/rwlock passthrough
+PASS first condvar wait with competing lock/trylock: 8 threads, 32 fresh mutexes
+PASS condvar signal: 1000 round trips
+PASS condvar broadcast/timed wakeups: 8 waiters, 50 rounds
+PASS timeout/error returns with mutex held (realtime and monotonic)
+PASS cancellation restores mutex before caller cleanup
+PASS cancel/signal race transfers notification, busy destroy: 32 rounds
+PASS condvar attributes, no stored notifications, negative deadline, cancellation mode
+PASS clockwait: both glibc symbol versions, explicit clocks, held mutex on return
+PASS all LiTL Accordin tests
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-TAS-Accordin with waiting WAITING_ORIGINAL
+PASS std::condition_variable wait, wait_for, wait_until, notification
+PASS no native shadow mutex calls, including after condvar wait (NDEBUG)
+PASS no native shadow mutex calls, including after condvar wait (NDEBUG)

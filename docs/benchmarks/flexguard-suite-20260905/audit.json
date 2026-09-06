@@ -1,0 +1,938 @@
+{
+  "attempts": 240,
+  "valid": 234,
+  "failures": [
+    {
+      "id": "performance-kyotocabinet-96-mcs_accordin-r1",
+      "returncode": -9,
+      "timeout": true,
+      "wall_seconds": 180.25246021151543,
+      "log": "logs/performance-kyotocabinet-96-mcs_accordin-r1.log"
+    },
+    {
+      "id": "performance-kyotocabinet-96-mcs_tas_accordin-r1",
+      "returncode": -9,
+      "timeout": true,
+      "wall_seconds": 180.1306889820844,
+      "log": "logs/performance-kyotocabinet-96-mcs_tas_accordin-r1.log"
+    },
+    {
+      "id": "performance-kyotocabinet-192-mcs_accordin-r1",
+      "returncode": -9,
+      "timeout": true,
+      "wall_seconds": 180.1720446832478,
+      "log": "logs/performance-kyotocabinet-192-mcs_accordin-r1.log"
+    },
+    {
+      "id": "performance-kyotocabinet-192-mcs_tas_accordin-r1",
+      "returncode": -9,
+      "timeout": true,
+      "wall_seconds": 180.16538569889963,
+      "log": "logs/performance-kyotocabinet-192-mcs_tas_accordin-r1.log"
+    },
+    {
+      "id": "performance-index-96-mcs_accordin-r1",
+      "returncode": -6,
+      "timeout": null,
+      "wall_seconds": 3.677911041304469,
+      "log": "logs/performance-index-96-mcs_accordin-r1.log"
+    },
+    {
+      "id": "performance-index-192-mcs_accordin-r1",
+      "returncode": -6,
+      "timeout": null,
+      "wall_seconds": 3.8794491477310658,
+      "log": "logs/performance-index-192-mcs_accordin-r1.log"
+    }
+  ],
+  "duplicate_ids": [],
+  "completed_groups": 84,
+  "expected_groups": 84,
+  "groups": [
+    {
+      "benchmark": "scheduling",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "scheduling",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "scheduling",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "scheduling",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "scheduling",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "scheduling",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "buckets",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "buckets",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "buckets",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "buckets",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "buckets",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "buckets",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readrandom",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readrandom",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readrandom",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readrandom",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readrandom",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readrandom",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillrandom",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillrandom",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillrandom",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillrandom",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillrandom",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillrandom",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillseq",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillseq",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillseq",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillseq",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillseq",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-fillseq",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readseq",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readseq",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readseq",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readseq",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readseq",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-readseq",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-overwrite",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-overwrite",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-overwrite",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-overwrite",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-overwrite",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "leveldb-overwrite",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "kyotocabinet",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "failed; later repetitions skipped",
+      "valid": 0,
+      "failed": 1
+    },
+    {
+      "benchmark": "kyotocabinet",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "failed; later repetitions skipped",
+      "valid": 0,
+      "failed": 1
+    },
+    {
+      "benchmark": "kyotocabinet",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "kyotocabinet",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "failed; later repetitions skipped",
+      "valid": 0,
+      "failed": 1
+    },
+    {
+      "benchmark": "kyotocabinet",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "failed; later repetitions skipped",
+      "valid": 0,
+      "failed": 1
+    },
+    {
+      "benchmark": "kyotocabinet",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "raytrace",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "raytrace",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "raytrace",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "raytrace",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "raytrace",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "raytrace",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "dedup",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "dedup",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "dedup",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "dedup",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "dedup",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "dedup",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "volrend",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "volrend",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "volrend",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "volrend",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "volrend",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "volrend",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "streamcluster",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "streamcluster",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "streamcluster",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "streamcluster",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "streamcluster",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "streamcluster",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "failed; later repetitions skipped",
+      "valid": 0,
+      "failed": 1
+    },
+    {
+      "benchmark": "index",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "failed; later repetitions skipped",
+      "valid": 0,
+      "failed": 1
+    },
+    {
+      "benchmark": "index",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index-4k",
+      "threads": 96,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index-4k",
+      "threads": 96,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index-4k",
+      "threads": 96,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index-4k",
+      "threads": 192,
+      "backend": "mcs_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index-4k",
+      "threads": 192,
+      "backend": "mcs_tas_accordin",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    },
+    {
+      "benchmark": "index-4k",
+      "threads": 192,
+      "backend": "flexguard",
+      "status": "three valid repetitions",
+      "valid": 3,
+      "failed": 0
+    }
+  ],
+  "binary_hashes": {
+    "/mnt/sde/jz/accordin/third_party/litl/lib/libmcsaccordin_original.so": {
+      "expected": "12b63a72c84a076c5bf689acbb6a3e2bc5e199ebc2402e1289a3780cf3ced459",
+      "actual": "12b63a72c84a076c5bf689acbb6a3e2bc5e199ebc2402e1289a3780cf3ced459",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/third_party/litl/lib/libmcstasaccordin_original.so": {
+      "expected": "e13e24e1d610974da675106f7f763d7f9e1f1b385466e4688eab2c33f0ce0f72",
+      "actual": "e13e24e1d610974da675106f7f763d7f9e1f1b385466e4688eab2c33f0ce0f72",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/release/libmcs_accordin_direct.so": {
+      "expected": "0ec56229f8331afdf05db210b5ae7bd0bd686cd5b4ae45739fc97154e0777869",
+      "actual": "0ec56229f8331afdf05db210b5ae7bd0bd686cd5b4ae45739fc97154e0777869",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/release/libmcs_tas_accordin_direct.so": {
+      "expected": "c28d1b6627a5e8e898c0d45a58f693a53c8146785c249f910ceb598a7b12160a",
+      "actual": "c28d1b6627a5e8e898c0d45a58f693a53c8146785c249f910ceb598a7b12160a",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/fg/interpose.so": {
+      "expected": "dc892ade91cbc55eace35b389519517c37826cedadc3e7a156b007ee4966afa6",
+      "actual": "dc892ade91cbc55eace35b389519517c37826cedadc3e7a156b007ee4966afa6",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/pthread/scheduling": {
+      "expected": "f4393d5944249a40a5c8889f1330eccf0b34c08a4e6ffb755df22d754749043f",
+      "actual": "f4393d5944249a40a5c8889f1330eccf0b34c08a4e6ffb755df22d754749043f",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/pthread/buckets": {
+      "expected": "7f8994f8dfe346f412c39b39218ce7896710625c32875d2802dca7255fe4a816",
+      "actual": "7f8994f8dfe346f412c39b39218ce7896710625c32875d2802dca7255fe4a816",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/leveldb/out-static/db_bench": {
+      "expected": "5f4ee4e128e60af6ff13a434d82c39bfee52ff80dc10d815f5a6f60b93034171",
+      "actual": "5f4ee4e128e60af6ff13a434d82c39bfee52ff80dc10d815f5a6f60b93034171",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/dedup/dedup": {
+      "expected": "ea95e8dc3e8c9424c93abac12bb04b0fa6dc4b6fd1d7898c3ab6b0fae0b1b407",
+      "actual": "ea95e8dc3e8c9424c93abac12bb04b0fa6dc4b6fd1d7898c3ab6b0fae0b1b407",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/streamcluster/streamcluster": {
+      "expected": "40289bd079fc392038529bcc97f3fa58a8139045e96598ce517180d189d2215a",
+      "actual": "40289bd079fc392038529bcc97f3fa58a8139045e96598ce517180d189d2215a",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/raytrace/raytrace": {
+      "expected": "514590f195f3ada917318772a0467421ec8b450326a5d2343e12f922ea567374",
+      "actual": "514590f195f3ada917318772a0467421ec8b450326a5d2343e12f922ea567374",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/volrend/volrend": {
+      "expected": "ff670d6360be513128fc7df3f6b7b4966dd87b3aff1be6396700e3833bb895c8",
+      "actual": "ff670d6360be513128fc7df3f6b7b4966dd87b3aff1be6396700e3833bb895c8",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/btreelc_mutex.so": {
+      "expected": "7187e319cdc6f9258550802ea277973d759d1431811b21600e9488f9b442d333",
+      "actual": "7187e319cdc6f9258550802ea277973d759d1431811b21600e9488f9b442d333",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/pibench-build/src/PiBench": {
+      "expected": "19419ab447220ed2e0c44ed95ff675674f2b335555644664694a0e04b70de2f0",
+      "actual": "19419ab447220ed2e0c44ed95ff675674f2b335555644664694a0e04b70de2f0",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/kyoto-driver-build/db_bench_tree_db": {
+      "expected": "f1000f5e2e111c35c529eaa0163fc4ac2e2169ebb9fc4ca89890d55b07e8ccc7",
+      "actual": "f1000f5e2e111c35c529eaa0163fc4ac2e2169ebb9fc4ca89890d55b07e8ccc7",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/kyotocabinet/libkyotocabinet.so.16.14.0": {
+      "expected": "6af08799a2e9b330663fdc9eb5ee63804307b8691b6e8fdd7320b8ad11643bb9",
+      "actual": "6af08799a2e9b330663fdc9eb5ee63804307b8691b6e8fdd7320b8ad11643bb9",
+      "unchanged": true
+    },
+    "/mnt/sde/jz/accordin/target/flexguard-suite-20260905/btreelc_mutex_4K.so": {
+      "expected": "f2b8357f397bc013be40a9791feb97ca03e10f958bfb8e8aac6e7df647f628f7",
+      "actual": "f2b8357f397bc013be40a9791feb97ca03e10f958bfb8e8aac6e7df647f628f7",
+      "unchanged": true
+    }
+  },
+  "dedup_verification": [
+    {
+      "id": "performance-dedup-96-mcs_accordin-r1",
+      "dedup_round_trip": true,
+      "returncode": 0
+    },
+    {
+      "id": "performance-dedup-96-mcs_tas_accordin-r1",
+      "dedup_round_trip": true,
+      "returncode": 0
+    },
+    {
+      "id": "performance-dedup-96-flexguard-r1",
+      "dedup_round_trip": true,
+      "returncode": 0
+    },
+    {
+      "id": "performance-dedup-192-mcs_accordin-r1",
+      "dedup_round_trip": true,
+      "returncode": 0
+    },
+    {
+      "id": "performance-dedup-192-mcs_tas_accordin-r1",
+      "dedup_round_trip": true,
+      "returncode": 0
+    },
+    {
+      "id": "performance-dedup-192-flexguard-r1",
+      "dedup_round_trip": true,
+      "returncode": 0
+    }
+  ],
+  "volrend_outputs": [
+    {
+      "id": "performance-volrend-96-mcs_accordin-r1",
+      "frames": 3000,
+      "bytes": 63013594
+    },
+    {
+      "id": "performance-volrend-96-mcs_tas_accordin-r1",
+      "frames": 3000,
+      "bytes": 63013670
+    },
+    {
+      "id": "performance-volrend-96-flexguard-r1",
+      "frames": 3000,
+      "bytes": 63015594
+    },
+    {
+      "id": "performance-volrend-192-mcs_accordin-r1",
+      "frames": 3000,
+      "bytes": 63140924
+    },
+    {
+      "id": "performance-volrend-192-mcs_tas_accordin-r1",
+      "frames": 3000,
+      "bytes": 63141700
+    },
+    {
+      "id": "performance-volrend-192-flexguard-r1",
+      "frames": 3000,
+      "bytes": 63237470
+    },
+    {
+      "id": "performance-volrend-96-mcs_tas_accordin-r2",
+      "frames": 3000,
+      "bytes": 63013770
+    },
+    {
+      "id": "performance-volrend-96-flexguard-r2",
+      "frames": 3000,
+      "bytes": 63016038
+    },
+    {
+      "id": "performance-volrend-96-mcs_accordin-r2",
+      "frames": 3000,
+      "bytes": 63013776
+    },
+    {
+      "id": "performance-volrend-192-mcs_tas_accordin-r2",
+      "frames": 3000,
+      "bytes": 63135846
+    },
+    {
+      "id": "performance-volrend-192-flexguard-r2",
+      "frames": 3000,
+      "bytes": 63241822
+    },
+    {
+      "id": "performance-volrend-192-mcs_accordin-r2",
+      "frames": 3000,
+      "bytes": 63143654
+    },
+    {
+      "id": "performance-volrend-96-flexguard-r3",
+      "frames": 3000,
+      "bytes": 63015630
+    },
+    {
+      "id": "performance-volrend-96-mcs_accordin-r3",
+      "frames": 3000,
+      "bytes": 63013666
+    },
+    {
+      "id": "performance-volrend-96-mcs_tas_accordin-r3",
+      "frames": 3000,
+      "bytes": 63013710
+    },
+    {
+      "id": "performance-volrend-192-flexguard-r3",
+      "frames": 3000,
+      "bytes": 63242506
+    },
+    {
+      "id": "performance-volrend-192-mcs_accordin-r3",
+      "frames": 3000,
+      "bytes": 63139366
+    },
+    {
+      "id": "performance-volrend-192-mcs_tas_accordin-r3",
+      "frames": 3000,
+      "bytes": 63139110
+    }
+  ],
+  "issues": [],
+  "scheduler_state_at_audit": "disabled"
+}

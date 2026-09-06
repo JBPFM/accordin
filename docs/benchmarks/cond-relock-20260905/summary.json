@@ -1,0 +1,135 @@
+[
+  {
+    "benchmark": "stream",
+    "variant": "relock",
+    "backend": "mcs_accordin",
+    "repeats": 3,
+    "mean_seconds": 72.78871387666666,
+    "min_seconds": 72.25282707,
+    "max_seconds": 73.15687657,
+    "runs_seconds": [
+      72.25282707,
+      72.95643799,
+      73.15687657
+    ]
+  },
+  {
+    "benchmark": "stream",
+    "variant": "relock",
+    "backend": "mcs_tas_accordin",
+    "repeats": 3,
+    "mean_seconds": 74.82314036,
+    "min_seconds": 72.90246789,
+    "max_seconds": 77.98110714,
+    "runs_seconds": [
+      77.98110714,
+      72.90246789,
+      73.58584605
+    ]
+  },
+  {
+    "benchmark": "barrier",
+    "variant": "baseline",
+    "backend": "mcs_accordin",
+    "repeats": 3,
+    "mean_seconds": 1.6290004306666668,
+    "min_seconds": 1.560609892,
+    "max_seconds": 1.727689048,
+    "runs_seconds": [
+      1.598702352,
+      1.727689048,
+      1.560609892
+    ],
+    "mean_counters": {
+      "task-clock": 105053.95,
+      "context-switches": 77948.66666666667,
+      "cpu-migrations": 56042.0,
+      "syscalls:sys_enter_futex": 37971.333333333336,
+      "syscalls:sys_enter_sched_yield": 341699.3333333333
+    }
+  },
+  {
+    "benchmark": "barrier",
+    "variant": "baseline",
+    "backend": "mcs_tas_accordin",
+    "repeats": 3,
+    "mean_seconds": 1.4048781813333333,
+    "min_seconds": 1.345054297,
+    "max_seconds": 1.444120672,
+    "runs_seconds": [
+      1.444120672,
+      1.425459575,
+      1.345054297
+    ],
+    "mean_counters": {
+      "task-clock": 58508.37666666666,
+      "context-switches": 65829.66666666667,
+      "cpu-migrations": 49463.666666666664,
+      "syscalls:sys_enter_futex": 38016.666666666664,
+      "syscalls:sys_enter_sched_yield": 672190.6666666666
+    }
+  },
+  {
+    "benchmark": "barrier",
+    "variant": "relock",
+    "backend": "mcs_accordin",
+    "repeats": 3,
+    "mean_seconds": 0.39339711633333335,
+    "min_seconds": 0.342822978,
+    "max_seconds": 0.479057368,
+    "runs_seconds": [
+      0.342822978,
+      0.479057368,
+      0.358311003
+    ],
+    "mean_counters": {
+      "task-clock": 509.6666666666667,
+      "context-switches": 38215.0,
+      "cpu-migrations": 931.3333333333334,
+      "syscalls:sys_enter_futex": 38010.0,
+      "syscalls:sys_enter_sched_yield": 239.66666666666666
+    }
+  },
+  {
+    "benchmark": "barrier",
+    "variant": "relock",
+    "backend": "mcs_tas_accordin",
+    "repeats": 3,
+    "mean_seconds": 0.462760765,
+    "min_seconds": 0.359418161,
+    "max_seconds": 0.666894583,
+    "runs_seconds": [
+      0.361969551,
+      0.666894583,
+      0.359418161
+    ],
+    "mean_counters": {
+      "task-clock": 502.63,
+      "context-switches": 38219.0,
+      "cpu-migrations": 647.0,
+      "syscalls:sys_enter_futex": 38010.0,
+      "syscalls:sys_enter_sched_yield": 321.6666666666667
+    }
+  },
+  {
+    "benchmark": "barrier",
+    "variant": "baseline",
+    "backend": "flexguard",
+    "repeats": 3,
+    "mean_seconds": 0.696410738,
+    "min_seconds": 0.565753661,
+    "max_seconds": 0.797956154,
+    "runs_seconds": [
+      0.797956154,
+      0.725522399,
+      0.565753661
+    ],
+    "mean_counters": {
+      "task-clock": 42134.573333333334,
+      "context-switches": 60559.666666666664,
+      "cpu-migrations": 12980.666666666666,
+      "syscalls:sys_enter_futex": 18286.333333333332,
+      "syscalls:sys_enter_sched_yield": 0.0
+    }
+  }
+]

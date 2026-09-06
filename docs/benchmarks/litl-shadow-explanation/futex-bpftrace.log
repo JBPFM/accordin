@@ -1,0 +1,9 @@
+Attaching 3 probes...
+TRACE_READY
+
+
+@futex_calls[3637508, 0]: 1
+@futex_calls[3637729, 1]: 2
+@futex_calls[3637729, 9]: 3
+@futex_calls[3637508, 9]: 3
+@futex_calls[3637508, 1]: 7

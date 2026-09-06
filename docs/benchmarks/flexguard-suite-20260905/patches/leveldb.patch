@@ -1,0 +1,10 @@
+--- a/db/db_bench.cc
++++ b/db/db_bench.cc
+@@ -346,6 +346,7 @@
+             done_,
+             (extra.empty() ? "" : " "),
+             extra.c_str());
++    fprintf(stdout, "\nBENCH_TOTAL ops=%d seconds=%.9f ops_per_second=%.3f\n", done_, (finish_ - start_) * 1e-6, done_ / ((finish_ - start_) * 1e-6));
+     if (wdone_ > 0)
+       fprintf(stdout, " %11.3f micros/op (write: %d)\n",
+               wseconds_ * 1e6 / wdone_, wdone_);

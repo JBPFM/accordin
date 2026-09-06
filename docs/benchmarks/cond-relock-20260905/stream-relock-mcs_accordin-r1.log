@@ -1,0 +1,6 @@
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+PARSEC Benchmark Suite
+Using LibMCS-Accordin with waiting WAITING_ORIGINAL
+read 32768 points
+Setup time: 406
+Benchmark time: 7225282707

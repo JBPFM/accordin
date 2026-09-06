@@ -24,7 +24,7 @@ BACKENDS := mcs_accordin_direct mcs_tas_accordin_direct
 LIBRARIES := $(BACKENDS:%=$(OUT)/lib%.so)
 HEADERS := $(wildcard src/*.h include/*.h src/bpf/*.h third_party/scx/scx/*.h) Makefile
 
-.PHONY: all $(BACKENDS) check check-bpf clean compile-commands
+.PHONY: all $(BACKENDS) check check-bpf litl check-litl check-litl-bpf clean compile-commands
 .DELETE_ON_ERROR:
 all: $(LIBRARIES)
 $(BACKENDS): %: $(OUT)/lib%.so
@@ -55,6 +55,15 @@ check: all
 
 check-bpf: all
 	DIRECT_LIB_DIR=$(abspath $(OUT)) bash scripts/test_direct_api.sh --bpf
+
+litl: all
+	$(MAKE) -C third_party/litl ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
+
+check-litl: litl
+	cd third_party/litl && ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) bash tests/run.sh --no-bpf
+
+check-litl-bpf: litl
+	cd third_party/litl && ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) bash tests/run.sh --bpf
 
 compile-commands: all
 	bash gen-compile-commands.sh

@@ -1,0 +1,36 @@
+{
+  "mcsaccordin_original": {
+    "direct": {
+      "runs": [
+        1286258.73,
+        1304755.28
+      ],
+      "mean_ops": 1295507.005
+    },
+    "upstream": {
+      "runs": [
+        1281471.92,
+        1295465.39
+      ],
+      "mean_ops": 1288468.6549999998
+    },
+    "difference_percent": -0.5432892275252565
+  },
+  "mcstasaccordin_original": {
+    "direct": {
+      "runs": [
+        1397121.79,
+        1390653.08
+      ],
+      "mean_ops": 1393887.435
+    },
+    "upstream": {
+      "runs": [
+        1317117.2,
+        1348128.54
+      ],
+      "mean_ops": 1332622.87
+    },
+    "difference_percent": -4.395230451302545
+  }
+}

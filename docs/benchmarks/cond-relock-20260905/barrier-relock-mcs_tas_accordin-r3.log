@@ -1,0 +1,3 @@
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-TAS-Accordin with waiting WAITING_ORIGINAL
+BARRIER threads=192 rounds=100 seconds=0.359418161

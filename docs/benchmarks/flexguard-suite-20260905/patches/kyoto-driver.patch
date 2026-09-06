@@ -1,0 +1,21 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -17,7 +17,7 @@
+ # C++ standard can be overridden when this is used as a sub-project.
+ if(NOT CMAKE_CXX_STANDARD)
+   # This project requires C++11.
+-  set(CMAKE_CXX_STANDARD 11)
++  set(CMAKE_CXX_STANDARD 17)
+   set(CMAKE_CXX_STANDARD_REQUIRED ON)
+   set(CMAKE_CXX_EXTENSIONS OFF)
+ endif(NOT CMAKE_CXX_STANDARD)
+--- a/benchmarks/db_bench_tree_db.cc
++++ b/benchmarks/db_bench_tree_db.cc
+@@ -237,6 +237,7 @@
+     std::fprintf(stdout, "%-12s : %11.3f micros/op;%s%s\n",
+                  name.ToString().c_str(), seconds_ * 1e6 / done_,
+                  (extra.empty() ? "" : " "), extra.c_str());
++    std::fprintf(stdout, "BENCH_TOTAL name=%s ops=%d seconds=%.9f ops_per_second=%.3f\n", name.ToString().c_str(), done_, (finish_ - start_) * 1e-6, done_ / ((finish_ - start_) * 1e-6));
+     if (FLAGS_histogram) {
+       std::fprintf(stdout, "Microseconds per op:\n%s\n",
+                    hist_.ToString().c_str());

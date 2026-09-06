@@ -1,0 +1,21 @@
+GLIBC_2.17 {
+   global:
+      pthread_create;
+      pthread_mutex_*;
+      pthread_spin_*;
+      pthread_cond_*;
+   local: *;
+};
+
+GLIBC_2.30 {
+   global: pthread_cond_clockwait;
+} GLIBC_2.17;
+
+GLIBC_2.34 {
+   global:
+      pthread_create;
+      pthread_mutex_trylock;
+      pthread_mutex_timedlock;
+      pthread_cond_clockwait;
+      pthread_rwlock_*;
+} GLIBC_2.30;

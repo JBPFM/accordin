@@ -33,8 +33,11 @@ RAW_FN bool raw_trylock(struct raw_lock *lock)
 {
     struct node *node = node_acquire(lock, false);
     struct node *expected = NULL;
+    /* Publish next = NULL before a successor can link itself to this node.
+     * Acquire alone allows that initialization to overwrite the successor's
+     * link on weakly ordered CPUs, stranding the owner in queue_release. */
     if (atomic_compare_exchange_strong_explicit(&lock->tail, &expected, node,
-                                                memory_order_acquire, memory_order_relaxed))
+                                                memory_order_acq_rel, memory_order_relaxed))
         return true;
     node_release(node);
     return false;

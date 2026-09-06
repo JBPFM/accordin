@@ -1,0 +1,1 @@
+{"case": "kyotocabinet-96-mcs_tas_accordin-r1", "reason": "Checkpoint runner to skip repeating known timeouts; unfinished sample excluded and will be rerun", "state": "disabled"}

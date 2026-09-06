@@ -9,12 +9,18 @@ Accordin 将用户态锁与 Linux eBPF `sched_ext` admission 调度器结合。�
 
 应用通过链接或 `dlopen` 调用 direct API。动态库加载时初始化调度器；它们不导出 `pthread_mutex_*` 或 `pthread_cond_*`，仅设置 `LD_PRELOAD` 无法替换普通程序的 pthread 锁。
 
+普通 pthread 程序可使用 `third_party/litl` 中的标准 [LiTL](https://github.com/multicore-locks/litl) 适配器。该目录保存官方源码及 Accordin 集成，来源版本见 [UPSTREAM.md](third_party/litl/UPSTREAM.md)。`mcsaccordin_original` 和 `mcstasaccordin_original` 分别链接当前的 MCS / MCS-TAS direct 库，共用直接 futex 条件变量，不使用 shadow mutex。
+
 ## 构建与验证
 
 ```sh
 make -j
 make check
 sudo make check-bpf
+# LiTL pthread 适配器及测试：
+make litl
+make check-litl
+sudo make check-litl-bpf
 # 将原始锁函数保留为独立的 perf 符号：
 make OUT=target/perf PERF_SYMBOLS=1
 # 至少允许两个 CPU 时，额外测试等待期间更改 affinity：
@@ -26,6 +32,26 @@ sudo env DIRECT_SMOKE_MIGRATE=1 bash scripts/test_direct_api.sh --bpf
 scx C 头文件固定在 `third_party/scx/`。构建时从 `/sys/kernel/btf/vmlinux` 生成 `vmlinux.h`，可用 `VMLINUX_BTF=/path/to/vmlinux.btf` 指定其他 BTF。实际调度需要支持 `sched_ext` 的 Linux 内核和 BPF 权限。`check-bpf` 会短时启动调度器，仅在当前没有其他 sched_ext 调度器时运行；可在命令前加 `taskset -c <CPU列表>` 验证受限 affinity。`bash gen-compile-commands.sh` 根据 Makefile 生成 clangd 编译数据库。
 
 应用应在退出所有使用 direct API 的线程后再卸载动态库。MCS 后端保持每线程最多同时持有 4 把锁；调度器支持最多 256 个逻辑 CPU。
+
+### LiTL pthread 接入
+
+```sh
+sudo third_party/litl/libmcsaccordin_original.sh ./program
+sudo third_party/litl/libmcstasaccordin_original.sh ./program
+# 无 BPF：
+MCS_ACCORDIN_DIRECT_DISABLE_BPF=1 third_party/litl/libmcsaccordin_original.sh ./program
+MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 third_party/litl/libmcstasaccordin_original.sh ./program
+```
+
+适配器通过 LiTL 的 `NO_INDIRECTION` 路径在 pthread mutex 中保存内部对象指针，线程节点仍由 direct 运行时管理；构建这两个适配器不需要 CLHT、ssmem 或 PAPI。条件变量支持始终启用，不使用 shadow mutex。waiter 在释放业务锁之前登记，释放后准备一个不占用 CPU 名额的 relock epoch。signal 通知一个已登记 waiter，broadcast 通知全部；被通知者转入 mutex 的停泊队列，首个接力者立即获得 futex wake，其余由接力者的 unlock 逐个唤醒。通知发生在 mutex 外或 mutex 空闲时也能启动接力。
+
+实际唤醒前发布 `USER_WAITING`，现有 BPF enqueue 可直接将其放入 `WAITING_DSQ`；重获锁复用该 epoch，先检查已有授权，再决定是否 yield。不会把休眠者放入 raw MCS 队列。仍持有其它 mutex 的嵌套等待保留外层 admission，并立即唤醒。普通 lock/trylock 仍直接调用 direct API；unlock 增加一次停泊状态的原子读取，仅存在待接力状态时获取队列 guard。唤醒、超时和 deferred cancellation 均恢复业务锁；取消与 signal 并发时补偿通知其它 waiter，已通知但仍停泊的 waiter 不因原条件变量截止时间到期而丢失通知。这些行为不受 `NDEBUG` 影响。
+
+当前队列设计与测量见 [condvar relock 接力](docs/benchmarks/cond-relock-20260905/README.md)。192 线程的随机读写对比见 [LevelDB readrandom / fillrandom](docs/benchmarks/leveldb-relock-20260905/README.md)。此前实现和 `mutexbench 300,3000` 对照见 [直接 futex 条件变量](docs/benchmarks/litl-futex-cond/README.md)。[shadow 开销测量](docs/benchmarks/litl-shadow-cost/README.md)、[集成迁移记录](docs/benchmarks/litl-upstream/README.md) 和 [此前按需 shadow 优化](docs/benchmarks/litl-lazy-shadow/README.md) 保留为历史记录。
+
+支持进程内普通 mutex 和条件变量（包括静态初始化）、`cond_wait`、`cond_timedwait`、`cond_clockwait`、signal、broadcast 和 deferred cancellation。超时支持 realtime/monotonic，包含现代 C++ `std::condition_variable::wait_for` 路径。显式请求递归、error-check、robust、进程共享或优先级协议 mutex 返回 `ENOTSUP`；mutex timedlock、进程共享条件变量同样返回 `ENOTSUP`。仍有 waiter 时 cond_destroy 返回 `EBUSY`。只支持普通 mutex 的静态初始化器。spinlock/rwlock 保留 libc 实现。MCS 的 4 把嵌套锁上限仍然适用。
+
+`make check-litl` / `sudo make check-litl-bpf` 对两个适配器运行实际符号绑定、并发计数、初始化与复用、嵌套锁、trylock、条件变量 signal/broadcast、两种时钟的超时、错误返回及取消测试，并验证首次等待与并发 lock/trylock、取消时的通知补偿、通知后的取消/超时、持锁外广播、多个 condvar 共用 mutex、C++ 条件变量，以及 `NDEBUG` 下没有原生 shadow mutex 调用。可通过 `LITL_TEST_THREADS`、`LITL_TEST_ITERATIONS`、`LITL_TEST_TIMEOUT` 调整规模。也可在 LiTL 目录运行 `make check` / `sudo make check-bpf`。BPF 测试会短时启动调度器，要求当前 sched_ext 空闲。
 
 C 头文件位于 `include/mcs_accordin_direct.h` 和 `include/mcs_tas_accordin_direct.h`。例如：
 
@@ -87,6 +113,6 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 
 实验、benchmark 子模块、第三方源码、结果和历史设计文档保留。mutexbench 的 direct 实验 1、3、6–9 继续使用原库名和 mutex C ABI。实验 4 的 LevelDB direct 选项依赖已移除的 CV/writer-event API，因此已停用；普通 mutex 等外部基线选项和历史结果绘图仍可使用。`patches/leveldb-accordin-direct.patch` 仅保留作历史参考。
 
-依赖已删除的 `accordin`、`mcs_accordin`、`mcs_tas_accordin`、`ttas_accordin`、`reciprocating_accordin` 或 `mcs_tse` preload 的历史入口已停用，会在使用这些库前报错，即使构建目录中仍有旧库。`run_benchmark.sh` 也已停用。外部 benchmark 子模块中的旧说明和脚本保留作历史参考；不属于当前核心支持的运行入口。
+依赖已删除的 `accordin`、`mcs_accordin`、`mcs_tas_accordin`、`ttas_accordin`、`reciprocating_accordin` 或 `mcs_tse` preload 的历史入口已停用，会在使用这些库前报错，即使构建目录中仍有旧库。`run_benchmark.sh` 也已停用。新的 pthread 入口使用上述 LiTL 库名；其余外部 benchmark 子模块中的旧说明和脚本保留作历史参考。
 
 实验标签可能仍叫 `mcs_accordin` 或 `mcs_tas_accordin_admission_only`；在支持 direct 的实验中，它们映射到对应 direct 库。历史文档描述的是当时版本，不代表当前功能。

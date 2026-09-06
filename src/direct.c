@@ -50,7 +50,7 @@ EXPORT int API(lock)(struct MUTEX *mutex)
     bool managed = admission_begin();
     if (!raw_trylock(&mutex->raw)) {
         if (managed)
-            admission_wait();
+            admission_wait(false);
         raw_lock(&mutex->raw);
     }
     admission_enter(managed);
@@ -78,6 +78,43 @@ EXPORT int API(unlock)(struct MUTEX *mutex)
     return 0;
 }
 
+EXPORT void API(relock_prepare)(accordin_relock_request_t *request)
+{
+    ensure_registered();
+    *request = (accordin_relock_request_t){.nested = thread_state.depth != 0};
+    if (!request->nested && admission_enabled) {
+        uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
+        request->word = &thread_state.word;
+        request->epoch = (word & ~USER_FLAGS) + 4;
+        atomic_store_explicit(&thread_state.word, request->epoch, memory_order_release);
+    }
+}
+
+EXPORT void API(relock_wake)(accordin_relock_request_t *request)
+{
+    if (request->word)
+        atomic_store_explicit((_Atomic uint32_t *)request->word,
+                              request->epoch | USER_WAITING, memory_order_release);
+}
+
+EXPORT int API(relock)(struct MUTEX *mutex, accordin_relock_request_t *request)
+{
+    if (!mutex || !request)
+        return EINVAL;
+    /* No admission_begin: the notifier published this exact request before
+     * FUTEX_WAKE. Timeouts/cancellation publish it here if still dormant. */
+    bool managed = request->word != NULL;
+    thread_state.depth++;
+    API(relock_wake)(request);
+    if (!raw_trylock(&mutex->raw)) {
+        if (managed)
+            admission_wait(true);
+        raw_lock(&mutex->raw);
+    }
+    admission_enter(managed);
+    return 0;
+}
+
 #ifndef MCS_TAS
 /* Historical MCS library aliases used by existing direct clients. */
 #define TAS_ALIAS(op) \
@@ -88,4 +125,7 @@ TAS_ALIAS(destroy)
 TAS_ALIAS(lock)
 TAS_ALIAS(trylock)
 TAS_ALIAS(unlock)
+TAS_ALIAS(relock_prepare)
+TAS_ALIAS(relock_wake)
+TAS_ALIAS(relock)
 #endif

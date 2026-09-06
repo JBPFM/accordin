@@ -1,0 +1,128 @@
+[
+  {
+    "id": "performance-volrend-96-mcs_accordin-r1",
+    "frames": 3000,
+    "bytes": 63013594,
+    "matching_reference_file_hashes": 3000,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-96-mcs_tas_accordin-r1",
+    "frames": 3000,
+    "bytes": 63013670,
+    "matching_reference_file_hashes": 1,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-96-flexguard-r1",
+    "frames": 3000,
+    "bytes": 63015594,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-mcs_accordin-r1",
+    "frames": 3000,
+    "bytes": 63140924,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-mcs_tas_accordin-r1",
+    "frames": 3000,
+    "bytes": 63141700,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-flexguard-r1",
+    "frames": 3000,
+    "bytes": 63237470,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-96-mcs_tas_accordin-r2",
+    "frames": 3000,
+    "bytes": 63013770,
+    "matching_reference_file_hashes": 2923,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-96-flexguard-r2",
+    "frames": 3000,
+    "bytes": 63016038,
+    "matching_reference_file_hashes": 2615,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-96-mcs_accordin-r2",
+    "frames": 3000,
+    "bytes": 63013776,
+    "matching_reference_file_hashes": 2897,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-mcs_tas_accordin-r2",
+    "frames": 3000,
+    "bytes": 63135846,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-flexguard-r2",
+    "frames": 3000,
+    "bytes": 63241822,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-mcs_accordin-r2",
+    "frames": 3000,
+    "bytes": 63143654,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-96-flexguard-r3",
+    "frames": 3000,
+    "bytes": 63015630,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-96-mcs_accordin-r3",
+    "frames": 3000,
+    "bytes": 63013666,
+    "matching_reference_file_hashes": 1,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-96-mcs_tas_accordin-r3",
+    "frames": 3000,
+    "bytes": 63013710,
+    "matching_reference_file_hashes": 1,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-flexguard-r3",
+    "frames": 3000,
+    "bytes": 63242506,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-mcs_accordin-r3",
+    "frames": 3000,
+    "bytes": 63139366,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  },
+  {
+    "id": "performance-volrend-192-mcs_tas_accordin-r3",
+    "frames": 3000,
+    "bytes": 63139110,
+    "matching_reference_file_hashes": 0,
+    "reference": "performance-volrend-96-mcs_accordin-r1"
+  }
+]

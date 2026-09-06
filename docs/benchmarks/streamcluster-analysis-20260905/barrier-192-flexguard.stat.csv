@@ -1,0 +1,7 @@
+# started on Sat Sep  5 17:19:49 2026
+
+50749.40,msec,task-clock,50749397630,100.00,62.506,CPUs utilized
+58153,,context-switches,50749397630,100.00,1.146,K/sec
+13304,,cpu-migrations,50749397630,100.00,262.151,/sec
+17023,,syscalls:sys_enter_futex,50749397630,100.00,335.433,/sec
+0,,syscalls:sys_enter_sched_yield,50749397630,100.00,0.000,/sec

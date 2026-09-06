@@ -1,0 +1,13 @@
+variant,backend,mode,throughput_ops_per_sec,total_operations,elapsed_seconds,avg_lock_hold_ns,avg_wait_ns_estimated,avg_lock_handoff_ns_estimated,burn_calibration,min_thread_ops,max_thread_ops,scx_enabled_samples,log
+direct,mcsaccordin_original,direct,1323160.46,6642432,5.020126,385.76,144177.88,370.01,9/32,30979,38114,51,/mnt/sde/jz/accordin/target/litl-futex-1-direct-condvar1-300-3000-3288rolh/mcsaccordin_original.log
+direct,mcstasaccordin_original,direct,1357782.75,6821056,5.023673,385.04,140383.01,351.45,9/32,32335,39589,51,/mnt/sde/jz/accordin/target/litl-futex-1-direct-condvar1-300-3000-3288rolh/mcstasaccordin_original.log
+condvar0,mcsaccordin_original,litl,1295451.37,6493846,5.012806,387.33,147518.49,384.60,9/32,29770,37506,54,/mnt/sde/jz/accordin/target/litl-futex-2-condvar0-condvar0-300-3000-djqnoto_/mcsaccordin_original.log
+condvar0,mcstasaccordin_original,litl,1352315.61,6771837,5.007586,385.90,141393.16,353.57,9/32,31250,39159,58,/mnt/sde/jz/accordin/target/litl-futex-2-condvar0-condvar0-300-3000-djqnoto_/mcstasaccordin_original.log
+condvar1,mcsaccordin_original,litl,1285784.60,6441506,5.009786,389.74,148678.77,387.99,9/32,29898,37526,59,/mnt/sde/jz/accordin/target/litl-futex-3-condvar1-condvar1-300-3000-9yrcps5q/mcsaccordin_original.log
+condvar1,mcstasaccordin_original,litl,1349467.76,6765058,5.013131,386.61,141581.85,354.43,9/32,31168,38593,59,/mnt/sde/jz/accordin/target/litl-futex-3-condvar1-condvar1-300-3000-9yrcps5q/mcstasaccordin_original.log
+condvar0,mcsaccordin_original,litl,1285709.53,6441490,5.010066,387.42,148688.98,390.36,9/32,29810,37129,59,/mnt/sde/jz/accordin/target/litl-futex-4-condvar0-condvar0-300-3000-7r2k9br4/mcsaccordin_original.log
+condvar0,mcstasaccordin_original,litl,1374625.76,6890541,5.012667,385.92,139005.78,341.55,9/32,31462,40374,57,/mnt/sde/jz/accordin/target/litl-futex-4-condvar0-condvar0-300-3000-7r2k9br4/mcstasaccordin_original.log
+direct,mcsaccordin_original,direct,1307335.12,6560885,5.018518,384.84,145955.78,380.08,9/32,30202,38324,51,/mnt/sde/jz/accordin/target/litl-futex-5-direct-condvar1-300-3000-biqj2zh3/mcsaccordin_original.log
+direct,mcstasaccordin_original,direct,1298078.14,6521366,5.023862,385.60,146855.97,384.77,9/32,27370,37728,52,/mnt/sde/jz/accordin/target/litl-futex-5-direct-condvar1-300-3000-biqj2zh3/mcstasaccordin_original.log
+condvar1,mcsaccordin_original,litl,1308030.69,6555375,5.011637,386.77,146120.08,377.73,9/32,30301,37139,56,/mnt/sde/jz/accordin/target/litl-futex-6-condvar1-condvar1-300-3000-titgq4da/mcsaccordin_original.log
+condvar1,mcstasaccordin_original,litl,1367729.64,6858392,5.014435,385.64,139637.68,345.49,9/32,31466,38994,59,/mnt/sde/jz/accordin/target/litl-futex-6-condvar1-condvar1-300-3000-titgq4da/mcstasaccordin_original.log

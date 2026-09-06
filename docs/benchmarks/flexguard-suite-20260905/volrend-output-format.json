@@ -1,0 +1,7 @@
+{
+  "application": "volrend",
+  "issue": "Bundled legacy libtiff writes a 16-byte TIFFHeader on LP64: unsigned long tiff_diroff is at byte8 instead of the classic byte4. Pillow cannot decode outputs. Same binary/output routine for all backends; timing valid as original application workload, image format correctness not passed.",
+  "observed_header_hex": "49492a0000000000d45e000000000000",
+  "decoder_result": "PIL.UnidentifiedImageError",
+  "all_backends_same_binary": true
+}

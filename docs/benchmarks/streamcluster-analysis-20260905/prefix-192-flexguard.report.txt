@@ -1,0 +1,19 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 187K of event 'cpu-clock'
+# Event count (approx.): 1889202001310
+#
+# Overhead  Command        Shared Object      Symbol                                                         
+# ........  .............  .................  ...............................................................
+#
+    94.81%  streamcluster  interpose.so       [.] flexguard_lock
+     2.31%  streamcluster  [kernel.kallsyms]  [k] queued_spin_lock_slowpath
+     1.29%  streamcluster  streamcluster      [.] pgain(long, Points*, double, long*, int, parsec_barrier_t*)
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

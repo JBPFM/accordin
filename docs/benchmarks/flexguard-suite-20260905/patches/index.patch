@@ -1,0 +1,55 @@
+--- a/latches/OMCSImpl.h
++++ b/latches/OMCSImpl.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+ #include <glog/logging.h>
+-#include <immintrin.h>
++#define _mm_pause() __asm__ volatile("yield" ::: "memory")
+ #include <stdint.h>
+ 
+ #include <atomic>
+--- a/latches/MCS.h
++++ b/latches/MCS.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+ #include <glog/logging.h>
+-#include <immintrin.h>
++#define _mm_pause() __asm__ volatile("yield" ::: "memory")
+ #include <stdint.h>
+ 
+ #include <atomic>
+--- a/latches/MCSRW.h
++++ b/latches/MCSRW.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+ #include <glog/logging.h>
+-#include <immintrin.h>
++#define _mm_pause() __asm__ volatile("yield" ::: "memory")
+ #include <stdint.h>
+ 
+ #include <atomic>
+--- a/indexes/BTreeOLC/BTreeOLCHybrid.h
++++ b/indexes/BTreeOLC/BTreeOLCHybrid.h
+@@ -7,7 +7,7 @@
+ #define BTREE_SYNC_IMPL
+ 
+ #include <glog/logging.h>
+-#include <immintrin.h>
++#define _mm_pause() __asm__ volatile("yield" ::: "memory")
+ 
+ #include <atomic>
+ #include <cassert>
+--- a/indexes/BTreeOLC/BTreeCommon.h
++++ b/indexes/BTreeOLC/BTreeCommon.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+ #include <glog/logging.h>
+-#include <immintrin.h>
++#define _mm_pause() __asm__ volatile("yield" ::: "memory")
+ 
+ #include <atomic>
+ #include <cassert>

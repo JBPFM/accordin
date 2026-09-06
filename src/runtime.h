@@ -38,16 +38,20 @@ static inline bool admission_begin(void)
     return managed;
 }
 
-static inline void admission_wait(void)
+static inline void admission_wait(bool prequeued)
 {
     uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
                                                memory_order_relaxed) & ~USER_FLAGS;
     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
     struct admission_state *state = scheduler_admission;
 
-    /* A yield need not dispatch. Confirm this request, never an older grant. */
+    /* Normal contention submits through yield. A condvar wake may already
+     * carry a grant: consume it before yielding, retaining the same epoch.
+     * A yield need not dispatch; confirm this request, never an older grant. */
     for (;;) {
-        sched_yield();
+        if (!prequeued)
+            sched_yield();
+        prequeued = false;
         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
             break;
         unsigned int cpu = sched_getcpu();

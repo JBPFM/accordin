@@ -1,0 +1,257 @@
+ Percent |	Source code & Disassembly of libmcs_accordin_direct.so for cpu-clock (72008 samples, percent: global period)
+----------------------------------------------------------------------------------------------------------------------------
+         :
+         :
+         :
+         : 3    Disassembly of section .text:
+         :
+         : 5    00000000000019f0 <mcs_accordin_direct_mutex_lock>:
+         : 6    free(mutex);
+         : 7    return 0;
+         : 8    }
+         :
+         : 10   EXPORT int API(lock)(struct MUTEX *mutex)
+         : 11   {
+    0.00 :   19f0:   stp     x29, x30, [sp, #-96]!
+    0.01 :   19f4:   str     x27, [sp, #16]
+    0.00 :   19f8:   stp     x26, x25, [sp, #32]
+    0.01 :   19fc:   stp     x24, x23, [sp, #48]
+    0.02 :   1a00:   stp     x22, x21, [sp, #64]
+    0.00 :   1a04:   stp     x20, x19, [sp, #80]
+    0.00 :   1a08:   mov     x29, sp
+         : 19   if (!mutex)
+    0.00 :   1a0c:   cbz     x0, 1ab0 <mcs_accordin_direct_mutex_lock+0xc0>
+    0.00 :   1a10:   mov     x20, x0
+         : 22   extern bool admission_enabled;
+         : 23   void register_thread(void);
+         :
+         : 25   static inline void ensure_registered(void)
+         : 26   {
+         : 27   if (!thread_state.registered)
+    0.00 :   1a14:   adrp    x0, 110000 <__isoc23_strtoul@GLIBC_2.38>
+    0.00 :   1a18:   ldr     x1, [x0, #416]
+    0.00 :   1a1c:   add     x0, x0, #0x1a0
+    0.00 :   1a20:   blr     x1
+    0.00 :   1a24:   mrs     x21, tpidr_el0
+    0.00 :   1a28:   add     x19, x21, x0
+    0.01 :   1a2c:   ldrb    w8, [x19, #12]
+    0.00 :   1a30:   tbnz    w8, #0, 1a38 <mcs_accordin_direct_mutex_lock+0x48>
+         : 36   register_thread();
+    0.00 :   1a34:   bl      1ec0 <register_thread>
+         : 38   }
+         :
+         : 40   /* All nested locks share the outer episode, including out-of-order unlocks. */
+         : 41   static inline bool admission_begin(void)
+         : 42   {
+         : 43   bool managed = thread_state.depth++ == 0 && admission_enabled;
+    0.01 :   1a38:   adrp    x9, 10f000 <__FRAME_END__+0x19854>
+    0.00 :   1a3c:   ldr     w8, [x19, #4]
+    0.00 :   1a40:   ldr     x9, [x9, #4032]
+    0.00 :   1a44:   cmp     w8, #0x0
+    0.00 :   1a48:   add     w8, w8, #0x1
+    0.01 :   1a4c:   ldrb    w9, [x9]
+    0.00 :   1a50:   cset    w10, eq // eq = none
+    0.01 :   1a54:   str     w8, [x19, #4]
+    0.00 :   1a58:   and     w22, w10, w9
+         : 53   if (managed) {
+    0.00 :   1a5c:   cmp     w22, #0x1
+    0.00 :   1a60:   b.ne    1a74 <mcs_accordin_direct_mutex_lock+0x84>  // b.any
+         : 56   uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
+    0.00 :   1a64:   ldr     w8, [x19]
+         : 58   atomic_store_explicit(&thread_state.word, (word & ~USER_FLAGS) + 4,
+    0.00 :   1a68:   and     w8, w8, #0xfffffffc
+    0.00 :   1a6c:   add     w8, w8, #0x4
+    0.00 :   1a70:   str     w8, [x19]
+    0.00 :   1a74:   adrp    x0, 110000 <__isoc23_strtoul@GLIBC_2.38>
+    0.00 :   1a78:   ldr     x1, [x0, #400]
+    0.00 :   1a7c:   add     x0, x0, #0x190
+    0.00 :   1a80:   blr     x1
+    0.00 :   1a84:   add     x23, x21, x0
+         : 67   } pool;
+         :
+         : 69   static inline struct node *node_acquire(struct raw_lock *lock, bool waiting)
+         : 70   {
+         : 71   for (unsigned int i = 0; i < 4; i++) {
+         : 72   if (!pool.owners[i]) {
+    0.00 :   1a88:   ldr     x8, [x23, #256]
+    0.00 :   1a8c:   cbz     x8, 1ab8 <mcs_accordin_direct_mutex_lock+0xc8>
+    0.00 :   1a90:   ldr     x8, [x23, #264]
+    0.00 :   1a94:   cbz     x8, 1ac0 <mcs_accordin_direct_mutex_lock+0xd0>
+    0.00 :   1a98:   ldr     x8, [x23, #272]
+    0.00 :   1a9c:   cbz     x8, 1ac8 <mcs_accordin_direct_mutex_lock+0xd8>
+    0.00 :   1aa0:   ldr     x8, [x23, #280]
+    0.00 :   1aa4:   cbnz    x8, 1c18 <mcs_accordin_direct_mutex_lock+0x228>
+    0.00 :   1aa8:   mov     w21, #0x3                       // #3
+    0.00 :   1aac:   b       1acc <mcs_accordin_direct_mutex_lock+0xdc>
+    0.00 :   1ab0:   mov     w0, #0x16                       // #22
+    0.00 :   1ab4:   b       1bfc <mcs_accordin_direct_mutex_lock+0x20c>
+    0.02 :   1ab8:   mov     x21, xzr
+    0.00 :   1abc:   b       1acc <mcs_accordin_direct_mutex_lock+0xdc>
+    0.00 :   1ac0:   mov     w21, #0x1                       // #1
+    0.00 :   1ac4:   b       1acc <mcs_accordin_direct_mutex_lock+0xdc>
+    0.00 :   1ac8:   mov     w21, #0x2                       // #2
+         : 90   pool.owners[i] = lock;
+         : 91   atomic_store_explicit(&pool.nodes[i].next, NULL, memory_order_relaxed);
+    0.00 :   1acc:   add     x1, x23, x21, lsl #6
+    0.00 :   1ad0:   add     x24, x23, #0x100
+         : 94   struct node *node = node_acquire(lock, false);
+         : 95   struct node *expected = NULL;
+         : 96   /* Publish next = NULL before a successor can link itself to this node.
+         : 97   * Acquire alone allows that initialization to overwrite the successor's
+         : 98   * link on weakly ordered CPUs, stranding the owner in queue_release. */
+         : 99   if (atomic_compare_exchange_strong_explicit(&lock->tail, &expected, node,
+    0.00 :   1ad4:   mov     x0, xzr
+    0.00 :   1ad8:   mov     x2, x20
+         : 102  pool.owners[i] = lock;
+    0.00 :   1adc:   str     x20, [x24, x21, lsl #3]
+         : 104  atomic_store_explicit(&pool.nodes[i].next, NULL, memory_order_relaxed);
+    0.01 :   1ae0:   str     xzr, [x1]
+         : 106  atomic_store_explicit(&pool.nodes[i].waiting, waiting, memory_order_relaxed);
+    0.01 :   1ae4:   strb    wzr, [x1, #8]
+         : 108  if (atomic_compare_exchange_strong_explicit(&lock->tail, &expected, node,
+    0.00 :   1ae8:   bl      3570 <__aarch64_cas8_acq_rel>
+    0.00 :   1aec:   cmp     x0, #0x0
+    0.00 :   1af0:   b.eq    1be4 <mcs_accordin_direct_mutex_lock+0x1f4>  // b.none
+         : 112  pool.owners[node - pool.nodes] = NULL;
+    0.00 :   1af4:   str     xzr, [x24, x21, lsl #3]
+         : 114  return EINVAL;
+         : 115  ensure_registered();
+         : 116  bool managed = admission_begin();
+         : 117  if (!raw_trylock(&mutex->raw)) {
+         : 118  if (managed)
+    0.00 :   1af8:   cbz     w22, 1b6c <mcs_accordin_direct_mutex_lock+0x17c>
+         : 120  return managed;
+         : 121  }
+         :
+         : 123  static inline void admission_wait(void)
+         : 124  {
+         : 125  uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
+    0.01 :   1afc:   mov     w0, #0x2                        // #2
+    0.00 :   1b00:   mov     x1, x19
+    0.00 :   1b04:   bl      35d0 <__aarch64_ldset4_relax>
+         : 129  memory_order_relaxed) & ~USER_FLAGS;
+         : 130  uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+         : 131  struct admission_state *state = scheduler_admission;
+    0.00 :   1b08:   adrp    x8, 10f000 <__FRAME_END__+0x19854>
+         : 133  uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
+    0.00 :   1b0c:   mov     w21, w0
+         : 135  struct admission_state *state = scheduler_admission;
+    0.00 :   1b10:   ldr     x8, [x8, #4040]
+         : 137  uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+    0.02 :   1b14:   ldr     w25, [x19, #8]
+         : 139  struct admission_state *state = scheduler_admission;
+    0.02 :   1b18:   ldr     x26, [x8]
+         :
+         : 142  /* A yield need not dispatch. Confirm this request, never an older grant. */
+         : 143  for (;;) {
+         : 144  sched_yield();
+    0.00 :   1b1c:   bl      1730 <sched_yield@plt>
+         : 146  if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+    0.04 :   1b20:   cbz     x26, 1b64 <mcs_accordin_direct_mutex_lock+0x174>
+    0.00 :   1b24:   ldar    w8, [x26]
+    0.00 :   1b28:   cbz     w8, 1b64 <mcs_accordin_direct_mutex_lock+0x174>
+    0.17 :   1b2c:   and     w8, w21, #0xfffffffc
+    0.00 :   1b30:   add     x27, x26, #0x8
+    0.00 :   1b34:   lsr     x8, x8, #2
+    0.00 :   1b38:   bfi     x25, x8, #34, #30
+    0.00 :   1b3c:   b       1b4c <mcs_accordin_direct_mutex_lock+0x15c>
+         : 155  sched_yield();
+    0.00 :   1b40:   bl      1730 <sched_yield@plt>
+         : 157  if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+    0.01 :   1b44:   ldar    w8, [x26]
+    0.00 :   1b48:   cbz     w8, 1b64 <mcs_accordin_direct_mutex_lock+0x174>
+         : 160  break;
+         : 161  unsigned int cpu = sched_getcpu();
+    0.05 :   1b4c:   bl      15d0 <sched_getcpu@plt>
+         : 163  if (cpu < MAX_CPUS &&
+    0.00 :   1b50:   cmp     w0, #0xff
+    0.00 :   1b54:   b.hi    1b40 <mcs_accordin_direct_mutex_lock+0x150>  // b.pmore
+         : 166  __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
+    0.00 :   1b58:   ldr     x8, [x27, w0, uxtw #3]
+         : 168  if (cpu < MAX_CPUS &&
+    0.00 :   1b5c:   cmp     x8, x25
+    0.00 :   1b60:   b.ne    1b40 <mcs_accordin_direct_mutex_lock+0x150>  // b.any
+         : 171  break;
+         : 172  }
+         : 173  atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+    0.08 :   1b64:   orr     w8, w21, #0x3
+    0.00 :   1b68:   str     w8, [x19]
+         : 176  if (!pool.owners[i]) {
+    0.00 :   1b6c:   ldr     x8, [x24]
+    0.00 :   1b70:   cbz     x8, 1ba0 <mcs_accordin_direct_mutex_lock+0x1b0>
+    0.00 :   1b74:   ldr     x8, [x23, #264]
+    0.00 :   1b78:   cbz     x8, 1b94 <mcs_accordin_direct_mutex_lock+0x1a4>
+    0.00 :   1b7c:   ldr     x8, [x23, #272]
+    0.00 :   1b80:   cbz     x8, 1b9c <mcs_accordin_direct_mutex_lock+0x1ac>
+    0.00 :   1b84:   ldr     x8, [x23, #280]
+    0.00 :   1b88:   cbnz    x8, 1c18 <mcs_accordin_direct_mutex_lock+0x228>
+    0.00 :   1b8c:   mov     w8, #0x3                        // #3
+    0.00 :   1b90:   b       1ba0 <mcs_accordin_direct_mutex_lock+0x1b0>
+    0.00 :   1b94:   mov     w8, #0x1                        // #1
+    0.00 :   1b98:   b       1ba0 <mcs_accordin_direct_mutex_lock+0x1b0>
+    0.00 :   1b9c:   mov     w8, #0x2                        // #2
+         : 190  atomic_store_explicit(&pool.nodes[i].next, NULL, memory_order_relaxed);
+    0.00 :   1ba0:   add     x21, x23, x8, lsl #6
+         : 192  pool.owners[i] = lock;
+    0.00 :   1ba4:   str     x20, [x24, x8, lsl #3]
+    0.00 :   1ba8:   mov     w8, #0x1                        // #1
+         : 195  }
+         :
+         : 197  RAW_FN void raw_lock(struct raw_lock *lock)
+         : 198  {
+         : 199  struct node *node = node_acquire(lock, true);
+         : 200  struct node *prev = atomic_exchange_explicit(&lock->tail, node, memory_order_acq_rel);
+    0.00 :   1bac:   mov     x1, x20
+    0.00 :   1bb0:   mov     x0, x21
+         : 203  atomic_store_explicit(&pool.nodes[i].next, NULL, memory_order_relaxed);
+    0.00 :   1bb4:   str     xzr, [x21]
+         : 205  atomic_store_explicit(&pool.nodes[i].waiting, waiting, memory_order_relaxed);
+    0.00 :   1bb8:   strb    w8, [x21, #8]
+         : 207  struct node *prev = atomic_exchange_explicit(&lock->tail, node, memory_order_acq_rel);
+    0.00 :   1bbc:   bl      3600 <__aarch64_swp8_acq_rel>
+         : 209  if (prev) {
+    0.00 :   1bc0:   cbz     x0, 1be4 <mcs_accordin_direct_mutex_lock+0x1f4>
+         : 211  atomic_store_explicit(&prev->next, node, memory_order_release);
+    0.00 :   1bc4:   stlr    x21, [x0]
+         : 213  while (atomic_load_explicit(&node->waiting, memory_order_acquire))
+    0.00 :   1bc8:   add     x8, x21, #0x8
+    0.38 :   1bcc:   ldarb   w8, [x8]
+    0.00 :   1bd0:   tbz     w8, #0, 1be4 <mcs_accordin_direct_mutex_lock+0x1f4>
+         :
+         : 218  static inline void spin_pause(void)
+         : 219  {
+         : 220  #if defined(__aarch64__)
+         : 221  /* Match Rust's std::hint::spin_loop() on AArch64. */
+         : 222  __asm__ volatile("isb" ::: "memory");
+   33.84 :   1bd4:   isb
+   61.94 :   1bd8:   add     x8, x21, #0x8
+    3.04 :   1bdc:   ldarb   w8, [x8]
+    0.00 :   1be0:   tbnz    w8, #0, 1bd4 <mcs_accordin_direct_mutex_lock+0x1e4>
+    0.21 :   1be4:   mov     w0, wzr
+         : 228  memory_order_relaxed);
+         : 229  }
+         :
+         : 231  static inline void admission_enter(bool managed)
+         : 232  {
+         : 233  if (managed) {
+    0.00 :   1be8:   cbz     w22, 1bfc <mcs_accordin_direct_mutex_lock+0x20c>
+         : 235  uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
+    0.00 :   1bec:   ldr     w8, [x19]
+         : 237  atomic_store_explicit(&thread_state.word, (word & ~USER_FLAGS) | USER_HELD,
+    0.00 :   1bf0:   and     w8, w8, #0xfffffffc
+    0.00 :   1bf4:   orr     w8, w8, #0x1
+    0.03 :   1bf8:   str     w8, [x19]
+         : 241  admission_wait();
+         : 242  raw_lock(&mutex->raw);
+         : 243  }
+         : 244  admission_enter(managed);
+         : 245  return 0;
+         : 246  }
+    0.00 :   1bfc:   ldp     x20, x19, [sp, #80]
+    0.00 :   1c00:   ldr     x27, [sp, #16]
+    0.01 :   1c04:   ldp     x22, x21, [sp, #64]
+    0.00 :   1c08:   ldp     x24, x23, [sp, #48]
+    0.01 :   1c0c:   ldp     x26, x25, [sp, #32]
+    0.00 :   1c10:   ldp     x29, x30, [sp], #96
+    0.00 :   1c14:   ret
+    0.00 :   1c18:   bl      16d0 <abort@plt>

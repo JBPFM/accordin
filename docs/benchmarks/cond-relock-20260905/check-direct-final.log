@@ -1,0 +1,33 @@
+make -C third_party/litl ACCORDIN_ROOT=/mnt/sde/jz/accordin ACCORDIN_LIB_DIR=/mnt/sde/jz/accordin/target/release ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
+make[1]: Entering directory '/mnt/sde/jz/accordin/third_party/litl'
+make -C /mnt/sde/jz/accordin OUT=/mnt/sde/jz/accordin/target/release all
+make[2]: Entering directory '/mnt/sde/jz/accordin'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/mnt/sde/jz/accordin'
+mkdir -p lib/ obj/mcsaccordin_original
+mkdir -p lib/ obj/mcstasaccordin_original
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcsaccordin_original.so
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcstasaccordin_original.so
+make[2]: Entering directory '/mnt/sde/jz/accordin/third_party/litl/src'
+make[2]: Entering directory '/mnt/sde/jz/accordin/third_party/litl/src'
+cc -std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include -I/mnt/sde/jz/accordin/include  -DMCSACCORDIN -DFCT_LINK_SUFFIX=mcsaccordin -c accordin-cond.c -o ../obj/mcsaccordin_original/accordin-cond.o
+cc -std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include -I/mnt/sde/jz/accordin/include  -DMCSTASACCORDIN -DFCT_LINK_SUFFIX=mcstasaccordin -c accordin-cond.c -o ../obj/mcstasaccordin_original/accordin-cond.o
+cc -shared -o ../lib/libmcsaccordin_original.so ../obj/mcsaccordin_original/interpose.o ../obj/mcsaccordin_original/mcsaccordin_original.o ../obj/mcsaccordin_original/accordin-cond.o -Wl,-z,defs,-z,now -Wl,--version-script=interpose-aarch64.map -L/mnt/sde/jz/accordin/target/release -Wl,-rpath,/mnt/sde/jz/accordin/target/release -lmcs_accordin_direct -ldl -pthread
+cc -shared -o ../lib/libmcstasaccordin_original.so ../obj/mcstasaccordin_original/interpose.o ../obj/mcstasaccordin_original/mcstasaccordin_original.o ../obj/mcstasaccordin_original/accordin-cond.o -Wl,-z,defs,-z,now -Wl,--version-script=interpose-aarch64.map -L/mnt/sde/jz/accordin/target/release -Wl,-rpath,/mnt/sde/jz/accordin/target/release -lmcs_tas_accordin_direct -ldl -pthread
+make[2]: Leaving directory '/mnt/sde/jz/accordin/third_party/litl/src'
+make[2]: Leaving directory '/mnt/sde/jz/accordin/third_party/litl/src'
+make[1]: Leaving directory '/mnt/sde/jz/accordin/third_party/litl'
+bash scripts/check_direct_symbols.sh target/release
+Both direct ABIs verified.
+DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/release bash scripts/test_direct_api.sh --no-bpf
+direct relock ok: cross-thread publication, same epoch, dormant/nested requests
+direct smoke ok: mcs_accordin_direct acquisitions=176000 nested=4000
+direct relock ok: cross-thread publication, same epoch, dormant/nested requests
+direct smoke ok: mcs_tas_accordin_direct acquisitions=176000 nested=4000
+DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/release bash scripts/test_direct_api.sh --bpf
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+direct relock ok: cross-thread publication, same epoch, dormant/nested requests
+direct smoke ok: mcs_accordin_direct acquisitions=176000 nested=4000
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+direct relock ok: cross-thread publication, same epoch, dormant/nested requests
+direct smoke ok: mcs_tas_accordin_direct acquisitions=176000 nested=4000

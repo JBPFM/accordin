@@ -1,0 +1,9 @@
+group,variant,backend,mode,throughput_ops_per_sec,total_operations,elapsed_seconds,avg_lock_hold_ns,avg_wait_ns_estimated,avg_lock_handoff_ns_estimated,burn_calibration,min_thread_ops,max_thread_ops,scx_enabled_samples,log
+1,direct,mcsaccordin_original,direct,1286258.73,6455246,5.018622,385.40,148391.42,392.05,9/32,29567,38032,51,/mnt/sde/jz/accordin/target/litl-upstream-1-direct-condvar1-300-3000-zlfa_jx_/mcsaccordin_original.log
+1,direct,mcstasaccordin_original,direct,1397121.79,7015413,5.021332,385.62,136490.51,330.14,9/32,32412,40007,51,/mnt/sde/jz/accordin/target/litl-upstream-1-direct-condvar1-300-3000-zlfa_jx_/mcstasaccordin_original.log
+2,upstream,mcsaccordin_original,litl,1281471.92,6423978,5.012968,390.08,149129.58,390.27,9/32,29707,37165,59,/mnt/sde/jz/accordin/target/litl-upstream-2-upstream-condvar1-300-3000-qerwf4ub/mcsaccordin_original.log
+2,upstream,mcstasaccordin_original,litl,1317117.20,6602521,5.012858,386.08,145077.37,373.15,9/32,30942,38225,59,/mnt/sde/jz/accordin/target/litl-upstream-2-upstream-condvar1-300-3000-qerwf4ub/mcstasaccordin_original.log
+3,upstream,mcsaccordin_original,litl,1295465.39,6489795,5.009624,386.71,147574.52,385.21,9/32,30745,37175,59,/mnt/sde/jz/accordin/target/litl-upstream-3-upstream-condvar1-300-3000-8ham38j1/mcsaccordin_original.log
+3,upstream,mcstasaccordin_original,litl,1348128.54,6759016,5.013629,386.26,141721.94,355.51,9/32,31230,39189,59,/mnt/sde/jz/accordin/target/litl-upstream-3-upstream-condvar1-300-3000-8ham38j1/mcstasaccordin_original.log
+4,direct,mcsaccordin_original,direct,1304755.28,6548389,5.018864,385.39,146248.81,381.04,9/32,31556,38866,51,/mnt/sde/jz/accordin/target/litl-upstream-4-direct-condvar1-300-3000-pdnxbu09/mcsaccordin_original.log
+4,direct,mcstasaccordin_original,direct,1390653.08,6980778,5.019784,385.39,137162.92,333.69,9/32,31322,42190,51,/mnt/sde/jz/accordin/target/litl-upstream-4-direct-condvar1-300-3000-pdnxbu09/mcstasaccordin_original.log

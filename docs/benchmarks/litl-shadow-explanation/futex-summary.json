@@ -1,0 +1,65 @@
+{
+  "run_dir": "/mnt/sde/jz/accordin/target/litl-paper-futex-bpftrace-condvar1-300-3000-pqcabk38",
+  "trace_file": "target/litl-shadow-explanation/futex-bpftrace.log",
+  "measured_operations": 6770891,
+  "futex_calls": 16,
+  "counts": [
+    {
+      "pid": 3637508,
+      "futex_command": 0,
+      "calls": 1
+    },
+    {
+      "pid": 3637729,
+      "futex_command": 1,
+      "calls": 2
+    },
+    {
+      "pid": 3637729,
+      "futex_command": 9,
+      "calls": 3
+    },
+    {
+      "pid": 3637508,
+      "futex_command": 9,
+      "calls": 3
+    },
+    {
+      "pid": 3637508,
+      "futex_command": 1,
+      "calls": 7
+    }
+  ],
+  "results": [
+    {
+      "backend": "mcsaccordin_original",
+      "mode": "litl",
+      "throughput_ops_per_sec": "710068.12",
+      "total_operations": "3558446",
+      "elapsed_seconds": "5.011415",
+      "avg_lock_hold_ns": "385.50",
+      "avg_wait_ns_estimated": "269460.73",
+      "avg_lock_handoff_ns_estimated": "1022.81",
+      "burn_calibration": "9/32",
+      "min_thread_ops": "16087",
+      "max_thread_ops": "21749",
+      "scx_enabled_samples": "59",
+      "log": "/mnt/sde/jz/accordin/target/litl-paper-futex-bpftrace-condvar1-300-3000-pqcabk38/mcsaccordin_original.log"
+    },
+    {
+      "backend": "mcstasaccordin_original",
+      "mode": "litl",
+      "throughput_ops_per_sec": "640880.56",
+      "total_operations": "3212445",
+      "elapsed_seconds": "5.012549",
+      "avg_lock_hold_ns": "387.04",
+      "avg_wait_ns_estimated": "298599.37",
+      "avg_lock_handoff_ns_estimated": "1173.32",
+      "burn_calibration": "9/32",
+      "min_thread_ops": "14307",
+      "max_thread_ops": "19580",
+      "scx_enabled_samples": "59",
+      "log": "/mnt/sde/jz/accordin/target/litl-paper-futex-bpftrace-condvar1-300-3000-pqcabk38/mcstasaccordin_original.log"
+    }
+  ]
+}

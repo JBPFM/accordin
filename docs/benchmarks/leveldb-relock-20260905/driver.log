@@ -1,0 +1,38 @@
+Seed audit: 1000000 entries
+START readrandom-192-mcs_accordin-r1
+DONE {"id": "readrandom-192-mcs_accordin-r1", "valid": true, "operations": 17188786, "roi_seconds": 30.008734, "ops_per_second": 572792.774, "max_process_threads": 193}
+START readrandom-192-mcs_tas_accordin-r1
+DONE {"id": "readrandom-192-mcs_tas_accordin-r1", "valid": true, "operations": 27741395, "roi_seconds": 30.006583, "ops_per_second": 924510.298, "max_process_threads": 193}
+START readrandom-192-flexguard-r1
+DONE {"id": "readrandom-192-flexguard-r1", "valid": true, "operations": 11987706, "roi_seconds": 30.001433, "ops_per_second": 399571.114, "max_process_threads": 193}
+START fillrandom-192-mcs_accordin-r1
+DONE {"id": "fillrandom-192-mcs_accordin-r1", "valid": true, "operations": 1651990, "roi_seconds": 30.002211, "ops_per_second": 55062.275, "max_process_threads": 194}
+START fillrandom-192-mcs_tas_accordin-r1
+DONE {"id": "fillrandom-192-mcs_tas_accordin-r1", "valid": true, "operations": 1773689, "roi_seconds": 30.002562, "ops_per_second": 59117.918, "max_process_threads": 194}
+START fillrandom-192-flexguard-r1
+DONE {"id": "fillrandom-192-flexguard-r1", "valid": true, "operations": 1132966, "roi_seconds": 30.012389, "ops_per_second": 37749.944, "max_process_threads": 194}
+START readrandom-192-mcs_tas_accordin-r2
+DONE {"id": "readrandom-192-mcs_tas_accordin-r2", "valid": true, "operations": 28727746, "roi_seconds": 30.008645, "ops_per_second": 957315.667, "max_process_threads": 193}
+START readrandom-192-flexguard-r2
+DONE {"id": "readrandom-192-flexguard-r2", "valid": true, "operations": 11694949, "roi_seconds": 30.002402, "ops_per_second": 389800.423, "max_process_threads": 193}
+START readrandom-192-mcs_accordin-r2
+DONE {"id": "readrandom-192-mcs_accordin-r2", "valid": true, "operations": 18304586, "roi_seconds": 30.018545, "ops_per_second": 609775.924, "max_process_threads": 193}
+START fillrandom-192-mcs_tas_accordin-r2
+DONE {"id": "fillrandom-192-mcs_tas_accordin-r2", "valid": true, "operations": 1681530, "roi_seconds": 30.082379, "ops_per_second": 55897.507, "max_process_threads": 194}
+START fillrandom-192-flexguard-r2
+DONE {"id": "fillrandom-192-flexguard-r2", "valid": true, "operations": 1091891, "roi_seconds": 30.00402, "ops_per_second": 36391.49, "max_process_threads": 194}
+START fillrandom-192-mcs_accordin-r2
+DONE {"id": "fillrandom-192-mcs_accordin-r2", "valid": true, "operations": 1642088, "roi_seconds": 30.002451, "ops_per_second": 54731.795, "max_process_threads": 194}
+START readrandom-192-flexguard-r3
+DONE {"id": "readrandom-192-flexguard-r3", "valid": true, "operations": 11695779, "roi_seconds": 30.002604, "ops_per_second": 389825.463, "max_process_threads": 193}
+START readrandom-192-mcs_accordin-r3
+DONE {"id": "readrandom-192-mcs_accordin-r3", "valid": true, "operations": 17421284, "roi_seconds": 30.006719, "ops_per_second": 580579.436, "max_process_threads": 193}
+START readrandom-192-mcs_tas_accordin-r3
+DONE {"id": "readrandom-192-mcs_tas_accordin-r3", "valid": true, "operations": 28617559, "roi_seconds": 30.002184, "ops_per_second": 953849.193, "max_process_threads": 193}
+START fillrandom-192-flexguard-r3
+DONE {"id": "fillrandom-192-flexguard-r3", "valid": true, "operations": 1105015, "roi_seconds": 30.016267, "ops_per_second": 36813.872, "max_process_threads": 194}
+START fillrandom-192-mcs_accordin-r3
+DONE {"id": "fillrandom-192-mcs_accordin-r3", "valid": true, "operations": 1583452, "roi_seconds": 30.001956, "ops_per_second": 52778.292, "max_process_threads": 194}
+START fillrandom-192-mcs_tas_accordin-r3
+DONE {"id": "fillrandom-192-mcs_tas_accordin-r3", "valid": true, "operations": 1781094, "roi_seconds": 30.002493, "ops_per_second": 59364.867, "max_process_threads": 194}
+SUMMARY [{"benchmark": "readrandom", "backend": "mcs_accordin", "n": 3, "mean_ops_per_second": 587716.0446666667, "stdev": 19497.095512575244, "cv_percent": 3.3174346165133812, "relative_to_flexguard": 1.4952108375445323, "runs_ops_per_second": [572792.774, 609775.924, 580579.436]}, {"benchmark": "readrandom", "backend": "mcs_tas_accordin", "n": 3, "mean_ops_per_second": 945225.0526666667, "stdev": 18023.038205954934, "cv_percent": 1.9067457168119255, "relative_to_flexguard": 2.404750994108703, "runs_ops_per_second": [924510.298, 957315.667, 953849.193]}, {"benchmark": "readrandom", "backend": "flexguard", "n": 3, "mean_ops_per_second": 393065.6666666667, "stdev": 5633.896565032087, "cv_percent": 1.4333219720789876, "relative_to_flexguard": 1.0, "runs_ops_per_second": [399571.114, 389800.423, 389825.463]}, {"benchmark": "fillrandom", "backend": "mcs_accordin", "n": 3, "mean_ops_per_second": 54190.787333333334, "stdev": 1234.366865083607, "cv_percent": 2.2778168131990486, "relative_to_flexguard": 1.4652058370241439, "runs_ops_per_second": [55062.275, 54731.795, 52778.292]}, {"benchmark": "fillrandom", "backend": "mcs_tas_accordin", "n": 3, "mean_ops_per_second": 58126.763999999996, "stdev": 1934.5376789266734, "cv_percent": 3.3281358634151275, "relative_to_flexguard": 1.5716264348818072, "runs_ops_per_second": [59117.918, 55897.507, 59364.867]}, {"benchmark": "fillrandom", "backend": "flexguard", "n": 3, "mean_ops_per_second": 36985.102, "stdev": 695.2259360840928, "cv_percent": 1.87974589358735, "relative_to_flexguard": 1.0, "runs_ops_per_second": [37749.944, 36391.49, 36813.872]}]

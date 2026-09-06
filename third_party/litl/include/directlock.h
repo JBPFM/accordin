@@ -33,7 +33,9 @@ int directlock_release(pthread_mutex_t *mutex);
 /*
  * Returns this thread's context for the given instance, zero filled on first
  * use and cache-line aligned. Contexts live until process exit because a queue
- * node can outlive the thread that allocated it.
+ * node can outlive the thread that allocated it, and an instance keeps its
+ * identifier for the lifetime of the process, so a workload that creates and
+ * destroys very large numbers of mutexes grows these tables.
  */
 void *directlock_context(void *instance, size_t size);
 

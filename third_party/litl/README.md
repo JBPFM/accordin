@@ -102,6 +102,62 @@ The condition-variable strategy in the upstream documentation below applies to
 the original LiTL algorithms. The two Accordin adapters use the futex strategy
 described above; the original algorithms have not been changed.
 
+### Baseline lock algorithms
+
+Every baseline lock the Accordin benchmarks compare against is a LiTL
+algorithm, so all of them are selected the same way: build the library and run
+the program under its launcher.
+
+```sh
+make -C third_party/litl ALGORITHMS="mbmcs_original" all
+bash third_party/litl/libmbmcs_original.sh ./my_program
+```
+
+The repository root provides `make litl-baselines` to build all of them at
+once and `make check-litl-baselines` to run their tests.
+
+| Algorithm | Origin | Notes |
+| --- | --- | --- |
+| `gcr` | Generic concurrency restriction over an MCS queue | Passive threads wait in a per-lock FIFO before entering the queue |
+| `cna` | Compact NUMA-aware lock, from libvsync | `third_party/libvsync` is cloned on first build |
+| `flexguard` | FlexGuard, SOSP'25 | Links the archive built from `bench/flexguard`; attaches a BPF program at first use |
+| `mbmcs` | MCS | From the mutex microbenchmark |
+| `mbmcstas` | MCS with a test-and-set fast path | From the mutex microbenchmark |
+| `mbmcstastse` | `mbmcstas` plus an rseq time-slice extension | From the mutex microbenchmark |
+| `mbmcstasnext` | `mbmcstas` handing the queue head an explicit turn | From the mutex microbenchmark |
+| `mbmcstasnexttse` | `mbmcstasnext` plus an rseq time-slice extension | From the mutex microbenchmark |
+| `mbclh` | CLH | From the mutex microbenchmark |
+| `mbtwa` | Ticket lock with a waiting array | From the mutex microbenchmark |
+| `mbhapax` | Hapax visible-waiter lock | From the mutex microbenchmark |
+| `mbreciprocating` | Reciprocating lock | From the mutex microbenchmark |
+
+The `mb` prefix separates these from LiTL's own `mcs` and `clh`, which are
+unchanged and still available.
+
+These algorithms share the front end in `src/directlock.c` and
+`src/directcond.c`. The algorithm instance pointer is stored in the intercepted
+`pthread_mutex_t`, so a statically initialized mutex needs no lookup table and
+the build needs no CLHT, ssmem or PAPI. Per-thread queue nodes come from
+storage private to one (thread, lock) pair, which is allocated on first use and
+kept until the process exits, because a queue node can outlive the thread that
+allocated it. Condition variables are a futex sequence held inside the
+intercepted `pthread_cond_t`, with `pthread_cond_clockwait` interposed so the
+C++ `std::condition_variable` steady-clock path stays inside the library.
+Spinlocks and rwlocks pass through to libc. Mutex attributes are ignored, as in
+the interposers these algorithms replace, and `pthread_mutex_timedlock` returns
+`ENOTSUP`.
+
+None of GCR, CNA or the microbenchmark locks has a non-blocking acquire, so
+their `pthread_mutex_trylock` always reports `EBUSY`. FlexGuard has a real one.
+A program that polls `trylock` until it succeeds will not make progress under
+the former group.
+
+`bash tests/run-direct.sh` exercises interposition, mutex counters with static
+and explicit initialization, condition-variable handoffs, a timed wait and a
+C++ `std::condition_variable`. With no argument it runs every algorithm that
+needs no BPF scheduler; FlexGuard attaches its own BPF program and is run only
+when named explicitly.
+
 ### Dependencies
 
 - numactl
@@ -267,6 +323,7 @@ Remarks:
 - If each thread needs its context for a lock, see `include/mcs.h` (`#define NEED_CONTEXT 1` is important)
 - If you want to automatically support different waiting policies, use `#define SUPPORT_WAITING 1` and `waiting_policy_{sleep/wake}`. Look into `src/mcs.c` for an example.
 - There is an example of a non-lock (`src/concurrency.c`) to show a case where the library can be used for logging statistics about locks (instead of replacing the original lock algorithm).
+- An algorithm that keeps its own state and does not want the CLHT lookup table can instead implement the six entry points of `include/directalgo.h`; `src/gcr.c` is the smallest example. Register it in `DIRECT_ALGORITHM_NAMES` in `Makefile.config` and give it a source list in `src/Makefile`.
 
 ### Cascading interposition libraries
 

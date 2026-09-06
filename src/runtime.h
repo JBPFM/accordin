@@ -32,7 +32,7 @@ static inline bool admission_begin(void)
     bool managed = thread_state.depth++ == 0 && admission_enabled;
     if (managed) {
         uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
-        atomic_store_explicit(&thread_state.word, (word & ~USER_FLAGS) + 4,
+        atomic_store_explicit(&thread_state.word, (word & ~USER_META) + 8,
                               memory_order_relaxed);
     }
     return managed;
@@ -42,7 +42,7 @@ static inline bool admission_begin(void)
 static inline void admission_wait(unsigned int *yields)
 {
     uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
-                                               memory_order_relaxed) & ~USER_FLAGS;
+                                               memory_order_relaxed) & ~USER_META;
     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
     struct admission_state *state = scheduler_admission;
 
@@ -59,6 +59,34 @@ static inline void admission_wait(unsigned int *yields)
             break;
     }
     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                          memory_order_relaxed);
+}
+
+/* One admission attempt for callers that park instead of queueing: publish
+ * this request as a waiter, yield once, and report whether the current CPU's
+ * slot came back carrying this request's ticket. */
+static inline bool admission_try_once(uint32_t extra_flags)
+{
+    uint32_t request = atomic_fetch_or_explicit(&thread_state.word,
+                                                USER_WAITING | extra_flags,
+                                                memory_order_relaxed) & ~USER_META;
+    uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+    struct admission_state *state = scheduler_admission;
+    unsigned int cpu;
+
+    sched_yield();
+    if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+        return false;
+    cpu = sched_getcpu();
+    return cpu < MAX_CPUS &&
+           __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket;
+}
+
+static inline void admission_publish_spinning(uint32_t extra_flags)
+{
+    uint32_t request = atomic_load_explicit(&thread_state.word,
+                                            memory_order_relaxed) & ~USER_META;
+    atomic_store_explicit(&thread_state.word, request | USER_SPINNING | extra_flags,
                           memory_order_relaxed);
 }
 

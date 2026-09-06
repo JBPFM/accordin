@@ -43,7 +43,7 @@ static __always_inline void release_slot(struct task_struct *p,
 }
 
 static __always_inline __u64 request_ticket(struct task_struct *p, __u32 state) {
-  return ((__u64)(state & ~USER_FLAGS) << 32) | (__u32)p->pid;
+  return ((__u64)(state & ~USER_META) << 32) | (__u32)p->pid;
 }
 
 /* Unless renewed at yield, a new request retires the old slot.
@@ -94,8 +94,10 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       /* Where the task runs next, decided once: an admitted task returns to
        * its reserved CPU, a holder preempts whatever occupies the CPU it is
        * bound to, because a holder left in the global queue stalls every
-       * spinner that wants its lock, and a new waiter joins the admission
-       * queue. */
+       * spinner that wants its lock, and a new lock waiter joins the
+       * admission queue. A condition-variable waiter is left in the global
+       * queue: it parks itself on a signal, and only a free slot drains the
+       * admission queue, which would hold it indefinitely. */
       if (tctx->admission_cpu) {
         cpu = tctx->admission_cpu - 1;
         dsq = SCX_DSQ_LOCAL_ON | cpu;
@@ -104,7 +106,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       } else if (holder && allowed(p, cpu)) {
         dsq = SCX_DSQ_LOCAL_ON | cpu;
         enq_flags |= SCX_ENQ_PREEMPT;
-      } else if (known && (state & USER_FLAGS) == USER_WAITING) {
+      } else if (known && (state & USER_FLAGS) == USER_WAITING &&
+                 !(state & USER_CV)) {
         tctx->ticket = request_ticket(p, state);
         dsq = WAITING_DSQ;
       }
@@ -157,12 +160,22 @@ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct
   volatile __u64 *owner = owner_slot(cpu);
 
   (void)to;
-  /* Renew only our existing slot; userspace still confirms the new ticket. */
   if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
-      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
+      (state & USER_FLAGS) == USER_WAITING) {
     __u64 next = request_ticket(from, state);
-    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
+
+    if (tctx->admission_cpu == cpu + 1) {
+      /* Renew only our existing slot; userspace still confirms the new ticket. */
+      if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
+        tctx->ticket = next;
+    } else if (!tctx->admission_cpu &&
+               !__sync_val_compare_and_swap(owner, 0, next)) {
+      /* The yielding task is the current one here, so no dispatch can be
+       * reserving this CPU; taking the free slot saves the round trip through
+       * the waiting queue. */
+      tctx->admission_cpu = cpu + 1;
       tctx->ticket = next;
+    }
   }
   from->scx.slice = 0;
   return false;

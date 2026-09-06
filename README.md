@@ -60,6 +60,8 @@ fullhook 库用 `LD_PRELOAD` 接管程序的 pthread 锁，使未修改的二进
 
 原始锁直接存放在调用方的 `pthread_mutex_t` 内部，不做任何堆分配：`kind` 字段与 glibc 的 `__data.__kind` 对齐在偏移 16，因此 `PTHREAD_MUTEX_INITIALIZER` 的全零对象是未加锁的普通 mutex，`PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP` 无需 init 调用即为递归 mutex；递归持有只占用一次原始加锁，也只对应一次 admission。条件变量则是 `pthread_cond_t` 内的一个 futex 序号，signal/broadcast 递增序号后唤醒等待者，等待返回后按普通外层加锁重新获取 mutex。
 
+条件变量的等待先尝试自旋：解锁后若本线程没有持有其他被拦截的锁、admission 已启用且调度器已加载，就开一次 admission，带 `USER_CV` 标志发布 WAITING 并 yield 一次；拿到本 CPU 名额时改发布 SPINNING 并直接轮询序号，最长 `ACCORDIN_CV_SPIN_US` 微秒（默认 1000，设为 `0` 关闭自旋，启动时解析一次）。序号在此期间变化就无需任何 syscall；没拿到名额或超出预算则立即按原路 park 到 futex 上。自旋中的等待者不计入 parked 计数，因此唤醒它不需要 syscall。
+
 限制：
 
 - 只支持普通与递归 mutex；errorcheck、robust、优先级继承等属性按普通 mutex 处理，`pthread_mutex_timedlock` 直接报错并 `abort()`。
@@ -115,6 +117,8 @@ sudo env LD_PRELOAD=$PWD/target/release/libmcs_tas_accordin_fullhook.so \
 6. 已获准线程在自旋等待期间不会让 CPU 变空，`ops.dispatch` 因此不会被调用，普通队列无人消费；tick 时若普通队列非空，就把该线程的时间片清零，让出一次调度给普通队列中的任务，自身保留名额并排到其后。普通队列为空时该路径不做任何事。
 
 调度器带 `SCX_OPS_ENQ_LAST` 标志：否则 CPU 上最后一个可运行线程会被内核直接续跑而不经过 `ops.enqueue`，在其他线程都睡眠时，yield 的等待者永远进不了等待队列，也就拿不到名额；置位后它会正常入队，该 CPU 可能因此空转，这是预期行为。
+
+admission word 的 bit 2 是 `USER_CV`：带该标志的等待者入队时进普通队列而不进等待队列（它靠信号而非名额被唤醒）；yield 时若本 CPU 名额空闲，线程可以直接 CAS 占用，省去入队与 dispatch 的往返。
 
 等待队列按 FIFO 扫描；已有名额的线程可以连续续用，因此不保证严格 FIFO 或有界等待。
 

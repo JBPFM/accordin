@@ -43,11 +43,13 @@ _Static_assert(_Alignof(struct hook_mutex) <= _Alignof(pthread_mutex_t),
 _Static_assert(offsetof(struct hook_mutex, kind) == 16,
                "kind must alias glibc's __kind field");
 
-/* A futex sequence counter plus a waiter census is the whole condition
- * variable; a zero-filled pthread_cond_t is therefore ready to use. */
+/* A futex sequence counter plus a census of sleeping waiters is the whole
+ * condition variable; a zero-filled pthread_cond_t is therefore ready to use.
+ * A waiter that spins is deliberately absent from the census, so releasing it
+ * costs no syscall. */
 struct hook_cond {
     _Atomic uint32_t seq;
-    _Atomic uint32_t waiters;
+    _Atomic uint32_t parked;
 };
 
 _Static_assert(sizeof(struct hook_cond) <= sizeof(pthread_cond_t),
@@ -90,6 +92,10 @@ struct stats_frame {
     uint64_t start_ns;
 };
 
+/* Microseconds a condition-variable waiter may spin before parking. */
+#define CV_SPIN_US_DEFAULT 1000
+
+static uint64_t cv_spin_ns;
 static bool stats_enabled;
 static pthread_key_t stats_key;
 static _Thread_local struct stats_table *thread_stats;
@@ -214,8 +220,26 @@ static void report_stats(void)
     print_row("addr=total", &totals);
 }
 
-__attribute__((constructor)) static void stats_start(void)
+/* A value that is not a plain number keeps the default; zero disables spinning. */
+static uint64_t spin_budget_ns(void)
 {
+    const char *value = getenv("ACCORDIN_CV_SPIN_US");
+    unsigned long long budget;
+    char *end;
+
+    if (!value || !*value)
+        return CV_SPIN_US_DEFAULT * 1000ULL;
+    budget = strtoull(value, &end, 10);
+    while (*end == ' ' || *end == '\t')
+        end++;
+    if (*end)
+        return CV_SPIN_US_DEFAULT * 1000ULL;
+    return budget * 1000ULL;
+}
+
+__attribute__((constructor)) static void hook_start(void)
+{
+    cv_spin_ns = spin_budget_ns();
     if (!env_flag("ACCORDIN_HOOK_STATS"))
         return;
     if (pthread_key_create(&stats_key, merge_table))
@@ -441,8 +465,67 @@ static void cond_wake(pthread_cond_t *cond, int waiters)
     struct hook_cond *state = cond_overlay(cond);
 
     atomic_fetch_add_explicit(&state->seq, 1, memory_order_seq_cst);
-    if (atomic_load_explicit(&state->waiters, memory_order_seq_cst))
+    if (atomic_load_explicit(&state->parked, memory_order_seq_cst))
         futex_call(&state->seq, FUTEX_WAKE_PRIVATE, (uint32_t)waiters, NULL, 0);
+}
+
+/* The spin phase runs only with a slot, so the waiter never burns a CPU that
+ * the scheduler owes to somebody else. */
+static bool cv_spin_allowed(void)
+{
+    if (!cv_spin_ns || thread_state.depth || !admission_enabled ||
+        !scheduler_admission)
+        return false;
+    ensure_registered();
+    return thread_state.registered;
+}
+
+static uint64_t cv_spin_deadline(const struct timespec *abstime)
+{
+    uint64_t base = lock_ops_now_ns();
+    uint64_t deadline = base + cv_spin_ns;
+    struct timespec now;
+    int64_t remaining;
+
+    if (!abstime)
+        return deadline;
+    /* The caller's deadline is on the realtime clock the futex wait uses. */
+    clock_gettime(CLOCK_REALTIME, &now);
+    remaining = ((int64_t)abstime->tv_sec - now.tv_sec) * 1000000000LL +
+                ((int64_t)abstime->tv_nsec - now.tv_nsec);
+    if (remaining < 0)
+        remaining = 0;
+    if (base + (uint64_t)remaining < deadline)
+        deadline = base + (uint64_t)remaining;
+    return deadline;
+}
+
+/* Ask for this CPU's admission slot with one yield and, if it is granted,
+ * watch the sequence directly instead of sleeping. Returns whether the
+ * sequence moved, in which case no futex wait is needed at all. */
+static bool cv_spin(struct hook_cond *state, uint32_t seq,
+                    const struct timespec *abstime)
+{
+    bool moved = false;
+
+    admission_begin();
+    if (admission_try_once(USER_CV)) {
+        uint64_t deadline = cv_spin_deadline(abstime);
+
+        admission_publish_spinning(USER_CV);
+        for (unsigned int spins = 0;; spins++) {
+            if (atomic_load_explicit(&state->seq, memory_order_acquire) != seq) {
+                moved = true;
+                break;
+            }
+            spin_pause();
+            /* Reading the clock every iteration would cost more than the spin. */
+            if (!(spins & 63) && lock_ops_now_ns() >= deadline)
+                break;
+        }
+    }
+    admission_finish();
+    return moved;
 }
 
 static int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex,
@@ -459,20 +542,28 @@ static int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex,
         if (entry)
             entry->cond_waits++;
     }
-    atomic_fetch_add_explicit(&state->waiters, 1, memory_order_seq_cst);
     seq = atomic_load_explicit(&state->seq, memory_order_seq_cst);
     hook_unlock(mutex);
-    for (;;) {
-        if (!futex_call(&state->seq, op, seq, abstime, FUTEX_BITSET_MATCH_ANY))
-            break;
-        if (errno == EINTR)
-            continue;
-        if (errno == ETIMEDOUT)
-            result = ETIMEDOUT;
-        /* EAGAIN means the sequence already moved, which is a wakeup. */
-        break;
+
+    if (!(cv_spin_allowed() && cv_spin(state, seq, abstime))) {
+        /* Joining the census and re-reading the sequence pairs sequentially
+         * with cond_wake's bump and census read, so a signal that misses the
+         * census here is one this thread observes before it sleeps. */
+        atomic_fetch_add_explicit(&state->parked, 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&state->seq, memory_order_seq_cst) == seq) {
+            for (;;) {
+                if (!futex_call(&state->seq, op, seq, abstime, FUTEX_BITSET_MATCH_ANY))
+                    break;
+                if (errno == EINTR)
+                    continue;
+                if (errno == ETIMEDOUT)
+                    result = ETIMEDOUT;
+                /* EAGAIN means the sequence already moved, which is a wakeup. */
+                break;
+            }
+        }
+        atomic_fetch_sub_explicit(&state->parked, 1, memory_order_seq_cst);
     }
-    atomic_fetch_sub_explicit(&state->waiters, 1, memory_order_seq_cst);
     /* Reacquisition is an ordinary outer lock and opens a new episode. */
     hook_lock(mutex);
     return result;

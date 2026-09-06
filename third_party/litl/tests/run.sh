@@ -56,6 +56,7 @@ run_case() {
     local status=0
     set +e
     timeout -k 5s "${LITL_TEST_TIMEOUT:-60}s" env \
+        LD_PRELOAD="${preload:-}" \
         MCS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
         MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
         MCS_ACCORDIN_DIRECT_STATS_ONLY=0 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0 \
@@ -118,6 +119,8 @@ check_counters() {
 ${CC:-cc} -std=gnu11 -O2 -Wall -Werror tests/accordin.c -pthread -ldl -o obj/tests/accordin
 ${CXX:-c++} -std=c++17 -O2 -Wall -Werror tests/condition-variable.cpp -pthread \
     -o obj/tests/condition-variable
+${CC:-cc} -std=gnu11 -O2 -Wall -Werror -fPIC -shared tests/early-lock.c -ldl \
+    -o obj/tests/libearlylock.so
 for backend in mcsaccordin_original mcstasaccordin_original; do
     echo "Testing $backend ($mode)"
     for custody_ms in "${custody_limits[@]}"; do
@@ -129,6 +132,17 @@ for backend in mcsaccordin_original mcstasaccordin_original; do
         check_counters 1
     done
     custody_ms="${custody_limits[0]}"
+    # A thread whose first lock lands while the scheduler library is still
+    # loading has no registry to publish its admission word into yet. Left
+    # unpublished it reads as idle to the scheduler, is never admitted, and
+    # waits for a grant that cannot arrive.
+    if [[ "$disable" == 0 ]]; then
+        echo "  lock taken during the library load"
+        preload="$PWD/obj/tests/libearlylock.so" \
+        run_case bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
+            "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
+        check_counters 1
+    fi
     # A single worker may find its predicate already true and never wait, so
     # this case only has to balance.
     run_case bash "./lib${backend}.sh" ./obj/tests/condition-variable

@@ -24,6 +24,10 @@ bool admission_enabled;
 static struct accordin *skel;
 static struct bpf_link *scheduler_link;
 static int thread_map_fd = -1;
+/* True until the constructor has decided whether a registry exists. A lock
+ * taken before that decision, by an allocator or a library the load itself
+ * calls into, has nowhere to publish its admission word. */
+static bool registry_opening = true;
 static pthread_key_t registration_key;
 static libbpf_print_fn_t previous_log;
 static int cv_flush_prog_fd = -1;
@@ -177,7 +181,15 @@ static void unregister_thread(void *value)
 
 void register_thread(void)
 {
-    thread_state.tid = syscall(SYS_gettid);
+    if (!thread_state.tid)
+        thread_state.tid = syscall(SYS_gettid);
+    /* An unpublished word reads as an idle thread, which is never admitted, so
+     * a thread that locks while the registry is still opening stays
+     * unregistered and publishes at its next lock instead. Where no registry is
+     * coming there is nothing to publish, ever. */
+    if (thread_map_fd < 0 &&
+        __atomic_load_n(&registry_opening, __ATOMIC_ACQUIRE))
+        return;
     if (thread_map_fd >= 0) {
         uint64_t address = (uintptr_t)&thread_state.word;
         SCX_BUG_ON(bpf_map_update_elem(thread_map_fd, &thread_state.tid, &address, BPF_ANY),
@@ -257,8 +269,10 @@ __attribute__((constructor)) static void scheduler_start(void)
     uint64_t limit_ns;
 
     admission_enabled = !env_flag("ACCORDIN_DISABLE_ADMISSION");
-    if (env_flag(PREFIX "_DISABLE_BPF"))
+    if (env_flag(PREFIX "_DISABLE_BPF")) {
+        __atomic_store_n(&registry_opening, false, __ATOMIC_RELEASE);
         return;
+    }
     previous_log = libbpf_set_print(libbpf_log);
     SCX_BUG_ON(libbpf_num_possible_cpus() > (int)MAX_CPUS,
                "Admission supports at most %u CPUs", MAX_CPUS);
@@ -283,6 +297,7 @@ __attribute__((constructor)) static void scheduler_start(void)
     if (env_flag("ACCORDIN_VERIFY_ONLY")) {
         verify_programs();
         admission_enabled = false;
+        __atomic_store_n(&registry_opening, false, __ATOMIC_RELEASE);
         pthread_key_delete(registration_key);
         btf__free(__COMPAT_vmlinux_btf);
         __COMPAT_vmlinux_btf = NULL;
@@ -291,6 +306,7 @@ __attribute__((constructor)) static void scheduler_start(void)
     }
     SCX_OPS_LOAD(skel, accordin_ops, accordin, uei);
     thread_map_fd = bpf_map__fd(skel->maps.thread_ctx_addr_map);
+    __atomic_store_n(&registry_opening, false, __ATOMIC_RELEASE);
     cv_flush_prog_fd = bpf_program__fd(skel->progs.accordin_cv_flush);
     scheduler_link = SCX_OPS_ATTACH(skel, accordin_ops, accordin);
     scheduler_admission = &skel->bss->admission;

@@ -113,14 +113,23 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     }
   }
   /* The core hands over the last runnable task of a CPU instead of keeping it,
-   * so keep that task where it already is. A slot holder is running on its
-   * admission CPU, which is the CPU the local queue belongs to, and a lone
-   * yielding waiter would otherwise have been kept by the core anyway, so the
-   * routing above stays observationally unchanged for the mutex path. */
-  if ((enq_flags & SCX_ENQ_LAST) && dsq != WAITFORSIGNAL_DSQ)
+   * so keep an ordinary task where it already is. A task bound for a managed
+   * queue has to reach it: a slot is granted only from ops.dispatch, over the
+   * admission queue, so a waiter kept on its CPU would yield forever without
+   * ever being offered one. A slot holder is already routed to the local queue
+   * of its admission CPU. */
+  if ((enq_flags & SCX_ENQ_LAST) && dsq == NORMAL_DSQ)
     dsq = SCX_DSQ_LOCAL;
   scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
-  scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+  /* The last task of a CPU queued away from it leaves that CPU with nothing to
+   * pick, and only this kick brings it back to dispatch. An idle kick may be
+   * dropped while the task being queued is still the current one, so the
+   * follow-up scheduling event the core asks for is an unconditional one. A
+   * wait held for a signal wants no such event; its custody bounds it. */
+  if ((enq_flags & SCX_ENQ_LAST) && dsq == WAITING_DSQ)
+    scx_bpf_kick_cpu(cpu, 0);
+  else
+    scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 /* Reserve both the task and this CPU before moving a candidate. Different CPUs

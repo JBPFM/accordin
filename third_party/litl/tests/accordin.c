@@ -638,6 +638,80 @@ static void mixed_mode_test(void) {
            MIXED_WAITERS, MIXED_ROUNDS);
 }
 
+/* A thread that loses a mutex to another has to pass admission before it may
+ * take it, and admission is offered from the scheduler's own queue. Once the
+ * loser is the only thread of the process still awake, nothing else drives the
+ * scheduler, so it is served only if a lone waiter reaches that queue. */
+static pthread_mutex_t lone_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t lone_gate = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t lone_cv = PTHREAD_COND_INITIALIZER;
+static int lone_held, lone_contending, lone_acquired;
+
+static void lone_publish(int *flag) {
+    OK(pthread_mutex_lock(&lone_gate));
+    *flag = 1;
+    OK(pthread_cond_broadcast(&lone_cv));
+    OK(pthread_mutex_unlock(&lone_gate));
+}
+
+static void lone_await(const int *flag) {
+    OK(pthread_mutex_lock(&lone_gate));
+    while (!*flag)
+        OK(pthread_cond_wait(&lone_cv, &lone_gate));
+    OK(pthread_mutex_unlock(&lone_gate));
+}
+
+static void *lone_holder(void *arg) {
+    (void)arg;
+    OK(pthread_mutex_lock(&lone_mutex));
+    lone_publish(&lone_held);
+    lone_await(&lone_contending);
+    /* Held long enough for the contender to lose the acquisition and start
+     * waiting for admission before this thread goes to sleep. */
+    settle(50);
+    OK(pthread_mutex_unlock(&lone_mutex));
+    lone_await(&lone_acquired);
+    return NULL;
+}
+
+static void *lone_contender(void *arg) {
+    (void)arg;
+    lone_await(&lone_held);
+    lone_publish(&lone_contending);
+    OK(pthread_mutex_lock(&lone_mutex));
+    OK(pthread_mutex_unlock(&lone_mutex));
+    lone_publish(&lone_acquired);
+    return NULL;
+}
+
+#define LONE_ROUNDS 10
+#define LONE_DEADLINE_MS 10000
+static void lone_waiter_test(void) {
+    struct timespec started;
+    OK(clock_gettime(CLOCK_MONOTONIC, &started));
+    for (int round = 0; round < LONE_ROUNDS; round++) {
+        pthread_t ids[2];
+        lone_held = lone_contending = lone_acquired = 0;
+        OK(pthread_create(&ids[0], NULL, lone_holder, NULL));
+        OK(pthread_create(&ids[1], NULL, lone_contender, NULL));
+        struct timespec limit = deadline(CLOCK_REALTIME,
+                                         (long)LONE_DEADLINE_MS * 1000000);
+        int ret = 0;
+        OK(pthread_mutex_lock(&lone_gate));
+        while (!lone_acquired && !ret)
+            ret = pthread_cond_timedwait(&lone_cv, &lone_gate, &limit);
+        OK(pthread_mutex_unlock(&lone_gate));
+        CHECK(lone_acquired);
+        OK(pthread_join(ids[0], NULL));
+        OK(pthread_join(ids[1], NULL));
+    }
+    OK(pthread_cond_destroy(&lone_cv));
+    OK(pthread_mutex_destroy(&lone_gate));
+    OK(pthread_mutex_destroy(&lone_mutex));
+    printf("PASS lone admission waiter: %d rounds served in %ld ms\n",
+           LONE_ROUNDS, elapsed_ms(&started));
+}
+
 static void cancel_cleanup(void *arg) {
     CHECK(pthread_mutex_trylock(&mutex) == EBUSY);
     ready = 2;
@@ -919,6 +993,7 @@ int main(int argc, char **argv) {
     signal_outside_mutex_test();
     broadcast_many_test();
     mixed_mode_test();
+    lone_waiter_test();
     timedwait_shorter_than_custody_test();
     timeout_test(CLOCK_REALTIME);
     timeout_test(CLOCK_MONOTONIC);

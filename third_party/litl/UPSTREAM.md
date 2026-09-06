@@ -33,10 +33,10 @@ integration changes are:
   futex sequence inside the intercepted `pthread_cond_t`. An algorithm on this
   front end supplies six entry points and needs neither CLHT, ssmem nor PAPI.
 - `include/gcrmcs.h`, `src/gcrmcs.c`, `src/gcr.c`: GCR-MCS, generic concurrency
-  restriction over an MCS queue, moved from the standalone interposer in
-  `bench/otherlocks` with the algorithm unchanged.
+  restriction over an MCS queue, moved from the standalone pthread interposer
+  the repository used to carry, with the algorithm unchanged.
 - `src/cna.c`: compact NUMA-aware lock over the libvsync implementation, moved
-  from the same interposer. `third_party/libvsync` is cloned on demand.
+  from that same interposer. `third_party/libvsync` is cloned on demand.
 - `include/mb*.hpp`, `src/mb*.cpp`: the nine lock algorithms of the mutex
   microbenchmark in `bench/mutexbench`, which no longer implements locks of its
   own. They keep their C++ implementation and are compiled into the shared

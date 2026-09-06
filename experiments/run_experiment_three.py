@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import experiment_defaults
+import litl_locks
 import run_experiment_one as experiment_one
 import run_experiment_three_common as parsec_common
 from run_experiment_three_common import *  # noqa: F401,F403
@@ -474,9 +475,20 @@ def ensure_multi_lock_helpers(locks: Iterable[str], logger: CommandLogger) -> No
     for lock in locks:
         if lock in {"mcstp", "malthusian", "flexguard"}:
             experiment_one.ensure_flexguard_interpose(lock, logger)
-    otherlocks = tuple(lock for lock in locks if experiment_defaults.is_otherlocks_interpose_lock(lock))
-    if otherlocks:
-        ensure_interpose_helpers(otherlocks, build_missing=True, logger=logger)
+    litl_baseline_locks = tuple(lock for lock in locks if experiment_defaults.is_litl_interpose_lock(lock))
+    if litl_baseline_locks:
+        ensure_interpose_helpers(litl_baseline_locks, build_missing=True, logger=logger)
+
+
+def ensure_litl_algorithm(lock: str, logger: CommandLogger) -> None:  # type: ignore[name-defined]
+    litl_locks.ensure_built(
+        lock,
+        lambda cmd: logger.run(
+            list(cmd),
+            log_name=f"build_litl_{litl_locks.litl_algorithm(lock)}.log",
+            timeout_seconds=0,
+        ),
+    )
 
 
 def ensure_accordin_direct_library(logger: CommandLogger) -> None:  # type: ignore[name-defined]
@@ -488,6 +500,7 @@ def ensure_accordin_direct_library(logger: CommandLogger) -> None:  # type: igno
         )
     if not ACCORDIN_DIRECT_RELEASE_LIB.is_file():
         raise RuntimeError(f"{ACCORDIN_DIRECT_PACKAGE} library was not produced: {ACCORDIN_DIRECT_RELEASE_LIB}")
+    ensure_litl_algorithm(ACCORDIN_DIRECT_LOCK_KIND, logger)
 
 
 def ensure_mcs_accordin_direct_library(logger: CommandLogger) -> None:  # type: ignore[name-defined]
@@ -501,6 +514,7 @@ def ensure_mcs_accordin_direct_library(logger: CommandLogger) -> None:  # type: 
         raise RuntimeError(
             f"{MCS_ACCORDIN_DIRECT_PACKAGE} library was not produced: {MCS_ACCORDIN_DIRECT_RELEASE_LIB}"
         )
+    ensure_litl_algorithm(MCS_ACCORDIN_DIRECT_LOCK_KIND, logger)
 
 
 def common_sweep_args(matrix: BaselineMatrix, threads: tuple[int, ...] | None = None) -> list[str]:
@@ -572,9 +586,9 @@ def accordin_sweep_command(
                 str(SWEEP_SINGLE),
                 *common_sweep_args(matrix, runnable_threads_for_lock(lock, matrix)),
                 "--lock-kind",
-                MCS_ACCORDIN_DIRECT_LOCK_KIND,
-                "--timeslice-extension",
-                "off",
+                "mutex",
+                "--litl-lock",
+                litl_locks.litl_algorithm(MCS_ACCORDIN_DIRECT_LOCK_KIND),
                 "--output-raw",
                 str(raw_path),
                 "--output-summary",
@@ -587,9 +601,9 @@ def accordin_sweep_command(
         str(SWEEP_SINGLE),
         *common_sweep_args(matrix, runnable_threads_for_lock(lock, matrix)),
         "--lock-kind",
-        ACCORDIN_DIRECT_LOCK_KIND,
-        "--timeslice-extension",
-        "off",
+        "mutex",
+        "--litl-lock",
+        litl_locks.litl_algorithm(ACCORDIN_DIRECT_LOCK_KIND),
         "--output-raw",
         str(raw_path),
         "--output-summary",
@@ -602,15 +616,15 @@ def accordin_sweep_command(
     return cmd, accordin_direct_env(lock)
 
 
-def mcs_extension_command(root: Path, matrix: BaselineMatrix, mode: str) -> list[str]:
+def mcs_extension_command(root: Path, matrix: BaselineMatrix) -> list[str]:
     lock_dir = root / "mcs_extension"
     return [
         str(SWEEP_SINGLE),
         *common_sweep_args(matrix, runnable_threads_for_lock("mcs_extension", matrix)),
         "--lock-kind",
-        "mcs",
-        "--timeslice-extension",
-        mode,
+        "mutex",
+        "--litl-lock",
+        litl_locks.litl_algorithm("mcs_extension"),
         "--output-raw",
         str(lock_dir / "raw.csv"),
         "--output-summary",
@@ -626,7 +640,7 @@ def multi_lock_command(
     threads: tuple[int, ...],
 ) -> list[str]:
     lock_items = tuple(
-        f"{lock}={interpose_script_path(lock)}" if experiment_defaults.is_otherlocks_interpose_lock(lock) else lock
+        f"{lock}={interpose_script_path(lock)}" if experiment_defaults.is_litl_interpose_lock(lock) else lock
         for lock in locks
     )
     return [
@@ -637,8 +651,6 @@ def multi_lock_command(
         str(root),
         "--sudo-mode",
         sudo_mode,
-        "--timeslice-extension",
-        "off",
         "--",
         *common_sweep_args(matrix, threads),
     ]
@@ -774,7 +786,6 @@ def write_settings(
         "duration_ms": matrix.duration_ms,
         "warmup_duration_ms": matrix.warmup_duration_ms,
         "repeats": matrix.repeats,
-        "mcs_extension_mode": args.mcs_extension_mode,
         "sudo_mode": args.sudo_mode,
         "mcs_accordin_taskset_policy": (
             "fixed_cli_override"
@@ -930,9 +941,11 @@ def run_baseline_supplement(
         )
 
     if "mcs_extension" in locks:
+        if not args.dry_run:
+            ensure_litl_algorithm("mcs_extension", logger)
         run_command(
             logger,
-            mcs_extension_command(root, matrix, args.mcs_extension_mode),
+            mcs_extension_command(root, matrix),
             log_name="sweep_mcs_extension.log",
             dry_run=args.dry_run,
         )
@@ -1043,12 +1056,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=non_negative_int,
         default=DEFAULT_WARMUP_DURATION_MS,
         help=f"Warmup duration for supplemental runs. Default: {DEFAULT_WARMUP_DURATION_MS}.",
-    )
-    parser.add_argument(
-        "--mcs-extension-mode",
-        choices=("require", "auto", "off"),
-        default="require",
-        help="timeslice-extension mode for mcs_extension. Default: require.",
     )
     parser.add_argument(
         "--sudo-mode",

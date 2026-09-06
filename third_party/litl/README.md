@@ -122,6 +122,7 @@ once and `make check-litl-baselines` to run their tests.
 | `cna` | Compact NUMA-aware lock, from libvsync | `third_party/libvsync` is cloned on first build |
 | `flexguard` | FlexGuard, SOSP'25 | Links the archive built from `bench/flexguard`; attaches a BPF program at first use |
 | `mbmcs` | MCS | From the mutex microbenchmark |
+| `mbmcstse` | `mbmcs` plus an rseq time-slice extension | The combination the microbenchmark measured as its extension arm |
 | `mbmcstas` | MCS with a test-and-set fast path | From the mutex microbenchmark |
 | `mbmcstastse` | `mbmcstas` plus an rseq time-slice extension | From the mutex microbenchmark |
 | `mbmcstasnext` | `mbmcstas` handing the queue head an explicit turn | From the mutex microbenchmark |

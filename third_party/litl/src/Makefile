@@ -80,7 +80,7 @@ $(FLEXGUARD_ARCHIVE):
 
 # The lock algorithms taken from the mutex microbenchmark keep their C++
 # implementation and are compiled into the shared object.
-MB_ALGORITHMS=mbmcs mbmcstas mbmcstastse mbmcstasnext mbmcstasnexttse \
+MB_ALGORITHMS=mbmcs mbmcstse mbmcstas mbmcstastse mbmcstasnext mbmcstasnexttse \
 	mbclh mbtwa mbhapax mbreciprocating
 
 define MB_ALGORITHM_VARS

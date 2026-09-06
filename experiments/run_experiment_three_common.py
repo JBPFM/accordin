@@ -20,14 +20,13 @@ from typing import Callable, Iterable, Sequence
 
 import experiment_failures
 import experiment_defaults
+import litl_locks
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FLEXGUARD_DIR = REPO_ROOT / "bench" / "flexguard"
 FLEXGUARD_BUILD_DIR = FLEXGUARD_DIR / "build"
 MAKE_ALL_SCRIPT = FLEXGUARD_DIR / "scripts" / "make_all.sh"
-OTHERLOCKS_DIR = REPO_ROOT / "bench" / "otherlocks"
-OTHERLOCKS_BUILD_DIR = OTHERLOCKS_DIR / "build"
 BUILD_DEDUP_SCRIPT = FLEXGUARD_DIR / "scripts" / "build_dedup.sh"
 BUILD_STREAMCLUSTER_SCRIPT = FLEXGUARD_DIR / "scripts" / "build_streamcluster.sh"
 DEDUP_BINARY = (
@@ -728,22 +727,18 @@ def benchmark_build_script(benchmark: str) -> Path:
     raise ValueError(f"Unsupported benchmark: {benchmark}")
 
 
+# Baseline algorithms come from LiTL and reach a process through its launcher;
+# the FlexGuard locks keep the interpose wrappers built out of that checkout.
 def interpose_script_path(lock: str) -> Path:
-    if experiment_defaults.is_otherlocks_interpose_lock(lock):
-        return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.sh"
+    if experiment_defaults.is_litl_interpose_lock(lock):
+        return litl_locks.litl_launcher(lock)
     return FLEXGUARD_BUILD_DIR / f"interpose_{lock}.sh"
 
 
 def interpose_library_path(lock: str) -> Path:
-    if experiment_defaults.is_otherlocks_interpose_lock(lock):
-        return OTHERLOCKS_BUILD_DIR / f"interpose_{lock}.so"
+    if experiment_defaults.is_litl_interpose_lock(lock):
+        return litl_locks.litl_library(lock)
     return FLEXGUARD_BUILD_DIR / f"interpose_{lock}.so"
-
-
-def interpose_expected_base_dir(lock: str) -> Path:
-    if experiment_defaults.is_otherlocks_interpose_lock(lock):
-        return OTHERLOCKS_DIR.resolve()
-    return FLEXGUARD_DIR.resolve()
 
 
 def is_native_mutex_lock(lock: str) -> bool:
@@ -801,6 +796,9 @@ def interpose_script_base_dir(script: Path) -> Path | None:
 
 
 def interpose_helper_error(lock: str) -> str | None:
+    if experiment_defaults.is_litl_interpose_lock(lock):
+        return litl_locks.artifact_error(lock)
+
     script = interpose_script_path(lock)
     library = interpose_library_path(lock)
 
@@ -810,7 +808,7 @@ def interpose_helper_error(lock: str) -> str | None:
         return f"{lock} wrapper is not executable: {script}"
 
     script_base_dir = interpose_script_base_dir(script)
-    expected_base_dir = interpose_expected_base_dir(lock)
+    expected_base_dir = FLEXGUARD_DIR.resolve()
     if script_base_dir != expected_base_dir:
         if script_base_dir is None:
             return f"{lock} wrapper does not declare BASE_DIR: {script}"
@@ -940,10 +938,10 @@ def ensure_interpose_helpers(
         )
 
     flexguard_locks = tuple(
-        lock for lock in invalid_locks if not experiment_defaults.is_otherlocks_interpose_lock(lock)
+        lock for lock in invalid_locks if not experiment_defaults.is_litl_interpose_lock(lock)
     )
-    otherlocks_locks = tuple(
-        lock for lock in invalid_locks if experiment_defaults.is_otherlocks_interpose_lock(lock)
+    litl_baseline_locks = tuple(
+        lock for lock in invalid_locks if experiment_defaults.is_litl_interpose_lock(lock)
     )
 
     if flexguard_locks:
@@ -956,10 +954,10 @@ def ensure_interpose_helpers(
             timeout_seconds=0,
         )
 
-    for lock in otherlocks_locks:
+    for lock in litl_baseline_locks:
         logger.run(
-            ["make", "-C", str(OTHERLOCKS_DIR), f"build/interpose_{lock}.sh"],
-            log_name=f"build_otherlocks_{lock}.log",
+            litl_locks.build_command(lock),
+            log_name=f"build_litl_{lock}.log",
             cwd=REPO_ROOT,
             timeout_seconds=0,
         )

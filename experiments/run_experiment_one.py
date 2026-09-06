@@ -34,6 +34,7 @@ from bench_csv_schema import (  # noqa: E402
 
 import experiment_defaults  # noqa: E402
 import experiment_failures  # noqa: E402
+import litl_locks  # noqa: E402
 import run_experiment_three_common as experiment_three  # noqa: E402
 from machine_config import (  # noqa: E402
     DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
@@ -354,12 +355,6 @@ Examples:
         ),
     )
     parser.add_argument(
-        "--mcs-extension-mode",
-        choices=("require", "auto", "off"),
-        default="require",
-        help="timeslice-extension mode for the native MCS extension curve. Default: require.",
-    )
-    parser.add_argument(
         "--sudo-mode",
         choices=("auto", "all", "none"),
         default="auto",
@@ -460,7 +455,6 @@ def runnable_threads_for_lock(lock_key: str, threads: tuple[int, ...] = THREADS)
 
 def write_settings(
     result_root: Path,
-    mcs_extension_mode: str,
     sudo_mode: str,
     mcs_accordin_taskset_enabled: bool,
     mcs_accordin_taskset_cpus: str,
@@ -489,7 +483,6 @@ def write_settings(
             lock.key: list(runnable_threads_for_lock(lock.key, threads))
             for lock in selected_locks
         },
-        "mcs_extension_mode": mcs_extension_mode,
         "sudo_mode": sudo_mode,
         "accordin_taskset_lock": ACCORDIN_TASKSET_LOCK,
         "mcs_accordin_taskset_enabled": mcs_accordin_taskset_enabled,
@@ -506,7 +499,6 @@ def write_settings(
 
 def write_settings_if_missing(
     result_root: Path,
-    mcs_extension_mode: str,
     sudo_mode: str,
     mcs_accordin_taskset_enabled: bool,
     mcs_accordin_taskset_cpus: str,
@@ -523,7 +515,6 @@ def write_settings_if_missing(
         return
     write_settings(
         result_root,
-        mcs_extension_mode,
         sudo_mode,
         mcs_accordin_taskset_enabled,
         mcs_accordin_taskset_cpus,
@@ -640,6 +631,15 @@ def ensure_inputs(
         if key not in requested_lock_keys:
             continue
         ensure_flexguard_interpose(key, logger)
+    for key in sorted(key for key in requested_lock_keys if experiment_defaults.is_litl_interpose_lock(key)):
+        litl_locks.ensure_built(
+            key,
+            lambda cmd, key=key: logger.run(
+                list(cmd),
+                log_name=f"build_litl_{key}.log",
+                timeout_seconds=0,
+            ),
+        )
 
 
 def common_sweep_args(args: argparse.Namespace, threads: tuple[int, ...]) -> list[str]:
@@ -695,16 +695,22 @@ def run_multi_lock_sweeps(
     env = {"FLEXGUARD_DIR": str(FLEXGUARD_DIR)}
     groups = lock_thread_groups(lock_keys, args.threads)
     for group_lock_keys, threads in groups:
+        # A baseline whose algorithm lives in LiTL is named with its launcher so the
+        # sweep keeps the experiment's lock name in its output.
+        lock_items = tuple(
+            f"{lock_key}={litl_locks.litl_launcher(lock_key)}"
+            if experiment_defaults.is_litl_interpose_lock(lock_key)
+            else lock_key
+            for lock_key in group_lock_keys
+        )
         sweep_cmd = [
             str(SWEEP_MULTI),
             "--locks",
-            ",".join(group_lock_keys),
+            ",".join(lock_items),
             "--output-root",
             str(result_root),
             "--sudo-mode",
             args.sudo_mode,
-            "--timeslice-extension",
-            "off",
             "--",
             *common_sweep_args(args, threads),
         ]
@@ -741,6 +747,15 @@ def ensure_accordin_direct_library(logger: CommandLogger) -> None:
     if not ACCORDIN_DIRECT_RELEASE_LIB.is_file():
         raise RuntimeError(f"{ACCORDIN_DIRECT_PACKAGE} library was not produced: {ACCORDIN_DIRECT_RELEASE_LIB}")
 
+    litl_locks.ensure_built(
+        ACCORDIN_DIRECT_LOCK_KIND,
+        lambda cmd: logger.run(
+            list(cmd),
+            log_name=f"build_litl_{ACCORDIN_DIRECT_LOCK_KIND}.log",
+            timeout_seconds=0,
+        ),
+    )
+
 
 def accordin_direct_sweep_env(lock: str) -> dict[str, str | None]:
     env: dict[str, str | None] = {
@@ -772,9 +787,9 @@ def accordin_sweep_command(
         str(SWEEP_SINGLE),
         *common_sweep_args(args, runnable_threads_for_lock(lock, args.threads)),
         "--lock-kind",
-        ACCORDIN_DIRECT_LOCK_KIND,
-        "--timeslice-extension",
-        "off",
+        "mutex",
+        "--litl-lock",
+        litl_locks.litl_algorithm(ACCORDIN_DIRECT_LOCK_KIND),
         "--output-raw",
         str(lock_dir / "raw.csv"),
         "--output-summary",
@@ -847,9 +862,9 @@ def run_benchmarks(
             str(SWEEP_SINGLE),
             *common_sweep_args(args, runnable_threads_for_lock("mcs_extension", args.threads)),
             "--lock-kind",
-            "mcs",
-            "--timeslice-extension",
-            args.mcs_extension_mode,
+            "mutex",
+            "--litl-lock",
+            litl_locks.litl_algorithm("mcs_extension"),
             "--output-raw",
             str(extension_dir / "raw.csv"),
             "--output-summary",
@@ -1561,7 +1576,6 @@ def main() -> int:
             ensure_supplement_targets(result_root, supplement_lock_keys, args.force)
             write_settings_if_missing(
                 result_root,
-                args.mcs_extension_mode,
                 args.sudo_mode,
                 ACCORDIN_TASKSET_LOCK in selected_lock_keys and not args.skip_mcs_accordin_taskset,
                 args.mcs_accordin_taskset_cpus,
@@ -1579,7 +1593,6 @@ def main() -> int:
             ensure_output_root(result_root, args.force)
             write_settings(
                 result_root,
-                args.mcs_extension_mode,
                 args.sudo_mode,
                 ACCORDIN_TASKSET_LOCK in selected_lock_keys and not args.skip_mcs_accordin_taskset,
                 args.mcs_accordin_taskset_cpus,

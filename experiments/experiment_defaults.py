@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from typing import Iterable
 
 try:
+    import litl_locks
+except ModuleNotFoundError:
+    from . import litl_locks  # type: ignore[no-redef]
+
+try:
     from machine_config import (
         ACTIVE_MACHINE_CONFIG,
         DEFAULT_MCS_ACCORDIN_TASKSET_CPUS,
@@ -90,7 +95,7 @@ BASELINE_LOCKS = (
     "cna",
     "gcr",
 )
-OTHERLOCKS_INTERPOSE_LOCKS = ("cna", "gcr")
+LITL_INTERPOSE_LOCKS = litl_locks.LITL_BASELINE_LOCKS
 FULL_LOCKS = (
     *BASELINE_LOCKS,
     *ACCORDIN_VARIANT_LOCKS,
@@ -344,8 +349,8 @@ def accordin_uses_taskset(lock: str) -> bool:
     return lock in ACCORDIN_TASKSET_LOCKS
 
 
-def is_otherlocks_interpose_lock(lock: str) -> bool:
-    return lock in OTHERLOCKS_INTERPOSE_LOCKS
+def is_litl_interpose_lock(lock: str) -> bool:
+    return litl_locks.is_litl_interpose_lock(lock)
 
 
 def runnable_threads_for_lock(lock: str, threads: tuple[int, ...]) -> tuple[int, ...]:

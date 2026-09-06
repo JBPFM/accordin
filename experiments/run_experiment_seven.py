@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import experiment_defaults
+import litl_locks
 import run_experiment_three as experiment_three
 import run_experiment_six as experiment_six
 
@@ -306,6 +307,10 @@ Examples:
     return args
 
 
+# The lock algorithm reaches the benchmark through an LD_PRELOAD launcher, so the
+# benchmark always measures a plain pthread mutex. mcs_extension keeps FlexGuard's
+# MCS launcher; the user-space slice extension the benchmark used to add on top of
+# it is no longer applied.
 def mutexbench_command(
     lock: str,
     threads: int,
@@ -313,36 +318,30 @@ def mutexbench_command(
     args: argparse.Namespace,
 ) -> tuple[list[str], dict[str, str | None], bool]:
     if is_legacy_mcs_accordin_lock(lock):
-        lock_kind = MCS_ACCORDIN_DIRECT_LOCK_KIND
+        lock_kind = "mutex"
         env = legacy_mcs_accordin_env()
         needs_sudo = True
-        cmd_prefix = []
-        timeslice_extension = "off"
-    elif experiment_six.is_flexguard_interpose_lock(lock) or experiment_six.is_otherlocks_interpose_lock(lock):
+        cmd_prefix = litl_locks.litl_command_prefix(MCS_ACCORDIN_DIRECT_LOCK_KIND)
+    elif experiment_six.is_flexguard_interpose_lock(lock):
         lock_kind = "mutex"
         env: dict[str, str | None] = {}
-        needs_sudo = (
-            experiment_six.flexguard_interpose_needs_sudo(lock)
-            if experiment_six.is_flexguard_interpose_lock(lock)
-            else False
-        )
-        script = (
-            experiment_six.flexguard_interpose_script(lock)
-            if experiment_six.is_flexguard_interpose_lock(lock)
-            else experiment_six.otherlocks_interpose_script(lock)
-        )
-        cmd_prefix = [str(script)]
-        timeslice_extension = (
-            experiment_six.flexguard_timeslice_extension(lock)
-            if experiment_six.is_flexguard_interpose_lock(lock)
-            else "off"
-        )
+        needs_sudo = experiment_six.flexguard_interpose_needs_sudo(lock)
+        cmd_prefix = [str(experiment_six.flexguard_interpose_script(lock))]
+    elif experiment_six.is_litl_interpose_lock(lock):
+        lock_kind = "mutex"
+        env = {}
+        needs_sudo = False
+        cmd_prefix = litl_locks.litl_command_prefix(lock)
+    elif experiment_six.is_accordin_direct_lock(lock):
+        lock_kind = "mutex"
+        env = experiment_six.accordin_env(lock)
+        needs_sudo = True
+        cmd_prefix = litl_locks.litl_command_prefix(experiment_six.ACCORDIN_DIRECT_LOCK_KIND)
     else:
-        lock_kind = experiment_six.BUILTIN_LOCK_KINDS.get(lock, experiment_six.ACCORDIN_DIRECT_LOCK_KIND)
-        env = experiment_six.accordin_env(lock) if experiment_six.is_accordin_direct_lock(lock) else {}
-        needs_sudo = experiment_six.is_accordin_direct_lock(lock)
+        lock_kind = experiment_six.BUILTIN_LOCK_KINDS[lock]
+        env = {}
+        needs_sudo = False
         cmd_prefix = []
-        timeslice_extension = "off"
 
     cmd = [
         *cmd_prefix,
@@ -359,8 +358,6 @@ def mutexbench_command(
         str(args.outside_ns),
         "--lock-kind",
         lock_kind,
-        "--timeslice-extension",
-        timeslice_extension,
     ]
     if experiment_defaults.accordin_uses_taskset(lock):
         cmd = ["taskset", "-c", args.mcs_accordin_taskset_cpus, *cmd]

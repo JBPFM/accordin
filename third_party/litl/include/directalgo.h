@@ -25,6 +25,8 @@
 #define LOCK_ALGORITHM "MB-MCS"
 #elif defined(MBMCSTAS)
 #define LOCK_ALGORITHM "MB-MCS-TAS"
+#elif defined(MBMCSTSE)
+#define LOCK_ALGORITHM "MB-MCS-TSE"
 #elif defined(MBMCSTASTSE)
 #define LOCK_ALGORITHM "MB-MCS-TAS-TSE"
 #elif defined(MBMCSTASNEXT)

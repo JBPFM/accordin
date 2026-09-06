@@ -16,6 +16,7 @@ from statistics import mean
 
 import experiment_defaults
 import experiment_failures
+import litl_locks
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MUTEXBENCH_DIR = REPO_ROOT / "bench" / "mutexbench"
@@ -132,7 +133,7 @@ class LockSpec:
     label: str
     mode: str
     lock_kind: str
-    timeslice_extension: str = "off"
+    launcher: str | None = None
     preload_library: Path | None = None
 
 
@@ -623,8 +624,9 @@ def resolve_lock_specs(
                 LockSpec(
                     key="mcs_tas",
                     label=experiment_defaults.lock_label("mcs_tas"),
-                    mode="native",
-                    lock_kind="mcs-tas",
+                    mode="interpose",
+                    lock_kind="mutex",
+                    launcher=litl_locks.litl_algorithm("mcs_tas"),
                 )
             )
         elif key == "mcs_extension":
@@ -632,10 +634,20 @@ def resolve_lock_specs(
                 LockSpec(
                     key="mcs_extension",
                     label=f"{experiment_defaults.lock_label('mcs_extension')} (native)",
-                    mode="native_timeslice_extension",
-                    lock_kind="mcs",
-                    timeslice_extension="require",
+                    mode="interpose",
+                    lock_kind="mutex",
+                    launcher=litl_locks.litl_algorithm("mcs_extension"),
                 )
+            )
+    if not dry_run:
+        for spec in specs:
+            if spec.launcher is None:
+                continue
+            litl_locks.ensure_built(
+                spec.key,
+                lambda cmd, key=spec.key: logger.run(
+                    list(cmd), log_name=f"build_litl_{key}.log"
+                ),
             )
     return tuple(specs)
 
@@ -674,8 +686,6 @@ def build_sweep_command(
         str(args.timing_sample_stride),
         "--repeats",
         str(args.repeats),
-        "--timeslice-extension",
-        spec.timeslice_extension,
         "--lock-kind",
         spec.lock_kind,
         "--output-root",
@@ -685,6 +695,8 @@ def build_sweep_command(
         "--output-summary",
         str(summary_path),
     ]
+    if spec.launcher is not None:
+        cmd.extend(["--litl-lock", spec.launcher])
     if spec.preload_library is not None:
         cmd.extend(["--bench-ld-preload", str(spec.preload_library)])
     return cmd
@@ -709,7 +721,7 @@ def write_settings(
                 "label": lock.label,
                 "mode": lock.mode,
                 "lock_kind": lock.lock_kind,
-                "timeslice_extension": lock.timeslice_extension,
+                "launcher": lock.launcher,
                 "preload_library": str(lock.preload_library) if lock.preload_library is not None else None,
             }
             for lock in locks

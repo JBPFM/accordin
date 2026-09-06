@@ -1,0 +1,173 @@
+make: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src'
+cc -std=c11 -O2 -Wall -Wextra -Werror -pthread scripts/tests/direct_api_smoke.c -ldl -o target/release/direct_api_smoke
+cc -std=c11 -O2 -Wall -Wextra -Werror -pthread scripts/tests/fullhook_smoke.c -ldl -o target/release/fullhook_smoke
+c++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread scripts/tests/fullhook_cxx_smoke.cc -ldl -o target/release/fullhook_cxx_smoke
+bash scripts/check_symbols.sh target/release
+All four libraries verified.
+SMOKE_BIN_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release FULLHOOK_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release bash scripts/test_direct_api.sh --no-bpf
+direct smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000
+direct smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000
+SMOKE_BIN_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release FULLHOOK_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release bash scripts/test_fullhook.sh --no-bpf
+fullhook smoke ok: acquisitions=16000 nested=4000 items=8000
+fullhook C++ smoke ok: rounds=1000
+fullhook smoke ok: acquisitions=16000 nested=4000 items=8000
+fullhook C++ smoke ok: rounds=1000
+make: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src'
+make: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src'
+SMOKE_BIN_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release FULLHOOK_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release bash scripts/test_direct_api.sh --bpf
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+direct smoke ok: mcs_accordin_direct acquisitions=16000 nested=4000
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+direct smoke ok: mcs_tas_accordin_direct acquisitions=16000 nested=4000
+SMOKE_BIN_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release FULLHOOK_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src/target/release bash scripts/test_fullhook.sh --bpf
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+fullhook smoke ok: acquisitions=16000 nested=4000 items=8000
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+fullhook C++ smoke ok: rounds=1000
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+fullhook smoke ok: acquisitions=16000 nested=4000 items=8000
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+fullhook C++ smoke ok: rounds=1000
+make: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fullhook-src'
+make: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+bash scripts/check_direct_symbols.sh target/release
+Both direct ABIs verified.
+DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release bash scripts/test_direct_api.sh --no-bpf
+direct relock ok: cross-thread publication, same epoch, dormant/nested requests
+direct smoke ok: mcs_accordin_direct acquisitions=176000 nested=4000
+direct relock ok: cross-thread publication, same epoch, dormant/nested requests
+direct smoke ok: mcs_tas_accordin_direct acquisitions=176000 nested=4000
+make -C third_party/litl ACCORDIN_ROOT=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src ACCORDIN_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
+make[1]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl'
+make -C /mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src OUT=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release all
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+mkdir -p lib/ obj/mcsaccordin_original
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcsaccordin_original.so
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+mkdir -p lib/ obj/mcstasaccordin_original
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcstasaccordin_original.so
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[1]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl'
+cd third_party/litl && ACCORDIN_ROOT=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src ACCORDIN_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release bash tests/run.sh --no-bpf
+Testing mcsaccordin_original (--no-bpf)
+Using LibMCS-Accordin with waiting WAITING_ORIGINAL
+PASS interposition: libmcsaccordin_original.so
+PASS counter/static initialization: 8 threads, 80000 operations
+PASS explicit initialization, reuse, nested locks, busy trylock
+PASS native spinlock/rwlock passthrough
+PASS first condvar wait with competing lock/trylock: 8 threads, 32 fresh mutexes
+PASS condvar signal: 1000 round trips
+PASS condvar broadcast/timed wakeups: 8 waiters, 50 rounds
+PASS timeout/error returns with mutex held (realtime and monotonic)
+PASS cancellation restores mutex before caller cleanup
+PASS cancel/signal race transfers notification, busy destroy: 32 rounds
+PASS relock queues: outside=0 nested=0, cancellation/expiry after notification
+PASS relock queues: outside=1 nested=0, cancellation/expiry after notification
+PASS relock queues: outside=0 nested=1, cancellation/expiry after notification
+PASS relock queues: outside=1 nested=1, cancellation/expiry after notification
+PASS condvar attributes, no stored notifications, negative deadline, cancellation mode
+PASS clockwait: both glibc symbol versions, explicit clocks, held mutex on return
+PASS all LiTL Accordin tests
+Using LibMCS-Accordin with waiting WAITING_ORIGINAL
+PASS std::condition_variable wait, wait_for, wait_until, notification
+Testing mcstasaccordin_original (--no-bpf)
+Using LibMCS-TAS-Accordin with waiting WAITING_ORIGINAL
+PASS interposition: libmcstasaccordin_original.so
+PASS counter/static initialization: 8 threads, 80000 operations
+PASS explicit initialization, reuse, nested locks, busy trylock
+PASS native spinlock/rwlock passthrough
+PASS first condvar wait with competing lock/trylock: 8 threads, 32 fresh mutexes
+PASS condvar signal: 1000 round trips
+PASS condvar broadcast/timed wakeups: 8 waiters, 50 rounds
+PASS timeout/error returns with mutex held (realtime and monotonic)
+PASS cancellation restores mutex before caller cleanup
+PASS cancel/signal race transfers notification, busy destroy: 32 rounds
+PASS relock queues: outside=0 nested=0, cancellation/expiry after notification
+PASS relock queues: outside=1 nested=0, cancellation/expiry after notification
+PASS relock queues: outside=0 nested=1, cancellation/expiry after notification
+PASS relock queues: outside=1 nested=1, cancellation/expiry after notification
+PASS condvar attributes, no stored notifications, negative deadline, cancellation mode
+PASS clockwait: both glibc symbol versions, explicit clocks, held mutex on return
+PASS all LiTL Accordin tests
+Using LibMCS-TAS-Accordin with waiting WAITING_ORIGINAL
+PASS std::condition_variable wait, wait_for, wait_until, notification
+PASS no native shadow mutex calls, including after condvar wait (NDEBUG)
+PASS no native shadow mutex calls, including after condvar wait (NDEBUG)
+make: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+make: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+DIRECT_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release bash scripts/test_direct_api.sh --bpf
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+direct relock ok: cross-thread publication, same epoch, dormant/nested requests
+direct smoke ok: mcs_accordin_direct acquisitions=176000 nested=4000
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+direct relock ok: cross-thread publication, same epoch, dormant/nested requests
+direct smoke ok: mcs_tas_accordin_direct acquisitions=176000 nested=4000
+make -C third_party/litl ACCORDIN_ROOT=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src ACCORDIN_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
+make[1]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl'
+make -C /mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src OUT=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release all
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+mkdir -p lib/ obj/mcsaccordin_original
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcsaccordin_original.so
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+mkdir -p lib/ obj/mcstasaccordin_original
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcstasaccordin_original.so
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[1]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl'
+cd third_party/litl && ACCORDIN_ROOT=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src ACCORDIN_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release bash tests/run.sh --bpf
+Testing mcsaccordin_original (--bpf)
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-Accordin with waiting WAITING_ORIGINAL
+PASS interposition: libmcsaccordin_original.so
+PASS counter/static initialization: 8 threads, 80000 operations
+PASS explicit initialization, reuse, nested locks, busy trylock
+PASS native spinlock/rwlock passthrough
+PASS first condvar wait with competing lock/trylock: 8 threads, 32 fresh mutexes
+PASS condvar signal: 1000 round trips
+PASS condvar broadcast/timed wakeups: 8 waiters, 50 rounds
+PASS timeout/error returns with mutex held (realtime and monotonic)
+PASS cancellation restores mutex before caller cleanup
+PASS cancel/signal race transfers notification, busy destroy: 32 rounds
+PASS relock queues: outside=0 nested=0, cancellation/expiry after notification
+PASS relock queues: outside=1 nested=0, cancellation/expiry after notification
+PASS relock queues: outside=0 nested=1, cancellation/expiry after notification
+PASS relock queues: outside=1 nested=1, cancellation/expiry after notification
+PASS condvar attributes, no stored notifications, negative deadline, cancellation mode
+PASS clockwait: both glibc symbol versions, explicit clocks, held mutex on return
+PASS all LiTL Accordin tests
+[MCS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-Accordin with waiting WAITING_ORIGINAL
+PASS std::condition_variable wait, wait_for, wait_until, notification
+Testing mcstasaccordin_original (--bpf)
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-TAS-Accordin with waiting WAITING_ORIGINAL
+PASS interposition: libmcstasaccordin_original.so
+PASS counter/static initialization: 8 threads, 80000 operations
+PASS explicit initialization, reuse, nested locks, busy trylock
+PASS native spinlock/rwlock passthrough
+PASS first condvar wait with competing lock/trylock: 8 threads, 32 fresh mutexes
+PASS condvar signal: 1000 round trips
+PASS condvar broadcast/timed wakeups: 8 waiters, 50 rounds
+PASS timeout/error returns with mutex held (realtime and monotonic)
+PASS cancellation restores mutex before caller cleanup
+PASS cancel/signal race transfers notification, busy destroy: 32 rounds
+PASS relock queues: outside=0 nested=0, cancellation/expiry after notification
+PASS relock queues: outside=1 nested=0, cancellation/expiry after notification
+PASS relock queues: outside=0 nested=1, cancellation/expiry after notification
+PASS relock queues: outside=1 nested=1, cancellation/expiry after notification
+PASS condvar attributes, no stored notifications, negative deadline, cancellation mode
+PASS clockwait: both glibc symbol versions, explicit clocks, held mutex on return
+PASS all LiTL Accordin tests
+[MCS_TAS_ACCORDIN_DIRECT] eBPF scheduler loaded successfully
+Using LibMCS-TAS-Accordin with waiting WAITING_ORIGINAL
+PASS std::condition_variable wait, wait_for, wait_until, notification
+PASS no native shadow mutex calls, including after condvar wait (NDEBUG)
+PASS no native shadow mutex calls, including after condvar wait (NDEBUG)
+make: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'

@@ -84,6 +84,7 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 2. 外层加锁进入慢路径时，发布 WAITING 并 yield。若线程仍拥有当前 CPU 的名额，BPF 用 CAS 将旧 ticket 更新为本次请求；否则进入全局 FIFO 等待队列。
 3. CPU 有空闲名额时，从队列中取一个 affinity 允许的线程，先保留名额；用户态确认名额属于本次请求后，才进入原始锁的自旋队列。
 4. 每次外层加锁使用递增的请求编号，用户态始终校验本次 ticket。解锁清除用户态状态，调度器观察到释放或未续用的新请求时回收名额，无需额外解锁 syscall；若下一次慢路径赶在回收前进入 yield，可以更新并续用自己的名额。
+5. 已获准线程处于 WAITING/SPINNING 且普通队列非空时，tick 结束其当前时间片，为普通任务提供运行机会，同时保留原 admission 名额。这使锁外执行的工作也能继续推进，不改变 raw 锁队列与 condvar 接力协议。
 
 等待队列按 FIFO 扫描；已有名额的线程可以连续续用，因此不保证严格 FIFO 或有界等待。
 
@@ -108,6 +109,12 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 ## 实验与历史入口
 
 192 线程下的 Rust → C 迁移性能对比、原始日志和复现命令见 [测量报告](docs/benchmarks/c-migration-192/README.md)。
+
+`fullhook-admission` 与 `simplify` 的 LevelDB readrandom/fillrandom 192 线程对比见 [分支性能报告](docs/benchmarks/leveldb-branches-20260906/README.md)，包含三轮测量及 MCS fillrandom 的超时记录。
+
+逐项归因、选择性迁入和完整应用回归见 [归因报告](docs/benchmarks/leveldb-attribution-20260906/README.md)。本轮仅迁入 tick 普通任务调度机会，192 线程下 readrandom 基本持平，fillrandom 的 MCS/MCS-TAS 分别提升约 54%/188%。
+
+此前的候选方案见 [condvar 授权自旋与 relock 设计](docs/plans/2026-09-05-cv-spin-relock-design.md)。其中 signal 独立唤醒在后续消融中明显回退，未迁入；当前保留 simplify 的通知接力，增加上述 tick 普通任务调度机会。
 
 当前 local 队列与授权更新的合入验证见 [验证记录](docs/benchmarks/local-owner-regression/integration.md)。
 

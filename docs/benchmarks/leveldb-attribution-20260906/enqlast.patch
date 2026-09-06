@@ -1,0 +1,10 @@
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -215,6 +215,7 @@
+ }
+ 
+ SCX_OPS_DEFINE(accordin_ops,
++               .flags = SCX_OPS_ENQ_LAST,
+                .select_cpu = (void *)accordin_select_cpu,
+                .enqueue = (void *)accordin_enqueue,
+                .dispatch = (void *)accordin_dispatch,

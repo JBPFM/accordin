@@ -1,0 +1,124 @@
+--- a/src/mcs_tas.h
++++ b/src/mcs_tas.h
+@@ -27,7 +27,8 @@
+         while (atomic_load_explicit(&node->waiting, memory_order_acquire))
+             spin_pause();
+     }
+-    while (atomic_exchange_explicit(&lock->locked, true, memory_order_acquire))
++    while (atomic_load_explicit(&lock->locked, memory_order_relaxed) ||
++           atomic_exchange_explicit(&lock->locked, true, memory_order_acquire))
+         spin_pause();
+     /* This node is reusable as soon as acquisition finishes, before unlock. */
+     queue_release(&lock->tail, node);
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -62,12 +62,19 @@
+                    u64 wake_flags) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+   bool idle = false;
++  s32 cpu;
+ 
+   if (!stats_only_mode && tctx && tctx->admission_cpu &&
+       allowed(p, tctx->admission_cpu - 1))
+     return tctx->admission_cpu - 1;
+-  /* All tasks pass enqueue, including wakeups on an idle CPU. */
+-  return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &idle);
++  cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &idle);
++  /* Dispatching a wakeup onto an idle CPU here skips enqueue and the kick that
++   * would otherwise have to reach that CPU before it looks for work. A waiter
++   * without a slot placed this way simply yields again and takes the ordinary
++   * enqueue path into the waiting queue, so admission is unaffected. */
++  if (idle)
++    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
++  return cpu;
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
+@@ -78,14 +85,27 @@
+ 
+   if (!stats_only_mode) {
+     bool known = user_state(p, &state);
++    bool holder = known && (state & USER_FLAGS) == USER_HELD;
+     tctx = bpf_task_storage_get(&task_ctx_map, p, 0,
+                               BPF_LOCAL_STORAGE_GET_F_CREATE);
+     if (tctx) {
+       if (known)
+         refresh_episode(p, tctx, state);
++      /* Where the task runs next, decided once: an admitted task returns to
++       * its reserved CPU, a holder preempts whatever occupies the CPU it is
++       * bound to, because a holder left in the global queue stalls every
++       * spinner that wants its lock, and a new lock waiter joins the
++       * admission queue. A condition-variable waiter is left in the global
++       * queue: it parks itself on a signal, and only a free slot drains the
++       * admission queue, which would hold it indefinitely. */
+       if (tctx->admission_cpu) {
+         cpu = tctx->admission_cpu - 1;
+         dsq = SCX_DSQ_LOCAL_ON | cpu;
++        if (holder)
++          enq_flags |= SCX_ENQ_PREEMPT;
++      } else if (holder && allowed(p, cpu)) {
++        dsq = SCX_DSQ_LOCAL_ON | cpu;
++        enq_flags |= SCX_ENQ_PREEMPT;
+       } else if (known && (state & USER_FLAGS) == USER_WAITING) {
+         tctx->ticket = request_ticket(p, state);
+         dsq = WAITING_DSQ;
+@@ -139,12 +159,22 @@
+   volatile __u64 *owner = owner_slot(cpu);
+ 
+   (void)to;
+-  /* Renew only our existing slot; userspace still confirms the new ticket. */
+   if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
+-      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
++      (state & USER_FLAGS) == USER_WAITING) {
+     __u64 next = request_ticket(from, state);
+-    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++
++    if (tctx->admission_cpu == cpu + 1) {
++      /* Renew only our existing slot; userspace still confirms the new ticket. */
++      if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++        tctx->ticket = next;
++    } else if (!tctx->admission_cpu &&
++               !__sync_val_compare_and_swap(owner, 0, next)) {
++      /* The yielding task is the current one here, so no dispatch can be
++       * reserving this CPU; taking the free slot saves the round trip through
++       * the waiting queue. */
++      tctx->admission_cpu = cpu + 1;
+       tctx->ticket = next;
++    }
+   }
+   from->scx.slice = 0;
+   return false;
+@@ -153,8 +183,19 @@
+ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+-  if (!stats_only_mode && tctx && user_state(p, &state))
+-    refresh_episode(p, tctx, state);
++
++  if (stats_only_mode || !tctx || !user_state(p, &state))
++    return;
++  refresh_episode(p, tctx, state);
++  /* An admitted thread that spins never empties its CPU, so ops.dispatch is
++   * never called there and the global queue is never consumed. Ending the
++   * slice hands the CPU to one queued ordinary task; the spinner keeps its
++   * slot and is re-enqueued behind it. */
++  if (tctx->admission_cpu &&
++      ((state & USER_FLAGS) == USER_WAITING ||
++       (state & USER_FLAGS) == USER_SPINNING) &&
++      scx_bpf_dsq_nr_queued(NORMAL_DSQ))
++    p->scx.slice = 0;
+ }
+ 
+ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
+@@ -215,6 +256,11 @@
+ }
+ 
+ SCX_OPS_DEFINE(accordin_ops,
++               /* Without this the core keeps the last runnable task on a CPU
++                * running without calling ops.enqueue, so a waiter yielding on
++                * an otherwise idle CPU would never reach WAITING_DSQ and could
++                * never be admitted. */
++               .flags = SCX_OPS_ENQ_LAST,
+                .select_cpu = (void *)accordin_select_cpu,
+                .enqueue = (void *)accordin_enqueue,
+                .dispatch = (void *)accordin_dispatch,

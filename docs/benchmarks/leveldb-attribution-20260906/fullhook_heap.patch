@@ -1,0 +1,102 @@
+--- a/src/fullhook.c
++++ b/src/fullhook.c
+@@ -27,7 +27,7 @@
+  * (PTHREAD_MUTEX_INITIALIZER) is an unlocked normal mutex. */
+ struct hook_mutex {
+     union {
+-        struct raw_lock raw;
++        struct raw_lock *raw;
+         char slot[16];
+     };
+     uint32_t kind;
+@@ -35,7 +35,6 @@
+     uint32_t count; /* recursive: hold depth */
+ };
+ 
+-_Static_assert(sizeof(struct raw_lock) <= 16, "raw lock exceeds the overlay slot");
+ _Static_assert(sizeof(struct hook_mutex) <= sizeof(pthread_mutex_t),
+                "mutex overlay exceeds pthread_mutex_t");
+ _Static_assert(_Alignof(struct hook_mutex) <= _Alignof(pthread_mutex_t),
+@@ -280,12 +279,31 @@
+     }
+ }
+ 
++/* Attribution control: isolate raw state from application cache lines. */
++static struct raw_lock *get_raw(struct hook_mutex *state)
++{
++    struct raw_lock *raw = __atomic_load_n(&state->raw, __ATOMIC_ACQUIRE);
++    if (!raw) {
++        size_t bytes = (sizeof(*raw) + 63) & ~(size_t)63;
++        struct raw_lock *candidate = aligned_alloc(64, bytes);
++        if (!candidate)
++            abort();
++        memset(candidate, 0, bytes);
++        if (__atomic_compare_exchange_n(&state->raw, &raw, candidate, false,
++                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            raw = candidate;
++        else
++            free(candidate);
++    }
++    return raw;
++}
++
+ static TRACED void traced_acquire(struct hook_mutex *state)
+ {
+     struct stats_entry *entry = stats_entry(state);
+     struct lock_trace trace;
+ 
+-    lock_ops_lock(&state->raw, &trace);
++    lock_ops_lock(get_raw(state), &trace);
+     if (!entry)
+         return;
+     entry->acquisitions++;
+@@ -304,7 +322,7 @@
+ {
+     struct stats_entry *entry;
+ 
+-    if (!lock_ops_trylock(&state->raw))
++    if (!lock_ops_trylock(get_raw(state)))
+         return false;
+     entry = stats_entry(state);
+     if (entry) {
+@@ -317,7 +335,7 @@
+ static TRACED void traced_release(struct hook_mutex *state)
+ {
+     stats_pop((uintptr_t)state);
+-    lock_ops_unlock(&state->raw);
++    lock_ops_unlock(get_raw(state));
+ }
+ 
+ static inline void acquire(struct hook_mutex *state)
+@@ -325,12 +343,12 @@
+     if (stats_enabled)
+         traced_acquire(state);
+     else
+-        lock_ops_lock(&state->raw, NULL);
++        lock_ops_lock(get_raw(state), NULL);
+ }
+ 
+ static inline bool try_acquire(struct hook_mutex *state)
+ {
+-    return stats_enabled ? traced_try_acquire(state) : lock_ops_trylock(&state->raw);
++    return stats_enabled ? traced_try_acquire(state) : lock_ops_trylock(get_raw(state));
+ }
+ 
+ static inline void release(struct hook_mutex *state)
+@@ -338,7 +356,7 @@
+     if (stats_enabled)
+         traced_release(state);
+     else
+-        lock_ops_unlock(&state->raw);
++        lock_ops_unlock(get_raw(state));
+ }
+ 
+ static inline struct hook_mutex *mutex_overlay(pthread_mutex_t *mutex)
+@@ -421,6 +439,7 @@
+ 
+ EXPORT int pthread_mutex_destroy(pthread_mutex_t *mutex)
+ {
++    free(__atomic_exchange_n(&mutex_overlay(mutex)->raw, NULL, __ATOMIC_ACQ_REL));
+     memset(mutex, 0, sizeof(*mutex));
+     return 0;
+ }

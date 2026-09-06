@@ -1,0 +1,165 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "branch": "fullhook-admission",
+    "commit": "4e5998e21c458e9b162855ef3c3d5c7e42b42ebb",
+    "attempts": 3,
+    "n": 3,
+    "timeouts": 0,
+    "complete": true,
+    "mean_ops_per_second": 607299.8916666666,
+    "stdev": 1893.7856623003436,
+    "cv_percent": 0.3118369833893862,
+    "relative_to_simplify": 1.0195403690377194,
+    "runs_ops_per_second": [
+      609464.985,
+      606483.244,
+      605951.446
+    ],
+    "failed_ids": []
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "branch": "simplify",
+    "commit": "8fc18994aa51f27b91bf6b490a575a309add8da3",
+    "attempts": 3,
+    "n": 3,
+    "timeouts": 0,
+    "complete": true,
+    "mean_ops_per_second": 595660.4663333333,
+    "stdev": 26887.768387737426,
+    "cv_percent": 4.513942070597473,
+    "relative_to_simplify": 1.0,
+    "runs_ops_per_second": [
+      579327.816,
+      580960.102,
+      626693.481
+    ],
+    "failed_ids": []
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "branch": "fullhook-admission",
+    "commit": "4e5998e21c458e9b162855ef3c3d5c7e42b42ebb",
+    "attempts": 3,
+    "n": 3,
+    "timeouts": 0,
+    "complete": true,
+    "mean_ops_per_second": 661381.9693333333,
+    "stdev": 10520.911394163639,
+    "cv_percent": 1.5907466308415719,
+    "relative_to_simplify": 0.6961027066197959,
+    "runs_ops_per_second": [
+      649721.96,
+      670165.398,
+      664258.55
+    ],
+    "failed_ids": []
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "branch": "simplify",
+    "commit": "8fc18994aa51f27b91bf6b490a575a309add8da3",
+    "attempts": 3,
+    "n": 3,
+    "timeouts": 0,
+    "complete": true,
+    "mean_ops_per_second": 950121.2436666667,
+    "stdev": 22733.735066952464,
+    "cv_percent": 2.3927193732896046,
+    "relative_to_simplify": 1.0,
+    "runs_ops_per_second": [
+      926825.621,
+      951290.115,
+      972247.995
+    ],
+    "failed_ids": []
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "branch": "fullhook-admission",
+    "commit": "4e5998e21c458e9b162855ef3c3d5c7e42b42ebb",
+    "attempts": 3,
+    "n": 1,
+    "timeouts": 2,
+    "complete": false,
+    "mean_ops_per_second": 121459.151,
+    "stdev": null,
+    "cv_percent": null,
+    "relative_to_simplify": null,
+    "runs_ops_per_second": [
+      null,
+      121459.151,
+      null
+    ],
+    "failed_ids": [
+      "fillrandom-192-fullhook-admission-mcs_accordin-r1",
+      "fillrandom-192-fullhook-admission-mcs_accordin-r3"
+    ]
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "branch": "simplify",
+    "commit": "8fc18994aa51f27b91bf6b490a575a309add8da3",
+    "attempts": 3,
+    "n": 3,
+    "timeouts": 0,
+    "complete": true,
+    "mean_ops_per_second": 52289.62566666667,
+    "stdev": 3653.1975557136716,
+    "cv_percent": 6.9864672181856795,
+    "relative_to_simplify": 1.0,
+    "runs_ops_per_second": [
+      55854.332,
+      48553.941,
+      52460.604
+    ],
+    "failed_ids": []
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "branch": "fullhook-admission",
+    "commit": "4e5998e21c458e9b162855ef3c3d5c7e42b42ebb",
+    "attempts": 3,
+    "n": 3,
+    "timeouts": 0,
+    "complete": true,
+    "mean_ops_per_second": 145996.22766666667,
+    "stdev": 2562.671537221532,
+    "cv_percent": 1.7552998308096917,
+    "relative_to_simplify": 2.817578095247408,
+    "runs_ops_per_second": [
+      143322.789,
+      148431.505,
+      146234.389
+    ],
+    "failed_ids": []
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "branch": "simplify",
+    "commit": "8fc18994aa51f27b91bf6b490a575a309add8da3",
+    "attempts": 3,
+    "n": 3,
+    "timeouts": 0,
+    "complete": true,
+    "mean_ops_per_second": 51816.21333333333,
+    "stdev": 4940.230090748541,
+    "cv_percent": 9.534139553903865,
+    "relative_to_simplify": 1.0,
+    "runs_ops_per_second": [
+      57518.338,
+      49107.292,
+      48823.01
+    ],
+    "failed_ids": []
+  }
+]

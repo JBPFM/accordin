@@ -1,0 +1,32 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "fullhook1000",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      648055.366,
+      661983.39,
+      662489.744
+    ],
+    "mean": 657509.5,
+    "cv_percent": 1.2458274272462044,
+    "relative_to_baseline": null
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "fullhook_tas",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      686645.156,
+      657279.752,
+      644841.845
+    ],
+    "mean": 662922.2509999999,
+    "cv_percent": 3.2379760584420394,
+    "relative_to_baseline": null
+  }
+]

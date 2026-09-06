@@ -1,0 +1,58 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "n": 2,
+    "attempts": 2,
+    "values": [
+      947418.694,
+      928558.141
+    ],
+    "mean": 937988.4175,
+    "cv_percent": 1.4218112584773293,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "enqlast",
+    "n": 2,
+    "attempts": 2,
+    "values": [
+      871268.52,
+      846027.057
+    ],
+    "mean": 858647.7885,
+    "cv_percent": 2.0786648371329646,
+    "relative_to_baseline": 0.9154140632019052
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "compact+ttas",
+    "n": 2,
+    "attempts": 2,
+    "values": [
+      757541.304,
+      797002.13
+    ],
+    "mean": 777271.717,
+    "cv_percent": 3.5898665866189527,
+    "relative_to_baseline": 0.8286581182650904
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "ttas+bpf_all",
+    "n": 2,
+    "attempts": 2,
+    "values": [
+      702434.716,
+      699875.981
+    ],
+    "mean": 701155.3485000001,
+    "cv_percent": 0.25804536378850007,
+    "relative_to_baseline": 0.7475096018443107
+  }
+]

@@ -1,0 +1,19 @@
+fillrandom-fullhook-admission-mcs_accordin-r3 age 65.72999999858439 wchan {'futex_wait_queue': 58, '0': 136}
+Traceback (most recent call last):
+  File "/mnt/sde/jz/accordin/target/leveldb-branches-20260906/watch_stalls.py", line 26, in <module>
+    result=subprocess.run(['perf','record','-q','-e','cpu-clock','-F','99','-g','-o',str(R/(name+'.perf.data')),'-p',p.name,'--','sleep','2'],stdout=log,stderr=subprocess.STDOUT,timeout=10)
+  File "/usr/lib/python3.13/subprocess.py", line 556, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 1222, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 2151, in _communicate
+    self.wait(timeout=self._remaining_time(endtime))
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 1277, in wait
+    return self._wait(timeout=timeout)
+           ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/subprocess.py", line 2055, in _wait
+    raise TimeoutExpired(self.args, timeout)
+subprocess.TimeoutExpired: Command '['perf', 'record', '-q', '-e', 'cpu-clock', '-F', '99', '-g', '-o', '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/fillrandom-fullhook-admission-mcs_accordin-r3.perf.data', '-p', '3900104', '--', 'sleep', '2']' timed out after 9.999969778582454 seconds

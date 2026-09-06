@@ -1,0 +1,13 @@
+--- a/src/mcs_tas.h
++++ b/src/mcs_tas.h
+@@ -2,8 +2,8 @@
+ #include "raw_lock.h"
+ 
+ struct raw_lock {
+-    _Alignas(64) _Atomic(struct node *) tail;
+-    _Alignas(64) _Atomic bool locked;
++    _Alignas(8) _Atomic(struct node *) tail;
++    _Alignas(8) _Atomic bool locked;
+ };
+ 
+ static _Thread_local struct node thread_node;

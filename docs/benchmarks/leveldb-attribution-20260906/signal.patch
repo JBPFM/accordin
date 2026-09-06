@@ -1,0 +1,57 @@
+--- a/third_party/litl/src/accordin.c
++++ b/third_party/litl/src/accordin.c
+@@ -171,7 +171,7 @@
+      * have its request cleared by admission_finish on the old acquisition. */
+     ACCORDIN_DIRECT(relock_prepare)(&waiter->request);
+     waiter->armed = 1;
+-    if (waiter->queued && waiter->request.nested) {
++    if (waiter->queued && (waiter->request.nested || waiter->independent)) {
+         /* A wait retaining other mutexes retains its outer admission episode.
+          * Do not delay its wake behind the serialized relock baton. */
+         park_remove(mutex, waiter);
+@@ -181,10 +181,11 @@
+     park_unlock(mutex);
+ }
+ 
+-void accordin_wait_notify(struct accordin_park_waiter *waiter) {
+-    struct accordin_mutex *mutex = waiter->mutex;
+-    park_lock(mutex);
+-    if (waiter->armed && waiter->request.nested) {
++void accordin_wait_notify(struct accordin_park_waiter *waiter, int independent) {
++    struct accordin_mutex *mutex = waiter->mutex;
++    park_lock(mutex);
++    waiter->independent = independent;
++    if (waiter->armed && (waiter->request.nested || independent)) {
+         park_wake(waiter);
+     } else {
+         waiter->prev = mutex->tail;
+--- a/third_party/litl/src/accordin-cond.c
++++ b/third_party/litl/src/accordin-cond.c
+@@ -71,7 +71,7 @@
+         return;
+     dequeue(cond, waiter);
+     waiter->signaled = signaled;
+-    accordin_wait_notify(&waiter->park);
++    accordin_wait_notify(&waiter->park, signaled);
+ }
+ 
+ struct wait_cleanup {
+--- a/third_party/litl/include/accordin-internal.h
++++ b/third_party/litl/include/accordin-internal.h
+@@ -10,14 +10,14 @@
+     struct accordin_mutex *mutex;
+     accordin_relock_request_t request;
+     uint32_t wake;
+-    unsigned int armed, queued;
++    unsigned int armed, queued, independent;
+ };
+ 
+ /* The condition queue guard may nest the parking guard, never the reverse.
+  * No caller may hold either guard across a raw mutex acquisition. */
+ void accordin_wait_init(pthread_mutex_t *mutex, struct accordin_park_waiter *waiter);
+ void accordin_wait_arm(struct accordin_park_waiter *waiter);
+-void accordin_wait_notify(struct accordin_park_waiter *waiter);
++void accordin_wait_notify(struct accordin_park_waiter *waiter, int independent);
+ void accordin_wait_cancel(struct accordin_park_waiter *waiter);
+ void accordin_wait_relock(struct accordin_park_waiter *waiter);
+ 

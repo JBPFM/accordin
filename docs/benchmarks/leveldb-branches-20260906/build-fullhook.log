@@ -1,0 +1,10 @@
+mkdir -p target/release
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > target/release/vmlinux.h.tmp
+mv target/release/vmlinux.h.tmp target/release/vmlinux.h
+clang -target bpf -mcpu=v3 -g -O2 -D__TARGET_ARCH_arm64 -Itarget/release -isystem third_party/scx  -idirafter /usr/include/aarch64-linux-gnu -c src/bpf/main.bpf.c -o target/release/accordin.bpf.o
+bpftool gen skeleton target/release/accordin.bpf.o name accordin > target/release/accordin.skel.h.tmp
+mv target/release/accordin.skel.h.tmp target/release/accordin.skel.h
+clang -D_GNU_SOURCE -Iinclude -Isrc -Itarget/release -isystem third_party/scx -O3 -g -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror   -shared src/direct.c src/runtime.c -o target/release/libmcs_accordin_direct.so  -Wl,-z,defs -lbpf  -pthread
+clang -D_GNU_SOURCE -Iinclude -Isrc -Itarget/release -isystem third_party/scx -O3 -g -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror  -DMCS_TAS -shared src/direct.c src/runtime.c -o target/release/libmcs_tas_accordin_direct.so  -Wl,-z,defs -lbpf  -pthread
+clang -D_GNU_SOURCE -Iinclude -Isrc -Itarget/release -isystem third_party/scx -O3 -g -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror  -DACCORDIN_FULLHOOK -ftls-model=initial-exec -shared src/fullhook.c src/runtime.c -o target/release/libmcs_accordin_fullhook.so  -Wl,-z,defs -lbpf  -pthread
+clang -D_GNU_SOURCE -Iinclude -Isrc -Itarget/release -isystem third_party/scx -O3 -g -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror  -DMCS_TAS -DACCORDIN_FULLHOOK -ftls-model=initial-exec -shared src/fullhook.c src/runtime.c -o target/release/libmcs_tas_accordin_fullhook.so  -Wl,-z,defs -lbpf  -pthread

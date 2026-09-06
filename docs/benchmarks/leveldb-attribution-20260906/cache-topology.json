@@ -1,0 +1,34 @@
+[
+  {
+    "index": "index0",
+    "level": "1",
+    "type": "Data",
+    "coherency_line_size": "64",
+    "shared_cpu_list": "0",
+    "size": "64K"
+  },
+  {
+    "index": "index1",
+    "level": "1",
+    "type": "Instruction",
+    "coherency_line_size": "64",
+    "shared_cpu_list": "0",
+    "size": "64K"
+  },
+  {
+    "index": "index2",
+    "level": "2",
+    "type": "Unified",
+    "coherency_line_size": "64",
+    "shared_cpu_list": "0",
+    "size": "512K"
+  },
+  {
+    "index": "index3",
+    "level": "3",
+    "type": "Unified",
+    "coherency_line_size": "128",
+    "shared_cpu_list": "0-23",
+    "size": "24576K"
+  }
+]

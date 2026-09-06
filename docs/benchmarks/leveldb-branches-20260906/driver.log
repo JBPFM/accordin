@@ -1,0 +1,20 @@
+Seed audit: 1000000 entries
+START readrandom-192-fullhook-admission-mcs_accordin-r1
+DONE {"id": "readrandom-192-fullhook-admission-mcs_accordin-r1", "valid": true, "operations": 18288846, "roi_seconds": 30.008034, "ops_per_second": 609464.985, "max_process_threads": 193}
+START readrandom-192-simplify-mcs_accordin-r1
+DONE {"id": "readrandom-192-simplify-mcs_accordin-r1", "valid": true, "operations": 17381087, "roi_seconds": 30.002162, "ops_per_second": 579327.816, "max_process_threads": 193}
+START readrandom-192-fullhook-admission-mcs_tas_accordin-r1
+DONE {"id": "readrandom-192-fullhook-admission-mcs_tas_accordin-r1", "valid": true, "operations": 19496188, "roi_seconds": 30.006971, "ops_per_second": 649721.96, "max_process_threads": 193}
+START readrandom-192-simplify-mcs_tas_accordin-r1
+DONE {"id": "readrandom-192-simplify-mcs_tas_accordin-r1", "valid": true, "operations": 27812946, "roi_seconds": 30.008823, "ops_per_second": 926825.621, "max_process_threads": 193}
+START fillrandom-192-fullhook-admission-mcs_accordin-r1
+DONE {"id": "fillrandom-192-fullhook-admission-mcs_accordin-r1", "valid": false, "max_process_threads": 194}
+Remaining owned DBs retained in /tmp/accordin-leveldb-branches-w6to2dae
+Traceback (most recent call last):
+  File "/mnt/sde/jz/accordin/target/leveldb-branches-20260906/run.py", line 121, in <module>
+    if __name__=='__main__':main()
+                            ~~~~^^
+  File "/mnt/sde/jz/accordin/target/leveldb-branches-20260906/run.py", line 105, in main
+    if not s['valid']:raise RuntimeError(f'Invalid run {s["id"]}; DB retained at {db}')
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Invalid run fillrandom-192-fullhook-admission-mcs_accordin-r1; DB retained at /tmp/accordin-leveldb-branches-w6to2dae/fillrandom-fullhook-admission-mcs_accordin-r1

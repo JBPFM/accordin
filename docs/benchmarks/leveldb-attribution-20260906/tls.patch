@@ -1,0 +1,11 @@
+--- a/Makefile
++++ b/Makefile
+@@ -10,7 +10,7 @@
+ CPPFLAGS += -D_GNU_SOURCE -Iinclude -Isrc -I$(OUT) -isystem third_party/scx
+ LIBBPF_CFLAGS := $(shell $(PKG_CONFIG) --cflags libbpf)
+ LIBBPF_LIBS := $(shell $(PKG_CONFIG) --libs libbpf)
+-HOST_FLAGS := -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror $(LIBBPF_CFLAGS)
++HOST_FLAGS := -ftls-model=initial-exec -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror $(LIBBPF_CFLAGS)
+ BPF_FLAGS := -target bpf -mcpu=v3 -g -O2 -D__TARGET_ARCH_$(ARCH) -I$(OUT) -isystem third_party/scx $(LIBBPF_CFLAGS)
+ MULTIARCH := $(shell gcc -print-multiarch 2>/dev/null)
+ ifneq ($(MULTIARCH),)

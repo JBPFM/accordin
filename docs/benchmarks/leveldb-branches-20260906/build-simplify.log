@@ -1,0 +1,46 @@
+mkdir -p target/release
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > target/release/vmlinux.h.tmp
+mv target/release/vmlinux.h.tmp target/release/vmlinux.h
+clang -target bpf -mcpu=v3 -g -O2 -D__TARGET_ARCH_arm64 -Itarget/release -isystem third_party/scx  -idirafter /usr/include/aarch64-linux-gnu -c src/bpf/main.bpf.c -o target/release/accordin.bpf.o
+bpftool gen skeleton target/release/accordin.bpf.o name accordin > target/release/accordin.skel.h.tmp
+mv target/release/accordin.skel.h.tmp target/release/accordin.skel.h
+clang -D_GNU_SOURCE -Iinclude -Isrc -Itarget/release -isystem third_party/scx -O3 -g -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror  -shared src/direct.c src/runtime.c -o target/release/libmcs_accordin_direct.so  -Wl,-z,defs -lbpf  -pthread
+clang -D_GNU_SOURCE -Iinclude -Isrc -Itarget/release -isystem third_party/scx -O3 -g -std=gnu11 -fPIC -fvisibility=hidden -Wall -Wextra -Werror  -DMCS_TAS -shared src/direct.c src/runtime.c -o target/release/libmcs_tas_accordin_direct.so  -Wl,-z,defs -lbpf  -pthread
+make -C third_party/litl ACCORDIN_ROOT=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src ACCORDIN_LIB_DIR=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
+make[1]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl'
+make -C /mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src OUT=/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release all
+mkdir -p obj/mcsaccordin_original
+mkdir -p obj/mcstasaccordin_original
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+cat include/topology.in | sed -e "s/@nodes@/$(numactl -H | head -1 | cut -f 2 -d' ')/g" > include/topology.h
+mkdir -p obj/
+cat src/liblock.in | sed -e "s/@abs_top_srcdir@/$(echo $(cd .; pwd) | sed -e 's/\([\/&]\)/\\\1/g')/g" > libmcsaccordin_original.sh
+cat src/liblock.in | sed -e "s/@abs_top_srcdir@/$(echo $(cd .; pwd) | sed -e 's/\([\/&]\)/\\\1/g')/g" > libmcstasaccordin_original.sh
+sed -i "s/@cpus@/$(nproc)/g" include/topology.h
+sed -i "s/@lib@/$(basename libmcsaccordin_original.sh .sh).so/g" libmcsaccordin_original.sh
+sed -i "s/@lib@/$(basename libmcstasaccordin_original.sh .sh).so/g" libmcstasaccordin_original.sh
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src'
+sed -i "s/@cachelinesize@/128/g" include/topology.h  # 128 bytes is advised by intel documentation to avoid false-sharing with the HW prefetcher
+chmod a+x libmcsaccordin_original.sh
+chmod a+x libmcstasaccordin_original.sh
+sed -i "s/@pagesize@/$(getconf PAGESIZE)/g" include/topology.h
+sed -i 's#@cpufreq@#'$(cat /proc/cpuinfo | grep MHz | head -1 | awk '{ x = $4/1000; printf("%0.2g", x); }')'#g' include/topology.h
+chmod a+x include/topology.h
+mkdir -p lib/ obj/mcsaccordin_original
+mkdir -p lib/ obj/mcstasaccordin_original
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcsaccordin_original.so
+make -C src/ EXTERNAL_CFLAGS="" ../lib/libmcstasaccordin_original.so
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[2]: Entering directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+cc -std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include -I/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/include  -DMCSTASACCORDIN -DFCT_LINK_SUFFIX=mcstasaccordin -DWAITING_ORIGINAL -c interpose.c -o ../obj/mcstasaccordin_original/interpose.o
+cc -std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include -I/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/include  -DMCSACCORDIN -DFCT_LINK_SUFFIX=mcsaccordin -DWAITING_ORIGINAL -c interpose.c -o ../obj/mcsaccordin_original/interpose.o
+cc -std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include -I/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/include  -DMCSTASACCORDIN -DFCT_LINK_SUFFIX=mcstasaccordin -DWAITING_ORIGINAL -c accordin.c -o ../obj/mcstasaccordin_original/mcstasaccordin_original.o
+cc -std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include -I/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/include  -DMCSACCORDIN -DFCT_LINK_SUFFIX=mcsaccordin -DWAITING_ORIGINAL -c accordin.c -o ../obj/mcsaccordin_original/mcsaccordin_original.o
+cc -std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include -I/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/include  -DMCSTASACCORDIN -DFCT_LINK_SUFFIX=mcstasaccordin -c accordin-cond.c -o ../obj/mcstasaccordin_original/accordin-cond.o
+cc -std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include -I/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/include  -DMCSACCORDIN -DFCT_LINK_SUFFIX=mcsaccordin -c accordin-cond.c -o ../obj/mcsaccordin_original/accordin-cond.o
+cc -shared -o ../lib/libmcsaccordin_original.so ../obj/mcsaccordin_original/interpose.o ../obj/mcsaccordin_original/mcsaccordin_original.o ../obj/mcsaccordin_original/accordin-cond.o -Wl,-z,defs,-z,now -Wl,--version-script=interpose-aarch64.map -L/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release -Wl,-rpath,/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release -lmcs_accordin_direct -ldl -pthread
+cc -shared -o ../lib/libmcstasaccordin_original.so ../obj/mcstasaccordin_original/interpose.o ../obj/mcstasaccordin_original/mcstasaccordin_original.o ../obj/mcstasaccordin_original/accordin-cond.o -Wl,-z,defs,-z,now -Wl,--version-script=interpose-aarch64.map -L/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release -Wl,-rpath,/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/target/release -lmcs_tas_accordin_direct -ldl -pthread
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[2]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl/src'
+make[1]: Leaving directory '/mnt/sde/jz/accordin/target/leveldb-branches-20260906/simplify-src/third_party/litl'

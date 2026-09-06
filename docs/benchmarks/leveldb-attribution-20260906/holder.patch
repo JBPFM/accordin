@@ -1,0 +1,30 @@
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -78,14 +78,27 @@
+ 
+   if (!stats_only_mode) {
+     bool known = user_state(p, &state);
++    bool holder = known && (state & USER_FLAGS) == USER_HELD;
+     tctx = bpf_task_storage_get(&task_ctx_map, p, 0,
+                               BPF_LOCAL_STORAGE_GET_F_CREATE);
+     if (tctx) {
+       if (known)
+         refresh_episode(p, tctx, state);
++      /* Where the task runs next, decided once: an admitted task returns to
++       * its reserved CPU, a holder preempts whatever occupies the CPU it is
++       * bound to, because a holder left in the global queue stalls every
++       * spinner that wants its lock, and a new lock waiter joins the
++       * admission queue. A condition-variable waiter is left in the global
++       * queue: it parks itself on a signal, and only a free slot drains the
++       * admission queue, which would hold it indefinitely. */
+       if (tctx->admission_cpu) {
+         cpu = tctx->admission_cpu - 1;
+         dsq = SCX_DSQ_LOCAL_ON | cpu;
++        if (holder)
++          enq_flags |= SCX_ENQ_PREEMPT;
++      } else if (holder && allowed(p, cpu)) {
++        dsq = SCX_DSQ_LOCAL_ON | cpu;
++        enq_flags |= SCX_ENQ_PREEMPT;
+       } else if (known && (state & USER_FLAGS) == USER_WAITING) {
+         tctx->ticket = request_ticket(p, state);
+         dsq = WAITING_DSQ;

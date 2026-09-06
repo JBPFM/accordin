@@ -1,0 +1,28 @@
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -139,12 +139,22 @@
+   volatile __u64 *owner = owner_slot(cpu);
+ 
+   (void)to;
+-  /* Renew only our existing slot; userspace still confirms the new ticket. */
+   if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
+-      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
++      (state & USER_FLAGS) == USER_WAITING) {
+     __u64 next = request_ticket(from, state);
+-    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++
++    if (tctx->admission_cpu == cpu + 1) {
++      /* Renew only our existing slot; userspace still confirms the new ticket. */
++      if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++        tctx->ticket = next;
++    } else if (!tctx->admission_cpu &&
++               !__sync_val_compare_and_swap(owner, 0, next)) {
++      /* The yielding task is the current one here, so no dispatch can be
++       * reserving this CPU; taking the free slot saves the round trip through
++       * the waiting queue. */
++      tctx->admission_cpu = cpu + 1;
+       tctx->ticket = next;
++    }
+   }
+   from->scx.slice = 0;
+   return false;

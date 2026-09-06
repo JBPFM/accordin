@@ -1,0 +1,106 @@
+[
+  {
+    "benchmark": "barrier",
+    "backend": "mcs_accordin",
+    "variant": "baseline",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      0.314657753,
+      0.29058153,
+      0.288806032
+    ],
+    "mean": 0.298015105
+  },
+  {
+    "benchmark": "barrier",
+    "backend": "mcs_accordin",
+    "variant": "tick",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      0.300643267,
+      0.297071617,
+      0.293235132
+    ],
+    "mean": 0.29698333866666665
+  },
+  {
+    "benchmark": "barrier",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      0.284682019,
+      0.30384109,
+      0.33274423
+    ],
+    "mean": 0.30708911299999997
+  },
+  {
+    "benchmark": "barrier",
+    "backend": "mcs_tas_accordin",
+    "variant": "tick",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      0.287590289,
+      0.288181515,
+      0.296605784
+    ],
+    "mean": 0.2907925293333333
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_accordin",
+    "variant": "baseline",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      73.91814706,
+      73.79890224,
+      72.87854565
+    ],
+    "mean": 73.53186498333334
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_accordin",
+    "variant": "tick",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      72.09324604,
+      70.86782357,
+      70.95986747
+    ],
+    "mean": 71.30697902666667
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      74.13969563,
+      74.69361591,
+      73.92760025
+    ],
+    "mean": 74.25363726333333
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "tick",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      74.89973184,
+      73.70311579,
+      71.9773758
+    ],
+    "mean": 73.52674114333334
+  }
+]

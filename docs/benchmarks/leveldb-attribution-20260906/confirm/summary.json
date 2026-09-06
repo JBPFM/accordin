@@ -1,0 +1,122 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "variant": "baseline",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      586589.139,
+      573762.988,
+      594045.907
+    ],
+    "mean": 584799.3446666667,
+    "cv_percent": 1.7543156231312063,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "variant": "tick",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      596861.648,
+      593739.264,
+      571864.734
+    ],
+    "mean": 587488.5486666667,
+    "cv_percent": 2.3184093528127963,
+    "relative_to_baseline": 1.0045985072051216
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      933774.035,
+      932664.258,
+      939868.814
+    ],
+    "mean": 935435.7023333333,
+    "cv_percent": 0.4146816127475377,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "tick",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      937612.129,
+      935086.514,
+      942333.356
+    ],
+    "mean": 938343.9996666666,
+    "cv_percent": 0.3920137977899329,
+    "relative_to_baseline": 1.003109029649049
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "variant": "baseline",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      47871.342,
+      54475.116,
+      52610.103
+    ],
+    "mean": 51652.187,
+    "cv_percent": 6.591213352464114,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "variant": "tick",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      80482.552,
+      76349.773,
+      82083.511
+    ],
+    "mean": 79638.612,
+    "cv_percent": 3.714989647091329,
+    "relative_to_baseline": 1.5418245891505038
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      59130.142,
+      55708.175,
+      56027.484
+    ],
+    "mean": 56955.267,
+    "cv_percent": 3.318835184414436,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "tick",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      159631.56,
+      170961.443,
+      161281.051
+    ],
+    "mean": 163958.018,
+    "cv_percent": 3.7332496003031506,
+    "relative_to_baseline": 2.8787156418738236
+  }
+]

@@ -1,0 +1,35 @@
+[
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "attempts": 1,
+    "n": 1,
+    "values": [
+      76.72929737
+    ],
+    "mean": 76.72929737
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "adaptive",
+    "attempts": 1,
+    "n": 1,
+    "values": [
+      95.28204276
+    ],
+    "mean": 95.28204276
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "fixed",
+    "attempts": 1,
+    "n": 1,
+    "values": [
+      250.64113211
+    ],
+    "mean": 250.64113211
+  }
+]

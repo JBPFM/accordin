@@ -43,7 +43,11 @@ MCS_ACCORDIN_DIRECT_DISABLE_BPF=1 third_party/litl/libmcsaccordin_original.sh ./
 MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 third_party/litl/libmcstasaccordin_original.sh ./program
 ```
 
-适配器通过 LiTL 的 `NO_INDIRECTION` 路径在 pthread mutex 中保存内部对象指针，线程节点仍由 direct 运行时管理；构建这两个适配器不需要 CLHT、ssmem 或 PAPI。条件变量支持始终启用，不使用 shadow mutex。waiter 在释放业务锁之前登记，释放后准备一个不占用 CPU 名额的 relock epoch。signal 通知一个已登记 waiter，broadcast 通知全部；被通知者转入 mutex 的停泊队列，首个接力者立即获得 futex wake，其余由接力者的 unlock 逐个唤醒。通知发生在 mutex 外或 mutex 空闲时也能启动接力。
+适配器通过 LiTL 的 `NO_INDIRECTION` 路径在 pthread mutex 中保存内部对象指针，线程节点仍由 direct 运行时管理；构建这两个适配器不需要 CLHT、ssmem 或 PAPI。条件变量支持始终启用，不使用 shadow mutex。waiter 在释放业务锁之前登记，释放后准备 relock epoch。signal 通知一个已登记 waiter，broadcast 通知全部；被通知者转入 mutex 的停泊队列，首个接力者立即获得 wake，其余由接力者的 unlock 逐个唤醒。正在自旋的接力者通过原子状态接收 wake，已进入停泊阶段的接力者使用 futex wake。通知发生在 mutex 外或 mutex 空闲时也能启动接力。
+
+条件等待采用来自 `fullhook-admission@f7fedc9` 的自适应策略：每个 condvar 记录自旋结果（失败 +2，成功 -1，范围 0–8）。评分达到 3 且 NORMAL_DSQ/WAITING_DSQ 有任务排队时直接停泊；否则可尝试一次 admission，获准后在同一 epoch 下自旋，上限由自旋预算控制。没有名额、预算耗尽或抢占后失去名额时进入 futex 等待。收到逻辑通知就结束 CV 自旋；如果尚未获得 mutex 接力 wake，仍需停泊等候接力。signal 和 broadcast 继续共用原接力队列。嵌套等待不借用新名额，重获锁与取消清理保留原语义。
+
+默认配置按后端区分：MCS 直接停泊，MCS-TAS 以 50 µs 为自旋上限。MCS 的写入收益在基线复查后未能稳健确认，且 streamcluster 有代价，因此默认保留停泊；设置非零 `ACCORDIN_CV_SPIN_US` 可在 MCS 上启用同一自适应机制。需求提示只表示队列是否非空，BPF 仅在提示变化时写入，减少共享缓存行更新。
 
 实际唤醒前发布 `USER_WAITING`，现有 BPF enqueue 可直接将其放入 `WAITING_DSQ`；重获锁复用该 epoch，先检查已有授权，再决定是否 yield。不会把休眠者放入 raw MCS 队列。仍持有其它 mutex 的嵌套等待保留外层 admission，并立即唤醒。普通 lock/trylock 仍直接调用 direct API；unlock 增加一次停泊状态的原子读取，仅存在待接力状态时获取队列 guard。唤醒、超时和 deferred cancellation 均恢复业务锁；取消与 signal 并发时补偿通知其它 waiter，已通知但仍停泊的 waiter 不因原条件变量截止时间到期而丢失通知。这些行为不受 `NDEBUG` 影响。
 
@@ -84,7 +88,8 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 2. 外层加锁进入慢路径时，发布 WAITING 并 yield。若线程仍拥有当前 CPU 的名额，BPF 用 CAS 将旧 ticket 更新为本次请求；否则进入全局 FIFO 等待队列。
 3. CPU 有空闲名额时，从队列中取一个 affinity 允许的线程，先保留名额；用户态确认名额属于本次请求后，才进入原始锁的自旋队列。
 4. 每次外层加锁使用递增的请求编号，用户态始终校验本次 ticket。解锁清除用户态状态，调度器观察到释放或未续用的新请求时回收名额，无需额外解锁 syscall；若下一次慢路径赶在回收前进入 yield，可以更新并续用自己的名额。
-5. 已获准线程处于 WAITING/SPINNING 且普通队列非空时，tick 结束其当前时间片，为普通任务提供运行机会，同时保留原 admission 名额。这使锁外执行的工作也能继续推进，不改变 raw 锁队列与 condvar 接力协议。
+5. 已获准线程处于 WAITING/SPINNING 且普通队列非空时，tick 结束其当前时间片，为普通任务提供运行机会。普通锁等待者保留名额；尚未收到接力 wake 的 CV 自旋者在被抢占时归还名额，恢复运行后可停泊。
+6. CV 等待者只在一次 yield 中尝试续用或借用当前 CPU 的空名额；未获准的 CV 等待者进入普通队列以便恢复并停泊。通知发布时清除 CV 标志，重获锁随后使用普通 WAITING_DSQ 和同一 epoch。
 
 等待队列按 FIFO 扫描；已有名额的线程可以连续续用，因此不保证严格 FIFO 或有界等待。
 
@@ -92,7 +97,7 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 
 实现只需要一个普通队列、一个新等待者队列，以及每 CPU 一个 owner 记录。已获准线程重新入队时，直接进入名额所属 CPU 的 local 队列。已删除按锁分类、随机选队列、概率参数、扫描预算、序列门控和定时强制放行。
 
-核心不再包含条件变量（CV）、writer-event、width control、锁类合并、动态 CPU affinity、CS/NCS/wait 采样或 timeslice extension。CPU 范围继承应用的 affinity，可通过外部 `taskset` 设置。
+核心只提供条件等待使用的 relock/admission 辅助函数，条件队列与 futex 协议位于 LiTL 适配器。不包含 writer-event、width control、锁类合并、动态 CPU affinity、CS/NCS/wait 采样或 timeslice extension。CPU 范围继承应用的 affinity，可通过外部 `taskset` 设置。
 
 ## 运行开关
 
@@ -103,8 +108,9 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 | `<PREFIX>_DISABLE_BPF` | 默认关闭；设为 `1` 时不加载 BPF。 |
 | `ACCORDIN_DISABLE_ADMISSION` | 默认关闭；设为 `1` 时不发布 admission 标志。 |
 | `<PREFIX>_STATS_ONLY` | 保留历史名称的对照模式；设为 `1` 时加载普通 sched_ext 调度，不进行锁感知路由，也不采样锁时间。 |
+| `ACCORDIN_CV_SPIN_US` | 条件等待的最大自旋微秒数，MCS 默认 `0`、MCS-TAS 默认 `50`，接受 `0`–`1000000`；`0` 仅关闭自旋，条件变量与接力仍启用。无 BPF、无 admission 或 stats-only 时不进行 CV 自旋。 |
 
-旧 CV、width、固定 width、依赖图、动态 CPU 和采样环境变量已不再解析。CV/writer-event 和动态 CPU 控制的 C 符号及旧时间统计输出已移除。旧 `DEBUG_COUNTERS`、`INACTIVE_PREVIOUS_LOCK_PERCENT` 参数和 `[lock_stats]` 计数输出也已移除。调度异常时，BPF dump 保留队列长度和 CPU owner 信息。
+除上述自旋预算外，旧 CV、width、固定 width、依赖图、动态 CPU 和采样环境变量已不再解析。旧 CV/writer-event 和动态 CPU 控制的 C 符号及旧时间统计输出已移除。旧 `DEBUG_COUNTERS`、`INACTIVE_PREVIOUS_LOCK_PERCENT` 参数和 `[lock_stats]` 计数输出也已移除。调度异常时，BPF dump 保留队列长度和 CPU owner 信息。
 
 ## 实验与历史入口
 
@@ -112,9 +118,11 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 
 `fullhook-admission` 与 `simplify` 的 LevelDB readrandom/fillrandom 192 线程对比见 [分支性能报告](docs/benchmarks/leveldb-branches-20260906/README.md)，包含三轮测量及 MCS fillrandom 的超时记录。
 
-逐项归因、选择性迁入和完整应用回归见 [归因报告](docs/benchmarks/leveldb-attribution-20260906/README.md)。本轮仅迁入 tick 普通任务调度机会，192 线程下 readrandom 基本持平，fillrandom 的 MCS/MCS-TAS 分别提升约 54%/188%。
+前一轮的逐项归因、选择性迁入和完整应用回归见 [归因报告](docs/benchmarks/leveldb-attribution-20260906/README.md)。该轮仅迁入 tick 普通任务调度机会，192 线程下 readrandom 基本持平，fillrandom 的 MCS/MCS-TAS 分别提升约 54%/188%。
 
-此前的候选方案见 [condvar 授权自旋与 relock 设计](docs/plans/2026-09-05-cv-spin-relock-design.md)。其中 signal 独立唤醒在后续消融中明显回退，未迁入；当前保留 simplify 的通知接力，增加上述 tick 普通任务调度机会。
+随后从 `fullhook-admission@f7fedc9` 迁入自适应条件等待，设计、预算对照和 192 线程应用结果见 [CV 迁移报告](docs/benchmarks/cv-adaptive-20260906/README.md)。MCS 默认停泊；MCS-TAS 默认使用 50 µs 预算，fillrandom 有收益，streamcluster 仍存在耗时和波动的代价。
+
+此前的候选方案见 [condvar 授权自旋与 relock 设计](docs/plans/2026-09-05-cv-spin-relock-design.md)。其中 signal 独立唤醒在后续消融中明显回退，未迁入；当前自适应 CV 自旋同样保留 simplify 的通知接力。
 
 当前 local 队列与授权更新的合入验证见 [验证记录](docs/benchmarks/local-owner-regression/integration.md)。
 

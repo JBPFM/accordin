@@ -1,0 +1,13 @@
+[
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "balanced-fixed",
+    "attempts": 1,
+    "n": 1,
+    "values": [
+      100.90418055
+    ],
+    "mean": 100.90418055
+  }
+]

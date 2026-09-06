@@ -1,0 +1,28 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "defaults",
+    "n": 1,
+    "attempts": 1,
+    "values": [
+      924574.732
+    ],
+    "mean": 924574.732,
+    "cv_percent": null,
+    "relative_to_baseline": null
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "defaults",
+    "n": 1,
+    "attempts": 1,
+    "values": [
+      181568.098
+    ],
+    "mean": 181568.098,
+    "cv_percent": null,
+    "relative_to_baseline": null
+  }
+]

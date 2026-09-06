@@ -1,0 +1,198 @@
+{
+  "base": "934bd1c80bcc15f063656d49afc4d7e5edf53fe8",
+  "upstream": "f7fedc94c46ff98f3ad20ada1fecc414b3fe233a",
+  "branch": "simplify",
+  "selected": "defaults",
+  "default_spin_us": {
+    "mcs_accordin": 0,
+    "mcs_tas_accordin": 50
+  },
+  "source_hashes_matching_tested_variant": {
+    "Makefile": "d01e848baaf5852e10d0ec849b8f6b6b6e09b93aa4fd024d05b311be2eada856",
+    "include/accordin_relock.h": "c657f481daa7733f26ec5743724199e0ac36ff20c93cd02cd5e5679845b2b70e",
+    "include/mcs_accordin_direct.h": "fecd7686ea6f9aea391dd4d12ba0d0f3d5579eb78f76eeac0f0c2ab5bd7d7507",
+    "include/mcs_tas_accordin_direct.h": "211ab8c5dd0eb2e6675ea261a402c3fa75e8d73247f44a0948383e18496ba919",
+    "src/mcs_tas.h": "d0774306b6ebe0c6c3bf20f92f57ccdf3f5a20096c9a9854f542cc602105017c",
+    "src/mcs.h": "df78f63602e2829889a9f8fc9ebd77b72a22dac6da8d96313eed593a8db6dce0",
+    "src/runtime.h": "ababd8cb5c0c8369b0c00caf7fbe4bd3ce5579e79b85f863e6963a3aaac8c336",
+    "src/raw_lock.h": "4b28864cf2b72132c9602675746ce7bb762b40ac820df73a9cb8382823e5ede1",
+    "src/runtime.c": "d7505e00371df08ea1a87331dde21e32a10fc339c4ebec7bf0acfab70387d7cf",
+    "src/direct.c": "ffd1d6a231cd064dedaceede851471c9f655f5c94fd927e46aff97eb92a16e29",
+    "scripts/tests/direct_api_smoke.c": "e9ef056f4032f0967756b267881c3d45056b9b310d4146882bf06e6fbd8a7d69",
+    "scripts/tests/relock_spin.c": "2f262d42c09106bbc32a85b27704d9a4e795778a5bcce8d738c92aa19bff36bc",
+    "src/bpf/main.bpf.c": "84f742ac2bd5967c482733a095c33cef5a6ec0134ac35e66836c3ca113c7f717",
+    "src/bpf/intf.h": "8ea8663820520070f97d1518c2c29666cd44bdc93dd487fc9c76bee80e37d2ce",
+    "src/bpf/maps.bpf.h": "ab610e90daf0497ef3126453dd9393b8d58af5f6d3f7425f4f0a4defc71d85a0",
+    "third_party/litl/Makefile": "711519d1be521ab2858f2c26614be8e751acd97409b8ede5a7c08da15b7fbc6f",
+    "third_party/scx/scx/user_exit_info.h": "5874cccec46ff964ac11bd66c0f7a432b4c9ed6f2d970ec7a6be1e06d116c422",
+    "third_party/scx/scx/common.h": "8ab4a23e0ec1847253ac21576f0c76c3b3bd347080a31571a4b47ea8cf35050e",
+    "third_party/scx/scx/enum_defs.autogen.h": "e218d3c0ce7bbf264e654441a8fef85a5be9b0dc031e86655e5609b6083a51c6",
+    "third_party/scx/scx/enums.autogen.bpf.h": "ae14f3a646335121295bff5ad078aaa214f3a9fe6b99fd2376b21ffaa3b9546a",
+    "third_party/scx/scx/compat.bpf.h": "bcfc777d6db52db25a55521ec225196b031e12eaf37fcbc092d32bd370822712",
+    "third_party/scx/scx/compat.h": "a56f091deb0681cef485319e9b1207a50eb6794c74a33f16c3133be6cbe17fb1",
+    "third_party/scx/scx/enums.autogen.h": "350007734b7963ed0ef8ee723bd1358868bfe57f637b09dfaa5855112b56d9ca",
+    "third_party/scx/scx/common.bpf.h": "1e05ad5012523fb87329e027751b7eee030dc750953d17bc2d585a254699692e",
+    "third_party/scx/scx/user_exit_info_common.h": "11330e9e9494ac32232fd8c91ac4914beab8bcbe290ef65886693076f0649f69",
+    "third_party/scx/scx/user_exit_info.bpf.h": "13b1b94cd3d2253fe7752e366c7f8263ed9153366daed7126178a22ee5d545cf",
+    "third_party/scx/scx/enums.h": "93a601e50a9eaf85d724cc4498c5b70526f9c89cf9a419eb3c2c4b81c1f5e35c",
+    "third_party/scx/scx/enums.bpf.h": "b7e75ff4337edcbb16f38bdf32a7c0caecba985366116129319592ec05eecb0d",
+    "third_party/litl/tests/no-shadow.c": "aa63b425a5db628f1c390464211e6c02edc61e26715e2f67953e5c457d2b95a3",
+    "third_party/litl/tests/accordin.c": "910bd8f09430e96613eaef24fde6d144457bd84c88af3b8b39fbe08efe60034e",
+    "third_party/litl/include/cbomcs.h": "3cce9ef8ac3be6482614f89f2891a3832ba5ccde06aab216ee2616624a3573d4",
+    "third_party/litl/include/spinlock.h": "9cb620386bf15e29075ca40816fb1269eeee627fac8675e63ece18be8f30e9a0",
+    "third_party/litl/include/hyshmcs.h": "b14519ef232b42c4957cbffab1006c147e3c5aa5134289f6ec9860a0f35dedbc",
+    "third_party/litl/include/backoff.h": "6e161d4476c33697a84374cb2beb92562435621260b6774962a7e7bad0224cab",
+    "third_party/litl/include/pthreadinterpose.h": "5763ec3666012778f9418b62e7787188d70a400ed188353121298145e39d169e",
+    "third_party/litl/include/accordin-internal.h": "7addf2262827184d24689353106641257ae5483c9c75aef07714dda6057172e4",
+    "third_party/litl/include/mutexee.h": "52ac646476b58cd1db60f45629d35abdf2bbbd9b842d57df5208cc3f740e79f8",
+    "third_party/litl/include/concurrency.h": "f8ca3dba0b87a5e2628f746b6a97524993e733aec079cbd4a9be46030e818572",
+    "third_party/litl/include/ctkttkt.h": "9a189b531ce8687fc99a3f48473343dda4710e7cab0d4e5e6290496cef793f64",
+    "third_party/litl/include/mcs.h": "3914d1d9ff93a294f07973af7f6d615087872b001c96550c643063d6858ff4cc",
+    "third_party/litl/include/ttasepfl.h": "c796c8fe4b77d53bab31fefc3563324064a492681d1897f9e97ab900e02293d1",
+    "third_party/litl/include/htlockepfl.h": "8a7e4cb457acd9744a8b09cf4a0894fd1f34b840b01fb17993e12e8d28a89563",
+    "third_party/litl/include/ticketepfl.h": "c1f5478d59bfabc4ed4edbe7a85ee18c7401d86560067eff8f0927043b545592",
+    "third_party/litl/include/topology.h": "8389e88f464c732bec8cf790ad7da4bd90f2fde131db110864b641d570b1c466",
+    "third_party/litl/include/hmcs.h": "3918ae257ef4477d6b045d54883c4e8dd73c9f251cb95f500f0f3dcc5398a0ab",
+    "third_party/litl/include/clhepfl.h": "c445a963bf167ada4fbc410c93b7d3e60e5d3f4239c0d8fbae4328d157ac6be8",
+    "third_party/litl/include/mcsepfl.h": "2f0b303ebfb86537d8e0223a356c0de68c94ff2e23f37b21050e1a514d498a14",
+    "third_party/litl/include/ticket.h": "780a5fbef779b2c258db49633d0c4481506f17d76e9a861853c19d5d544a6f08",
+    "third_party/litl/include/pthreadadaptive.h": "40799ab0c4a2c90ab3ffa56ef64110d1e6df039f8b03d77d707b8c70819d596d",
+    "third_party/litl/include/empty.h": "0f44ae3a3894bf157b95dbd743cd9679145b8bfc3da88f9dfb5416cc0d695c7f",
+    "third_party/litl/include/alockepfl.h": "4b64b8041e55447c542e45e32a2caf318aa8b3ca222995b516140e25a5406a2d",
+    "third_party/litl/include/spinlockepfl.h": "515c73267ff2e225f8db462c06f1a2a435a157e22743a7e4e6c9cf2e539cd323",
+    "third_party/litl/include/accordin.h": "e6f34ce3e4d1d10e308825943e3900a440117906d7929dc273d4613b7b3c6f89",
+    "third_party/litl/include/partitioned.h": "ae704014ba9ce7dc8e213619efc6143e18f29902f45152a194243df10bd457f6",
+    "third_party/litl/include/mutexee_in.h": "763dbc660605990f26be2abafb48a4ca27fb93f79402f3de305920d80fa1af5c",
+    "third_party/litl/include/malthusian.h": "ee94d808862e49b859221fda2ccc3425ce06e274234334bae211fc08af1ad02b",
+    "third_party/litl/include/clh.h": "cad60630b316293ec31b4a2f56cd06a96659e894512142107fbc53f8a1c703e7",
+    "third_party/litl/include/cptltkt.h": "47a704b0ddc08c82b1b34a8fbf2292d6d49642d2fcc8f7108fb2cf82c8b490de",
+    "third_party/litl/include/ttas.h": "f542d359bf72981278abda4b1487defcad1fd1752c6ae6c5363e0dab2b5191da",
+    "third_party/litl/include/mcstp.h": "3acb563a2d2fcc7ffb808c1d900eb0e5b852aea42bb01f67c731939af15aced9",
+    "third_party/litl/include/padding.h": "541650ed87834135cda0c54edef0ddc54a888385f42db9c89e31ae30ca9aa1b9",
+    "third_party/litl/src/ticket.c": "5f7ad8813a721557bc87b0e35f5a00920f593131e02cad13e1cbe99124aaa5c6",
+    "third_party/litl/src/cptltkt.c": "353f1a99f9cb4fdfee0cded97e823a55725f4aaa8ebd0188f826996b0125cf73",
+    "third_party/litl/src/clhepfl.c": "7d7498f3259584407cced76c932fd6f5a9c3413bf959e3d77671509961ae4410",
+    "third_party/litl/src/partitioned.c": "9152503f47937286f3991fb0e3c45cce1a3b46a518b17c107dc5cc950b6966cd",
+    "third_party/litl/src/malthusian.c": "e891abb60e0a6507d5ed8e65bb26088f7f40bb356075091a318e4193c2c22cde",
+    "third_party/litl/src/alockepfl.c": "b20e8f4ac3c12a0e0f5100bf30388cbe6068efd36329474b9ae04304d0931884",
+    "third_party/litl/src/empty.c": "5d16cc50d9ac551d09ecb069c30ece6f370688b3735e0ab31b59231474eb01fb",
+    "third_party/litl/src/Makefile": "4b9084e1ca786e1e017cd0265313240f7414048869031a1b58e2a4f193ffdf0b",
+    "third_party/litl/src/ticketepfl.c": "637d96317aff58a9af6db08edc15f34e6ccd9dd85d1a1bae21b229ec240a9dc7",
+    "third_party/litl/src/cbomcs.c": "a20995d26c34dcc8ea94cd0d09b1b65c6155c5063603924d5b69855a9bf51ac0",
+    "third_party/litl/src/accordin.c": "4407ab70a5e04994715114f0525f7fbe0a4a1f8c9f61e16d100450196b6a22cf",
+    "third_party/litl/src/mutexee.c": "463ed45acfc4a5641074dfacc3c9971502a754bc94329b7d3878c5f669bd9a0a",
+    "third_party/litl/src/utils.h": "a4b5aecc890740227e8a27fe20e732d102c763581fe08eb4ab9c660d986f570e",
+    "third_party/litl/src/mcstp.c": "94d902fb54cf0c22f3c6035eade2a11cfd09e07316752a41b2be9695bf634925",
+    "third_party/litl/src/waiting_policy.h": "47a05866b56ce0937d83f1b9b642ae11042803b16db1c6a48372bc81bc213d66",
+    "third_party/litl/src/interpose.h": "40ca09791f73d5b6fe69f2f69bcb37c2840c23426916158bee5003e5499c4350",
+    "third_party/litl/src/ctkttkt.c": "d52ae95702b62be9b7197b9e764328f4799bde6f983f93b5446a31c820cf3903",
+    "third_party/litl/src/spinlockepfl.c": "f1beb8ddab25cdd687e2beb14bb5604a2401a6c5284a4b590ca717bf04a3da4b",
+    "third_party/litl/src/utils.c": "989d98da8ac74d45cf202acfd2bf469bcb268852808216a5830189e8ff581e3c",
+    "third_party/litl/src/concurrency.c": "4546d295514e644984a37248b7d581a25a65a95a38fb03f7bcfcaceb41809622",
+    "third_party/litl/src/accordin-cond.c": "bed375f188ae4790b1b6c1577fe75d8b530e64ab36e669bd008c4ddd7041dcb8",
+    "third_party/litl/src/spinlock.c": "c9a34858aaa08555a92a7e4a1ec40db192a17592db9631fe47e68a30d8c84fba",
+    "third_party/litl/src/mcs.c": "258fcda40d95fd787cae712ea91b2f2e7a6b0a2b7876f5f5a52264d47f92db31",
+    "third_party/litl/src/clh.c": "e3b8d3fcfa3b3d927bd3a77da39a2dc8e4e9372a3c7f0ffb1c2704900a2d267e",
+    "third_party/litl/src/pthreadinterpose.c": "9b1bf3b08c540850d5328eb96406122a6b4b92fd70b205e2ae2af315ae5e5272",
+    "third_party/litl/src/mcsepfl.c": "4d9e16c07e1ed0569d69f8694436f7b31fe891e473dd458fbc0a7c685834ba24",
+    "third_party/litl/src/hmcs.c": "cb06b550028133db7f9edb68dfe3d2519ef9bdad3b4f81cd774a120c7ed70eac",
+    "third_party/litl/src/ttas.c": "2262399a6a9c37728f1d013f3319ca8e50062f44d9daaa6c92d8cd3945579db5",
+    "third_party/litl/src/interpose.c": "d091e6ffff38970462f6b6ccd08b217456bcfdade0912d56543b7d29139add95",
+    "third_party/litl/src/pthreadadaptive.c": "2e06128ab60de29c74818043fafbca8f527eaa1b651880f7d9bc08feb0e827d0",
+    "third_party/litl/src/backoff.c": "a5ee1cda23fcf1fc823087872821893cda32785ee40e0ab2a9ec9d6aaf9cd69b",
+    "third_party/litl/src/ttasepfl.c": "154ce15cae2c7bebc32199a27c3d0455c9042946e39ff5992439584f1b6d46af",
+    "third_party/litl/src/hyshmcs.c": "99fb374f6b943873a6ac7dafe88bca5a09d45879e546c5bd0585f4a5d77aa1e9",
+    "third_party/litl/src/htlockepfl.c": "33888e6e84c8129dfa7417fce87944e7147bed1c90dc8969a518e7b80a762413"
+  },
+  "library_hashes": {
+    "target/release/libmcs_accordin_direct.so": "70ddea9577ab1cc50a116f088e468059a1c2b39d20604e2c01fdb5d2cd5129c7",
+    "target/release/libmcs_tas_accordin_direct.so": "243573aceedd822bb8f4ca5143866ce32e84c2937798cdf64c5c103ae5c39a72",
+    "third_party/litl/lib/libmcsaccordin_original.so": "e34a04e45be7bf0a05c80d38b9a277b2047c46c20e75abc7ba1e381006e558b4",
+    "third_party/litl/lib/libmcstasaccordin_original.so": "ef6b201aeee7db801339b947781b7c6f2a29930cfa013ebe50b2b767b044ba55"
+  },
+  "commands": [
+    {
+      "command": "make -j8 check check-litl",
+      "returncode": 0,
+      "log": "defaults-check-no-bpf.log",
+      "log_sha256": "46c22001fc7a6e8177ee6bb087bdcffdd7a21e9d9c7753f6b59bc7ed62c85eab"
+    },
+    {
+      "command": "make check-bpf check-litl-bpf",
+      "returncode": 0,
+      "log": "defaults-check-bpf.log",
+      "log_sha256": "9b7b6a557db82268755892f3ee59ed658884ac0eff09ce087d852af3b0d2f8a0"
+    },
+    {
+      "command": "taskset -c 0,1 env LITL_TEST_THREADS=24 LITL_TEST_ITERATIONS=1000 make check-bpf check-litl-bpf",
+      "returncode": 0,
+      "log": "defaults-check-oversubscribed.log",
+      "log_sha256": "a2e16741224109919c0d209eba05bf1f412224c97947c5977166ef288cb0c016"
+    },
+    {
+      "command": "env ACCORDIN_CV_SPIN_US=50 make check-bpf check-litl-bpf",
+      "returncode": 0,
+      "log": "defaults-check-spin50.log",
+      "log_sha256": "9b7b6a557db82268755892f3ee59ed658884ac0eff09ce087d852af3b0d2f8a0"
+    }
+  ],
+  "strict_headers": {
+    "log": "defaults-check-headers.log",
+    "returncode": 0,
+    "log_sha256": "80b77e1606a8187f12ee3004abed7086ae6aaabf104d823d0c293098382a2dbd"
+  },
+  "patch_replay": [
+    {
+      "patch": "adaptive.patch",
+      "sha256": "8abab66d79f92b6c74c6a0fa513676b70f7a74c7c22931b33819e056fb82b678",
+      "checked_files": 111,
+      "generated_before_check": "make -C third_party/litl include/topology.h"
+    },
+    {
+      "patch": "fixed.patch",
+      "sha256": "a6d1c403eea7453209aec5885a30dd12f76921188cbf9b1347682354c87ed374",
+      "checked_files": 111,
+      "generated_before_check": "make -C third_party/litl include/topology.h"
+    },
+    {
+      "patch": "notified.patch",
+      "sha256": "814ba3b6178e1959bf588b571a3260d44d73feb8a89266a296c7d4bb9aac1f0a",
+      "checked_files": 114,
+      "generated_before_check": "make -C third_party/litl include/topology.h"
+    },
+    {
+      "patch": "balanced.patch",
+      "sha256": "58c19fbd3aac7a26fdceae01003142bb6b4528ffdf76c5856d8187a1011e7845",
+      "checked_files": 111,
+      "generated_before_check": "make -C third_party/litl include/topology.h"
+    },
+    {
+      "patch": "balanced-fixed.patch",
+      "sha256": "816674f4195c27e7e5f239d8d683d3e8738fd2f236cad8ace3929dd828a936eb",
+      "checked_files": 111,
+      "generated_before_check": "make -C third_party/litl include/topology.h"
+    },
+    {
+      "patch": "pressure.patch",
+      "sha256": "d850409bcf8aca5c359253373157bc2044af13c1e118c9afc3c0084451409f6f",
+      "checked_files": 114,
+      "generated_before_check": "make -C third_party/litl include/topology.h"
+    },
+    {
+      "patch": "defaults.patch",
+      "sha256": "b7c13660ca8863e4374f6dce7d526cc1ae3b18397c768d008cea27672d132def",
+      "checked_files": 114,
+      "generated_before_check": "make -C third_party/litl include/topology.h"
+    },
+    {
+      "patch": "production.patch",
+      "sha256": "97fd48a59115b5ee81391ad9999d798a84298ca84c49dc2047abbcf657bd877c",
+      "checked_files": 95,
+      "generated_before_check": "make -C third_party/litl include/topology.h"
+    }
+  ],
+  "application_runs": 90,
+  "valid_runs": 90,
+  "state_after": "disabled",
+  "source_verified_utc": "2026-09-06T08:28:24.969877+00:00"
+}

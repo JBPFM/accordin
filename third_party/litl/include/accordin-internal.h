@@ -9,7 +9,7 @@ struct accordin_park_waiter {
     struct accordin_park_waiter *prev, *next;
     struct accordin_mutex *mutex;
     accordin_relock_request_t request;
-    uint32_t wake;
+    uint32_t wake, parked, notified;
     unsigned int armed, queued;
 };
 

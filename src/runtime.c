@@ -20,6 +20,13 @@
 _Thread_local struct thread_state thread_state;
 struct admission_state *scheduler_admission;
 bool admission_enabled;
+/* Keep MCS on parking by default: its measured write gain was not stable
+ * enough to justify the streamcluster cost. Both backends accept an override. */
+#ifdef MCS_TAS
+uint64_t cv_spin_ns = 50000;
+#else
+uint64_t cv_spin_ns;
+#endif
 static struct accordin *skel;
 static struct bpf_link *scheduler_link;
 static int thread_map_fd = -1;
@@ -68,6 +75,13 @@ static int libbpf_log(enum libbpf_print_level level, const char *fmt, va_list ar
 
 __attribute__((constructor)) static void scheduler_start(void)
 {
+    const char *spin = getenv("ACCORDIN_CV_SPIN_US");
+    if (spin && *spin >= '0' && *spin <= '9') {
+        char *end;
+        unsigned long us = strtoul(spin, &end, 10);
+        if (!*end && us <= 1000000)
+            cv_spin_ns = (uint64_t)us * 1000;
+    }
     admission_enabled = !env_flag("ACCORDIN_DISABLE_ADMISSION");
     if (env_flag(PREFIX "_DISABLE_BPF"))
         return;

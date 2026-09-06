@@ -43,7 +43,7 @@ static __always_inline void release_slot(struct task_struct *p,
 }
 
 static __always_inline __u64 request_ticket(struct task_struct *p, __u32 state) {
-  return ((__u64)(state & ~USER_FLAGS) << 32) | (__u32)p->pid;
+  return ((__u64)(state & ~USER_META) << 32) | (__u32)p->pid;
 }
 
 /* Unless renewed at yield, a new request retires the old slot.
@@ -56,6 +56,15 @@ static __always_inline void refresh_episode(struct task_struct *p,
   } else if (tctx->admission_cpu && !allowed(p, tctx->admission_cpu - 1)) {
     release_slot(p, tctx);
   }
+}
+
+static __always_inline void publish_demand(void) {
+  /* Consumers need only queue presence. Avoid bouncing this shared cache
+   * line on every enqueue/dispatch while demand remains nonzero. */
+  __u32 demand = scx_bpf_dsq_nr_queued(NORMAL_DSQ) ||
+                 scx_bpf_dsq_nr_queued(WAITING_DSQ);
+  if (READ_ONCE(admission.demand) != demand)
+    WRITE_ONCE(admission.demand, demand);
 }
 
 s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -86,7 +95,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       if (tctx->admission_cpu) {
         cpu = tctx->admission_cpu - 1;
         dsq = SCX_DSQ_LOCAL_ON | cpu;
-      } else if (known && (state & USER_FLAGS) == USER_WAITING) {
+      } else if (known && (state & USER_FLAGS) == USER_WAITING &&
+                 !(state & USER_CV)) {
         tctx->ticket = request_ticket(p, state);
         dsq = WAITING_DSQ;
       }
@@ -94,6 +104,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   }
   scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
   scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+  publish_demand();
 }
 
 /* Reserve both the task and this CPU before moving a candidate. Different CPUs
@@ -128,9 +139,9 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   /* Serve ordinary work alongside the reserved waiter. This also lets an
    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
-  if (stats_only_mode || cpu < 0 || cpu >= MAX_CPUS)
-    return;
-  admit_waiter((__u32)cpu);
+  if (!stats_only_mode && cpu >= 0 && cpu < MAX_CPUS)
+    admit_waiter((__u32)cpu);
+  publish_demand();
 }
 
 bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
@@ -139,12 +150,20 @@ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct
   volatile __u64 *owner = owner_slot(cpu);
 
   (void)to;
-  /* Renew only our existing slot; userspace still confirms the new ticket. */
   if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
-      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
+      (state & USER_FLAGS) == USER_WAITING) {
     __u64 next = request_ticket(from, state);
-    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
+    if (tctx->admission_cpu == cpu + 1) {
+      /* Ordinary lock requests only renew an existing slot. */
+      if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
+        tctx->ticket = next;
+    } else if ((state & USER_CV) && !tctx->admission_cpu &&
+               !__sync_val_compare_and_swap(owner, 0, next)) {
+      /* CV waiters try once, then park. Never put them in WAITING_DSQ:
+       * they must resume even when all slots belong to raw-lock waiters. */
+      tctx->admission_cpu = cpu + 1;
       tctx->ticket = next;
+    }
   }
   from->scx.slice = 0;
   return false;
@@ -154,13 +173,14 @@ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
   struct task_scx_ctx *tctx = task_ctx(p);
   __u32 state;
 
+  publish_demand();
   if (stats_only_mode || !tctx || !user_state(p, &state))
     return;
   refresh_episode(p, tctx, state);
   /* An admitted thread that spins never empties its CPU, so ops.dispatch is
    * never called there and the global queue is never consumed. Ending the
-   * slice hands the CPU to one queued ordinary task; the spinner keeps its
-   * slot and is re-enqueued behind it. */
+   * slice serves queued ordinary work. Raw-lock spinners keep their slot;
+   * stopping revokes a CV spinner's slot so it can park on resumption. */
   if (tctx->admission_cpu &&
       ((state & USER_FLAGS) == USER_WAITING ||
        (state & USER_FLAGS) == USER_SPINNING) &&
@@ -175,8 +195,15 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   if (stats_only_mode || !tctx || !user_state(p, &state))
     return;
   refresh_episode(p, tctx, state);
+  /* A CV spinner has no raw node and can park after losing its slot. Once
+   * notified, the publisher clears USER_CV and ordinary relock rules apply. */
+  if (runnable) {
+    if ((state & USER_FLAGS) == USER_SPINNING && (state & USER_CV))
+      release_slot(p, tctx);
+    return;
+  }
   /* A holder or an existing raw-lock node must be allowed to resume. */
-  if (!runnable && (state & USER_FLAGS) != USER_HELD &&
+  if ((state & USER_FLAGS) != USER_HELD &&
       (state & USER_FLAGS) != USER_SPINNING)
     release_slot(p, tctx);
 }

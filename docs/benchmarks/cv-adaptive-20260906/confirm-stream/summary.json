@@ -1,0 +1,54 @@
+[
+  {
+    "benchmark": "stream",
+    "backend": "mcs_accordin",
+    "variant": "baseline",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      74.9058753,
+      75.55104154,
+      74.34776934
+    ],
+    "mean": 74.93489539333333
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_accordin",
+    "variant": "balanced",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      83.77590497,
+      77.76959075,
+      76.88746887
+    ],
+    "mean": 79.47765486333334
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      76.37794936,
+      76.32050996,
+      73.32050028
+    ],
+    "mean": 75.3396532
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "balanced",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      80.66912405,
+      77.29468777,
+      77.74595949
+    ],
+    "mean": 78.56992377
+  }
+]

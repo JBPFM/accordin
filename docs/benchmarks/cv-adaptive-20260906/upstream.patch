@@ -1,0 +1,231 @@
+diff --git a/src/bpf/intf.h b/src/bpf/intf.h
+index 175d459..fe5cecc 100644
+--- a/src/bpf/intf.h
++++ b/src/bpf/intf.h
+@@ -19,6 +19,9 @@
+ /* Mapped read-only by the direct runtime to confirm admission after yielding. */
+ struct admission_state {
+   unsigned int enabled;
++  /* Runnable threads queued for a CPU or a slot; advisory, published by the
++   * scheduler whenever it touches those queues. */
++  unsigned int demand;
+   unsigned long long owners[MAX_CPUS];
+ };
+ 
+diff --git a/src/bpf/main.bpf.c b/src/bpf/main.bpf.c
+index 457b615..b503e24 100644
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -58,6 +58,13 @@ static __always_inline void refresh_episode(struct task_struct *p,
+   }
+ }
+ 
++/* Userspace spins only while this is zero, so it is refreshed wherever the
++ * scheduler touches the queues. */
++static __always_inline void publish_demand(void) {
++  admission.demand = scx_bpf_dsq_nr_queued(NORMAL_DSQ) +
++                     scx_bpf_dsq_nr_queued(WAITING_DSQ);
++}
++
+ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
+                    u64 wake_flags) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+@@ -115,6 +122,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
+   }
+   scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
+   scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
++  publish_demand();
+ }
+ 
+ /* Reserve both the task and this CPU before moving a candidate. Different CPUs
+@@ -149,9 +157,9 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
+   /* Serve ordinary work alongside the reserved waiter. This also lets an
+    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
+   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+-  if (stats_only_mode || cpu < 0 || cpu >= MAX_CPUS)
+-    return;
+-  admit_waiter((__u32)cpu);
++  if (!stats_only_mode && cpu >= 0 && cpu < MAX_CPUS)
++    admit_waiter((__u32)cpu);
++  publish_demand();
+ }
+ 
+ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
+@@ -185,6 +193,7 @@ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+ 
++  publish_demand();
+   if (stats_only_mode || !tctx || !user_state(p, &state))
+     return;
+   refresh_episode(p, tctx, state);
+@@ -206,9 +215,16 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
+   if (stats_only_mode || !tctx || !user_state(p, &state))
+     return;
+   refresh_episode(p, tctx, state);
+-  /* A holder or an existing raw-lock node must be allowed to resume. */
+-  if (!runnable && (state & USER_FLAGS) != USER_HELD &&
+-      (state & USER_FLAGS) != USER_SPINNING)
++  /* A condition-variable spinner that is preempted gives its slot back: the
++   * scheduler wanted this CPU, and the waiter can park instead of returning
++   * as an admitted spinner. A holder or a thread already queued on a raw lock
++   * must be allowed to resume, so blocking leaves their slot in place. */
++  if (runnable) {
++    if ((state & USER_FLAGS) == USER_SPINNING && (state & USER_CV))
++      release_slot(p, tctx);
++    return;
++  }
++  if ((state & USER_FLAGS) != USER_HELD && (state & USER_FLAGS) != USER_SPINNING)
+     release_slot(p, tctx);
+ }
+ 
+diff --git a/src/fullhook.c b/src/fullhook.c
+index 76d2b80..4b20301 100644
+--- a/src/fullhook.c
++++ b/src/fullhook.c
+@@ -50,6 +50,8 @@ _Static_assert(offsetof(struct hook_mutex, kind) == 16,
+ struct hook_cond {
+     _Atomic uint32_t seq;
+     _Atomic uint32_t parked;
++    /* Saturating score of recent spin outcomes on this condition variable. */
++    _Atomic uint32_t spin_fail;
+ };
+ 
+ _Static_assert(sizeof(struct hook_cond) <= sizeof(pthread_cond_t),
+@@ -94,6 +96,11 @@ struct stats_frame {
+ 
+ /* Microseconds a condition-variable waiter may spin before parking. */
+ #define CV_SPIN_US_DEFAULT 1000
++/* A spin that pays off lowers the score by one, one that runs out raises it by
++ * two, so a condition variable settles into parking after a few failed waits
++ * and needs a run of successes to earn the CPU back. */
++#define SPIN_FAIL_PARK 3
++#define SPIN_FAIL_MAX 8
+ 
+ static uint64_t cv_spin_ns;
+ static bool stats_enabled;
+@@ -504,13 +511,15 @@ static uint64_t cv_spin_deadline(const struct timespec *abstime)
+  * watch the sequence directly instead of sleeping. Returns whether the
+  * sequence moved, in which case no futex wait is needed at all. */
+ static bool cv_spin(struct hook_cond *state, uint32_t seq,
+-                    const struct timespec *abstime)
++                    const struct timespec *abstime, bool demand_breaks)
+ {
+     bool moved = false;
++    uint64_t ticket;
+ 
+     admission_begin();
+-    if (admission_try_once(USER_CV)) {
++    if (admission_try_once(USER_CV, &ticket)) {
+         uint64_t deadline = cv_spin_deadline(abstime);
++        uint32_t score;
+ 
+         admission_publish_spinning(USER_CV);
+         for (unsigned int spins = 0;; spins++) {
+@@ -519,10 +528,23 @@ static bool cv_spin(struct hook_cond *state, uint32_t seq,
+                 break;
+             }
+             spin_pause();
+-            /* Reading the clock every iteration would cost more than the spin. */
+-            if (!(spins & 63) && lock_ops_now_ns() >= deadline)
++            /* Reading the clock every iteration would cost more than the
++             * spin. The waiter always stops at the budget or once a preemption
++             * has taken this CPU's slot away; the queue length the scheduler
++             * publishes is decisive only for a condition variable whose waits
++             * have been outlasting the budget, so one whose spins pay off may
++             * still borrow a CPU others are queued for. */
++            if (!(spins & 63) &&
++                ((demand_breaks && admission_demand()) ||
++                 lock_ops_now_ns() >= deadline || !admission_slot_held(ticket)))
+                 break;
+         }
++        score = atomic_load_explicit(&state->spin_fail, memory_order_relaxed);
++        if (moved)
++            score = score ? score - 1 : 0;
++        else
++            score = score + 2 > SPIN_FAIL_MAX ? SPIN_FAIL_MAX : score + 2;
++        atomic_store_explicit(&state->spin_fail, score, memory_order_relaxed);
+     }
+     admission_finish();
+     return moved;
+@@ -535,6 +557,7 @@ static int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex,
+     int op = abstime ? (FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME)
+                      : FUTEX_WAIT_PRIVATE;
+     int result = 0;
++    bool moved = false;
+     uint32_t seq;
+ 
+     if (stats_enabled) {
+@@ -545,7 +568,15 @@ static int cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex,
+     seq = atomic_load_explicit(&state->seq, memory_order_seq_cst);
+     hook_unlock(mutex);
+ 
+-    if (!(cv_spin_allowed() && cv_spin(state, seq, abstime))) {
++    if (cv_spin_allowed()) {
++        /* A condition variable whose recent spins ran out of budget yields to
++         * anything queued; one whose spins keep succeeding does not. */
++        bool demand_breaks = atomic_load_explicit(&state->spin_fail,
++                                                  memory_order_relaxed) >= SPIN_FAIL_PARK;
++        if (!demand_breaks || !admission_demand())
++            moved = cv_spin(state, seq, abstime, demand_breaks);
++    }
++    if (!moved) {
+         /* Joining the census and re-reading the sequence pairs sequentially
+          * with cond_wake's bump and census read, so a signal that misses the
+          * census here is one this thread observes before it sleeps. */
+diff --git a/src/runtime.h b/src/runtime.h
+index a4b472a..76edc96 100644
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -62,19 +62,20 @@ static inline void admission_wait(unsigned int *yields)
+                           memory_order_relaxed);
+ }
+ 
+-/* One admission attempt for callers that park instead of queueing: publish
+- * this request as a waiter, yield once, and report whether the current CPU's
+- * slot came back carrying this request's ticket. */
+-static inline bool admission_try_once(uint32_t extra_flags)
++/* How many runnable threads are waiting for a CPU or a slot right now. */
++static inline unsigned int admission_demand(void)
++{
++    struct admission_state *state = scheduler_admission;
++
++    return state ? __atomic_load_n(&state->demand, __ATOMIC_RELAXED) : 0;
++}
++
++/* Whether the current CPU's admission slot still carries this ticket. */
++static inline bool admission_slot_held(uint64_t ticket)
+ {
+-    uint32_t request = atomic_fetch_or_explicit(&thread_state.word,
+-                                                USER_WAITING | extra_flags,
+-                                                memory_order_relaxed) & ~USER_META;
+-    uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+     unsigned int cpu;
+ 
+-    sched_yield();
+     if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
+         return false;
+     cpu = sched_getcpu();
+@@ -82,6 +83,21 @@ static inline bool admission_try_once(uint32_t extra_flags)
+            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket;
+ }
+ 
++/* One admission attempt for callers that park instead of queueing: publish
++ * this request as a waiter, yield once, and report whether the current CPU's
++ * slot came back carrying this request's ticket. The ticket is handed back so
++ * the caller can notice the slot being taken away again. */
++static inline bool admission_try_once(uint32_t extra_flags, uint64_t *ticket)
++{
++    uint32_t request = atomic_fetch_or_explicit(&thread_state.word,
++                                                USER_WAITING | extra_flags,
++                                                memory_order_relaxed) & ~USER_META;
++
++    *ticket = ((uint64_t)request << 32) | thread_state.tid;
++    sched_yield();
++    return admission_slot_held(*ticket);
++}
++
+ static inline void admission_publish_spinning(uint32_t extra_flags)
+ {
+     uint32_t request = atomic_load_explicit(&thread_state.word,

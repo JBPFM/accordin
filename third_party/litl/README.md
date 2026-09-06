@@ -45,7 +45,7 @@ and takes the parking queue guard only when a relock handoff is pending.
 The internal mutex object includes its direct pointer and relock queue state;
 there is no native shadow mutex.
 
-Waiters register before releasing the user mutex and sleep on individual futex
+Waiters register before releasing the user mutex and wait on individual wake
 words. Signal selects one registered waiter; broadcast selects all. Selected
 waiters move to the mutex's parking queue: the first is woken immediately,
 and its subsequent unlock wakes the next. This also starts progress when a
@@ -53,12 +53,32 @@ notification occurs outside the mutex or while it is idle. A canceled baton
 holder passes the wake to a successor. A wait retaining other mutexes bypasses
 parking and retains its outer admission episode.
 
-After releasing the mutex, a waiter prepares a dormant relock epoch. The waker
-publishes `USER_WAITING` before the futex wake, allowing the existing BPF enqueue
+After releasing the mutex, a waiter prepares a dormant relock epoch. It may
+borrow the current CPU's admission slot with one yield and spin on its wake
+word, retaining that epoch. A per-condvar saturating score adds 2 for an
+unsuccessful admitted spin and subtracts 1 for a successful one (range 0–8).
+At score 3 or above, queued scheduler demand prevents or ends spinning;
+otherwise the waiter may spin up to `ACCORDIN_CV_SPIN_US` (default 0 for MCS, 50 for MCS-TAS).
+Preemption revokes a CV spinner's slot; losing the slot also ends its spin.
+Unadmitted CV waiters remain in the ordinary queue so they can resume and park.
+Nested waits do not borrow a new slot. With BPF/admission disabled or a zero
+budget, the waiter parks directly.
+
+Success means receiving the logical condition notification. This ends CV
+spinning even if the mutex's relock baton is still pending; the waiter then
+parks for that baton instead of occupying an admission slot for it.
+The waker clears `USER_CV` and publishes `USER_WAITING` before wake, allowing the BPF enqueue
 path to route it directly into `WAITING_DSQ`. Reacquisition consumes the same
 epoch and checks for an existing grant before yielding. Sleeping outermost
 waiters hold no CPU admission slots; only runnable, admitted threads may join
 the raw lock queue. This changes no BPF per-lock quotas or DSQs.
+
+The spinner changes its admission word with CAS so it cannot overwrite a
+concurrent notification. Wake publication and the waiter's parked publication
+use a sequentially consistent handshake: the waiter sees wake before sleeping,
+or the notifier sees parked and calls futex. A handoff to a spinning waiter
+therefore needs no futex syscall. The parking guard protects the request and
+stack waiter until the notifier has finished using them.
 
 The lock order is condition queue guard, then mutex parking guard; neither is
 held across raw lock acquisition. Notifications cannot be lost
@@ -72,7 +92,7 @@ the first wait; the behavior is independent of `NDEBUG`.
 Timed waits support realtime and monotonic clocks. `pthread_cond_clockwait`
 is interposed at both GLIBC_2.30 and GLIBC_2.34, including the modern C++
 `std::condition_variable::wait_for` path. The futex wait loop is cancellable;
-queue mutation and mutex reacquisition run with cancellation disabled. The
+queue mutation, bounded CV admission/spinning, and mutex reacquisition run with cancellation disabled. The
 adapter is eagerly bound (`-z now`) to avoid lazy symbol resolution inside the
 cancellable wait loop. Condvar support is unconditional.
 

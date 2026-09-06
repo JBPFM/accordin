@@ -46,8 +46,11 @@ static void park_remove(struct accordin_mutex *mutex,
  * before returning: neither the futex nor its TLS request can disappear. */
 static void park_wake(struct accordin_park_waiter *waiter) {
     ACCORDIN_DIRECT(relock_wake)(&waiter->request);
-    __atomic_store_n(&waiter->wake, 1, __ATOMIC_RELEASE);
-    if (syscall(SYS_futex, &waiter->wake, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0) < 0)
+    /* Pair with the waiter's parked publication and wake recheck. Either it
+     * sees wake before sleeping or we see parked and issue FUTEX_WAKE. */
+    __atomic_store_n(&waiter->wake, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&waiter->parked, __ATOMIC_SEQ_CST) &&
+        syscall(SYS_futex, &waiter->wake, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0) < 0)
         abort();
 }
 
@@ -184,6 +187,10 @@ void accordin_wait_arm(struct accordin_park_waiter *waiter) {
 void accordin_wait_notify(struct accordin_park_waiter *waiter) {
     struct accordin_mutex *mutex = waiter->mutex;
     park_lock(mutex);
+    /* Logical notification ends CV spinning even if a previous waiter still
+     * owns the relock baton. A notified waiter must not burn a CPU waiting for
+     * that separate queue; park_wake alone publishes its relock admission. */
+    __atomic_store_n(&waiter->notified, 1, __ATOMIC_RELEASE);
     if (waiter->armed && waiter->request.nested) {
         park_wake(waiter);
     } else {

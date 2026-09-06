@@ -1,0 +1,15 @@
+[
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "adaptive",
+    "n": 1,
+    "attempts": 1,
+    "values": [
+      191627.616
+    ],
+    "mean": 191627.616,
+    "cv_percent": null,
+    "relative_to_baseline": null
+  }
+]

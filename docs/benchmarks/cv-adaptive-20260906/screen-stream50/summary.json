@@ -1,0 +1,13 @@
+[
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "notified",
+    "attempts": 1,
+    "n": 1,
+    "values": [
+      80.78916096
+    ],
+    "mean": 80.78916096
+  }
+]

@@ -1,0 +1,791 @@
+diff --git a/Makefile b/Makefile
+index b6df87c..42eba19 100644
+--- a/Makefile
++++ b/Makefile
+@@ -24,7 +24,7 @@ BACKENDS := mcs_accordin_direct mcs_tas_accordin_direct
+ LIBRARIES := $(BACKENDS:%=$(OUT)/lib%.so)
+ HEADERS := $(wildcard src/*.h include/*.h src/bpf/*.h third_party/scx/scx/*.h) Makefile
+ 
+-.PHONY: all $(BACKENDS) check check-bpf litl check-litl check-litl-bpf clean compile-commands
++.PHONY: all $(BACKENDS) check check-spin check-bpf litl check-litl check-litl-bpf clean compile-commands
+ .DELETE_ON_ERROR:
+ all: $(LIBRARIES)
+ $(BACKENDS): %: $(OUT)/lib%.so
+@@ -49,10 +49,15 @@ $(OUT)/libmcs_accordin_direct.so: src/direct.c src/runtime.c $(HEADERS) $(OUT)/a
+ $(OUT)/libmcs_tas_accordin_direct.so: src/direct.c src/runtime.c $(HEADERS) $(OUT)/accordin.skel.h
+ 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_FLAGS) -DMCS_TAS -shared src/direct.c src/runtime.c -o $@ $(LDFLAGS) -Wl,-z,defs $(LIBBPF_LIBS) -pthread
+ 
+-check: all
++check: all check-spin
+ 	bash scripts/check_direct_symbols.sh $(OUT)
+ 	DIRECT_LIB_DIR=$(abspath $(OUT)) bash scripts/test_direct_api.sh --no-bpf
+ 
++check-spin: | $(OUT)
++	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_FLAGS) scripts/tests/relock_spin.c -pthread -o $(OUT)/test-relock-spin
++	$(OUT)/test-relock-spin
++
++
+ check-bpf: all
+ 	DIRECT_LIB_DIR=$(abspath $(OUT)) bash scripts/test_direct_api.sh --bpf
+ 
+diff --git a/README.md b/README.md
+index f547948..3fbbaa9 100644
+--- a/README.md
++++ b/README.md
+@@ -43,7 +43,11 @@ MCS_ACCORDIN_DIRECT_DISABLE_BPF=1 third_party/litl/libmcsaccordin_original.sh ./
+ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 third_party/litl/libmcstasaccordin_original.sh ./program
+ ```
+ 
+-适配器通过 LiTL 的 `NO_INDIRECTION` 路径在 pthread mutex 中保存内部对象指针，线程节点仍由 direct 运行时管理；构建这两个适配器不需要 CLHT、ssmem 或 PAPI。条件变量支持始终启用，不使用 shadow mutex。waiter 在释放业务锁之前登记，释放后准备一个不占用 CPU 名额的 relock epoch。signal 通知一个已登记 waiter，broadcast 通知全部；被通知者转入 mutex 的停泊队列，首个接力者立即获得 futex wake，其余由接力者的 unlock 逐个唤醒。通知发生在 mutex 外或 mutex 空闲时也能启动接力。
++适配器通过 LiTL 的 `NO_INDIRECTION` 路径在 pthread mutex 中保存内部对象指针，线程节点仍由 direct 运行时管理；构建这两个适配器不需要 CLHT、ssmem 或 PAPI。条件变量支持始终启用，不使用 shadow mutex。waiter 在释放业务锁之前登记，释放后准备 relock epoch。signal 通知一个已登记 waiter，broadcast 通知全部；被通知者转入 mutex 的停泊队列，首个接力者立即获得 wake，其余由接力者的 unlock 逐个唤醒。正在自旋的接力者通过原子状态接收 wake，已进入停泊阶段的接力者使用 futex wake。通知发生在 mutex 外或 mutex 空闲时也能启动接力。
++
++条件等待采用来自 `fullhook-admission@f7fedc9` 的自适应策略：每个 condvar 记录自旋结果（失败 +2，成功 -1，范围 0–8）。评分达到 3 且 NORMAL_DSQ/WAITING_DSQ 有任务排队时直接停泊；否则可尝试一次 admission，获准后在同一 epoch 下自旋，上限由自旋预算控制。没有名额、预算耗尽或抢占后失去名额时进入 futex 等待。收到逻辑通知就结束 CV 自旋；如果尚未获得 mutex 接力 wake，仍需停泊等候接力。signal 和 broadcast 继续共用原接力队列。嵌套等待不借用新名额，重获锁与取消清理保留原语义。
++
++默认配置按后端区分：MCS 直接停泊，MCS-TAS 以 50 µs 为自旋上限。MCS 的写入收益在基线复查后未能稳健确认，且 streamcluster 有代价，因此默认保留停泊；设置非零 `ACCORDIN_CV_SPIN_US` 可在 MCS 上启用同一自适应机制。需求提示只表示队列是否非空，BPF 仅在提示变化时写入，减少共享缓存行更新。
+ 
+ 实际唤醒前发布 `USER_WAITING`，现有 BPF enqueue 可直接将其放入 `WAITING_DSQ`；重获锁复用该 epoch，先检查已有授权，再决定是否 yield。不会把休眠者放入 raw MCS 队列。仍持有其它 mutex 的嵌套等待保留外层 admission，并立即唤醒。普通 lock/trylock 仍直接调用 direct API；unlock 增加一次停泊状态的原子读取，仅存在待接力状态时获取队列 guard。唤醒、超时和 deferred cancellation 均恢复业务锁；取消与 signal 并发时补偿通知其它 waiter，已通知但仍停泊的 waiter 不因原条件变量截止时间到期而丢失通知。这些行为不受 `NDEBUG` 影响。
+ 
+@@ -84,7 +88,8 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
+ 2. 外层加锁进入慢路径时，发布 WAITING 并 yield。若线程仍拥有当前 CPU 的名额，BPF 用 CAS 将旧 ticket 更新为本次请求；否则进入全局 FIFO 等待队列。
+ 3. CPU 有空闲名额时，从队列中取一个 affinity 允许的线程，先保留名额；用户态确认名额属于本次请求后，才进入原始锁的自旋队列。
+ 4. 每次外层加锁使用递增的请求编号，用户态始终校验本次 ticket。解锁清除用户态状态，调度器观察到释放或未续用的新请求时回收名额，无需额外解锁 syscall；若下一次慢路径赶在回收前进入 yield，可以更新并续用自己的名额。
+-5. 已获准线程处于 WAITING/SPINNING 且普通队列非空时，tick 结束其当前时间片，为普通任务提供运行机会，同时保留原 admission 名额。这使锁外执行的工作也能继续推进，不改变 raw 锁队列与 condvar 接力协议。
++5. 已获准线程处于 WAITING/SPINNING 且普通队列非空时，tick 结束其当前时间片，为普通任务提供运行机会。普通锁等待者保留名额；尚未收到接力 wake 的 CV 自旋者在被抢占时归还名额，恢复运行后可停泊。
++6. CV 等待者只在一次 yield 中尝试续用或借用当前 CPU 的空名额；未获准的 CV 等待者进入普通队列以便恢复并停泊。通知发布时清除 CV 标志，重获锁随后使用普通 WAITING_DSQ 和同一 epoch。
+ 
+ 等待队列按 FIFO 扫描；已有名额的线程可以连续续用，因此不保证严格 FIFO 或有界等待。
+ 
+@@ -92,7 +97,7 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
+ 
+ 实现只需要一个普通队列、一个新等待者队列，以及每 CPU 一个 owner 记录。已获准线程重新入队时，直接进入名额所属 CPU 的 local 队列。已删除按锁分类、随机选队列、概率参数、扫描预算、序列门控和定时强制放行。
+ 
+-核心不再包含条件变量（CV）、writer-event、width control、锁类合并、动态 CPU affinity、CS/NCS/wait 采样或 timeslice extension。CPU 范围继承应用的 affinity，可通过外部 `taskset` 设置。
++核心只提供条件等待使用的 relock/admission 辅助函数，条件队列与 futex 协议位于 LiTL 适配器。不包含 writer-event、width control、锁类合并、动态 CPU affinity、CS/NCS/wait 采样或 timeslice extension。CPU 范围继承应用的 affinity，可通过外部 `taskset` 设置。
+ 
+ ## 运行开关
+ 
+@@ -103,8 +108,9 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
+ | `<PREFIX>_DISABLE_BPF` | 默认关闭；设为 `1` 时不加载 BPF。 |
+ | `ACCORDIN_DISABLE_ADMISSION` | 默认关闭；设为 `1` 时不发布 admission 标志。 |
+ | `<PREFIX>_STATS_ONLY` | 保留历史名称的对照模式；设为 `1` 时加载普通 sched_ext 调度，不进行锁感知路由，也不采样锁时间。 |
++| `ACCORDIN_CV_SPIN_US` | 条件等待的最大自旋微秒数，MCS 默认 `0`、MCS-TAS 默认 `50`，接受 `0`–`1000000`；`0` 仅关闭自旋，条件变量与接力仍启用。无 BPF、无 admission 或 stats-only 时不进行 CV 自旋。 |
+ 
+-旧 CV、width、固定 width、依赖图、动态 CPU 和采样环境变量已不再解析。CV/writer-event 和动态 CPU 控制的 C 符号及旧时间统计输出已移除。旧 `DEBUG_COUNTERS`、`INACTIVE_PREVIOUS_LOCK_PERCENT` 参数和 `[lock_stats]` 计数输出也已移除。调度异常时，BPF dump 保留队列长度和 CPU owner 信息。
++除上述自旋预算外，旧 CV、width、固定 width、依赖图、动态 CPU 和采样环境变量已不再解析。旧 CV/writer-event 和动态 CPU 控制的 C 符号及旧时间统计输出已移除。旧 `DEBUG_COUNTERS`、`INACTIVE_PREVIOUS_LOCK_PERCENT` 参数和 `[lock_stats]` 计数输出也已移除。调度异常时，BPF dump 保留队列长度和 CPU owner 信息。
+ 
+ ## 实验与历史入口
+ 
+@@ -112,9 +118,11 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
+ 
+ `fullhook-admission` 与 `simplify` 的 LevelDB readrandom/fillrandom 192 线程对比见 [分支性能报告](docs/benchmarks/leveldb-branches-20260906/README.md)，包含三轮测量及 MCS fillrandom 的超时记录。
+ 
+-逐项归因、选择性迁入和完整应用回归见 [归因报告](docs/benchmarks/leveldb-attribution-20260906/README.md)。本轮仅迁入 tick 普通任务调度机会，192 线程下 readrandom 基本持平，fillrandom 的 MCS/MCS-TAS 分别提升约 54%/188%。
++前一轮的逐项归因、选择性迁入和完整应用回归见 [归因报告](docs/benchmarks/leveldb-attribution-20260906/README.md)。该轮仅迁入 tick 普通任务调度机会，192 线程下 readrandom 基本持平，fillrandom 的 MCS/MCS-TAS 分别提升约 54%/188%。
++
++随后从 `fullhook-admission@f7fedc9` 迁入自适应条件等待，设计、预算对照和 192 线程应用结果见 [CV 迁移报告](docs/benchmarks/cv-adaptive-20260906/README.md)。MCS 默认停泊；MCS-TAS 默认使用 50 µs 预算，fillrandom 有收益，streamcluster 仍存在耗时和波动的代价。
+ 
+-此前的候选方案见 [condvar 授权自旋与 relock 设计](docs/plans/2026-09-05-cv-spin-relock-design.md)。其中 signal 独立唤醒在后续消融中明显回退，未迁入；当前保留 simplify 的通知接力，增加上述 tick 普通任务调度机会。
++此前的候选方案见 [condvar 授权自旋与 relock 设计](docs/plans/2026-09-05-cv-spin-relock-design.md)。其中 signal 独立唤醒在后续消融中明显回退，未迁入；当前自适应 CV 自旋同样保留 simplify 的通知接力。
+ 
+ 当前 local 队列与授权更新的合入验证见 [验证记录](docs/benchmarks/local-owner-regression/integration.md)。
+ 
+diff --git a/include/accordin_relock.h b/include/accordin_relock.h
+index fc1c901..a45cdbc 100644
+--- a/include/accordin_relock.h
++++ b/include/accordin_relock.h
+@@ -4,11 +4,16 @@
+ 
+ #include <stdint.h>
+ 
++struct timespec;
++
+ /* One condition-wait reacquisition, owned by the waiting thread. Prepare only
+  * after releasing its mutex. Publish wake before making the thread runnable;
+  * consume with relock, including on timeout/cancellation. The caller must
+  * serialize wake against consumption and keep the request and TLS alive.
+- * Preparation reserves an epoch, never a CPU admission slot. */
++ * Preparation reserves an epoch, never a CPU admission slot. Optional spin
++ * borrows a slot for this epoch; wake may race spin, but must be serialized
++ * against relock/consumption. Call spin with cancellation disabled, after
++ * preparing and before parking; wake and spin_fail remain alive throughout. */
+ typedef struct accordin_relock_request {
+     void *word;
+     uint32_t epoch;
+diff --git a/include/mcs_accordin_direct.h b/include/mcs_accordin_direct.h
+index f6aeb48..e1e4ffa 100644
+--- a/include/mcs_accordin_direct.h
++++ b/include/mcs_accordin_direct.h
+@@ -16,6 +16,9 @@ int mcs_accordin_direct_mutex_trylock(mcs_accordin_direct_mutex_t *mutex);
+ int mcs_accordin_direct_mutex_unlock(mcs_accordin_direct_mutex_t *mutex);
+ void mcs_accordin_direct_mutex_relock_prepare(accordin_relock_request_t *request);
+ void mcs_accordin_direct_mutex_relock_wake(accordin_relock_request_t *request);
++void mcs_accordin_direct_mutex_relock_spin(accordin_relock_request_t *request,
++                                        uint32_t *wake, uint32_t *spin_fail,
++                                        int clock, const struct timespec *deadline);
+ int mcs_accordin_direct_mutex_relock(mcs_accordin_direct_mutex_t *mutex,
+                                    accordin_relock_request_t *request);
+ 
+diff --git a/include/mcs_tas_accordin_direct.h b/include/mcs_tas_accordin_direct.h
+index 7210708..be796ca 100644
+--- a/include/mcs_tas_accordin_direct.h
++++ b/include/mcs_tas_accordin_direct.h
+@@ -16,6 +16,9 @@ int mcs_tas_accordin_direct_mutex_trylock(mcs_tas_accordin_direct_mutex_t *mutex
+ int mcs_tas_accordin_direct_mutex_unlock(mcs_tas_accordin_direct_mutex_t *mutex);
+ void mcs_tas_accordin_direct_mutex_relock_prepare(accordin_relock_request_t *request);
+ void mcs_tas_accordin_direct_mutex_relock_wake(accordin_relock_request_t *request);
++void mcs_tas_accordin_direct_mutex_relock_spin(accordin_relock_request_t *request,
++                                            uint32_t *wake, uint32_t *spin_fail,
++                                            int clock, const struct timespec *deadline);
+ int mcs_tas_accordin_direct_mutex_relock(mcs_tas_accordin_direct_mutex_t *mutex,
+                                        accordin_relock_request_t *request);
+ 
+diff --git a/scripts/check_direct_symbols.sh b/scripts/check_direct_symbols.sh
+index 87d3760..4bdf87d 100755
+--- a/scripts/check_direct_symbols.sh
++++ b/scripts/check_direct_symbols.sh
+@@ -9,7 +9,7 @@ for backend in mcs_accordin_direct mcs_tas_accordin_direct; do
+     prefixes+=(mcs_tas_accordin_direct)
+   fi
+   for prefix in "${prefixes[@]}"; do
+-    for op in create destroy lock trylock unlock relock_prepare relock_wake relock; do
++    for op in create destroy lock trylock unlock relock_prepare relock_wake relock_spin relock; do
+       symbol="${prefix}_mutex_${op}"
+       if ! grep -Fxq "$symbol" <<< "$symbols"; then
+         echo "missing direct ABI symbol in $backend: $symbol" >&2
+diff --git a/src/bpf/intf.h b/src/bpf/intf.h
+index 0fc61ea..d82f6c2 100644
+--- a/src/bpf/intf.h
++++ b/src/bpf/intf.h
+@@ -7,14 +7,20 @@
+ #define MAX_TASKS 65536U
+ #define MAX_CPUS 256U
+ 
++/* Bits 0-1 hold lock state, bit 2 marks revocable CV spinning, and the
++ * request epoch occupies bits 3 and above. */
+ #define USER_HELD 1U
+ #define USER_WAITING 2U
+ #define USER_SPINNING 3U
+ #define USER_FLAGS 3U
++#define USER_CV 4U
++#define USER_META 7U
+ 
+ /* Mapped read-only by the direct runtime to confirm admission after yielding. */
+ struct admission_state {
+   unsigned int enabled;
++  /* Advisory presence of tasks queued for a CPU or an admission slot. */
++  unsigned int demand;
+   unsigned long long owners[MAX_CPUS];
+ };
+ 
+diff --git a/src/bpf/main.bpf.c b/src/bpf/main.bpf.c
+index c1cfa35..970710a 100644
+--- a/src/bpf/main.bpf.c
++++ b/src/bpf/main.bpf.c
+@@ -43,7 +43,7 @@ static __always_inline void release_slot(struct task_struct *p,
+ }
+ 
+ static __always_inline __u64 request_ticket(struct task_struct *p, __u32 state) {
+-  return ((__u64)(state & ~USER_FLAGS) << 32) | (__u32)p->pid;
++  return ((__u64)(state & ~USER_META) << 32) | (__u32)p->pid;
+ }
+ 
+ /* Unless renewed at yield, a new request retires the old slot.
+@@ -58,6 +58,15 @@ static __always_inline void refresh_episode(struct task_struct *p,
+   }
+ }
+ 
++static __always_inline void publish_demand(void) {
++  /* Consumers need only queue presence. Avoid bouncing this shared cache
++   * line on every enqueue/dispatch while demand remains nonzero. */
++  __u32 demand = scx_bpf_dsq_nr_queued(NORMAL_DSQ) ||
++                 scx_bpf_dsq_nr_queued(WAITING_DSQ);
++  if (READ_ONCE(admission.demand) != demand)
++    WRITE_ONCE(admission.demand, demand);
++}
++
+ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
+                    u64 wake_flags) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+@@ -86,7 +95,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
+       if (tctx->admission_cpu) {
+         cpu = tctx->admission_cpu - 1;
+         dsq = SCX_DSQ_LOCAL_ON | cpu;
+-      } else if (known && (state & USER_FLAGS) == USER_WAITING) {
++      } else if (known && (state & USER_FLAGS) == USER_WAITING &&
++                 !(state & USER_CV)) {
+         tctx->ticket = request_ticket(p, state);
+         dsq = WAITING_DSQ;
+       }
+@@ -94,6 +104,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
+   }
+   scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
+   scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
++  publish_demand();
+ }
+ 
+ /* Reserve both the task and this CPU before moving a candidate. Different CPUs
+@@ -128,9 +139,9 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
+   /* Serve ordinary work alongside the reserved waiter. This also lets an
+    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
+   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+-  if (stats_only_mode || cpu < 0 || cpu >= MAX_CPUS)
+-    return;
+-  admit_waiter((__u32)cpu);
++  if (!stats_only_mode && cpu >= 0 && cpu < MAX_CPUS)
++    admit_waiter((__u32)cpu);
++  publish_demand();
+ }
+ 
+ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
+@@ -139,12 +150,20 @@ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct
+   volatile __u64 *owner = owner_slot(cpu);
+ 
+   (void)to;
+-  /* Renew only our existing slot; userspace still confirms the new ticket. */
+   if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
+-      (state & USER_FLAGS) == USER_WAITING && tctx->admission_cpu == cpu + 1) {
++      (state & USER_FLAGS) == USER_WAITING) {
+     __u64 next = request_ticket(from, state);
+-    if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++    if (tctx->admission_cpu == cpu + 1) {
++      /* Ordinary lock requests only renew an existing slot. */
++      if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
++        tctx->ticket = next;
++    } else if ((state & USER_CV) && !tctx->admission_cpu &&
++               !__sync_val_compare_and_swap(owner, 0, next)) {
++      /* CV waiters try once, then park. Never put them in WAITING_DSQ:
++       * they must resume even when all slots belong to raw-lock waiters. */
++      tctx->admission_cpu = cpu + 1;
+       tctx->ticket = next;
++    }
+   }
+   from->scx.slice = 0;
+   return false;
+@@ -154,13 +173,14 @@ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
+   struct task_scx_ctx *tctx = task_ctx(p);
+   __u32 state;
+ 
++  publish_demand();
+   if (stats_only_mode || !tctx || !user_state(p, &state))
+     return;
+   refresh_episode(p, tctx, state);
+   /* An admitted thread that spins never empties its CPU, so ops.dispatch is
+    * never called there and the global queue is never consumed. Ending the
+-   * slice hands the CPU to one queued ordinary task; the spinner keeps its
+-   * slot and is re-enqueued behind it. */
++   * slice serves queued ordinary work. Raw-lock spinners keep their slot;
++   * stopping revokes a CV spinner's slot so it can park on resumption. */
+   if (tctx->admission_cpu &&
+       ((state & USER_FLAGS) == USER_WAITING ||
+        (state & USER_FLAGS) == USER_SPINNING) &&
+@@ -175,8 +195,15 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
+   if (stats_only_mode || !tctx || !user_state(p, &state))
+     return;
+   refresh_episode(p, tctx, state);
++  /* A CV spinner has no raw node and can park after losing its slot. Once
++   * notified, the publisher clears USER_CV and ordinary relock rules apply. */
++  if (runnable) {
++    if ((state & USER_FLAGS) == USER_SPINNING && (state & USER_CV))
++      release_slot(p, tctx);
++    return;
++  }
+   /* A holder or an existing raw-lock node must be allowed to resume. */
+-  if (!runnable && (state & USER_FLAGS) != USER_HELD &&
++  if ((state & USER_FLAGS) != USER_HELD &&
+       (state & USER_FLAGS) != USER_SPINNING)
+     release_slot(p, tctx);
+ }
+diff --git a/src/direct.c b/src/direct.c
+index 4ad559b..d134888 100644
+--- a/src/direct.c
++++ b/src/direct.c
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ #include <errno.h>
+ #include <string.h>
++#include <time.h>
+ #include "runtime.h"
+ 
+ #ifdef MCS_TAS
+@@ -85,7 +86,7 @@ EXPORT void API(relock_prepare)(accordin_relock_request_t *request)
+     if (!request->nested && admission_enabled) {
+         uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
+         request->word = &thread_state.word;
+-        request->epoch = (word & ~USER_FLAGS) + 4;
++        request->epoch = (word & ~USER_META) + 8;
+         atomic_store_explicit(&thread_state.word, request->epoch, memory_order_release);
+     }
+ }
+@@ -97,6 +98,84 @@ EXPORT void API(relock_wake)(accordin_relock_request_t *request)
+                               request->epoch | USER_WAITING, memory_order_release);
+ }
+ 
++static uint64_t monotonic_ns(void)
++{
++    struct timespec now;
++    if (clock_gettime(CLOCK_MONOTONIC, &now))
++        abort();
++    return (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
++}
++
++static bool deadline_passed(clockid_t clock, const struct timespec *deadline)
++{
++    if (!deadline)
++        return false;
++    struct timespec now;
++    if (clock_gettime(clock, &now))
++        return true;
++    return now.tv_sec > deadline->tv_sec ||
++           (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec);
++}
++
++EXPORT void API(relock_spin)(accordin_relock_request_t *request,
++                             uint32_t *wake, uint32_t *spin_fail,
++                             clockid_t clock, const struct timespec *deadline)
++{
++    struct admission_state *state = scheduler_admission;
++    if (!request->word || !cv_spin_ns || !state ||
++        !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE) ||
++        __atomic_load_n(wake, __ATOMIC_ACQUIRE) || deadline_passed(clock, deadline))
++        return;
++    bool demand_breaks = __atomic_load_n(spin_fail, __ATOMIC_RELAXED) >= 3;
++    if (demand_breaks && admission_demand())
++        return;
++
++    _Atomic uint32_t *word = request->word;
++    uint32_t expected = request->epoch;
++    uint32_t waiting = request->epoch | USER_CV | USER_WAITING;
++    uint32_t spinning = request->epoch | USER_CV | USER_SPINNING;
++    uint64_t ticket = ((uint64_t)request->epoch << 32) | thread_state.tid;
++    /* A notifier may already have published ordinary WAITING. Never overwrite
++     * it, including when withdrawing an unsuccessful CV admission request. */
++    if (!atomic_compare_exchange_strong_explicit(word, &expected, waiting,
++                                                memory_order_acq_rel, memory_order_acquire))
++        return;
++    sched_yield();
++    expected = waiting;
++    if (admission_slot_held(ticket) &&
++        atomic_compare_exchange_strong_explicit(word, &expected, spinning,
++                                                memory_order_acq_rel, memory_order_acquire)) {
++        uint64_t start = monotonic_ns();
++        bool moved = false;
++        for (unsigned int spins = 0;; spins++) {
++            if (__atomic_load_n(wake, __ATOMIC_ACQUIRE)) {
++                moved = true;
++                break;
++            }
++            if (!(spins & 63) &&
++                ((demand_breaks && admission_demand()) ||
++                 monotonic_ns() - start >= cv_spin_ns ||
++                 deadline_passed(clock, deadline) || !admission_slot_held(ticket)))
++                break;
++            spin_pause();
++        }
++        /* Shared condvars can finish spins concurrently. Keep the score
++         * saturating without losing another waiter's update. */
++        uint32_t score = __atomic_load_n(spin_fail, __ATOMIC_RELAXED), next;
++        do {
++            next = moved ? (score ? score - 1 : 0) : (score >= 6 ? 8 : score + 2);
++        } while (!__atomic_compare_exchange_n(spin_fail, &score, next, 1,
++                                              __ATOMIC_RELAXED, __ATOMIC_RELAXED));
++    }
++    expected = spinning;
++    if (!atomic_compare_exchange_strong_explicit(word, &expected, request->epoch,
++                                                 memory_order_acq_rel, memory_order_acquire)) {
++        expected = waiting;
++        atomic_compare_exchange_strong_explicit(word, &expected, request->epoch,
++                                                memory_order_acq_rel, memory_order_acquire);
++    }
++}
++
+ EXPORT int API(relock)(struct MUTEX *mutex, accordin_relock_request_t *request)
+ {
+     if (!mutex || !request)
+@@ -127,5 +206,6 @@ TAS_ALIAS(trylock)
+ TAS_ALIAS(unlock)
+ TAS_ALIAS(relock_prepare)
+ TAS_ALIAS(relock_wake)
++TAS_ALIAS(relock_spin)
+ TAS_ALIAS(relock)
+ #endif
+diff --git a/src/runtime.c b/src/runtime.c
+index f87aa57..2782584 100644
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -20,6 +20,13 @@
+ _Thread_local struct thread_state thread_state;
+ struct admission_state *scheduler_admission;
+ bool admission_enabled;
++/* Keep MCS on parking by default: its measured write gain was not stable
++ * enough to justify the streamcluster cost. Both backends accept an override. */
++#ifdef MCS_TAS
++uint64_t cv_spin_ns = 50000;
++#else
++uint64_t cv_spin_ns;
++#endif
+ static struct accordin *skel;
+ static struct bpf_link *scheduler_link;
+ static int thread_map_fd = -1;
+@@ -68,6 +75,13 @@ static int libbpf_log(enum libbpf_print_level level, const char *fmt, va_list ar
+ 
+ __attribute__((constructor)) static void scheduler_start(void)
+ {
++    const char *spin = getenv("ACCORDIN_CV_SPIN_US");
++    if (spin && *spin >= '0' && *spin <= '9') {
++        char *end;
++        unsigned long us = strtoul(spin, &end, 10);
++        if (!*end && us <= 1000000)
++            cv_spin_ns = (uint64_t)us * 1000;
++    }
+     admission_enabled = !env_flag("ACCORDIN_DISABLE_ADMISSION");
+     if (env_flag(PREFIX "_DISABLE_BPF"))
+         return;
+diff --git a/src/runtime.h b/src/runtime.h
+index c5545bd..f1a51e3 100644
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -18,6 +18,7 @@ struct thread_state {
+ extern _Thread_local struct thread_state thread_state;
+ extern struct admission_state *scheduler_admission;
+ extern bool admission_enabled;
++extern uint64_t cv_spin_ns;
+ void register_thread(void);
+ 
+ static inline void ensure_registered(void)
+@@ -32,7 +33,7 @@ static inline bool admission_begin(void)
+     bool managed = thread_state.depth++ == 0 && admission_enabled;
+     if (managed) {
+         uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
+-        atomic_store_explicit(&thread_state.word, (word & ~USER_FLAGS) + 4,
++        atomic_store_explicit(&thread_state.word, (word & ~USER_META) + 8,
+                               memory_order_relaxed);
+     }
+     return managed;
+@@ -41,7 +42,7 @@ static inline bool admission_begin(void)
+ static inline void admission_wait(bool prequeued)
+ {
+     uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
+-                                               memory_order_relaxed) & ~USER_FLAGS;
++                                               memory_order_relaxed) & ~USER_META;
+     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
+     struct admission_state *state = scheduler_admission;
+ 
+@@ -67,7 +68,7 @@ static inline void admission_enter(bool managed)
+ {
+     if (managed) {
+         uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
+-        atomic_store_explicit(&thread_state.word, (word & ~USER_FLAGS) | USER_HELD,
++        atomic_store_explicit(&thread_state.word, (word & ~USER_META) | USER_HELD,
+                               memory_order_relaxed);
+     }
+ }
+@@ -75,7 +76,23 @@ static inline void admission_enter(bool managed)
+ static inline void admission_finish(void)
+ {
+     if (--thread_state.depth == 0 && admission_enabled)
+-        atomic_fetch_and_explicit(&thread_state.word, ~USER_FLAGS, memory_order_relaxed);
++        atomic_fetch_and_explicit(&thread_state.word, ~USER_META, memory_order_relaxed);
++}
++
++static inline unsigned int admission_demand(void)
++{
++    struct admission_state *state = scheduler_admission;
++    return state ? __atomic_load_n(&state->demand, __ATOMIC_RELAXED) : 0;
++}
++
++static inline bool admission_slot_held(uint64_t ticket)
++{
++    struct admission_state *state = scheduler_admission;
++    if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
++        return false;
++    unsigned int cpu = sched_getcpu();
++    return cpu < MAX_CPUS &&
++           __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket;
+ }
+ 
+ #endif
+diff --git a/third_party/litl/README.md b/third_party/litl/README.md
+index 5eb572b..8046bbf 100644
+--- a/third_party/litl/README.md
++++ b/third_party/litl/README.md
+@@ -45,7 +45,7 @@ and takes the parking queue guard only when a relock handoff is pending.
+ The internal mutex object includes its direct pointer and relock queue state;
+ there is no native shadow mutex.
+ 
+-Waiters register before releasing the user mutex and sleep on individual futex
++Waiters register before releasing the user mutex and wait on individual wake
+ words. Signal selects one registered waiter; broadcast selects all. Selected
+ waiters move to the mutex's parking queue: the first is woken immediately,
+ and its subsequent unlock wakes the next. This also starts progress when a
+@@ -53,13 +53,33 @@ notification occurs outside the mutex or while it is idle. A canceled baton
+ holder passes the wake to a successor. A wait retaining other mutexes bypasses
+ parking and retains its outer admission episode.
+ 
+-After releasing the mutex, a waiter prepares a dormant relock epoch. The waker
+-publishes `USER_WAITING` before the futex wake, allowing the existing BPF enqueue
++After releasing the mutex, a waiter prepares a dormant relock epoch. It may
++borrow the current CPU's admission slot with one yield and spin on its wake
++word, retaining that epoch. A per-condvar saturating score adds 2 for an
++unsuccessful admitted spin and subtracts 1 for a successful one (range 0–8).
++At score 3 or above, queued scheduler demand prevents or ends spinning;
++otherwise the waiter may spin up to `ACCORDIN_CV_SPIN_US` (default 0 for MCS, 50 for MCS-TAS).
++Preemption revokes a CV spinner's slot; losing the slot also ends its spin.
++Unadmitted CV waiters remain in the ordinary queue so they can resume and park.
++Nested waits do not borrow a new slot. With BPF/admission disabled or a zero
++budget, the waiter parks directly.
++
++Success means receiving the logical condition notification. This ends CV
++spinning even if the mutex's relock baton is still pending; the waiter then
++parks for that baton instead of occupying an admission slot for it.
++The waker clears `USER_CV` and publishes `USER_WAITING` before wake, allowing the BPF enqueue
+ path to route it directly into `WAITING_DSQ`. Reacquisition consumes the same
+ epoch and checks for an existing grant before yielding. Sleeping outermost
+ waiters hold no CPU admission slots; only runnable, admitted threads may join
+ the raw lock queue. This changes no BPF per-lock quotas or DSQs.
+ 
++The spinner changes its admission word with CAS so it cannot overwrite a
++concurrent notification. Wake publication and the waiter's parked publication
++use a sequentially consistent handshake: the waiter sees wake before sleeping,
++or the notifier sees parked and calls futex. A handoff to a spinning waiter
++therefore needs no futex syscall. The parking guard protects the request and
++stack waiter until the notifier has finished using them.
++
+ The lock order is condition queue guard, then mutex parking guard; neither is
+ held across raw lock acquisition. Notifications cannot be lost
+ between registration and entering the kernel, nor saved for future waiters.
+@@ -72,7 +92,7 @@ the first wait; the behavior is independent of `NDEBUG`.
+ Timed waits support realtime and monotonic clocks. `pthread_cond_clockwait`
+ is interposed at both GLIBC_2.30 and GLIBC_2.34, including the modern C++
+ `std::condition_variable::wait_for` path. The futex wait loop is cancellable;
+-queue mutation and mutex reacquisition run with cancellation disabled. The
++queue mutation, bounded CV admission/spinning, and mutex reacquisition run with cancellation disabled. The
+ adapter is eagerly bound (`-z now`) to avoid lazy symbol resolution inside the
+ cancellable wait loop. Condvar support is unconditional.
+ 
+diff --git a/third_party/litl/include/accordin-internal.h b/third_party/litl/include/accordin-internal.h
+index 1defae6..68389cd 100644
+--- a/third_party/litl/include/accordin-internal.h
++++ b/third_party/litl/include/accordin-internal.h
+@@ -9,7 +9,7 @@ struct accordin_park_waiter {
+     struct accordin_park_waiter *prev, *next;
+     struct accordin_mutex *mutex;
+     accordin_relock_request_t request;
+-    uint32_t wake;
++    uint32_t wake, parked, notified;
+     unsigned int armed, queued;
+ };
+ 
+diff --git a/third_party/litl/src/accordin-cond.c b/third_party/litl/src/accordin-cond.c
+index fa0478c..7e3446a 100644
+--- a/third_party/litl/src/accordin-cond.c
++++ b/third_party/litl/src/accordin-cond.c
+@@ -27,6 +27,7 @@ typedef struct __attribute__((may_alias)) {
+     clockid_t clock;
+     struct cond_waiter *head, *tail;
+     unsigned int active;
++    uint32_t spin_fail;
+ } cond_state_t;
+ 
+ _Static_assert(sizeof(cond_state_t) <= sizeof(pthread_cond_t), "condvar storage");
+@@ -129,13 +130,22 @@ static int wait_on_cond(pthread_cond_t *cond, pthread_mutex_t *mutex,
+     cleanup.unlocked = 1;
+     accordin_wait_arm(&cleanup.waiter.park);
+ 
++    /* One optional admission attempt, using the same relock epoch. Logical
++     * notification ends CV spinning; actual relock still follows the mutex's
++     * baton queue. Cancellation remains disabled until CV state has
++     * been withdrawn, so cleanup never inherits a revocable spinning slot. */
++    ACCORDIN_DIRECT(relock_spin)(&cleanup.waiter.park.request,
++                                &cleanup.waiter.park.notified,
++                                &cleanup.cond->spin_fail, clock, deadline);
++    __atomic_store_n(&cleanup.waiter.park.parked, 1, __ATOMIC_SEQ_CST);
++
+     /* syscall(SYS_futex) is not a libc cancellation point. Enable asynchronous
+      * cancellation only around the resource-free futex wait loop, with the
+      * cleanup handler installed and neither user mutex nor queue guard held.
+      * The adapter is linked with -z now, avoiding lazy PLT binding here. */
+     cond_require(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old_type));
+     cond_require(pthread_setcancelstate(old_state, NULL));
+-    while (!__atomic_load_n(&cleanup.waiter.park.wake, __ATOMIC_ACQUIRE)) {
++    while (!__atomic_load_n(&cleanup.waiter.park.wake, __ATOMIC_SEQ_CST)) {
+         int error = 0;
+         int op = FUTEX_WAIT_BITSET_PRIVATE;
+         if (clock == CLOCK_REALTIME)
+diff --git a/third_party/litl/src/accordin.c b/third_party/litl/src/accordin.c
+index b700894..b2bd64a 100644
+--- a/third_party/litl/src/accordin.c
++++ b/third_party/litl/src/accordin.c
+@@ -46,8 +46,11 @@ static void park_remove(struct accordin_mutex *mutex,
+  * before returning: neither the futex nor its TLS request can disappear. */
+ static void park_wake(struct accordin_park_waiter *waiter) {
+     ACCORDIN_DIRECT(relock_wake)(&waiter->request);
+-    __atomic_store_n(&waiter->wake, 1, __ATOMIC_RELEASE);
+-    if (syscall(SYS_futex, &waiter->wake, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0) < 0)
++    /* Pair with the waiter's parked publication and wake recheck. Either it
++     * sees wake before sleeping or we see parked and issue FUTEX_WAKE. */
++    __atomic_store_n(&waiter->wake, 1, __ATOMIC_SEQ_CST);
++    if (__atomic_load_n(&waiter->parked, __ATOMIC_SEQ_CST) &&
++        syscall(SYS_futex, &waiter->wake, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0) < 0)
+         abort();
+ }
+ 
+@@ -184,6 +187,10 @@ void accordin_wait_arm(struct accordin_park_waiter *waiter) {
+ void accordin_wait_notify(struct accordin_park_waiter *waiter) {
+     struct accordin_mutex *mutex = waiter->mutex;
+     park_lock(mutex);
++    /* Logical notification ends CV spinning even if a previous waiter still
++     * owns the relock baton. A notified waiter must not burn a CPU waiting for
++     * that separate queue; park_wake alone publishes its relock admission. */
++    __atomic_store_n(&waiter->notified, 1, __ATOMIC_RELEASE);
+     if (waiter->armed && waiter->request.nested) {
+         park_wake(waiter);
+     } else {
+diff --git a/scripts/tests/relock_spin.c b/scripts/tests/relock_spin.c
+new file mode 100644
+index 0000000..17ed7ec
+--- /dev/null
++++ b/scripts/tests/relock_spin.c
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Drive the real spin/epoch transitions with deterministic scheduler events.
++ * In particular, a notification racing withdrawal must never be erased. */
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include <assert.h>
++#include <stdio.h>
++#include <time.h>
++#include <sched.h>
++
++static int test_yield(void);
++static int test_cpu(void) { return 0; }
++static int test_clock(clockid_t clock, struct timespec *now);
++#define sched_yield test_yield
++#define sched_getcpu test_cpu
++#define clock_gettime test_clock
++#include "../../src/direct.c"
++
++_Thread_local struct thread_state thread_state;
++static struct admission_state state;
++struct admission_state *scheduler_admission = &state;
++bool admission_enabled = true;
++uint64_t cv_spin_ns = 1000;
++void register_thread(void) { thread_state.registered = true; }
++
++enum event { NO_SLOT, EXPIRE, NOTIFY_AT_YIELD, NOTIFY_SPIN, NOTIFY_ONLY, REVOKE };
++static enum event event;
++static unsigned int yields, clocks;
++static accordin_relock_request_t request;
++static uint32_t wake, score;
++
++static void notify_waiter(void)
++{
++    API(relock_wake)(&request);
++    __atomic_store_n(&wake, 1, __ATOMIC_RELEASE);
++}
++
++static int test_yield(void)
++{
++    yields++;
++    if (event == NOTIFY_AT_YIELD)
++        notify_waiter();
++    else if (event != NO_SLOT)
++        state.owners[0] = ((uint64_t)request.epoch << 32) | thread_state.tid;
++    return 0;
++}
++
++static int test_clock(clockid_t clock, struct timespec *now)
++{
++    (void)clock;
++    *now = (struct timespec){.tv_sec = 100, .tv_nsec = clocks++ * 2000};
++    if (clocks == 2) {
++        if (event == NOTIFY_SPIN) {
++            notify_waiter();
++            now->tv_nsec = 0;
++        } else if (event == NOTIFY_ONLY) {
++            /* Logical notification arrived, but the relock baton is pending. */
++            wake = 1;
++            now->tv_nsec = 0;
++        } else if (event == REVOKE) {
++            state.owners[0] = 0;
++            now->tv_nsec = 0;
++        }
++    }
++    return 0;
++}
++
++static void reset(enum event next, uint32_t failures, unsigned int demand)
++{
++    thread_state = (struct thread_state){.tid = 123, .registered = true};
++    state = (struct admission_state){.enabled = 1, .demand = demand};
++    event = next;
++    wake = yields = clocks = 0;
++    score = failures;
++    API(relock_prepare)(&request);
++}
++
++static void spin(void)
++{
++    API(relock_spin)(&request, &wake, &score, CLOCK_MONOTONIC, NULL);
++}
++
++int main(void)
++{
++    reset(NO_SLOT, 0, 0);
++    spin();
++    assert(yields == 1 && score == 0 && thread_state.word == request.epoch);
++
++    reset(EXPIRE, 0, 1);
++    spin();
++    assert(yields == 1 && score == 2 && thread_state.word == request.epoch);
++    reset(EXPIRE, 2, 1);
++    spin();
++    assert(yields == 1 && score == 4);
++    reset(EXPIRE, 4, 1);
++    spin();
++    assert(yields == 0 && score == 4 && thread_state.word == request.epoch);
++
++    reset(EXPIRE, 7, 0);
++    spin();
++    assert(yields == 1 && score == 8);
++    reset(NOTIFY_SPIN, 8, 0);
++    spin();
++    assert(yields == 1 && score == 7 && wake == 1);
++    assert(thread_state.word == (request.epoch | USER_WAITING));
++    reset(NOTIFY_SPIN, 0, 1);
++    spin();
++    assert(yields == 1 && score == 0 && wake == 1);
++    reset(NOTIFY_ONLY, 8, 0);
++    spin();
++    assert(yields == 1 && score == 7 && wake == 1);
++    assert(thread_state.word == request.epoch);
++
++    reset(REVOKE, 0, 0);
++    spin();
++    assert(yields == 1 && score == 2 && thread_state.word == request.epoch);
++    reset(NOTIFY_AT_YIELD, 0, 0);
++    spin();
++    assert(yields == 1 && wake == 1);
++    assert(thread_state.word == (request.epoch | USER_WAITING));
++    struct MUTEX *mutex = API(create)();
++    assert(mutex && API(relock)(mutex, &request) == 0);
++    assert(thread_state.word == (request.epoch | USER_HELD));
++    assert(API(unlock)(mutex) == 0 && thread_state.word == request.epoch);
++    assert(API(destroy)(mutex) == 0);
++
++    reset(EXPIRE, 0, 0);
++    struct timespec expired = {.tv_sec = 99};
++    API(relock_spin)(&request, &wake, &score, CLOCK_REALTIME, &expired);
++    assert(yields == 0 && thread_state.word == request.epoch);
++    state.enabled = 0;
++    spin();
++    assert(yields == 0);
++    state.enabled = 1;
++    thread_state.depth = 1;
++    API(relock_prepare)(&request);
++    assert(request.nested && !request.word);
++    spin();
++    assert(yields == 0 && thread_state.depth == 1);
++    puts("PASS adaptive spin: demand/history, grant loss, racing wake, same epoch, deadlines/nesting");
++    return 0;
++}

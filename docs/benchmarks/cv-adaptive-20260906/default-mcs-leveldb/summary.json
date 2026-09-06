@@ -1,0 +1,32 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "variant": "defaults",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      626441.066,
+      625262.886,
+      578840.363
+    ],
+    "mean": 610181.4383333334,
+    "cv_percent": 4.449260126246077,
+    "relative_to_baseline": null
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "variant": "defaults",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      77123.547,
+      66849.171,
+      76328.399
+    ],
+    "mean": 73433.70566666668,
+    "cv_percent": 7.784187145124271,
+    "relative_to_baseline": null
+  }
+]

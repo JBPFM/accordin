@@ -1,0 +1,122 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "baseline": [
+      625582.688,
+      629629.12,
+      621352.532
+    ],
+    "current": [
+      626441.066,
+      625262.886,
+      578840.363
+    ],
+    "baseline_mean": 625521.4466666667,
+    "current_mean": 610181.4383333334,
+    "change_percent": -2.45235529734088,
+    "closing_baseline": 622387.744,
+    "source_variant": "defaults",
+    "default_spin_us": 0
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "baseline": [
+      938447.843,
+      956638.166,
+      987836.226
+    ],
+    "current": [
+      938364.586,
+      947372.284,
+      962924.903
+    ],
+    "baseline_mean": 960974.0783333334,
+    "current_mean": 949553.9243333334,
+    "change_percent": -1.1883935537373214,
+    "closing_baseline": 932529.074,
+    "source_variant": "pressure",
+    "default_spin_us": 50
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "baseline": [
+      68351.394,
+      70918.398,
+      69474.01
+    ],
+    "current": [
+      77123.547,
+      66849.171,
+      76328.399
+    ],
+    "baseline_mean": 69581.26733333334,
+    "current_mean": 73433.70566666668,
+    "change_percent": 5.536602710723848,
+    "closing_baseline": 75880.966,
+    "source_variant": "defaults",
+    "default_spin_us": 0
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "baseline": [
+      160884.731,
+      159501.134,
+      159205.854
+    ],
+    "current": [
+      190858.19,
+      182837.431,
+      189962.198
+    ],
+    "baseline_mean": 159863.90633333332,
+    "current_mean": 187885.93966666667,
+    "change_percent": 17.528680473317372,
+    "closing_baseline": 156396.72,
+    "source_variant": "pressure",
+    "default_spin_us": 50
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_accordin",
+    "baseline": [
+      74.9058753,
+      75.55104154,
+      74.34776934
+    ],
+    "current": [
+      77.17710656,
+      73.18317492,
+      74.11137192
+    ],
+    "baseline_mean": 74.93489539333333,
+    "current_mean": 74.82388446666667,
+    "change_percent": -0.14814316625647583,
+    "closing_baseline": 76.21644732,
+    "source_variant": "defaults",
+    "default_spin_us": 0
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "baseline": [
+      76.37794936,
+      76.32050996,
+      73.32050028
+    ],
+    "current": [
+      76.66744516,
+      76.76628354,
+      76.93185396
+    ],
+    "baseline_mean": 75.3396532,
+    "current_mean": 76.78852755333334,
+    "change_percent": 1.9231232051030167,
+    "closing_baseline": 72.41574455,
+    "source_variant": "pressure",
+    "default_spin_us": 50
+  }
+]

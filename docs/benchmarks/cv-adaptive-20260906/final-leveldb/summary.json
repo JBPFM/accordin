@@ -1,0 +1,62 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "variant": "pressure",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      629806.881,
+      620901.915,
+      629382.28
+    ],
+    "mean": 626697.0253333334,
+    "cv_percent": 0.801535814151554,
+    "relative_to_baseline": null
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "pressure",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      938364.586,
+      947372.284,
+      962924.903
+    ],
+    "mean": 949553.9243333334,
+    "cv_percent": 1.30847242394222,
+    "relative_to_baseline": null
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "variant": "pressure",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      77352.458,
+      77468.018,
+      71832.38
+    ],
+    "mean": 75550.952,
+    "cv_percent": 4.26321050236903,
+    "relative_to_baseline": null
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "pressure",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      190858.19,
+      182837.431,
+      189962.198
+    ],
+    "mean": 187885.93966666667,
+    "cv_percent": 2.3392006046698905,
+    "relative_to_baseline": null
+  }
+]

@@ -1,0 +1,35 @@
+commit f7fedc94c46ff98f3ad20ada1fecc414b3fe233a
+Author:     JerryMouseZ <1711333@mail.nankai.edu.cn>
+AuthorDate: Sun Sep 6 00:44:43 2026 -0600
+Commit:     JerryMouseZ <1711333@mail.nankai.edu.cn>
+CommitDate: Sun Sep 6 00:44:43 2026 -0600
+
+    Park condition-variable spinners that keep losing under queued demand
+    
+    PARSEC streamcluster at 192 threads spent 74% of its CPU in the cond-wait
+    spin: at every barrier the admitted waiters held the CPUs for the whole
+    budget while the threads still running toward the barrier were queued, so
+    each of 22k barriers paid about 2 ms. With spinning disabled the run takes
+    69 s against 89 s for pthread, but disabling it costs LevelDB fillrandom
+    4x at 512 threads, where the signal arrives well inside the budget.
+    
+    The scheduler now publishes how many tasks are queued for a CPU or a slot,
+    and a preempted cv spinner gives up its slot. A waiter always spins while
+    nothing is queued; under queued demand it spins only if this condition
+    variable's recent spins have been succeeding (a saturating score, +2 per
+    spin that ran out, -1 per spin ended by a signal, parked from 3). Barrier
+    condition variables settle into parking; per-writer ones keep spinning.
+    
+    streamcluster 192 threads: 154 s to 73-74 s. fillrandom 48/512 and
+    readrandom 512 unchanged. The runner accepts extra preload arms.
+    
+    Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01ThgEz3jJxvbPUfcH2iGTjX
+
+ README.md                              |  2 +-
+ experiments/run_fullhook_readrandom.py | 59 +++++++++++++++++++++++++++++++---
+ src/bpf/intf.h                         |  3 ++
+ src/bpf/main.bpf.c                     | 28 ++++++++++++----
+ src/fullhook.c                         | 41 ++++++++++++++++++++---
+ src/runtime.h                          | 34 ++++++++++++++------
+ 6 files changed, 141 insertions(+), 26 deletions(-)

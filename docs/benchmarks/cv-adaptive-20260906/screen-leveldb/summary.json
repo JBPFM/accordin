@@ -1,0 +1,41 @@
+[
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "n": 1,
+    "attempts": 1,
+    "values": [
+      161416.747
+    ],
+    "mean": 161416.747,
+    "cv_percent": null,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "adaptive",
+    "n": 1,
+    "attempts": 1,
+    "values": [
+      45811.048
+    ],
+    "mean": 45811.048,
+    "cv_percent": null,
+    "relative_to_baseline": 0.2838060415131523
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "fixed",
+    "n": 1,
+    "attempts": 1,
+    "values": [
+      46242.523
+    ],
+    "mean": 46242.523,
+    "cv_percent": null,
+    "relative_to_baseline": 0.28647909129280125
+  }
+]

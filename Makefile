@@ -24,7 +24,7 @@ BACKENDS := mcs_accordin_direct mcs_tas_accordin_direct
 LIBRARIES := $(BACKENDS:%=$(OUT)/lib%.so)
 HEADERS := $(wildcard src/*.h include/*.h src/bpf/*.h third_party/scx/scx/*.h) Makefile
 
-.PHONY: all $(BACKENDS) check check-bpf litl check-litl check-litl-bpf clean compile-commands
+.PHONY: all $(BACKENDS) check check-spin check-bpf litl check-litl check-litl-bpf clean compile-commands
 .DELETE_ON_ERROR:
 all: $(LIBRARIES)
 $(BACKENDS): %: $(OUT)/lib%.so
@@ -49,9 +49,14 @@ $(OUT)/libmcs_accordin_direct.so: src/direct.c src/runtime.c $(HEADERS) $(OUT)/a
 $(OUT)/libmcs_tas_accordin_direct.so: src/direct.c src/runtime.c $(HEADERS) $(OUT)/accordin.skel.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_FLAGS) -DMCS_TAS -shared src/direct.c src/runtime.c -o $@ $(LDFLAGS) -Wl,-z,defs $(LIBBPF_LIBS) -pthread
 
-check: all
+check: all check-spin
 	bash scripts/check_direct_symbols.sh $(OUT)
 	DIRECT_LIB_DIR=$(abspath $(OUT)) bash scripts/test_direct_api.sh --no-bpf
+
+check-spin: | $(OUT)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(HOST_FLAGS) scripts/tests/relock_spin.c -pthread -o $(OUT)/test-relock-spin
+	$(OUT)/test-relock-spin
+
 
 check-bpf: all
 	DIRECT_LIB_DIR=$(abspath $(OUT)) bash scripts/test_direct_api.sh --bpf

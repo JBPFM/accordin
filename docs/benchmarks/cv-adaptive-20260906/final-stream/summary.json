@@ -1,0 +1,28 @@
+[
+  {
+    "benchmark": "stream",
+    "backend": "mcs_accordin",
+    "variant": "pressure",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      83.40364642,
+      80.09062299,
+      78.14413553
+    ],
+    "mean": 80.54613498
+  },
+  {
+    "benchmark": "stream",
+    "backend": "mcs_tas_accordin",
+    "variant": "pressure",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      76.66744516,
+      76.76628354,
+      76.93185396
+    ],
+    "mean": 76.78852755333334
+  }
+]

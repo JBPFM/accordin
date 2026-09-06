@@ -16,6 +16,9 @@ int mcs_accordin_direct_mutex_trylock(mcs_accordin_direct_mutex_t *mutex);
 int mcs_accordin_direct_mutex_unlock(mcs_accordin_direct_mutex_t *mutex);
 void mcs_accordin_direct_mutex_relock_prepare(accordin_relock_request_t *request);
 void mcs_accordin_direct_mutex_relock_wake(accordin_relock_request_t *request);
+void mcs_accordin_direct_mutex_relock_spin(accordin_relock_request_t *request,
+                                        uint32_t *wake, uint32_t *spin_fail,
+                                        int clock, const struct timespec *deadline);
 int mcs_accordin_direct_mutex_relock(mcs_accordin_direct_mutex_t *mutex,
                                    accordin_relock_request_t *request);
 

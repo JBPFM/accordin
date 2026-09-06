@@ -1,0 +1,122 @@
+[
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "variant": "baseline",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      625582.688,
+      629629.12,
+      621352.532
+    ],
+    "mean": 625521.4466666667,
+    "cv_percent": 0.6616294081415434,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_accordin",
+    "variant": "balanced",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      602216.971,
+      672951.78,
+      633929.396
+    ],
+    "mean": 636366.049,
+    "cv_percent": 5.567597687850858,
+    "relative_to_baseline": 1.0173368993039695
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      938447.843,
+      956638.166,
+      987836.226
+    ],
+    "mean": 960974.0783333334,
+    "cv_percent": 2.599243293246551,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "readrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "balanced",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      963883.528,
+      970120.305,
+      938954.94
+    ],
+    "mean": 957652.9243333334,
+    "cv_percent": 1.7219663592415393,
+    "relative_to_baseline": 0.9965439712944598
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "variant": "baseline",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      68351.394,
+      70918.398,
+      69474.01
+    ],
+    "mean": 69581.26733333334,
+    "cv_percent": 1.849432779985435,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_accordin",
+    "variant": "balanced",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      75616.043,
+      78666.44,
+      76046.734
+    ],
+    "mean": 76776.40566666667,
+    "cv_percent": 2.150299644883109,
+    "relative_to_baseline": 1.1034062558657431
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "baseline",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      160884.731,
+      159501.134,
+      159205.854
+    ],
+    "mean": 159863.90633333332,
+    "cv_percent": 0.5606665319104914,
+    "relative_to_baseline": 1.0
+  },
+  {
+    "benchmark": "fillrandom",
+    "backend": "mcs_tas_accordin",
+    "variant": "balanced",
+    "n": 3,
+    "attempts": 3,
+    "values": [
+      185519.288,
+      183411.805,
+      172028.96
+    ],
+    "mean": 180320.01766666665,
+    "cv_percent": 4.024609019693198,
+    "relative_to_baseline": 1.127959536348875
+  }
+]

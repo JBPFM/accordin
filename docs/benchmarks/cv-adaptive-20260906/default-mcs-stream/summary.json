@@ -1,0 +1,15 @@
+[
+  {
+    "benchmark": "stream",
+    "backend": "mcs_accordin",
+    "variant": "defaults",
+    "attempts": 3,
+    "n": 3,
+    "values": [
+      77.17710656,
+      73.18317492,
+      74.11137192
+    ],
+    "mean": 74.82388446666667
+  }
+]

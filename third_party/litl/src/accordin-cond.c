@@ -27,6 +27,7 @@ typedef struct __attribute__((may_alias)) {
     clockid_t clock;
     struct cond_waiter *head, *tail;
     unsigned int active;
+    uint32_t spin_fail;
 } cond_state_t;
 
 _Static_assert(sizeof(cond_state_t) <= sizeof(pthread_cond_t), "condvar storage");
@@ -129,13 +130,22 @@ static int wait_on_cond(pthread_cond_t *cond, pthread_mutex_t *mutex,
     cleanup.unlocked = 1;
     accordin_wait_arm(&cleanup.waiter.park);
 
+    /* One optional admission attempt, using the same relock epoch. Logical
+     * notification ends CV spinning; actual relock still follows the mutex's
+     * baton queue. Cancellation remains disabled until CV state has
+     * been withdrawn, so cleanup never inherits a revocable spinning slot. */
+    ACCORDIN_DIRECT(relock_spin)(&cleanup.waiter.park.request,
+                                &cleanup.waiter.park.notified,
+                                &cleanup.cond->spin_fail, clock, deadline);
+    __atomic_store_n(&cleanup.waiter.park.parked, 1, __ATOMIC_SEQ_CST);
+
     /* syscall(SYS_futex) is not a libc cancellation point. Enable asynchronous
      * cancellation only around the resource-free futex wait loop, with the
      * cleanup handler installed and neither user mutex nor queue guard held.
      * The adapter is linked with -z now, avoiding lazy PLT binding here. */
     cond_require(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old_type));
     cond_require(pthread_setcancelstate(old_state, NULL));
-    while (!__atomic_load_n(&cleanup.waiter.park.wake, __ATOMIC_ACQUIRE)) {
+    while (!__atomic_load_n(&cleanup.waiter.park.wake, __ATOMIC_SEQ_CST)) {
         int error = 0;
         int op = FUTEX_WAIT_BITSET_PRIVATE;
         if (clock == CLOCK_REALTIME)

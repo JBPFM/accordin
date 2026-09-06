@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
 #include <assert.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <time.h>
 #include "../../include/accordin_relock.h"
 #include "../../src/bpf/intf.h"
@@ -23,6 +26,8 @@ static int (*mutex_trylock)(void *);
 static int (*mutex_unlock)(void *);
 static void (*relock_prepare)(accordin_relock_request_t *);
 static void (*relock_wake)(accordin_relock_request_t *);
+static int (*relock_park)(accordin_relock_request_t *);
+static int (*cv_flush)(unsigned int, unsigned int);
 static int (*mutex_relock)(void *, accordin_relock_request_t *);
 static void *primary, *secondary;
 static unsigned counter, nested_counter;
@@ -70,6 +75,53 @@ static void relock_test(void) {
     assert(mutex_unlock(primary) == 0);
     assert(__atomic_load_n((uint32_t *)request.word, __ATOMIC_ACQUIRE) == request.epoch);
     puts("direct relock ok: cross-thread publication, same epoch, dormant/nested requests");
+}
+
+/* Custody hands the thread to the scheduler until the wait is notified or its
+ * limit passes. Nothing notifies here, so the park must end through expiry. */
+static void park_test(int scheduled) {
+    accordin_relock_request_t request;
+    assert(mutex_lock(primary) == 0);
+    assert(mutex_unlock(primary) == 0);
+    relock_prepare(&request);
+    assert(request.word && !request.nested);
+    struct timespec before, after;
+    assert(clock_gettime(CLOCK_MONOTONIC, &before) == 0);
+    int parked = relock_park(&request);
+    assert(clock_gettime(CLOCK_MONOTONIC, &after) == 0);
+    assert(parked == scheduled);
+    assert(__atomic_load_n((uint32_t *)request.word, __ATOMIC_ACQUIRE) ==
+           (scheduled ? (request.epoch | USER_WAITING) : request.epoch));
+    /* A park that returns without waiting never reached the scheduler. */
+    long long elapsed_us = (after.tv_sec - before.tv_sec) * 1000000LL +
+                           (after.tv_nsec - before.tv_nsec) / 1000;
+    assert(!scheduled || elapsed_us >= 1000);
+    assert(mutex_relock(primary, &request) == 0);
+    assert(mutex_unlock(primary) == 0);
+
+    /* A request notified before the park is never handed to the scheduler. */
+    relock_prepare(&request);
+    pthread_t notifier;
+    assert(pthread_create(&notifier, NULL, publish_relock, &request) == 0);
+    assert(pthread_join(notifier, NULL) == 0);
+    assert(relock_park(&request) == 0);
+    assert(__atomic_load_n((uint32_t *)request.word, __ATOMIC_ACQUIRE) ==
+           (request.epoch | USER_WAITING));
+    assert(mutex_relock(primary, &request) == 0);
+    assert(mutex_unlock(primary) == 0);
+
+    assert(cv_flush(0, CV_FLUSH_EXPIRE) >= 0);
+    printf("direct park ok: custody %s, notified request skips the park\n",
+           scheduled ? "expired" : "unavailable");
+}
+
+/* Mirrors the runtime's reading of ACCORDIN_CV_CUSTODY: on unless denied. */
+static int custody_allowed(void) {
+    const char *value = getenv("ACCORDIN_CV_CUSTODY");
+    if (!value)
+        return 1;
+    return !(!strcasecmp(value, "0") || !strcasecmp(value, "false") ||
+             !strcasecmp(value, "no") || !strcasecmp(value, "off"));
 }
 
 static void *symbol(const char *suffix) {
@@ -129,6 +181,14 @@ static void *mixed_contender(void *unused) {
 int main(int argc, char **argv) {
     assert(argc == 3);
     prefix = argv[2];
+    char disable[96];
+    snprintf(disable, sizeof(disable), "%s_DISABLE_BPF", prefix);
+    for (char *c = disable; *c; ++c)
+        *c = (char)toupper((unsigned char)*c);
+    const char *setting = getenv(disable);
+    /* Custody needs both the scheduler and the custody setting, which the
+     * runtime reads as enabled unless it is explicitly denied. */
+    int scheduled = setting && setting[0] == '0' && custody_allowed();
     library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!library) {
         fprintf(stderr, "dlopen: %s\n", dlerror());
@@ -142,6 +202,8 @@ int main(int argc, char **argv) {
     relock_prepare = symbol("mutex_relock_prepare");
     relock_wake = symbol("mutex_relock_wake");
     mutex_relock = symbol("mutex_relock");
+    relock_park = symbol("mutex_relock_park");
+    cv_flush = symbol("mutex_cv_flush");
     assert(mutex_lock(NULL) == EINVAL);
     assert(mutex_trylock(NULL) == EINVAL);
     assert(mutex_unlock(NULL) == EINVAL);
@@ -160,6 +222,7 @@ int main(int argc, char **argv) {
     assert(mutex_unlock(secondary) == 0);
 
     relock_test();
+    park_test(scheduled);
 
     pthread_t threads[THREADS];
     assert(pthread_barrier_init(&barrier, NULL, THREADS) == 0);

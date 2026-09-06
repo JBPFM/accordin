@@ -24,7 +24,11 @@ BACKENDS := mcs_accordin_direct mcs_tas_accordin_direct
 LIBRARIES := $(BACKENDS:%=$(OUT)/lib%.so)
 HEADERS := $(wildcard src/*.h include/*.h src/bpf/*.h third_party/scx/scx/*.h) Makefile
 
-.PHONY: all $(BACKENDS) check check-bpf litl check-litl check-litl-bpf clean compile-commands
+ACCORDIN_CV_ENV := ACCORDIN_CV_CUSTODY="$(ACCORDIN_CV_CUSTODY)" \
+	ACCORDIN_CV_CUSTODY_MS="$(ACCORDIN_CV_CUSTODY_MS)" \
+	ACCORDIN_CV_COUNTERS="$(ACCORDIN_CV_COUNTERS)"
+
+.PHONY: all $(BACKENDS) check check-bpf litl check-litl check-litl-bpf verify-insns clean compile-commands
 .DELETE_ON_ERROR:
 all: $(LIBRARIES)
 $(BACKENDS): %: $(OUT)/lib%.so
@@ -60,10 +64,17 @@ litl: all
 	$(MAKE) -C third_party/litl ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
 
 check-litl: litl
-	cd third_party/litl && ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) bash tests/run.sh --no-bpf
+	cd third_party/litl && ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) \
+		$(ACCORDIN_CV_ENV) bash tests/run.sh --no-bpf
 
 check-litl-bpf: litl
-	cd third_party/litl && ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) bash tests/run.sh --bpf
+	cd third_party/litl && ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) \
+		$(ACCORDIN_CV_ENV) bash tests/run.sh --bpf
+
+# Loads the BPF objects to read the verifier's budget, so it needs privileges
+# and the same serialization as any other scheduler load.
+verify-insns: all
+	ACCORDIN_VERIFY_ONLY=1 LD_PRELOAD=$(abspath $(OUT))/libmcs_tas_accordin_direct.so /bin/true
 
 compile-commands: all
 	bash gen-compile-commands.sh

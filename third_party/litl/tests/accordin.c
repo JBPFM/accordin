@@ -271,6 +271,51 @@ static void broadcast_test(int threads) {
     printf("PASS condvar broadcast/timed wakeups: %d waiters, 50 rounds\n", threads);
 }
 
+/* Untimed waits are held by the scheduler rather than sleeping on a futex.
+ * A notification arriving well after every waiter is held must still release
+ * all of them, whether it reaches them directly or through custody expiry. */
+#define CUSTODY_WAITERS 16
+static pthread_cond_t custody_cv;
+static int custody_ready, custody_go, custody_woken;
+
+static void *custody_waiter(void *arg) {
+    (void)arg;
+    OK(pthread_mutex_lock(&mutex));
+    custody_ready++;
+    OK(pthread_cond_broadcast(&custody_cv));
+    while (!custody_go)
+        OK(pthread_cond_wait(&custody_cv, &mutex));
+    CHECK(pthread_mutex_trylock(&mutex) == EBUSY);
+    custody_woken++;
+    OK(pthread_mutex_unlock(&mutex));
+    return NULL;
+}
+
+static void custody_expiry_test(void) {
+    pthread_t ids[CUSTODY_WAITERS];
+    custody_ready = custody_go = custody_woken = 0;
+    OK(pthread_cond_init(&custody_cv, NULL));
+    for (int i = 0; i < CUSTODY_WAITERS; i++)
+        OK(pthread_create(&ids[i], NULL, custody_waiter, NULL));
+    OK(pthread_mutex_lock(&mutex));
+    while (custody_ready < CUSTODY_WAITERS)
+        OK(pthread_cond_wait(&custody_cv, &mutex));
+    OK(pthread_mutex_unlock(&mutex));
+    struct timespec delay = {.tv_nsec = 50000000};
+    while (nanosleep(&delay, &delay) && errno == EINTR) {}
+    OK(pthread_mutex_lock(&mutex));
+    custody_go = 1;
+    OK(pthread_cond_signal(&custody_cv));
+    OK(pthread_cond_broadcast(&custody_cv));
+    OK(pthread_mutex_unlock(&mutex));
+    for (int i = 0; i < CUSTODY_WAITERS; i++)
+        OK(pthread_join(ids[i], NULL));
+    CHECK(custody_woken == CUSTODY_WAITERS);
+    OK(pthread_cond_destroy(&custody_cv));
+    printf("PASS condvar custody: %d untimed waiters released after a delayed notification\n",
+           CUSTODY_WAITERS);
+}
+
 static void cancel_cleanup(void *arg) {
     CHECK(pthread_mutex_trylock(&mutex) == EBUSY);
     ready = 2;
@@ -547,6 +592,7 @@ int main(int argc, char **argv) {
     first_wait_test(threads);
     signal_test();
     broadcast_test(threads);
+    custody_expiry_test();
     timeout_test(CLOCK_REALTIME);
     timeout_test(CLOCK_MONOTONIC);
     puts("PASS timeout/error returns with mutex held (realtime and monotonic)");

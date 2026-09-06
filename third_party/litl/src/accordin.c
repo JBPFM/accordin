@@ -46,7 +46,9 @@ static void park_remove(struct accordin_mutex *mutex,
  * before returning: neither the futex nor its TLS request can disappear. */
 static void park_wake(struct accordin_park_waiter *waiter) {
     ACCORDIN_DIRECT(relock_wake)(&waiter->request);
-    __atomic_store_n(&waiter->wake, 1, __ATOMIC_RELEASE);
+    /* Sequenced against the waiter's mode store and wake load, so at least one
+     * of the two sides observes the other. */
+    (void)__atomic_exchange_n(&waiter->wake, 1, __ATOMIC_SEQ_CST);
     if (syscall(SYS_futex, &waiter->wake, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0) < 0)
         abort();
 }
@@ -201,6 +203,7 @@ void accordin_wait_notify(struct accordin_park_waiter *waiter) {
 
 void accordin_wait_cancel(struct accordin_park_waiter *waiter) {
     struct accordin_mutex *mutex = waiter->mutex;
+    atomic_store_explicit(&waiter->mode, PARK_NONE, memory_order_seq_cst);
     park_lock(mutex);
     if (waiter->queued) {
         park_remove(mutex, waiter);

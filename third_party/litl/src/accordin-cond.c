@@ -129,6 +129,21 @@ static int wait_on_cond(pthread_cond_t *cond, pthread_mutex_t *mutex,
     cleanup.unlocked = 1;
     accordin_wait_arm(&cleanup.waiter.park);
 
+    /* An untimed, outermost wait is handed to the scheduler instead of sleeping
+     * on the futex straight away. The park returns once the wait is notified or
+     * its custody ends, and the futex loop below re-checks either way. The
+     * seq_cst pair with the notifier leaves neither side able to miss the
+     * other. Cancellation stays disabled: the park is not a cancellation
+     * point, and a held wait takes the signal when it next runs. */
+    if (!ts && !cleanup.waiter.park.request.nested) {
+        atomic_store_explicit(&cleanup.waiter.park.mode, PARK_CUSTODY,
+                              memory_order_seq_cst);
+        if (!__atomic_load_n(&cleanup.waiter.park.wake, __ATOMIC_SEQ_CST))
+            ACCORDIN_DIRECT(relock_park)(&cleanup.waiter.park.request);
+    }
+    atomic_store_explicit(&cleanup.waiter.park.mode, PARK_FUTEX,
+                          memory_order_seq_cst);
+
     /* syscall(SYS_futex) is not a libc cancellation point. Enable asynchronous
      * cancellation only around the resource-free futex wait loop, with the
      * cleanup handler installed and neither user mutex nor queue guard held.

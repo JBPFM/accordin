@@ -97,6 +97,33 @@ EXPORT void API(relock_wake)(accordin_relock_request_t *request)
                               request->epoch | USER_WAITING, memory_order_release);
 }
 
+/* Enter scheduler custody for one prepared request. The scheduler holds the
+ * thread until the request is notified or its custody expires, so the caller
+ * must be prepared to wait again. Returns whether the thread yielded; either
+ * way the word ends in the waiting state, ready for relock to confirm. */
+EXPORT int API(relock_park)(accordin_relock_request_t *request)
+{
+    if (!request->word || !accordin_cv_custody_ready())
+        return 0;
+    uint32_t dormant = request->epoch;
+    if (!atomic_compare_exchange_strong_explicit((_Atomic uint32_t *)request->word,
+                                                 &dormant,
+                                                 request->epoch | USER_CV | USER_WAITING,
+                                                 memory_order_seq_cst,
+                                                 memory_order_relaxed))
+        return 0;
+    sched_yield();
+    /* A bare epoch would retire the grant a flush may have just arranged. */
+    atomic_store_explicit((_Atomic uint32_t *)request->word,
+                          request->epoch | USER_WAITING, memory_order_relaxed);
+    return 1;
+}
+
+EXPORT int API(cv_flush)(unsigned int width, unsigned int flags)
+{
+    return accordin_cv_flush_now(width, flags);
+}
+
 EXPORT int API(relock)(struct MUTEX *mutex, accordin_relock_request_t *request)
 {
     if (!mutex || !request)
@@ -127,5 +154,7 @@ TAS_ALIAS(trylock)
 TAS_ALIAS(unlock)
 TAS_ALIAS(relock_prepare)
 TAS_ALIAS(relock_wake)
+TAS_ALIAS(relock_park)
 TAS_ALIAS(relock)
+TAS_ALIAS(cv_flush)
 #endif

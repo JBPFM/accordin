@@ -4,6 +4,7 @@
 
 #define NORMAL_DSQ 0x100ULL
 #define WAITING_DSQ 0x101ULL
+#define WAITFORSIGNAL_DSQ 0x102ULL
 #define MAX_TASKS 65536U
 #define MAX_CPUS 256U
 
@@ -28,6 +29,27 @@ struct task_scx_ctx {
   /* CPU + 1, or zero without an admission slot. */
   unsigned int admission_cpu;
   unsigned long long ticket;
+  /* Time the condvar wait entered scheduler custody, zero outside custody. */
+  unsigned long long parked_at;
+  /* Request whose custody was withdrawn; it may not be granted again. */
+  unsigned long long custody_denied;
+};
+
+/* Batched transfer of notified condvar waiters out of scheduler custody.
+ * The caller fills the request fields and reads back the result fields. */
+#define CV_FLUSH_EXPIRE 1U
+#define CV_FLUSH_REV 2U
+#define CV_FLUSH_TAIL 4U
+#define CV_FLUSH_MOVE 8U
+
+struct cv_flush_ctx {
+  unsigned int width;
+  unsigned int flags;
+  unsigned long long now;
+  unsigned int moved;
+  unsigned int expired;
+  unsigned int pending;
+  unsigned int queued;
 };
 
 #endif

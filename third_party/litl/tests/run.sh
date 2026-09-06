@@ -16,24 +16,98 @@ esac
 mkdir -p obj/tests
 root="${ACCORDIN_ROOT:-$(cd ../.. && pwd)}"
 libdir="${ACCORDIN_LIB_DIR:-$root/target/release}"
+
+# Under the scheduler every untimed wait is held until its custody expires, so
+# the shortest limit keeps the ping-pong tests inside the suite timeout.
+if [[ "$disable" == 0 ]]; then
+    custody_ms="${ACCORDIN_CV_CUSTODY_MS:-1}"
+    counters="${ACCORDIN_CV_COUNTERS:-1}"
+else
+    custody_ms="${ACCORDIN_CV_CUSTODY_MS:-}"
+    counters="${ACCORDIN_CV_COUNTERS:-}"
+fi
+
+# The runtime reads custody as enabled unless it is explicitly denied.
+if [[ "${ACCORDIN_CV_CUSTODY:-}" =~ ^([0]|[Ff]alse|[Nn]o|[Oo]ff|FALSE|NO|OFF)$ ]]; then
+    custody=0
+else
+    custody=1
+fi
+
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
+
+run_case() {
+    local status=0
+    set +e
+    timeout -k 5s "${LITL_TEST_TIMEOUT:-60}s" env \
+        MCS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
+        MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
+        MCS_ACCORDIN_DIRECT_STATS_ONLY=0 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0 \
+        ACCORDIN_DISABLE_ADMISSION=0 \
+        ACCORDIN_CV_CUSTODY="${ACCORDIN_CV_CUSTODY:-}" \
+        ACCORDIN_CV_CUSTODY_MS="$custody_ms" \
+        ACCORDIN_CV_COUNTERS="$counters" \
+        "$@" >"$log" 2>&1
+    status=$?
+    set -e
+    cat "$log"
+    [[ $status -eq 0 ]] || exit "$status"
+}
+
+# Every park leaves custody exactly once, so the totals must add up. The first
+# argument is the number of parks the case is expected to reach at least.
+check_counters() {
+    [[ "$disable" == 0 && "$counters" == 1 ]] || return 0
+    local least="${1:-0}" line
+    line="$(grep -m1 '^\[accordin_cv\]' "$log" || true)"
+    if [[ -z "$line" ]]; then
+        echo "missing [accordin_cv] counters" >&2
+        exit 1
+    fi
+    awk -v line="$line" -v custody="$custody" -v least="$least" 'BEGIN {
+        split(line, fields, " ");
+        for (i in fields) {
+            split(fields[i], pair, "=");
+            value[pair[1]] = pair[2] + 0;
+        }
+        total = value["flushed"] + value["expired"] + value["drained"] + value["parked_now"];
+        if (value["parked"] != total) {
+            printf "custody counters do not balance: %s\n", line > "/dev/stderr";
+            exit 1;
+        }
+        if (!custody) {
+            if (value["parked"] != 0) {
+                printf "custody is off but waits were parked: %s\n", line > "/dev/stderr";
+                exit 1;
+            }
+            exit 0;
+        }
+        if (value["parked"] < least) {
+            printf "no wait reached custody: %s\n", line > "/dev/stderr";
+            exit 1;
+        }
+        # Notification still goes through the relock baton, so nothing leaves
+        # custody through a flush yet.
+        if (value["flushed"] != 0) {
+            printf "unexpected flush release: %s\n", line > "/dev/stderr";
+            exit 1;
+        }
+    }'
+}
+
 ${CC:-cc} -std=gnu11 -O2 -Wall -Werror tests/accordin.c -pthread -ldl -o obj/tests/accordin
 ${CXX:-c++} -std=c++17 -O2 -Wall -Werror tests/condition-variable.cpp -pthread \
     -o obj/tests/condition-variable
 for backend in mcsaccordin_original mcstasaccordin_original; do
     echo "Testing $backend ($mode)"
-    timeout -k 5s "${LITL_TEST_TIMEOUT:-60}s" env \
-        MCS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
-        MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
-        MCS_ACCORDIN_DIRECT_STATS_ONLY=0 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0 \
-        ACCORDIN_DISABLE_ADMISSION=0 \
-        bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
+    run_case bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
         "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
-    timeout -k 5s "${LITL_TEST_TIMEOUT:-60}s" env \
-        MCS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
-        MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF="$disable" \
-        MCS_ACCORDIN_DIRECT_STATS_ONLY=0 MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY=0 \
-        ACCORDIN_DISABLE_ADMISSION=0 \
-        bash "./lib${backend}.sh" ./obj/tests/condition-variable
+    check_counters 1
+    # A single worker may find its predicate already true and never wait, so
+    # this case only has to balance.
+    run_case bash "./lib${backend}.sh" ./obj/tests/condition-variable
+    check_counters
     if [[ "$disable" == 0 && "$(cat /sys/kernel/sched_ext/state)" != disabled ]]; then
         echo "sched_ext is still active after $backend exited" >&2
         exit 1

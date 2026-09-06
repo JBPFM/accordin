@@ -43,7 +43,7 @@ static __always_inline void release_slot(struct task_struct *p,
 }
 
 static __always_inline __u64 request_ticket(struct task_struct *p, __u32 state) {
-  return ((__u64)(state & ~USER_FLAGS) << 32) | (__u32)p->pid;
+  return ((__u64)(state & ~USER_META) << 32) | (__u32)p->pid;
 }
 
 /* Unless renewed at yield, a new request retires the old slot.

@@ -85,7 +85,7 @@ EXPORT void API(relock_prepare)(accordin_relock_request_t *request)
     if (!request->nested && admission_enabled) {
         uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
         request->word = &thread_state.word;
-        request->epoch = (word & ~USER_FLAGS) + 4;
+        request->epoch = (word & ~USER_META) + 8;
         atomic_store_explicit(&thread_state.word, request->epoch, memory_order_release);
     }
 }

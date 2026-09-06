@@ -39,6 +39,8 @@ static void relock_test(void) {
     assert(mutex_unlock(primary) == 0);
     relock_prepare(&request);
     assert(request.word && !request.nested);
+    assert(!(request.epoch & USER_META));
+    uint32_t first_epoch = request.epoch;
     assert(__atomic_load_n((uint32_t *)request.word, __ATOMIC_ACQUIRE) == request.epoch);
     pthread_t notifier;
     assert(pthread_create(&notifier, NULL, publish_relock, &request) == 0);
@@ -52,6 +54,7 @@ static void relock_test(void) {
     assert(__atomic_load_n((uint32_t *)request.word, __ATOMIC_ACQUIRE) == request.epoch);
     /* Timeout/cancel consumes a dormant request without a notifier. */
     relock_prepare(&request);
+    assert(!(request.epoch & USER_META) && request.epoch == first_epoch + 8);
     assert(mutex_relock(primary, &request) == 0);
     uint32_t held = __atomic_load_n((uint32_t *)request.word, __ATOMIC_ACQUIRE);
     assert(held == (request.epoch | USER_HELD));

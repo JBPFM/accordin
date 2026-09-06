@@ -32,7 +32,7 @@ static inline bool admission_begin(void)
     bool managed = thread_state.depth++ == 0 && admission_enabled;
     if (managed) {
         uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
-        atomic_store_explicit(&thread_state.word, (word & ~USER_FLAGS) + 4,
+        atomic_store_explicit(&thread_state.word, (word & ~USER_META) + 8,
                               memory_order_relaxed);
     }
     return managed;
@@ -41,7 +41,7 @@ static inline bool admission_begin(void)
 static inline void admission_wait(bool prequeued)
 {
     uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
-                                               memory_order_relaxed) & ~USER_FLAGS;
+                                               memory_order_relaxed) & ~USER_META;
     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
     struct admission_state *state = scheduler_admission;
 
@@ -67,7 +67,7 @@ static inline void admission_enter(bool managed)
 {
     if (managed) {
         uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
-        atomic_store_explicit(&thread_state.word, (word & ~USER_FLAGS) | USER_HELD,
+        atomic_store_explicit(&thread_state.word, (word & ~USER_META) | USER_HELD,
                               memory_order_relaxed);
     }
 }
@@ -75,7 +75,7 @@ static inline void admission_enter(bool managed)
 static inline void admission_finish(void)
 {
     if (--thread_state.depth == 0 && admission_enabled)
-        atomic_fetch_and_explicit(&thread_state.word, ~USER_FLAGS, memory_order_relaxed);
+        atomic_fetch_and_explicit(&thread_state.word, ~USER_META, memory_order_relaxed);
 }
 
 #endif

@@ -7,10 +7,16 @@
 #define MAX_TASKS 65536U
 #define MAX_CPUS 256U
 
+/* Admission word: bits 0-1 hold the state value (0 idle, USER_HELD,
+ * USER_WAITING, USER_SPINNING), bit 2 marks a condvar wait, and bits 3 and
+ * above count requests, advancing by 8. USER_FLAGS masks the value alone,
+ * USER_META the value together with the condvar marker. */
 #define USER_HELD 1U
 #define USER_WAITING 2U
 #define USER_SPINNING 3U
 #define USER_FLAGS 3U
+#define USER_CV 4U
+#define USER_META 7U
 
 /* Mapped read-only by the direct runtime to confirm admission after yielding. */
 struct admission_state {

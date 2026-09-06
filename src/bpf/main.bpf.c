@@ -62,12 +62,19 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
   struct task_scx_ctx *tctx = task_ctx(p);
   bool idle = false;
+  s32 cpu;
 
   if (!stats_only_mode && tctx && tctx->admission_cpu &&
       allowed(p, tctx->admission_cpu - 1))
     return tctx->admission_cpu - 1;
-  /* All tasks pass enqueue, including wakeups on an idle CPU. */
-  return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &idle);
+  cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &idle);
+  /* Dispatching a wakeup onto an idle CPU here skips enqueue and the kick that
+   * would otherwise have to reach that CPU before it looks for work. A waiter
+   * without a slot placed this way simply yields again and takes the ordinary
+   * enqueue path into the waiting queue, so admission is unaffected. */
+  if (idle)
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+  return cpu;
 }
 
 void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
@@ -237,6 +244,11 @@ void BPF_STRUCT_OPS(accordin_exit, struct scx_exit_info *ei) {
 }
 
 SCX_OPS_DEFINE(accordin_ops,
+               /* Without this the core keeps the last runnable task on a CPU
+                * running without calling ops.enqueue, so a waiter yielding on
+                * an otherwise idle CPU would never reach WAITING_DSQ and could
+                * never be admitted. */
+               .flags = SCX_OPS_ENQ_LAST,
                .select_cpu = (void *)accordin_select_cpu,
                .enqueue = (void *)accordin_enqueue,
                .dispatch = (void *)accordin_dispatch,

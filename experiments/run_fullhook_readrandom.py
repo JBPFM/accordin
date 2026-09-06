@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run stock LevelDB db_bench readrandom under the fullhook lock arms.
+"""Run stock LevelDB db_bench under the fullhook lock arms.
 
 Each arm differs only in the environment wrapped around the same db_bench
-binary, so the same filled database is reused for every measured run.
+binary. The readrandom benchmark reuses one filled database for every measured
+run; the fillrandom benchmark writes a fresh database on each run instead.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import statistics
 import subprocess
@@ -36,7 +38,9 @@ STDERR_TAIL_LINES = 20
 STDOUT_TAIL_LINES = 40
 DMESG_TAIL_LINES = 50
 
-BENCHMARK = "readrandom"
+READ_BENCHMARK = "readrandom"
+WRITE_BENCHMARK = "fillrandom"
+BENCHMARKS = (READ_BENCHMARK, WRITE_BENCHMARK)
 FILL_BENCHMARK = "fillseq"
 FILL_THREADS = 1
 
@@ -211,6 +215,36 @@ def db_bench_args(
     return args
 
 
+def ops_per_thread(args: argparse.Namespace, threads: int) -> int:
+    """The per-thread operation count db_bench receives for one run."""
+    return args.total_ops // threads
+
+
+def db_dir_is_writable(db_dir: Path) -> bool:
+    """True when this user can create and unlink files inside the database."""
+    return os.access(db_dir, os.R_OK | os.W_OK | os.X_OK)
+
+
+def reset_db_dir(db_dir: Path) -> None:
+    """Drop the database so the next run starts from an empty store.
+
+    Elevated arms create their files as root, so a plain removal can fail with
+    EACCES; the privileged removal is the fallback for exactly that case.
+    """
+    if db_dir.exists():
+        shutil.rmtree(db_dir, ignore_errors=True)
+    if db_dir.exists():
+        subprocess.run(
+            ["sudo", "-n", "rm", "-rf", "--", str(db_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    if db_dir.exists():
+        raise RuntimeError(f"could not remove database directory {db_dir}")
+    db_dir.mkdir(parents=True, exist_ok=True)
+
+
 def run_tag(run: Run) -> str:
     return f"{run.arm.name} threads={run.threads} repeat={run.repeat}"
 
@@ -222,6 +256,7 @@ def arm_command(run: Run, args: argparse.Namespace) -> list[str]:
     handed to `env` inside the elevated command instead.
     """
     library = args.libraries.get(run.arm.name)
+    writes = args.benchmark == WRITE_BENCHMARK
     assignments: list[str] = []
     if library is not None:
         assignments.append(f"LD_PRELOAD={library}")
@@ -237,11 +272,13 @@ def arm_command(run: Run, args: argparse.Namespace) -> list[str]:
         db_bench_args(
             db_bench=args.db_bench,
             db_dir=args.db_dir,
-            benchmark=BENCHMARK,
+            benchmark=args.benchmark,
             threads=run.threads,
-            num=args.num,
-            use_existing_db=True,
-            reads=args.total_reads // run.threads,
+            # db_bench interprets --num as the per-thread write count, so the
+            # write benchmark splits the requested total across the threads.
+            num=ops_per_thread(args, run.threads) if writes else args.num,
+            use_existing_db=not writes,
+            reads=None if writes else ops_per_thread(args, run.threads),
         )
     )
     return command
@@ -290,10 +327,10 @@ def run_command(command: list[str], timeout_seconds: float) -> tuple[int, str, s
     return process.returncode, stdout or "", stderr or "", timed_out, wall_seconds
 
 
-def parse_result(output: str) -> dict[str, str]:
+def parse_result(output: str, benchmark: str) -> dict[str, str]:
     """Prefer the measured benchmark's line, falling back to the first one."""
     matches = RESULT_PATTERN.findall(output)
-    named = [match for match in matches if match[0] == BENCHMARK]
+    named = [match for match in matches if match[0] == benchmark]
     groups = (named or matches or [("", "", "", "", "")])[0]
     return {
         "micros_per_op": groups[1],
@@ -328,8 +365,10 @@ def git_head() -> str:
 
 
 def fill_command(args: argparse.Namespace) -> list[str] | None:
-    """The command that creates the database, or None when one already exists."""
-    if (args.db_dir / "CURRENT").exists():
+    """The command that creates the database, or None when no fill is needed."""
+    if args.benchmark == WRITE_BENCHMARK:
+        return None
+    if (args.db_dir / "CURRENT").exists() and db_dir_is_writable(args.db_dir):
         return None
     return db_bench_args(
         db_bench=args.db_bench,
@@ -342,7 +381,7 @@ def fill_command(args: argparse.Namespace) -> list[str] | None:
 
 
 def fill_database(args: argparse.Namespace, command: list[str]) -> None:
-    args.db_dir.mkdir(parents=True, exist_ok=True)
+    reset_db_dir(args.db_dir)
     returncode, stdout, stderr, timed_out, wall_seconds = run_command(
         command, args.timeout_seconds
     )
@@ -366,12 +405,12 @@ def write_metadata(args: argparse.Namespace, arms: tuple[str, ...]) -> None:
         "lib_dir": str(args.lib_dir),
         "flexguard_lib": str(args.flexguard_lib),
         "db_dir": str(args.db_dir),
-        "benchmark": BENCHMARK,
+        "benchmark": args.benchmark,
         "arms": list(arms),
         "threads": list(args.threads),
         "repeats": args.repeats,
         "num": args.num,
-        "total_reads": args.total_reads,
+        "total_ops": args.total_ops,
         "timeout_seconds": args.timeout_seconds,
         "argv": sys.argv,
         "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -383,6 +422,8 @@ def run_one(run: Run, args: argparse.Namespace) -> tuple[dict[str, object], dict
     command = arm_command(run, args)
     tag = run_tag(run)
     errors: list[str] = []
+    if args.benchmark == WRITE_BENCHMARK:
+        reset_db_dir(args.db_dir)
     state_before = sched_ext_state()
     if run.arm.uses_bpf:
         settled, state_before, settle_seconds = wait_sched_ext_disabled()
@@ -402,7 +443,7 @@ def run_one(run: Run, args: argparse.Namespace) -> tuple[dict[str, object], dict
     state_after = sched_ext_state()
     ops_after = sched_ext_ops()
 
-    parsed = parse_result(stdout + "\n" + stderr)
+    parsed = parse_result(stdout + "\n" + stderr, args.benchmark)
     failed = timed_out or returncode != 0
     dmesg_tail = dmesg_sched_ext_tail() if run.arm.uses_bpf and failed else ""
 
@@ -415,6 +456,7 @@ def run_one(run: Run, args: argparse.Namespace) -> tuple[dict[str, object], dict
             print(f"[{tag}] WARNING {errors[-1]}", flush=True)
 
     row: dict[str, object] = {
+        "benchmark": args.benchmark,
         "arm": run.arm.name,
         "threads": run.threads,
         "repeat": run.repeat,
@@ -438,7 +480,7 @@ def run_one(run: Run, args: argparse.Namespace) -> tuple[dict[str, object], dict
     record.update(
         {
             "command": command,
-            "reads_per_thread": args.total_reads // run.threads,
+            "ops_per_thread": ops_per_thread(args, run.threads),
             "epoch": time.time(),
             "stdout_tail": tail(stdout, STDOUT_TAIL_LINES),
             "stderr_tail": tail(stderr, STDERR_TAIL_LINES),
@@ -453,7 +495,7 @@ def run_one(run: Run, args: argparse.Namespace) -> tuple[dict[str, object], dict
     return row, record
 
 
-def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def summarize(rows: list[dict[str, object]], benchmark: str) -> list[dict[str, object]]:
     groups: dict[tuple[str, int], list[dict[str, object]]] = {}
     for row in rows:
         groups.setdefault((str(row["arm"]), int(row["threads"])), []).append(row)
@@ -467,6 +509,7 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         failures = sum(1 for row in group if row["exit_status"] != 0)
         summary.append(
             {
+                "benchmark": benchmark,
                 "arm": arm_name,
                 "threads": threads,
                 "n": len(values),
@@ -481,9 +524,9 @@ def summarize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     return summary
 
 
-def print_summary(summary: list[dict[str, object]]) -> None:
+def print_summary(summary: list[dict[str, object]], benchmark: str) -> None:
     width = max((len(str(row["arm"])) for row in summary), default=8)
-    print("\nreadrandom micros/op (lower is better)")
+    print(f"\n{benchmark} micros/op (lower is better)")
     print(
         f"{'arm':<{width}}  {'threads':>7}  {'n':>3}  {'median':>10}  "
         f"{'min':>10}  {'max':>10}  {'timeouts':>8}  {'failures':>8}"
@@ -497,19 +540,22 @@ def print_summary(summary: list[dict[str, object]]) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    default_out = f"experiments/results/fullhook_readrandom_{datetime.now():%Y%m%d_%H%M%S}"
     parser = argparse.ArgumentParser(
-        description="Run stock LevelDB db_bench readrandom under the fullhook lock arms.",
+        description="Run stock LevelDB db_bench under the fullhook lock arms.",
     )
     parser.add_argument("--db-bench", default="target/leveldb-stock/build/db_bench")
+    parser.add_argument("--benchmark", choices=BENCHMARKS, default=READ_BENCHMARK)
     parser.add_argument("--arms", default=",".join(DEFAULT_ARMS))
     parser.add_argument("--threads", default="48,96,192")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--num", type=int, default=500000)
-    parser.add_argument("--total-reads", type=int, default=1572864)
+    # --total-reads is the former name of this option, kept for older invocations.
+    parser.add_argument(
+        "--total-ops", "--total-reads", dest="total_ops", type=int, default=1572864
+    )
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     parser.add_argument("--db-dir", default="/tmp/accordin-readrandom-db")
-    parser.add_argument("--out", default=default_out)
+    parser.add_argument("--out", default=None)
     parser.add_argument("--lib-dir", default="target/release")
     parser.add_argument("--flexguard-lib", default=DEFAULT_FLEXGUARD_LIB)
     parser.add_argument("--dry-run", action="store_true")
@@ -536,6 +582,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if args.repeats <= 0:
         parser.error("--repeats must be positive")
+    if args.out is None:
+        args.out = (
+            f"experiments/results/fullhook_{args.benchmark}"
+            f"_{datetime.now():%Y%m%d_%H%M%S}"
+        )
     args.db_bench = resolve_path(args.db_bench)
     args.db_dir = resolve_path(args.db_dir)
     args.out = resolve_path(args.out)
@@ -578,13 +629,18 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             raise SystemExit("preload library not found: " + ", ".join(missing))
         for threads in args.threads:
-            if args.total_reads // threads <= 0:
+            if ops_per_thread(args, threads) <= 0:
                 raise SystemExit(
-                    f"--total-reads {args.total_reads} yields no reads at {threads} threads"
+                    f"--total-ops {args.total_ops} yields no operations at {threads} threads"
                 )
 
     command = fill_command(args)
-    if command is None:
+    if args.benchmark == WRITE_BENCHMARK:
+        print(
+            f"[fill] skipped: every {args.benchmark} run rebuilds {args.db_dir}",
+            flush=True,
+        )
+    elif command is None:
         print(f"[fill] reusing existing database at {args.db_dir}", flush=True)
     else:
         print("[fill] " + " ".join(command), flush=True)
@@ -616,13 +672,13 @@ def main(argv: list[str] | None = None) -> int:
                 jsonl_handle.write(json.dumps(record) + "\n")
                 jsonl_handle.flush()
 
-    summary = summarize(rows)
+    summary = summarize(rows, args.benchmark)
     if summary:
         with (args.out / "summary.csv").open("w", newline="") as handle:
             summary_writer = csv.DictWriter(handle, fieldnames=list(summary[0]))
             summary_writer.writeheader()
             summary_writer.writerows(summary)
-        print_summary(summary)
+        print_summary(summary, args.benchmark)
     print(f"\nresults: {args.out}")
     return 0
 

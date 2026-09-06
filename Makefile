@@ -24,7 +24,7 @@ BACKENDS := mcs_accordin_direct mcs_tas_accordin_direct
 LIBRARIES := $(BACKENDS:%=$(OUT)/lib%.so)
 HEADERS := $(wildcard src/*.h include/*.h src/bpf/*.h third_party/scx/scx/*.h) Makefile
 
-.PHONY: all $(BACKENDS) check check-bpf litl check-litl check-litl-bpf clean compile-commands
+.PHONY: all $(BACKENDS) check check-bpf litl litl-baselines check-litl check-litl-bpf check-litl-baselines clean compile-commands
 .DELETE_ON_ERROR:
 all: $(LIBRARIES)
 $(BACKENDS): %: $(OUT)/lib%.so
@@ -58,6 +58,14 @@ check-bpf: all
 
 litl: all
 	$(MAKE) -C third_party/litl ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
+
+# Baseline lock algorithms. They carry no Accordin runtime dependency, so they
+# build and run without the direct libraries.
+litl-baselines:
+	$(MAKE) -C third_party/litl ALGORITHMS="$$($(MAKE) --no-print-directory -C third_party/litl print-direct-algorithms)" all
+
+check-litl-baselines:
+	$(MAKE) -C third_party/litl check-direct
 
 check-litl: litl
 	cd third_party/litl && ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) bash tests/run.sh --no-bpf

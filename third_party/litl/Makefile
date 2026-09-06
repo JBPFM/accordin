@@ -13,10 +13,11 @@ SHS=$(TARGETS:=.sh)
 export ACCORDIN_ROOT ?= $(abspath ../..)
 export ACCORDIN_LIB_DIR ?= $(ACCORDIN_ROOT)/target/release
 ACCORDIN_SOS=$(addprefix lib,$(addsuffix .so,$(ACCORDIN_ALGORITHMS)))
+DIRECT_SOS=$(addprefix lib,$(addsuffix .so,$(DIRECT_ALGORITHMS)))
 
 .PRECIOUS: %.o
 .SECONDARY: $(OBJS)
-.PHONY: all clean format accordin-direct check check-bpf
+.PHONY: all clean format accordin-direct check check-bpf check-direct print-direct-algorithms
 
 all: $(DIR) include/topology.h $(SOS) $(SHS)
 
@@ -29,9 +30,21 @@ $(ACCORDIN_SOS): include/topology.h accordin-direct | obj/
 	mkdir -p lib/ obj/$(patsubst lib%.so,%,$@)
 	$(MAKE) -C src/ EXTERNAL_CFLAGS="$(EXTERNAL_CFLAGS)" ../lib/$@
 
+# The baseline algorithms carry no external runtime dependency either.
+$(DIRECT_SOS): include/topology.h | obj/
+	mkdir -p lib/ obj/$(patsubst lib%.so,%,$@)
+	$(MAKE) -C src/ EXTERNAL_CFLAGS="$(EXTERNAL_CFLAGS)" ../lib/$@
+
 check check-bpf:
 	$(MAKE) ALGORITHMS="$(ACCORDIN_ALGORITHMS)" all
 	bash tests/run.sh $(if $(filter check-bpf,$@),--bpf,--no-bpf)
+
+print-direct-algorithms:
+	@echo $(DIRECT_ALGORITHMS)
+
+check-direct:
+	$(MAKE) ALGORITHMS="$(DIRECT_ALGORITHMS)" all
+	bash tests/run-direct.sh
 
 %.so: obj/CLHT/libclht.a obj/
 	mkdir -p lib/

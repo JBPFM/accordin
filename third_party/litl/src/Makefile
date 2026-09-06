@@ -33,6 +33,68 @@ endef
 $(eval $(call ACCORDIN_RULES,mcsaccordin,MCSACCORDIN,mcs_accordin_direct))
 $(eval $(call ACCORDIN_RULES,mcstasaccordin,MCSTASACCORDIN,mcs_tas_accordin_direct))
 
+# Baseline algorithms sharing the direct front end. Each one contributes its
+# own sources and, when it wraps an external runtime, its own flags.
+DIRECT_CFLAGS=-std=gnu11 -fPIC -Wall -Werror -O3 -g -I../include $(EXTERNAL_CFLAGS)
+DIRECT_CXXFLAGS=-std=c++20 -fPIC -Wall -Werror -O3 -g -I../include $(EXTERNAL_CFLAGS)
+DIRECT_HEADERS=interpose.h utils.h waiting_policy.h ../include/directalgo.h \
+	../include/directlock.h ../include/topology.h
+DIRECT_SHARED_SOURCES=interpose directlock directcond
+
+gcr_DEFINE=GCR
+gcr_CSOURCES=gcr gcrmcs
+gcr_LINKER=$(CC)
+
+LIBVSYNC_HEADER=$(LIBVSYNC_DIR)/include/vsync/spinlock/cnalock.h
+cna_DEFINE=CNA
+cna_CSOURCES=cna
+cna_LINKER=$(CC)
+cna_CFLAGS=-I$(LIBVSYNC_DIR)/include -I$(LIBVSYNC_DIR)/vatomic/include
+cna_PREREQS=$(LIBVSYNC_HEADER)
+
+$(LIBVSYNC_HEADER):
+	[ -d $(LIBVSYNC_DIR) ] || git clone https://github.com/open-s4c/libvsync.git $(LIBVSYNC_DIR)
+
+# The lock algorithms taken from the mutex microbenchmark keep their C++
+# implementation and are compiled into the shared object.
+MB_ALGORITHMS=mbmcs mbmcstas mbmcstastse mbmcstasnext mbmcstasnexttse \
+	mbclh mbtwa mbhapax mbreciprocating
+
+define MB_ALGORITHM_VARS
+$(1)_DEFINE=$(shell echo $(1) | tr '[:lower:]' '[:upper:]')
+$(1)_CXXSOURCES=$(1)
+$(1)_LINKER=$$(CXX)
+endef
+
+$(foreach a,$(MB_ALGORITHMS),$(eval $(call MB_ALGORITHM_VARS,$(a))))
+
+define DIRECT_C_RULE
+../obj/$(1)_original/$(2).o: $(2).c $(DIRECT_HEADERS) $($(1)_PREREQS) Makefile ../Makefile.config
+	$(CC) $(DIRECT_CFLAGS) $($(1)_CFLAGS) -DLITL_DIRECT_ALGORITHM -D$($(1)_DEFINE) \
+		-DFCT_LINK_SUFFIX=$(1) -DWAITING_ORIGINAL -c $$< -o $$@
+endef
+
+define DIRECT_CXX_RULE
+../obj/$(1)_original/$(2).o: $(2).cpp $(DIRECT_HEADERS) $($(1)_PREREQS) Makefile ../Makefile.config
+	$(CXX) $(DIRECT_CXXFLAGS) $($(1)_CFLAGS) -DLITL_DIRECT_ALGORITHM -D$($(1)_DEFINE) \
+		-DFCT_LINK_SUFFIX=$(1) -DWAITING_ORIGINAL -c $$< -o $$@
+endef
+
+define DIRECT_LINK_RULE
+../lib/lib$(1)_original.so: $(addprefix ../obj/$(1)_original/,$(addsuffix .o,\
+		$(DIRECT_SHARED_SOURCES) $($(1)_CSOURCES) $($(1)_CXXSOURCES))) \
+		$($(1)_PREREQS) $(ACCORDIN_MAP)
+	$($(1)_LINKER) -shared -o $$@ $$(filter %.o,$$^) -Wl,-z,defs,-z,now \
+		-Wl,--version-script=$(ACCORDIN_MAP) $($(1)_LDFLAGS) -ldl -pthread
+endef
+
+$(foreach a,$(DIRECT_ALGORITHM_NAMES),\
+	$(foreach c,$(DIRECT_SHARED_SOURCES) $($(a)_CSOURCES),\
+		$(eval $(call DIRECT_C_RULE,$(a),$(c))))\
+	$(foreach c,$($(a)_CXXSOURCES),\
+		$(eval $(call DIRECT_CXX_RULE,$(a),$(c))))\
+	$(eval $(call DIRECT_LINK_RULE,$(a))))
+
 LDFLAGS=-L../obj/CLHT/external/lib -L../obj/CLHT -Wl,--whole-archive -Wl,--version-script=interpose.map -lsspfd -lssmem -lclht -Wl,--no-whole-archive  -lrt -lm -ldl -lpapi -m64 -pthread
 CFLAGS=-I../include/ -I../obj/CLHT/include/ -I../obj/CLHT/external/include/ -fPIC -Wall -Werror -O3 -g
 

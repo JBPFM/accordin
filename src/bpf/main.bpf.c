@@ -92,6 +92,13 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       }
     }
   }
+  /* The core hands over the last runnable task of a CPU instead of keeping it,
+   * so keep that task where it already is. A slot holder is running on its
+   * admission CPU, which is the CPU the local queue belongs to, and a lone
+   * yielding waiter would otherwise have been kept by the core anyway, so the
+   * routing above stays observationally unchanged for the mutex path. */
+  if (enq_flags & SCX_ENQ_LAST)
+    dsq = SCX_DSQ_LOCAL;
   scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
   scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
@@ -226,6 +233,7 @@ void BPF_STRUCT_OPS(accordin_exit, struct scx_exit_info *ei) {
 }
 
 SCX_OPS_DEFINE(accordin_ops,
+               .flags = SCX_OPS_ENQ_LAST,
                .select_cpu = (void *)accordin_select_cpu,
                .enqueue = (void *)accordin_enqueue,
                .dispatch = (void *)accordin_dispatch,

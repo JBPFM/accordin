@@ -17,6 +17,10 @@
  * which keeps a lock context private to one (thread, lock) pair.
  */
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Attaches an instance, creating it on first use. Returns NULL on failure. */
 void *directlock_attach(pthread_mutex_t *mutex);
 
@@ -32,5 +36,9 @@ int directlock_release(pthread_mutex_t *mutex);
  * node can outlive the thread that allocated it.
  */
 void *directlock_context(void *instance, size_t size);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* LITL_DIRECTLOCK_H */

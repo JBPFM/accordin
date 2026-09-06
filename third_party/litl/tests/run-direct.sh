@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Exercises the baseline algorithms that share the direct front end. None of
-# them attaches a BPF scheduler, so this runs without sched_ext.
+# Exercises the baseline algorithms that share the direct front end.
+#
+# With no argument it runs every algorithm that needs no BPF scheduler, so it
+# is safe on a machine where sched_ext belongs to someone else. FlexGuard
+# attaches its own BPF program and is therefore only run when named
+# explicitly.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p obj/tests
@@ -9,15 +13,24 @@ ${CC:-cc} -std=gnu11 -O2 -Wall -Werror tests/direct.c -pthread -ldl \
 ${CXX:-c++} -std=c++17 -O2 -Wall -Werror tests/condition-variable.cpp -pthread \
     -o obj/tests/condition-variable
 
+# Releasing the last active holder must wake the head of the passive queue.
+${CC:-cc} -std=gnu11 -O2 -Wall -Werror -Iinclude tests/gcr-wakeup.c src/gcrmcs.c \
+    -pthread -o obj/tests/gcr-wakeup
+./obj/tests/gcr-wakeup
+echo "PASS gcr passive-head wakeup"
+
 algorithms=("$@")
 if [[ ${#algorithms[@]} -eq 0 ]]; then
-    mapfile -t algorithms < <(make --no-print-directory -f - <<'MK'
+    listed=$(make --no-print-directory -f - <<'MK'
 include Makefile.config
 print:
 	@echo $(DIRECT_ALGORITHMS)
 MK
 )
-    read -r -a algorithms <<<"${algorithms[*]}"
+    for candidate in $listed; do
+        [[ "$candidate" == flexguard_original ]] && continue
+        algorithms+=("$candidate")
+    done
 fi
 
 for backend in "${algorithms[@]}"; do

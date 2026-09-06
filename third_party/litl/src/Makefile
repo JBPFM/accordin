@@ -55,6 +55,29 @@ cna_PREREQS=$(LIBVSYNC_HEADER)
 $(LIBVSYNC_HEADER):
 	[ -d $(LIBVSYNC_DIR) ] || git clone https://github.com/open-s4c/libvsync.git $(LIBVSYNC_DIR)
 
+# FlexGuard keeps its lock, its queue nodes and its BPF runtime in an archive
+# produced by the FlexGuard checkout, so the adapter has to agree with the
+# archive on the lock layout: padding, spin queue flavour and BPF support are
+# part of the structure definitions. FLEXGUARD_NOBPF=1 selects the userspace
+# only variant, whose lock loads no BPF program at all.
+FLEXGUARD_NOBPF ?= 0
+FLEXGUARD_ARCHIVE=$(FLEXGUARD_DIR)/libsync.a
+FLEXGUARD_BPF_ENABLED=$(filter 0,$(FLEXGUARD_NOBPF))
+flexguard_DEFINE=FLEXGUARD
+flexguard_CSOURCES=flexguard
+flexguard_LINKER=$(CC)
+flexguard_CFLAGS=-I$(FLEXGUARD_DIR)/include -DADD_PADDING -DHYBRID_MCS \
+	$(if $(FLEXGUARD_BPF_ENABLED),-DBPF)
+flexguard_LDFLAGS=$(FLEXGUARD_ARCHIVE) $(if $(FLEXGUARD_BPF_ENABLED),-lelf -lz)
+flexguard_PREREQS=$(FLEXGUARD_ARCHIVE)
+
+# The bundled libbpf predates the diagnostics the host compiler reports, so it
+# is compiled without -Werror. CFLAGS travels through the environment: bpftool
+# appends to it and would lose its own flags to a command line assignment.
+$(FLEXGUARD_ARCHIVE):
+	CFLAGS="-g -O2 -Wall -Wno-error" $(MAKE) -C $(FLEXGUARD_DIR) \
+		NOBPF=$(FLEXGUARD_NOBPF) libsync.a
+
 # The lock algorithms taken from the mutex microbenchmark keep their C++
 # implementation and are compiled into the shared object.
 MB_ALGORITHMS=mbmcs mbmcstas mbmcstastse mbmcstasnext mbmcstasnexttse \

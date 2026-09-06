@@ -25,6 +25,18 @@ integration changes are:
   that reacquisition consumes with the same epoch. The mutex object stores its
   direct pointer and parking metadata; ordinary unlock checks the parking
   state. Condvar support is unconditional.
+- `include/directalgo.h`, `include/directlock.h`, `src/directlock.c`,
+  `src/directcond.c`: a shared front end for baseline lock algorithms that keep
+  their state outside the intercepted pthread objects. It stores the algorithm
+  instance pointer in the intercepted mutex, hands out per-thread storage that
+  is private to one (thread, lock) pair, and implements condition variables as a
+  futex sequence inside the intercepted `pthread_cond_t`. An algorithm on this
+  front end supplies six entry points and needs neither CLHT, ssmem nor PAPI.
+- `include/gcrmcs.h`, `src/gcrmcs.c`, `src/gcr.c`: GCR-MCS, generic concurrency
+  restriction over an MCS queue, moved from the standalone interposer in
+  `bench/otherlocks` with the algorithm unchanged.
+- `src/cna.c`: compact NUMA-aware lock over the libvsync implementation, moved
+  from the same interposer. `third_party/libvsync` is cloned on demand.
 - `Makefile`, `Makefile.config`, `src/Makefile`: register the two algorithms,
   build/link the direct libraries, track configuration changes, and provide
   `check` / `check-bpf`. The condition-variable build switch and mutex-only
@@ -39,6 +51,9 @@ integration changes are:
 - `src/utils.h`: AArch64 helpers needed by the interposer and removal of the
   unused local `gettid` definition that conflicts with modern glibc.
 - `src/liblock.in`: launchers resolve their own location and `exec` the program.
+- `tests/direct.c`, `tests/gcr-wakeup.c`, `tests/run-direct.sh`: interposition,
+  mutex, condition-variable and GCR wakeup tests for the baseline algorithms.
+  None of them attaches a BPF scheduler.
 - `tests/`, `README.md`: integration tests and usage documentation.
 
 Building all of the historical upstream algorithms still has their original

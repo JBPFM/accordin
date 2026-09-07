@@ -45,7 +45,7 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 third_party/litl/libmcstasaccordin_origina
 
 适配器通过 LiTL 的 `NO_INDIRECTION` 路径在 pthread mutex 中保存内部对象指针，线程节点仍由 direct 运行时管理；构建这两个适配器不需要 CLHT、ssmem 或 PAPI。条件变量支持始终启用，不使用 shadow mutex。waiter 在释放业务锁之前登记，释放后准备一个不占用 CPU 名额的 relock epoch。signal 通知一个已登记 waiter，broadcast 通知全部；被通知者转入 mutex 的停泊队列，首个接力者立即获得 futex wake，其余由接力者的 unlock 逐个唤醒。通知发生在 mutex 外或 mutex 空闲时也能启动接力。
 
-实际唤醒前发布 `USER_WAITING`，现有 BPF enqueue 可直接将其放入 `WAITING_DSQ`；重获锁复用该 epoch，先检查已有授权，再决定是否 yield。不会把休眠者放入 raw MCS 队列。仍持有其它 mutex 的嵌套等待保留外层 admission，并立即唤醒。普通 lock/trylock 仍直接调用 direct API；unlock 增加一次停泊状态的原子读取，仅存在待接力状态时获取队列 guard。唤醒、超时和 deferred cancellation 均恢复业务锁；取消与 signal 并发时补偿通知其它 waiter，已通知但仍停泊的 waiter 不因原条件变量截止时间到期而丢失通知。这些行为不受 `NDEBUG` 影响。
+实际唤醒前发布 `USER_WAITING`，现有 BPF enqueue 可直接将其放入 admission 队列——该队列由 `WAITING_SHARDS` 个分片组成，按等待线程所在 CPU 取模选择分片；重获锁复用该 epoch，先检查已有授权，再决定是否 yield。不会把休眠者放入 raw MCS 队列。仍持有其它 mutex 的嵌套等待保留外层 admission，并立即唤醒。普通 lock/trylock 仍直接调用 direct API；unlock 增加一次停泊状态的原子读取，仅存在待接力状态时获取队列 guard。唤醒、超时和 deferred cancellation 均恢复业务锁；取消与 signal 并发时补偿通知其它 waiter，已通知但仍停泊的 waiter 不因原条件变量截止时间到期而丢失通知。这些行为不受 `NDEBUG` 影响。
 
 当前队列设计与测量见 [condvar relock 接力](docs/benchmarks/cond-relock-20260905/README.md)。192 线程的随机读写对比见 [LevelDB readrandom / fillrandom](docs/benchmarks/leveldb-relock-20260905/README.md)。此前实现和 `mutexbench 300,3000` 对照见 [直接 futex 条件变量](docs/benchmarks/litl-futex-cond/README.md)。[shadow 开销测量](docs/benchmarks/litl-shadow-cost/README.md)、[集成迁移记录](docs/benchmarks/litl-upstream/README.md) 和 [此前按需 shadow 优化](docs/benchmarks/litl-lazy-shadow/README.md) 保留为历史记录。
 

@@ -65,5 +65,6 @@ __u64 cv_expired;
 __u64 cv_flush_misses;
 __u64 cv_drained;
 __u32 flush_cursor;
+__u32 admit_cursor;
 
 #endif

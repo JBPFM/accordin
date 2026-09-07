@@ -5,6 +5,33 @@
 char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
+static __always_inline __u64 waiting_dsq(__u32 cpu) {
+  return WAITING_DSQ + cpu % WAITING_SHARDS;
+}
+
+static __always_inline bool is_waiting(__u64 dsq) {
+  return dsq >= WAITING_DSQ && dsq < WAITING_DSQ + WAITING_SHARDS;
+}
+
+/* The shard bank owns a contiguous id range that the other queues stay out of. */
+_Static_assert(NORMAL_DSQ < WAITING_DSQ || NORMAL_DSQ >= WAITING_DSQ + WAITING_SHARDS,
+               "NORMAL_DSQ overlaps the admission shards");
+_Static_assert(WAITFORSIGNAL_DSQ < WAITING_DSQ ||
+                   WAITFORSIGNAL_DSQ >= WAITING_DSQ + WAITING_SHARDS,
+               "WAITFORSIGNAL_DSQ overlaps the admission shards");
+
+static __always_inline __u32 nr_waiting(void) {
+  __u32 total = 0, shard;
+
+  bpf_for(shard, 0, WAITING_SHARDS) {
+    s32 nr = scx_bpf_dsq_nr_queued(WAITING_DSQ + shard);
+
+    if (nr > 0)
+      total += nr;
+  }
+  return total;
+}
+
 static __always_inline volatile __u64 *owner_slot(__u32 cpu) {
   barrier_var(cpu);
   return cpu < MAX_CPUS ? &admission.owners[cpu] : 0;
@@ -108,7 +135,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       } else if (known && !(state & USER_CV) &&
                  (state & USER_FLAGS) == USER_WAITING) {
         tctx->ticket = request_ticket(p, state);
-        dsq = WAITING_DSQ;
+        dsq = waiting_dsq(cpu);
       }
     }
   }
@@ -126,22 +153,24 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
    * dropped while the task being queued is still the current one, so the
    * follow-up scheduling event the core asks for is an unconditional one. A
    * wait held for a signal wants no such event; its custody bounds it. */
-  if ((enq_flags & SCX_ENQ_LAST) && dsq == WAITING_DSQ)
+  if ((enq_flags & SCX_ENQ_LAST) && is_waiting(dsq))
     scx_bpf_kick_cpu(cpu, 0);
   else
     scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 /* Reserve both the task and this CPU before moving a candidate. Different CPUs
- * may examine the same global queue concurrently; a failed move rolls back both
- * reservations. There is no path that admits a new waiter onto an occupied CPU. */
-static __always_inline void admit_waiter(__u32 cpu) {
+ * may examine the same shard concurrently; a failed move rolls back both
+ * reservations. There is no path that admits a new waiter onto an occupied CPU.
+ * An empty shard costs one depth query and no iteration. */
+static __always_inline bool admit_from(__u32 cpu, __u32 shard) {
   volatile __u64 *owner = owner_slot(cpu);
+  __u64 dsq = waiting_dsq(shard);
   struct task_struct *p;
 
-  if (!owner || *owner)
-    return;
-  bpf_for_each(scx_dsq, p, WAITING_DSQ, 0) {
+  if (!owner || *owner || scx_bpf_dsq_nr_queued(dsq) <= 0)
+    return false;
+  bpf_for_each(scx_dsq, p, dsq, 0) {
     struct task_scx_ctx *tctx;
 
     if (!allowed(p, cpu))
@@ -151,11 +180,33 @@ static __always_inline void admit_waiter(__u32 cpu) {
       continue;
     if (__sync_val_compare_and_swap(owner, 0, tctx->ticket)) {
       tctx->admission_cpu = 0;
-      return;
+      return false;
     }
     if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
-      return;
+      return true;
     release_slot(p, tctx);
+  }
+  return false;
+}
+
+/* The cursor is shared by every CPU and holds the shard after the last grant,
+ * so a walk starts there and only falls back to the CPU's own shard while no
+ * grant has been made yet. Rotating past the shard that granted keeps one busy
+ * shard from starving the rest of the bank. */
+static __always_inline void admit_waiter(__u32 cpu) {
+  volatile __u64 *owner = owner_slot(cpu);
+  __u32 cursor = admit_cursor, start, shard;
+
+  if (!owner || *owner)
+    return;
+  start = cursor ? cursor - 1 : cpu;
+  bpf_for(shard, 0, WAITING_SHARDS) {
+    __u32 index = (start + shard) % WAITING_SHARDS;
+
+    if (admit_from(cpu, index)) {
+      admit_cursor = (index + 1) % WAITING_SHARDS + 1;
+      return;
+    }
   }
 }
 
@@ -314,9 +365,8 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
   __u32 cpu;
 
   (void)dump_ctx;
-  scx_bpf_dump("accordin normal=%d waiting=%d waitforsignal=%d\n",
-               scx_bpf_dsq_nr_queued(NORMAL_DSQ),
-               scx_bpf_dsq_nr_queued(WAITING_DSQ),
+  scx_bpf_dump("accordin normal=%d waiting=%u waitforsignal=%d\n",
+               scx_bpf_dsq_nr_queued(NORMAL_DSQ), nr_waiting(),
                scx_bpf_dsq_nr_queued(WAITFORSIGNAL_DSQ));
   scx_bpf_dump("accordin cv parked=%llu now=%llu flushed=%llu expired=%llu\n",
                cv_parked, cv_parked_now, cv_flushed, cv_expired);
@@ -356,14 +406,17 @@ static __always_inline struct cv_timer_state *cv_timer(void) {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   struct cv_timer_state *timer;
+  __u32 shard;
   s32 ret;
 
   ret = scx_bpf_create_dsq(NORMAL_DSQ, -1);
   if (ret)
     return ret;
-  ret = scx_bpf_create_dsq(WAITING_DSQ, -1);
-  if (ret)
-    return ret;
+  bpf_for(shard, 0, WAITING_SHARDS) {
+    ret = scx_bpf_create_dsq(WAITING_DSQ + shard, -1);
+    if (ret)
+      return ret;
+  }
   ret = scx_bpf_create_dsq(WAITFORSIGNAL_DSQ, -1);
   if (ret)
     return ret;
@@ -418,16 +471,17 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
     bpf_rcu_read_lock();
     bpf_for_each(scx_dsq, p, WAITFORSIGNAL_DSQ, iter_flags) {
       struct task_scx_ctx *tctx;
-      __u64 target = WAITING_DSQ;
       __u64 move_flags = enq_flags;
-      __u64 parked;
-      __u32 state;
+      __u64 target, parked;
+      __u32 task_cpu, state;
 
       if (p->tgid != tgid)
         continue;
       tctx = task_ctx(p);
       if (!tctx || !tctx->parked_at)
         continue;
+      task_cpu = scx_bpf_task_cpu(p);
+      target = waiting_dsq(task_cpu);
       /* Running in the process's own context, an unreadable word is not a
        * notification and cannot be confirmed later either. */
       if (!user_state(p, &state)) {
@@ -463,13 +517,23 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       } else {
         __sync_fetch_and_add(&cv_flushed, 1);
         tally->moved++;
+        /* The wait is filed in the shard of the CPU it last ran on. Any CPU
+         * with a free slot may grant it while walking the shards; waking that
+         * CPU is the cheapest attempt, since it is the one most likely to still
+         * hold the waiter's cache footprint. */
+        scx_bpf_kick_cpu(task_cpu, SCX_KICK_IDLE);
       }
     }
     bpf_rcu_read_unlock();
   }
   if (ctx->flags & CV_FLUSH_EXPIRE)
     tally->expired += cv_expire_parked(ctx->now);
-  kick_free_slots(tally->moved);
+  /* Waits handed back to the ordinary queue may be served by any free CPU and
+   * always need the sweep. A flushed wait has had one idle kick aimed at its
+   * own CPU, which is dropped if that CPU is busy; sweeping the free slots for
+   * it as well is what the spread flag asks for. */
+  kick_free_slots((ctx->flags & CV_FLUSH_SPREAD) ? tally->moved + tally->expired
+                                                 : tally->expired);
   __sync_fetch_and_add(&cv_flush_calls, 1);
   if (!tally->moved)
     __sync_fetch_and_add(&cv_flush_misses, 1);

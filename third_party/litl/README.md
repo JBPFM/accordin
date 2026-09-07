@@ -54,11 +54,14 @@ holder passes the wake to a successor. A wait retaining other mutexes bypasses
 parking and retains its outer admission episode.
 
 After releasing the mutex, a waiter prepares a dormant relock epoch. The waker
-publishes `USER_WAITING` before the futex wake, allowing the existing BPF enqueue
-path to route it directly into `WAITING_DSQ`. Reacquisition consumes the same
-epoch and checks for an existing grant before yielding. Sleeping outermost
-waiters hold no CPU admission slots; only runnable, admitted threads may join
-the raw lock queue. This changes no BPF per-lock quotas or DSQs.
+publishes `USER_WAITING` before the futex wake, allowing the existing BPF
+enqueue path to route it directly into the admission queue, a bank of
+`WAITING_SHARDS` shards the waiter is filed into by the CPU it runs on.
+Reacquisition consumes the same epoch and checks for an existing grant before
+yielding. Sleeping outermost waiters hold no CPU admission slots; only
+runnable, admitted threads may join the raw lock queue. The adapter introduces
+no per-lock quota and no queue of its own: it reuses the admission shards and
+the custody queue the scheduler already serves.
 
 The lock order is condition queue guard, then mutex parking guard; neither is
 held across raw lock acquisition. Notifications cannot be lost

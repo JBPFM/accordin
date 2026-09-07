@@ -3,8 +3,12 @@
 #define __INTF_H
 
 #define NORMAL_DSQ 0x100ULL
-#define WAITING_DSQ 0x101ULL
 #define WAITFORSIGNAL_DSQ 0x102ULL
+/* Lock admission is served from a bank of queues, one per shard, so that
+ * dispatch on different CPUs rarely contends on the same queue lock. A waiter
+ * is filed in the shard of the CPU it woke on. */
+#define WAITING_DSQ 0x200ULL
+#define WAITING_SHARDS 32U
 #define MAX_TASKS 65536U
 #define MAX_CPUS 256U
 
@@ -36,11 +40,17 @@ struct task_scx_ctx {
 };
 
 /* Batched transfer of notified condvar waiters out of scheduler custody.
- * The caller fills the request fields and reads back the result fields. */
+ * The caller fills the request fields and reads back the result fields.
+ * MOVE hands notified waits to the admission queue and EXPIRE withdraws custody
+ * from waits past their limit. REV walks the custody queue from its tail and
+ * TAIL appends the waits it moves instead of inserting them at the head.
+ * SPREAD also wakes idle CPUs holding a free admission slot for the moved
+ * waits, not only for the waits handed back to the ordinary queue. */
 #define CV_FLUSH_EXPIRE 1U
 #define CV_FLUSH_REV 2U
 #define CV_FLUSH_TAIL 4U
 #define CV_FLUSH_MOVE 8U
+#define CV_FLUSH_SPREAD 16U
 
 struct cv_flush_ctx {
   unsigned int width;

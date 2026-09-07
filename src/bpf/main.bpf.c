@@ -5,8 +5,10 @@
 char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
-static __always_inline __u64 waiting_dsq(__u32 cpu) {
-  return WAITING_DSQ + cpu % WAITING_SHARDS;
+/* The shard a waiter is filed in. The index is a CPU id at the enqueue and
+ * release sites and a shard number when the bank itself is walked. */
+static __always_inline __u64 waiting_dsq(__u32 index) {
+  return WAITING_DSQ + index % WAITING_SHARDS;
 }
 
 static __always_inline bool is_waiting(__u64 dsq) {
@@ -24,7 +26,7 @@ static __always_inline __u32 nr_waiting(void) {
   __u32 total = 0, shard;
 
   bpf_for(shard, 0, WAITING_SHARDS) {
-    s32 nr = scx_bpf_dsq_nr_queued(WAITING_DSQ + shard);
+    s32 nr = scx_bpf_dsq_nr_queued(waiting_dsq(shard));
 
     if (nr > 0)
       total += nr;
@@ -159,17 +161,24 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
+/* Outcome of examining one shard: a waiter was granted this CPU's slot, the
+ * shard held nothing for it, or the slot was taken while the grant was being
+ * made and there is nothing left to hand out. */
+#define ADMIT_NONE 0
+#define ADMIT_GRANTED 1
+#define ADMIT_SLOT_LOST 2
+
 /* Reserve both the task and this CPU before moving a candidate. Different CPUs
  * may examine the same shard concurrently; a failed move rolls back both
  * reservations. There is no path that admits a new waiter onto an occupied CPU.
  * An empty shard costs one depth query and no iteration. */
-static __always_inline bool admit_from(__u32 cpu, __u32 shard) {
-  volatile __u64 *owner = owner_slot(cpu);
+static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
+                                      __u32 shard) {
   __u64 dsq = waiting_dsq(shard);
   struct task_struct *p;
 
-  if (!owner || *owner || scx_bpf_dsq_nr_queued(dsq) <= 0)
-    return false;
+  if (scx_bpf_dsq_nr_queued(dsq) <= 0)
+    return ADMIT_NONE;
   bpf_for_each(scx_dsq, p, dsq, 0) {
     struct task_scx_ctx *tctx;
 
@@ -180,33 +189,35 @@ static __always_inline bool admit_from(__u32 cpu, __u32 shard) {
       continue;
     if (__sync_val_compare_and_swap(owner, 0, tctx->ticket)) {
       tctx->admission_cpu = 0;
-      return false;
+      return ADMIT_SLOT_LOST;
     }
     if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
-      return true;
+      return ADMIT_GRANTED;
     release_slot(p, tctx);
   }
-  return false;
+  return ADMIT_NONE;
 }
 
 /* The cursor is shared by every CPU and holds the shard after the last grant,
- * so a walk starts there and only falls back to the CPU's own shard while no
- * grant has been made yet. Rotating past the shard that granted keeps one busy
- * shard from starving the rest of the bank. */
+ * so every walk starts there. Rotating past the shard that granted keeps one
+ * busy shard from starving the rest of the bank. */
 static __always_inline void admit_waiter(__u32 cpu) {
   volatile __u64 *owner = owner_slot(cpu);
-  __u32 cursor = admit_cursor, start, shard;
+  __u32 start, shard;
 
   if (!owner || *owner)
     return;
-  start = cursor ? cursor - 1 : cpu;
+  start = admit_cursor;
   bpf_for(shard, 0, WAITING_SHARDS) {
     __u32 index = (start + shard) % WAITING_SHARDS;
+    int result = admit_from(cpu, owner, index);
 
-    if (admit_from(cpu, index)) {
-      admit_cursor = (index + 1) % WAITING_SHARDS + 1;
+    if (result == ADMIT_GRANTED) {
+      admit_cursor = (index + 1) % WAITING_SHARDS;
       return;
     }
+    if (result == ADMIT_SLOT_LOST)
+      return;
   }
 }
 
@@ -413,7 +424,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   if (ret)
     return ret;
   bpf_for(shard, 0, WAITING_SHARDS) {
-    ret = scx_bpf_create_dsq(WAITING_DSQ + shard, -1);
+    ret = scx_bpf_create_dsq(waiting_dsq(shard), -1);
     if (ret)
       return ret;
   }

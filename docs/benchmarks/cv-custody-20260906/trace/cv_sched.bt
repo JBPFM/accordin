@@ -1,0 +1,57 @@
+/* Kernel-side view of the same window: how many worker threads actually run at
+ * once, and how long a wakeup takes to reach the CPU.
+ *
+ * Heavier than cv_regime.bt because sched_switch fires for every context switch
+ * on the machine. Run it in its own window, never together with cv_regime.bt.
+ *
+ * Concurrency is sampled rather than counted: profile:hz:99 fires once per
+ * online CPU per period, so within a 10 ms bucket each online CPU contributes
+ * about one sample. db_samples[bucket] / cpu_samples[bucket] is the share of
+ * online CPUs occupied by the workload during that bucket; multiply by the
+ * number of online CPUs for a concurrency estimate. This is the timeline the
+ * "all admission slots busy" question needs, and it is far cheaper than
+ * maintaining a shared counter from sched_switch on 48 CPUs at once.
+ */
+
+BEGIN { @t0 = nsecs; }
+
+profile:hz:99
+{
+  $b = (nsecs - @t0) / 10000000;
+  @cpu_samples[$b] = count();
+  if (comm == "db_bench") {
+    @db_samples[$b] = count();
+    @db_cpu[cpu] = count();
+  }
+}
+
+tracepoint:sched:sched_wakeup
+/args->comm == "db_bench"/
+{
+  @wk_ts[args->pid] = nsecs;
+  @wakeups = count();
+}
+
+tracepoint:sched:sched_switch
+{
+  $t = @wk_ts[args->next_pid];
+  if ($t) {
+    @wake_to_run_us = hist((nsecs - $t) / 1000);
+    delete(@wk_ts[args->next_pid]);
+  }
+  if (args->prev_comm == "db_bench") {
+    /* 0 means still runnable: preempted, yielded, or held by the scheduler.
+     * Non-zero means the thread actually went to sleep (futex). */
+    @db_prev_state[args->prev_state & 0xff] = count();
+    @db_switch_out = count();
+  }
+  if (args->next_comm == "db_bench") { @db_switch_in = count(); }
+  @switches = count();
+}
+
+END
+{
+  printf("window_ns %llu\n", nsecs - @t0);
+  clear(@t0);
+  clear(@wk_ts);
+}

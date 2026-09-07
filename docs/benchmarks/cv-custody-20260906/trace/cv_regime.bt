@@ -1,0 +1,172 @@
+/* Regime discriminators for the condvar-custody fillrandom run, user space only.
+ *
+ * Attach with -p <db_bench pid> so every uprobe is private to the traced
+ * process. Everything accumulates in maps and is printed once at END.
+ *
+ * What each map answers:
+ *   batch_signals              followers notified per leader DBImpl::Write
+ *   leader_cs_us               leader critical section (Write minus AddRecord,
+ *                              the only stretch of Write that runs unlocked)
+ *   notify_to_relock_return_us signal -> the follower holds the mutex again
+ *   flush_moved                waiters released by one cv_flush call
+ *   custody_depth_at_flush     parks outstanding when a flush starts
+ *   park_us                    how long one wait stayed in scheduler custody
+ *   leader_parks               whether the leader itself parked during its Write
+ */
+
+BEGIN { @t0 = nsecs; }
+
+/* ---- write group attribution ------------------------------------------- */
+
+uprobe:/mnt/data/home/jz/accordin-m0/target/flexguard-suite-20260905/leveldb/out-static/db_bench:_ZN7leveldb6DBImpl5WriteERKNS_12WriteOptionsEPNS_10WriteBatchE
+{
+  @w_start[tid] = nsecs;
+  @w_sig[tid] = 0;
+  @w_park[tid] = 0;
+  @w_ar[tid] = 0;
+  @w_first[tid] = 0;
+  @w_last[tid] = 0;
+}
+
+/* AddRecord is the log write; DBImpl::Write releases the DB mutex around it. */
+uprobe:/mnt/data/home/jz/accordin-m0/target/flexguard-suite-20260905/leveldb/out-static/db_bench:_ZN7leveldb3log6Writer9AddRecordERKNS_5SliceE
+{ @ar_start[tid] = nsecs; }
+
+uretprobe:/mnt/data/home/jz/accordin-m0/target/flexguard-suite-20260905/leveldb/out-static/db_bench:_ZN7leveldb3log6Writer9AddRecordERKNS_5SliceE
+/@ar_start[tid]/
+{
+  $d = nsecs - @ar_start[tid];
+  @addrecord_us = hist($d / 1000);
+  @w_ar[tid] = @w_ar[tid] + $d;
+  delete(@ar_start[tid]);
+}
+
+uretprobe:/mnt/data/home/jz/accordin-m0/target/flexguard-suite-20260905/leveldb/out-static/db_bench:_ZN7leveldb6DBImpl5WriteERKNS_12WriteOptionsEPNS_10WriteBatchE
+/@w_start[tid]/
+{
+  $d = nsecs - @w_start[tid];
+  $n = @w_sig[tid];
+  if ($n > 0) {
+    @leader_writes = count();
+    @batch_signals = lhist($n, 0, 200, 5);
+    @batch_signals_stats = stats($n);
+    @leader_write_us = hist($d / 1000);
+    @leader_cs_us = hist(($d - @w_ar[tid]) / 1000);
+    @leader_addrecord_in_write_us = hist(@w_ar[tid] / 1000);
+    @leader_signal_loop_us = hist((@w_last[tid] - @w_first[tid]) / 1000);
+    @leader_lastsignal_to_ret_us = hist((nsecs - @w_last[tid]) / 1000);
+    @leader_parks = lhist(@w_park[tid], 0, 4, 1);
+  } else {
+    @follower_writes = count();
+    @follower_write_us = hist($d / 1000);
+    @follower_parks = lhist(@w_park[tid], 0, 4, 1);
+  }
+  delete(@w_start[tid]);
+  delete(@w_sig[tid]);
+  delete(@w_park[tid]);
+  delete(@w_ar[tid]);
+  delete(@w_first[tid]);
+  delete(@w_last[tid]);
+}
+
+/* ---- notification and the hop it starts --------------------------------- */
+
+/* arg0 is the waiter, the same pointer the woken thread passes to relock. */
+uprobe:/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/custody-src/third_party/litl/lib/libmcstasaccordin_original.so:accordin_wait_notify
+{
+  @notify_ts[arg0] = nsecs;
+  @notifies = count();
+  if (@w_start[tid]) {
+    @w_sig[tid] = @w_sig[tid] + 1;
+    if (@w_first[tid] == 0) { @w_first[tid] = nsecs; }
+    @w_last[tid] = nsecs;
+  }
+}
+
+uprobe:/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/custody-src/third_party/litl/lib/libmcstasaccordin_original.so:accordin_wait_relock
+{
+  $t = @notify_ts[arg0];
+  if ($t) {
+    @notify_to_relock_entry_us = hist((nsecs - $t) / 1000);
+    @hopkey[tid] = $t;
+    delete(@notify_ts[arg0]);
+  }
+  @rl_start[tid] = nsecs;
+}
+
+uretprobe:/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/custody-src/third_party/litl/lib/libmcstasaccordin_original.so:accordin_wait_relock
+{
+  $s = @rl_start[tid];
+  if ($s) {
+    @relock_call_us = hist((nsecs - $s) / 1000);
+    delete(@rl_start[tid]);
+  }
+  $k = @hopkey[tid];
+  if ($k) {
+    @notify_to_relock_return_us = hist((nsecs - $k) / 1000);
+    delete(@hopkey[tid]);
+  }
+  @relock_returns = count();
+  if (@prev_relock_ret) {
+    $h = nsecs - @prev_relock_ret;
+    if ($h < 10000000) { @relock_to_relock_us = hist($h / 1000); }
+  }
+  @prev_relock_ret = nsecs;
+}
+
+/* ---- scheduler custody -------------------------------------------------- */
+
+uprobe:/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/custody-src/target/release/libmcs_tas_accordin_direct.so:mcs_tas_accordin_direct_mutex_relock_park
+{
+  @pk_start[tid] = nsecs;
+  @park_calls = count();
+  @in_custody = @in_custody + 1;
+  @custody_depth_at_park = lhist(@in_custody, 0, 200, 5);
+  if (@w_start[tid]) { @w_park[tid] = @w_park[tid] + 1; }
+}
+
+uretprobe:/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/custody-src/target/release/libmcs_tas_accordin_direct.so:mcs_tas_accordin_direct_mutex_relock_park
+/@pk_start[tid]/
+{
+  @in_custody = @in_custody - 1;
+  @park_us = hist((nsecs - @pk_start[tid]) / 1000);
+  @park_yielded = lhist((int64)retval, 0, 2, 1);
+  delete(@pk_start[tid]);
+}
+
+/* ---- batched release ---------------------------------------------------- */
+
+uprobe:/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/custody-src/target/release/libmcs_tas_accordin_direct.so:mcs_tas_accordin_direct_mutex_cv_flush
+{
+  @fl_start[tid] = nsecs;
+  @flush_calls = count();
+  @custody_depth_at_flush = lhist(@in_custody, 0, 200, 5);
+  if (@prev_flush_ret) { @flush_gap_us = hist((nsecs - @prev_flush_ret) / 1000); }
+}
+
+uretprobe:/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/custody-src/target/release/libmcs_tas_accordin_direct.so:mcs_tas_accordin_direct_mutex_cv_flush
+/@fl_start[tid]/
+{
+  $m = (int64)retval;
+  @flush_us = hist((nsecs - @fl_start[tid]) / 1000);
+  if ($m >= 0) {
+    @flush_moved = lhist($m, 0, 200, 5);
+    @flush_moved_stats = stats($m);
+    if ($m == 0) { @flush_empty = count(); }
+  } else {
+    @flush_error = count();
+  }
+  delete(@fl_start[tid]);
+  @prev_flush_ret = nsecs;
+}
+
+END
+{
+  printf("window_ns %llu\n", nsecs - @t0);
+  clear(@t0);
+  clear(@w_start); clear(@w_sig); clear(@w_park); clear(@w_ar);
+  clear(@w_first); clear(@w_last); clear(@ar_start);
+  clear(@notify_ts); clear(@rl_start); clear(@hopkey);
+  clear(@pk_start); clear(@fl_start);
+  clear(@prev_relock_ret); clear(@prev_flush_ret);
+}

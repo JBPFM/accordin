@@ -114,6 +114,17 @@ the noise of these single runs.
 
 - The multi-repeat confirmation of the tip across the seven workloads is still
   owed; every figure supporting the merge comes from one run per cell.
+- The tip is unchanged at `4b3b0a8` after the streamcluster diagnosis below.
+  The progress backstop stays on `cv_owner_fair`: it buys streamcluster 4–20 %
+  and costs `readrandom` on `mcs_accordin` 12–13 % even with its timer
+  unarmed, which is the code-volume question rather than a property of the
+  rule, so it waits on that. The never-skip flush change is rejected — waiting
+  for a pass in flight makes streamcluster 6–9 % slower and raises expiries by
+  a third.
+- `readrandom` on `mcs_accordin` loses 10–16 % to the volume of BPF text
+  loaded into the kernel, reachable or not, with no data-layout, userspace or
+  instruction-fetch cause found. It bounds what any further scheduler code can
+  cost before it does anything.
 - Cross-group service is reached only when both the own queue and the topology
   group have nothing, so a queue starved by its own group's traffic is served
   late.
@@ -1455,6 +1466,242 @@ workloads that decided the series, since everything above rests on one run per
 cell. That confirmation is still owed: the branch was merged before it, on the
 strength of these screens, and the Decision section records what was shipped.
 
+## Streamcluster gap diagnosis
+
+After the merge, streamcluster on `4b3b0a8` runs where the shard family has
+always run, and a set of sessions on 2026-09-08 asked why it does not run
+faster. Every arm is `4b3b0a8` unless a commit is named, and every session in
+this part is **one run per cell** unless it says otherwise.
+
+### The custody limit sweeps — `custody-ms` and `custody-ms-long`
+
+Both directions of `ACCORDIN_CV_CUSTODY_MS` around the 20 ms default, on
+streamcluster.
+
+| session | arm | env | backend | stream s | rel | parked | expired | expired share |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| `custody-ms` | tip | — | mcs_accordin | 107.827 | 1.000x | 8430666 | 57668 | 0.68 % |
+| `custody-ms` | ms5 | `CUSTODY_MS=5` | mcs_accordin | 129.789 | 1.204x | 8432236 | 888719 | 10.5 % |
+| `custody-ms` | ms2 | `CUSTODY_MS=2` | mcs_accordin | 137.650 | 1.277x | 8413941 | 1042072 | 12.4 % |
+| `custody-ms` | tip | — | mcs_tas_accordin | 109.429 | 1.000x | 8431734 | 63562 | 0.75 % |
+| `custody-ms` | ms5 | `CUSTODY_MS=5` | mcs_tas_accordin | 128.363 | 1.173x | 8433164 | 874079 | 10.4 % |
+| `custody-ms` | ms2 | `CUSTODY_MS=2` | mcs_tas_accordin | 131.318 | 1.200x | 8414809 | 980950 | 11.7 % |
+| `custody-ms-long` | tip | — | mcs_accordin | 90.614 | 1.000x | 8428820 | 45341 | 0.54 % |
+| `custody-ms-long` | ms50 | `CUSTODY_MS=50` | mcs_accordin | 113.480 | 1.252x | 8432652 | 748 | 0.009 % |
+| `custody-ms-long` | ms100 | `CUSTODY_MS=100` | mcs_accordin | 109.199 | 1.205x | 8432754 | 695 | 0.008 % |
+| `custody-ms-long` | tip | — | mcs_tas_accordin | 103.473 | 1.000x | 8428368 | 59986 | 0.71 % |
+| `custody-ms-long` | ms50 | `CUSTODY_MS=50` | mcs_tas_accordin | 108.769 | 1.051x | 8432194 | 1202 | 0.014 % |
+| `custody-ms-long` | ms100 | `CUSTODY_MS=100` | mcs_tas_accordin | 123.032 | 1.189x | 8433395 | 1195 | 0.014 % |
+
+`fillrandom` in the same `custody-ms` session: 255.739 Kops/s at the tip
+against 261.304 at 5 ms and 239.128 at 2 ms on `mcs_accordin`, and 256.687
+against 266.348 and 235.904 on `mcs_tas_accordin`, with expiries rising from
+944 to 17899 and from 1544 to 19522 at the shortest limit.
+
+Both directions are slower than the default, and that is the finding. Cutting
+the limit to 5 or 2 ms pushes 10–12 % of parks past it, and those waits leave
+custody through the timer and fall back to the futex path; streamcluster then
+runs 17–28 % slower. Raising it to 50 or 100 ms removes the expiries almost
+entirely — 0.01 % of parks — and streamcluster is 5–25 % slower again. A wait
+that expires and goes back to the futex is therefore served *faster* than one
+the scheduler releases into the admission bank, and holding waits longer to
+release more of them the scheduler's way loses time rather than saving it.
+
+### Where the expiries come from — `wait-instrument` and `wait-diag`
+
+`wait-instrument` runs one arm of branch `cv-wait-instrument` (`33457f0`),
+which splits the expiry counter by whether the waiter had been notified.
+
+| session | commit | backend | stream s | parked | expired | expired notified | expired unnotified |
+|---|---|---|---:|---:|---:|---:|---:|
+| `wait-instrument` | `33457f0` | mcs_accordin | 104.792 | 8428304 | 55520 | 22800 | 32720 |
+| `wait-instrument` | `33457f0` | mcs_tas_accordin | 95.715 | 8427908 | 50504 | 21505 | 28999 |
+
+So of 55520 expiries, 22800 belonged to waits that had been notified and were
+still sitting in custody when the limit ran out — the release the scheduler
+owed them never arrived. The `wait-diag` sessions then asked when those
+notifications happened. The notifier-time probe (`8490b3a`) stamps each
+notification against the waiter's custody deadline:
+
+| counter | value |
+|---|---:|
+| notifications arriving while the wait was still inside its limit | 20 |
+| notifications arriving after the limit had already passed | 27048 |
+| notifications seen with no flush in flight | 7590 |
+| notifications seen with one flush in flight | 19478 |
+
+99.93 % of the notifications behind a notified expiry arrive after the wait's
+limit has already gone by, so they are not releases the scheduler dropped:
+the waiter had already timed out and the notification simply came later. The
+genuinely missed releases are the first row — 20 in that run, and 134 and 159
+in the two runs of `wait-fix/stream-v2` that carry the same probe — against
+8.4 M parks. Nothing worth chasing is hiding in the expiry counter.
+
+The same sessions priced the flush itself. A pass costs 541 µs
+(`wait-fix/probe`, 23977434528 ns over 44296 passes) and covers about 190
+parked waits (8429877 parks over 44296 calls), while that run parks 8429877
+waits in 101.133 s, so roughly 45 more waits arrive while a pass is in flight;
+the `wait-diag/stream3` run puts the same figure at 51 (603.9 µs a pass,
+83804 parks a second). Of the flush calls, 27697 of 71946 and 29609 of 73899
+in `wait-diag/stream` lose the claim to another thread — about 40 % — and the
+walk over the bank refuses or fails to read almost nothing (`unreadable` 0 in
+every run, `refused` at most 3). The flush is not failing; it is simply always
+behind.
+
+### Never skipping the flush — `wait-fix/stream-clean` and `wait-fix/leveldb-clean`
+
+`94d830a` makes a thread that loses the claim wait for the pass instead of
+returning, so no notification goes unflushed.
+
+| session | arm | commit | backend | value | rel | expired | flush calls |
+|---|---|---|---|---:|---:|---:|---:|
+| stream | base | `33457f0` | mcs_accordin | 102.350 s | 1.000x | 52650 | 50671 |
+| stream | clean | `94d830a` | mcs_accordin | 111.638 s | 1.091x | 72179 | 44297 |
+| stream | base | `33457f0` | mcs_tas_accordin | 99.006 s | 1.000x | 54259 | 50145 |
+| stream | clean | `94d830a` | mcs_tas_accordin | 105.476 s | 1.065x | 70880 | 44308 |
+| fillrandom | base | `33457f0` | mcs_accordin | 245.586 Kops/s | 1.000x | 377 | 66076 |
+| fillrandom | clean | `94d830a` | mcs_accordin | 261.113 Kops/s | 1.063x | 580 | 47910 |
+| fillrandom | base | `33457f0` | mcs_tas_accordin | 239.326 Kops/s | 1.000x | 685 | 65319 |
+| fillrandom | clean | `94d830a` | mcs_tas_accordin | 253.059 Kops/s | 1.057x | 1812 | 46174 |
+| readrandom | base | `33457f0` | mcs_accordin | 1329.618 Kops/s | 1.000x | 1 | 2 |
+| readrandom | clean | `94d830a` | mcs_accordin | 1304.677 Kops/s | 0.981x | 1 | 2 |
+| readrandom | base | `33457f0` | mcs_tas_accordin | 1060.648 Kops/s | 1.000x | 1 | 2 |
+| readrandom | clean | `94d830a` | mcs_tas_accordin | 1094.198 Kops/s | 1.032x | 1 | 2 |
+
+Waiting for the pass makes streamcluster 9.1 % and 6.5 % slower and raises
+expiries by 37 % and 31 %, because a thread that waits is a thread not running
+the workload, and the waits it saves expire anyway. `fillrandom` gains about
+6 % and `readrandom` is flat. The change is not adopted.
+
+### The progress backstop — `backstop`, `backstop2`, `backstop-rr`
+
+Three commits on `cv_owner_fair` wake an idle CPU for an admission queue whose
+head has stopped moving: `455edb9` judges a head by its age, `515813e` limits
+the rule to waiters the flush filed and arms it at 300 µs, and `c211073` drops
+the write from the dispatch path, defaults to 1 ms and removes the backoff.
+The sessions measured the first two.
+
+streamcluster:
+
+| session | arm | commit | env | backend | stream s | rel |
+|---|---|---|---|---|---:|---:|
+| `backstop` | tip | `4b3b0a8` | — | mcs_accordin | 96.049 | 1.000x |
+| `backstop` | bs300 | `455edb9` | — | mcs_accordin | 92.369 | 0.962x |
+| `backstop` | bs1000 | `455edb9` | `PROGRESS_US=1000` | mcs_accordin | 95.039 | 0.989x |
+| `backstop` | tip | `4b3b0a8` | — | mcs_tas_accordin | 101.839 | 1.000x |
+| `backstop` | bs300 | `455edb9` | — | mcs_tas_accordin | 81.970 | 0.805x |
+| `backstop` | bs1000 | `455edb9` | `PROGRESS_US=1000` | mcs_tas_accordin | 86.283 | 0.847x |
+| `backstop2` | tip | `4b3b0a8` | — | mcs_accordin | 99.955 | 1.000x |
+| `backstop2` | bs | `515813e` | — | mcs_accordin | 83.875 | 0.839x |
+| `backstop2` | bsoff | `515813e` | `PROGRESS_US=0` | mcs_accordin | 99.489 | 0.995x |
+| `backstop2` | tip | `4b3b0a8` | — | mcs_tas_accordin | 101.974 | 1.000x |
+| `backstop2` | bs | `515813e` | — | mcs_tas_accordin | 95.321 | 0.935x |
+| `backstop2` | bsoff | `515813e` | `PROGRESS_US=0` | mcs_tas_accordin | 95.396 | 0.935x |
+
+LevelDB:
+
+| session | arm | commit | env | backend | fill Kops/s | rel | read Kops/s | rel |
+|---|---|---|---|---|---:|---:|---:|---:|
+| `backstop` | tip | `4b3b0a8` | — | mcs_accordin | 233.366 | 1.000x | 1258.986 | 1.000x |
+| `backstop` | bs300 | `455edb9` | — | mcs_accordin | 200.755 | 0.860x | 1097.428 | 0.872x |
+| `backstop` | bs1000 | `455edb9` | `PROGRESS_US=1000` | mcs_accordin | 236.666 | 1.014x | 1121.225 | 0.891x |
+| `backstop` | tip | `4b3b0a8` | — | mcs_tas_accordin | 241.470 | 1.000x | 1048.106 | 1.000x |
+| `backstop` | bs300 | `455edb9` | — | mcs_tas_accordin | 222.495 | 0.921x | 1011.846 | 0.965x |
+| `backstop` | bs1000 | `455edb9` | `PROGRESS_US=1000` | mcs_tas_accordin | 237.975 | 0.986x | 1028.258 | 0.981x |
+| `backstop2` | tip | `4b3b0a8` | — | mcs_accordin | 240.508 | 1.000x | 1300.597 | 1.000x |
+| `backstop2` | bs | `515813e` | — | mcs_accordin | 224.531 | 0.934x | 1046.146 | 0.804x |
+| `backstop2` | bsoff | `515813e` | `PROGRESS_US=0` | mcs_accordin | 246.984 | 1.027x | 1050.316 | 0.808x |
+| `backstop2` | tip | `4b3b0a8` | — | mcs_tas_accordin | 237.161 | 1.000x | 1059.019 | 1.000x |
+| `backstop2` | bs | `515813e` | — | mcs_tas_accordin | 214.346 | 0.904x | 977.621 | 0.923x |
+| `backstop2` | bsoff | `515813e` | `PROGRESS_US=0` | mcs_tas_accordin | 248.688 | 1.049x | 1016.801 | 0.960x |
+
+`backstop-rr`, three repeats, `readrandom` with the timer unarmed on both
+backstop commits:
+
+| arm | commit | env | backend | read Kops/s | CV% | rel |
+|---|---|---|---|---:|---:|---:|
+| tip | `4b3b0a8` | — | mcs_accordin | 1268.365 | 0.98 | 1.000x |
+| bs1off | `455edb9` | `PROGRESS_US=0` | mcs_accordin | 1118.186 | 3.55 | 0.882x |
+| bs2off | `515813e` | `PROGRESS_US=0` | mcs_accordin | 1097.032 | 1.29 | 0.865x |
+| tip | `4b3b0a8` | — | mcs_tas_accordin | 1010.152 | 10.06 | 1.000x |
+| bs1off | `455edb9` | `PROGRESS_US=0` | mcs_tas_accordin | 995.534 | 2.94 | 0.986x |
+| bs2off | `515813e` | `PROGRESS_US=0` | mcs_tas_accordin | 997.391 | 1.55 | 0.987x |
+
+Per-thread fairness at 192 threads (`backstop/exp7`) moves very little: the
+factor reads 0.5206 / 0.5222 / 0.5234 at 100 ns on `mcs_accordin_direct` and
+0.6572 / 0.6575 / 0.6580 at 30000 ns for tip, `bs300` and `bs1000`.
+
+The backstop does what it was written to do on streamcluster — 4 % to 20 %
+faster, the largest gains on `mcs_tas_accordin` — and costs `fillrandom` 7 % to
+14 % at the 300 µs setting, which the 1 ms setting mostly recovers. What stops
+it is `readrandom` on `mcs_accordin`: 0.872x, 0.804x and, over three repeats
+with the timer switched off entirely, 0.882x and 0.865x at CV under 3.6 %. An
+arm whose timer never fires cannot be losing time to the timer, so the loss
+belongs to the commit's presence rather than to its behaviour, which is the
+same shape as the `readrandom` question below.
+
+### The `readrandom` code-volume effect — `layout-rr` through `layout-rr5`
+
+Every arm below is `readrandom` at 192 threads, three repeats, `rel` against
+the tip of its own session. The question is why a commit that does nothing at
+run time still costs `readrandom` on `mcs_accordin`.
+
+| session | arm | commit | what the arm carries | MCS rel | MCS-TAS rel |
+|---|---|---|---|---:|---:|
+| `layout-rr` | bs1off | `455edb9` | backstop, timer unarmed | 0.861x | 0.990x |
+| `layout-rr` | L1 | `d426aa8` | admission word off its neighbours' lines | 0.882x | 0.968x |
+| `layout-rr` | L2 | `758ca2d` | a cache line per admission slot | 0.864x | 0.966x |
+| `layout-rr` | L3 | `39d072b` | backstop globals moved past the grant order's | 0.767x | 0.964x |
+| `layout-rr2` | G | `8d4d96b` | the backstop's counters, no backstop | 1.028x | 1.036x |
+| `layout-rr2` | P | `6e09b70` | the callback loaded, never allowed to run | 0.874x | 0.957x |
+| `layout-rr2` | R | `02bbeff` | the BPF object with no knob to arm it | 0.857x | 0.932x |
+| `layout-rr3` | Pmap | `1e0392a` | a second timer held, neither end used | 1.011x | 0.977x |
+| `layout-rr3` | Pcode | `a38c016` | the walk loaded with no timer to reach it | 0.905x | 0.942x |
+| `layout-rr4` | D1 | `425b757` | an unreached bank walk behind setup | 0.838x | 0.906x |
+| `layout-rr4` | D2 | `2774b32` | an unreached bank walk behind the transfer pass | 0.849x | 0.913x |
+| `layout-rr4` | D3 | `5b44f32` | an unreached bank walk behind the dump | 0.875x | 0.896x |
+| `layout-rr5` | U1 | `917b9fa` | read-only ballast the size of a larger object | 1.024x | 0.985x |
+| `layout-rr5` | U2 | `a7ae4f3` | the admission word on its own line, TLS aligned | 0.996x | 0.981x |
+
+The reference arm for the last three sessions, `Pcode`, repeats at 0.905x,
+0.848x, 0.887x, and again at 0.875x under `bpf_stats` (`layout-perf`) and
+0.849x with perf counters attached (`layout-perfk`), so the effect survives
+instrumentation.
+
+Read together: data layout does not explain it (`L1`, `L2`, `L3` and `U2`
+change placement and recover nothing), userspace does not (`G` publishes the
+globals alone and is neutral at 1.028x, `U1` carries read-only ballast and is
+neutral at 1.024x, and the TLS block is identical across arms), and the host
+program does not (`R` loads the object with no knob at all and still loses
+14 %). What moves `readrandom` is BPF text loaded into the kernel, whether or
+not anything can reach it: an extra map with no user is free (`Pmap`, 1.011x),
+dead instructions are not (`Pcode`, `D1`, `D2`, `D3`, all 0.838x–0.905x).
+Under instrumentation the loaded programs cost the same per invocation and are
+simply invoked less often at the same cycle count with a lower IPC, and the
+instruction-fetch counters — iTLB and icache miss rates — do not move. A
+metastable idle-and-wake regime is the open hypothesis; it is being probed and
+nothing here settles it. `readrandom` on `mcs_accordin` loses 10–16 % from the
+volume of scheduler text on the machine, and the series has no mechanism for
+that yet.
+
+The scratch branches carrying these arms, each one commit on top of the tip:
+
+| branch | commit | what it changes |
+|---|---|---|
+| `readrandom-layout` | `d426aa8` | keeps the admission word off its neighbours' cache lines |
+| `layout-slotline` | `758ca2d` | gives every admission slot a cache line of its own |
+| `layout-place` | `39d072b` | moves the backstop's globals past the grant order's own |
+| `prog-globals` | `8d4d96b` | publishes the backstop's counters without the backstop |
+| `prog-callback` | `6e09b70` | loads the backstop's callback without letting it run |
+| `prog-noknob` | `02bbeff` | loads the backstop with no runtime knob to arm it |
+| `prog-maponly` | `1e0392a` | holds a second timer for the backstop and uses neither end |
+| `prog-codeonly` | `a38c016` | loads the backstop walk with no timer to reach it |
+| `pad-init` | `425b757` | loads an unreached bank walk behind the scheduler's setup |
+| `pad-flush` | `2774b32` | loads an unreached bank walk behind the transfer pass |
+| `pad-dump` | `5b44f32` | loads an unreached bank walk behind the scheduler's dump |
+| `rodata-ballast` | `917b9fa` | carries read-only ballast the size of a larger object |
+| `tls-align` | `a7ae4f3` | keeps the admission word on a cache line of its own |
+
 ## Machine state, not code: the reboot observation
 
 The `baseline` and `custody` arms of `h2-tail` are the same binaries the two
@@ -1511,4 +1758,6 @@ baseline inside the same session.
   on that metric, and that repeat across two of these screens, are treated as
   settled. Individual cells in them go visibly wrong — the tip at half
   throughput at one `age` point, its `readrandom` at 0.896x in `peek` — without
-  invalidating the session around them.
+  invalidating the session around them. The same holds for the streamcluster
+  diagnosis sessions, which are single-repeat except `backstop-rr` and the
+  `layout-rr` series.

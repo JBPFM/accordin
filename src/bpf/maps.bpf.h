@@ -85,14 +85,19 @@ volatile __u32 group_count;
 volatile __u32 group_size[MAX_GROUPS];
 volatile __u32 group_member[MAX_GROUPS][MAX_GROUP_SIZE];
 /* How many grants in a row a CPU may take out of its own queue before it has
- * to look at its group; zero lifts the bound. */
+ * to look at its group; zero lifts the bound. With the age rule choosing the
+ * queue, the own queue gives way as soon as the group holds an older head, so
+ * this bound rarely engages and is kept as a ceiling rather than as the rule. */
 volatile __u32 own_limit;
 /* How much younger than the oldest head of its group the head of a CPU's own
  * queue may be and still be served; zero holds the group in strict age order. */
 volatile __u64 own_slack_ns;
+/* Whether the loaded scheduler resolved the lockless queue-head peek. */
+__u32 dsq_peek_ready;
 
-/* Rotating start of the group scan, so members of equal depth take turns
- * instead of always losing to the lowest CPU id. */
+/* Rotating start of the group scan. Members are ranked by the age of their
+ * heads, which are equal only rarely; the cursor settles those ties instead of
+ * letting the lowest CPU id always win them. */
 __u32 group_cursor[MAX_GROUPS];
 /* Grants a CPU has taken from its own queue since it last served another
  * queue. Only that CPU's dispatch touches its entry, and dispatch runs under

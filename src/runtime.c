@@ -401,8 +401,8 @@ __attribute__((constructor)) static void scheduler_start(void)
     cv_counters_on = env_flag("ACCORDIN_CV_COUNTERS");
     cv_flush_width = env_u32("ACCORDIN_CV_FLUSH_WIDTH", 0);
     /* Notified waits leave custody through the flush; the timer keeps expiry.
-     * Reverse iteration pairs with the flush's head insertion to hand the waits
-     * over in the order they parked. */
+     * Reverse iteration walks the custody queue from its tail; where a released
+     * wait lands in the admission queue is set by its park stamp. */
     cv_flush_flags = env_u32("ACCORDIN_CV_FLUSH_FLAGS",
                              CV_FLUSH_MOVE | CV_FLUSH_REV);
     SCX_BUG_ON(pthread_atfork(NULL, NULL, forget_flush),
@@ -436,6 +436,11 @@ __attribute__((constructor)) static void scheduler_start(void)
     scheduler_link = SCX_OPS_ATTACH(skel, accordin_ops, accordin);
     scheduler_admission = &skel->bss->admission;
     __atomic_store_n(&cv_custody_live, true, __ATOMIC_RELEASE);
+    /* The head peek is resolved by the loader, so only the attached scheduler
+     * can say whether the running kernel offers it. */
+    if (cv_counters_on)
+        fprintf(stderr, "[accordin_peek] dsq_peek=%s\n",
+                skel->bss->dsq_peek_ready ? "yes" : "no");
     fprintf(stderr, "[%s] eBPF scheduler loaded successfully\n", PREFIX);
 }
 

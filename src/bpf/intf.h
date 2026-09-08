@@ -53,8 +53,9 @@ struct task_scx_ctx {
 /* Batched transfer of notified condvar waiters out of scheduler custody.
  * The caller fills the request fields and reads back the result fields.
  * MOVE hands notified waits to the admission queue and EXPIRE withdraws custody
- * from waits past their limit. REV walks the custody queue from its tail and
- * TAIL appends the waits it moves instead of inserting them at the head.
+ * from waits past their limit. REV walks the custody queue from its tail. TAIL
+ * places nothing any more: the admission queue is ordered by the age stamp a
+ * wait carries, so a released wait takes the place its park time gives it.
  * SPREAD also wakes idle CPUs holding a free admission slot for the moved
  * waits, not only for the waits handed back to the ordinary queue. */
 #define CV_FLUSH_EXPIRE 1U

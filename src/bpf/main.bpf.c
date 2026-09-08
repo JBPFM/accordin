@@ -5,6 +5,11 @@
 char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
+/* The lockless read of a dispatch queue's head postdates the vendored scx
+ * headers, so the kfunc is declared here and, like the __COMPAT helpers, used
+ * only where the running kernel exports it. */
+struct task_struct *scx_bpf_dsq_peek(u64 dsq_id) __ksym __weak;
+
 /* The admission queue a waiter is filed in. The index is a CPU id at the
  * enqueue and release sites and a queue number when the bank itself is walked;
  * the wrap keeps it inside the bank whatever the caller reports. */
@@ -206,7 +211,14 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
    * of its admission CPU. */
   if ((enq_flags & SCX_ENQ_LAST) && dsq == NORMAL_DSQ)
     dsq = SCX_DSQ_LOCAL;
-  scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
+  /* The admission bank is ordered by the age stamp, which makes the head of a
+   * queue its oldest request by construction. A queue holds either ordered or
+   * plain insertions and never both, so the bank takes these and nothing else,
+   * and every other queue takes the plain form. */
+  if (is_waiting(dsq))
+    scx_bpf_dsq_insert_vtime(p, dsq, SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
+  else
+    scx_bpf_dsq_insert(p, dsq, SCX_SLICE_DFL, enq_flags);
   /* The last task of a CPU queued away from it leaves that CPU with nothing to
    * pick, and only this kick brings it back to dispatch. An idle kick may be
    * dropped while the task being queued is still the current one, so the
@@ -216,6 +228,14 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     scx_bpf_kick_cpu(cpu, 0);
   else
     scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+}
+
+/* Time between two stamps, floored at zero so a stamp taken slightly ahead of
+ * the reader reads as no time at all. */
+static __always_inline __u64 elapsed(__u64 now, __u64 stamp) {
+  s64 span = (s64)(now - stamp);
+
+  return span > 0 ? (__u64)span : 0;
 }
 
 /* Outcome of examining one queue: a waiter was granted this CPU's slot, the
@@ -228,7 +248,9 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
 /* Reserve both the task and this CPU before moving a candidate. Different CPUs
  * may examine the same queue concurrently; a failed move rolls back both
  * reservations. There is no path that admits a new waiter onto an occupied CPU.
- * An empty queue costs one depth query and no iteration. */
+ * An empty queue costs one depth query and no iteration. The queue is ordered
+ * by the age stamp and the iterator walks that order, so the first candidate
+ * offered is the oldest request the queue holds. */
 static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
                                       __u32 index) {
   __u64 dsq = waiting_dsq(index);
@@ -255,22 +277,35 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
   return ADMIT_NONE;
 }
 
-/* How long the waiter at the head of a queue has been in line, which is the
- * longest wait that queue holds. The stamp a waiter carries is written by the
- * CPU that queued it and read here by another, so the difference is taken
- * signed and a head stamped slightly ahead of this CPU reads as no wait at all
- * rather than as an enormous one. An empty queue costs one depth query and has
- * no age to report. */
+/* How long the waiter at the head of an admission queue has been in line. The
+ * bank is ordered by the age stamp, so its head is the oldest request the queue
+ * holds. Reading it through the head peek touches no queue lock; opening an
+ * iterator would take the queue's raw spinlock and write its list twice, which
+ * a group scan would pay for on every member of the group. The iterator is kept
+ * for a kernel without the peek.
+ *
+ * A stamp is written by the clock of the CPU that queued the waiter, and only
+ * the group scan compares stamps taken on different CPUs. The difference is
+ * taken signed so a head stamped slightly ahead of this CPU reads as no wait at
+ * all rather than as an enormous one; a persistent offset between two CPUs
+ * wider than the slack would bias the order in favour of the CPU that runs
+ * behind, which assumes a host whose clock is stable across CPUs. */
 static __always_inline bool head_age(__u64 dsq, __u64 now, __u64 *age) {
   struct task_struct *p;
   bool found = false;
 
+  if (bpf_ksym_exists(scx_bpf_dsq_peek)) {
+    /* No head is how an empty queue reports itself, so no depth query. */
+    p = scx_bpf_dsq_peek(dsq);
+    if (!p)
+      return false;
+    *age = elapsed(now, p->scx.dsq_vtime);
+    return true;
+  }
   if (scx_bpf_dsq_nr_queued(dsq) <= 0)
     return false;
   bpf_for_each(scx_dsq, p, dsq, 0) {
-    s64 waited = (s64)(now - p->scx.dsq_vtime);
-
-    *age = waited > 0 ? (__u64)waited : 0;
+    *age = elapsed(now, p->scx.dsq_vtime);
     found = true;
     break;
   }
@@ -561,8 +596,8 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
                cv_parked, cv_parked_now, cv_flushed, cv_expired);
   scx_bpf_dump("accordin cv calls=%llu misses=%llu drained=%llu\n",
                cv_flush_calls, cv_flush_misses, cv_drained);
-  scx_bpf_dump("accordin groups=%u own_limit=%u own_slack_ns=%llu\n",
-               group_count, own_limit, own_slack_ns);
+  scx_bpf_dump("accordin groups=%u own_limit=%u own_slack_ns=%llu peek=%u\n",
+               group_count, own_limit, own_slack_ns, dsq_peek_ready);
   bpf_for(cpu, 0, MAX_CPUS) {
     volatile __u64 *owner = owner_slot(cpu);
     if (owner && *owner)
@@ -633,6 +668,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   ret = bpf_timer_start(&timer->timer, cv_scan_period(), 0);
   if (ret)
     return ret;
+  /* Which head read the loaded program took is only knowable here, so the
+   * runtime is told rather than left to guess at the kernel's version. */
+  dsq_peek_ready = bpf_ksym_exists(scx_bpf_dsq_peek);
   admission.enabled = !stats_only_mode;
   admission.active = !auto_admission;
   return 0;
@@ -650,9 +688,9 @@ void BPF_STRUCT_OPS(accordin_exit, struct scx_exit_info *ei) {
 /* Hand every notified wait of the calling process to the lock admission queue
  * in one pass, and withdraw custody from the waits that outlived their limit.
  * Runs from a syscall, so it holds no rq lock and may move tasks between
- * queues. Head insertion keeps notified waits ahead of ordinary lock waiters;
- * reverse iteration then preserves the order they parked in. Each pass is
- * selected by the caller's flags. */
+ * queues. A released wait enters the admission queue at the place its park
+ * stamp gives it, ahead of every lock request made after it parked. Each pass
+ * is selected by the caller's flags. */
 SEC("syscall")
 int accordin_cv_flush(struct cv_flush_ctx *ctx) {
   struct cv_flush_tally *tally;
@@ -660,7 +698,6 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
   __u32 tgid = bpf_get_current_pid_tgid() >> 32;
   __u32 width = ctx->width, key = 0;
   __u64 iter_flags = (ctx->flags & CV_FLUSH_REV) ? SCX_DSQ_ITER_REV : 0;
-  __u64 enq_flags = (ctx->flags & CV_FLUSH_TAIL) ? 0 : SCX_ENQ_HEAD;
 
   ctx->moved = ctx->expired = ctx->pending = ctx->queued = 0;
   if (stats_only_mode || !admission.enabled)
@@ -673,8 +710,8 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
     bpf_rcu_read_lock();
     bpf_for_each(scx_dsq, p, WAITFORSIGNAL_DSQ, iter_flags) {
       struct task_scx_ctx *tctx;
-      __u64 move_flags = enq_flags;
       __u64 target, parked;
+      bool moved;
       __u32 task_cpu, state;
 
       if (p->tgid != tgid)
@@ -683,15 +720,16 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       if (!tctx || !tctx->parked_at)
         continue;
       task_cpu = scx_bpf_task_cpu(p);
-      /* The age stamp a released wait carries into the admission queue is the
-       * moment it parked, so the grant rule ranks it by the wait it has already
-       * served rather than by the moment it was handed over. */
+      /* A released wait keeps the stamp it took when it parked, and the
+       * admission queue is ordered by that stamp, so its place in line is the
+       * wait it has already served rather than the moment it was handed over.
+       * Where it goes in the queue is therefore no longer a choice the caller's
+       * flags make. */
       target = waiting_dsq(task_cpu);
       /* Running in the process's own context, an unreadable word is not a
        * notification and cannot be confirmed later either. */
       if (!user_state(p, &state)) {
         target = NORMAL_DSQ;
-        move_flags = 0;
       } else if ((state & USER_META) != USER_WAITING) {
         continue;
       } else if (width && tally->moved >= width) {
@@ -711,7 +749,11 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       /* A move can be refused while the wait is still queued, so put the claim
        * back and leave it to the next pass. Only a claim that cannot be put
        * back means the wait left the queue by another path, which counted it. */
-      if (!__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, target, move_flags)) {
+      moved = target == NORMAL_DSQ
+                  ? __COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, target, 0)
+                  : __COMPAT_scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p, target,
+                                                    0);
+      if (!moved) {
         if (__sync_bool_compare_and_swap(&tctx->parked_at, 0, parked))
           __sync_fetch_and_add(&cv_parked_now, 1);
         else

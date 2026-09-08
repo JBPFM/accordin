@@ -40,7 +40,14 @@ branch `cv_percpu_queue`: `1189963` gives every possible CPU id its own
 admission queue in place of the thirty-two hash shards, with the walk rotating
 over the queues that exist — 96 on this host, which has 96 possible CPU ids and
 48 online — and `cec374b` adds a probe of the dispatching CPU's own queue ahead
-of that rotation.
+of that rotation. A third, `bf7080f` on branch `cv_owner_fair`, bounds that
+preference: a CPU serves its own queue at most `ACCORDIN_OWN_LIMIT` times in a
+row, then the deepest queue of its topology group, then its own queue again if
+the group was empty, and the global rotation last. The groups come from the
+NUMA node CPU lists chunked into eights, six groups of eight on this host —
+the even CPUs 0–14, 16–30 and 32–46 and their odd counterparts. `8fe30c4`
+follows it and restarts the grant count after a fallback own grant; it is not
+part of the screen below.
 
 The reference point is `934bd1c`, the commit before the series. `9520d7d` is
 the last change of the custody mechanism itself and is carried as an
@@ -94,7 +101,11 @@ slot nor the dispatch-side release passed validation.
   reproducing that spread, so it is not the shard geometry; the spread stays an
   open cost of sharding, and neither follow-up commit joins `cv_admission`,
   whose tip remains `ded83aa`. The own-queue probe of `cec374b` is left on that
-  branch as a throughput-against-fairness trade for the user to decide. The sharding tip
+  branch as a throughput-against-fairness trade for the user to decide. The
+  bounded form of that probe, `bf7080f` on branch `cv_owner_fair`, screens well
+  — it keeps the `fillrandom` gain and gives back much of the fairness — but
+  its follow-up `8fe30c4` has not been measured, so nothing from that branch
+  joins the tip either. The sharding tip
   is kept regardless: on the same commits `fillrandom` runs at 3.77x and 3.73x
   of the `custody` arm and streamcluster at 0.517x and 0.514x of the baseline's
   seconds, so the gains on the workloads that park dominate the microbenchmark
@@ -113,7 +124,7 @@ slot nor the dispatch-side release passed validation.
   throughput.
 - The host was rebooted early on 2026-09-07 UTC. Every session in the tables
   below except the last two ran after that reboot, between 14:45 UTC on
-  2026-09-07 and 02:53 UTC on 2026-09-08, with the host up for 12 h or more.
+  2026-09-07 and 04:45 UTC on 2026-09-08, with the host up for 12 h or more.
 - The machine drifts within a single day. The `fillrandom` / `mcs_accordin`
   baseline anchor alone reads 51.287, 47.100 and 52.551 Kops/s in three
   sessions a few hours apart, and 31.152 Kops/s on the day before the reboot.
@@ -715,6 +726,97 @@ streamcluster, one repeat, seconds (lower is better, `rel` against `baseline`):
 All arms park the same 8.43 M waits with 44.4 k flush calls; `own` expires
 41.2 k of them on `mcs_accordin` against 62.0 k for `tidy`.
 
+### `bounded` — bounded own-queue preference, single repeat
+
+`bf7080f` under two bounds, against `934bd1c`, the retained tip and the
+unbounded own-queue probe. **One run per cell again**, so the throughput
+columns scatter and only differences far larger than that scatter mean
+anything.
+
+Per-thread fairness, 192 threads, one repeat:
+
+| critical | arm | commit | env | backend | Mops/s | rel | fairness | min ops | max ops |
+|---|---|---|---|---|---:|---:|---:|---:|---:|
+| 100 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 2.624 | 1.000x | 0.5113 | 100913 | 118634 |
+| 100 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 2.599 | 0.991x | 0.5187 | 90092 | 126102 |
+| 100 ns | own | `cec374b` | — | mcs_accordin_direct | 2.544 | 0.970x | 0.6275 | 49823 | 217888 |
+| 100 ns | k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_accordin_direct | 2.374 | 0.905x | 0.5530 | 80033 | 127451 |
+| 100 ns | k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_accordin_direct | 2.596 | 0.989x | 0.5552 | 86049 | 147997 |
+| 100 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 2.468 | 1.000x | 0.5181 | 94075 | 116936 |
+| 100 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 2.324 | 0.942x | 0.5221 | 83330 | 117125 |
+| 100 ns | own | `cec374b` | — | mcs_tas_accordin_direct | 2.199 | 0.891x | 0.6133 | 45499 | 172849 |
+| 100 ns | k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 2.329 | 0.944x | 0.5415 | 80449 | 132769 |
+| 100 ns | k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_tas_accordin_direct | 2.395 | 0.971x | 0.5587 | 80030 | 138892 |
+| 300 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 1.490 | 1.000x | 0.5183 | 54730 | 70888 |
+| 300 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 1.489 | 0.999x | 0.5290 | 51287 | 73122 |
+| 300 ns | own | `cec374b` | — | mcs_accordin_direct | 1.377 | 0.924x | 0.6180 | 30420 | 118765 |
+| 300 ns | k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_accordin_direct | 1.411 | 0.947x | 0.5523 | 46329 | 76236 |
+| 300 ns | k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_accordin_direct | 1.390 | 0.933x | 0.5801 | 39862 | 97990 |
+| 300 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 1.373 | 1.000x | 0.5285 | 48995 | 70823 |
+| 300 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 1.358 | 0.988x | 0.5382 | 42685 | 73249 |
+| 300 ns | own | `cec374b` | — | mcs_tas_accordin_direct | 1.347 | 0.981x | 0.6461 | 26432 | 114074 |
+| 300 ns | k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 1.332 | 0.970x | 0.5697 | 36340 | 91484 |
+| 300 ns | k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_tas_accordin_direct | 1.223 | 0.891x | 0.5593 | 36813 | 82703 |
+| 1000 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 0.548 | 1.000x | 0.5264 | 19014 | 27240 |
+| 1000 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 0.575 | 1.048x | 0.5469 | 16933 | 32936 |
+| 1000 ns | own | `cec374b` | — | mcs_accordin_direct | 0.581 | 1.059x | 0.6138 | 13610 | 51540 |
+| 1000 ns | k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_accordin_direct | 0.463 | 0.844x | 0.5762 | 12267 | 29489 |
+| 1000 ns | k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_accordin_direct | 0.587 | 1.072x | 0.5666 | 17944 | 36327 |
+| 1000 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 0.598 | 1.000x | 0.5539 | 17806 | 39379 |
+| 1000 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 0.568 | 0.951x | 0.5748 | 14515 | 40446 |
+| 1000 ns | own | `cec374b` | — | mcs_tas_accordin_direct | 0.476 | 0.796x | 0.6395 | 6649 | 44360 |
+| 1000 ns | k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 0.618 | 1.033x | 0.5817 | 14984 | 46256 |
+| 1000 ns | k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_tas_accordin_direct | 0.537 | 0.897x | 0.6015 | 13570 | 50852 |
+| 30000 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 0.021 | 1.000x | 0.6496 | 210 | 1953 |
+| 30000 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 0.023 | 1.083x | 0.7206 | 23 | 2736 |
+| 30000 ns | own | `cec374b` | — | mcs_accordin_direct | 0.020 | 0.967x | 0.6986 | 115 | 2687 |
+| 30000 ns | k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_accordin_direct | 0.023 | 1.072x | 0.6780 | 62 | 2448 |
+| 30000 ns | k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_accordin_direct | 0.022 | 1.025x | 0.6949 | 109 | 2293 |
+| 30000 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 0.026 | 1.000x | 0.6569 | 201 | 2211 |
+| 30000 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 0.026 | 1.002x | 0.6901 | 147 | 3022 |
+| 30000 ns | own | `cec374b` | — | mcs_tas_accordin_direct | 0.026 | 1.002x | 0.6710 | 69 | 2393 |
+| 30000 ns | k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 0.026 | 1.003x | 0.6795 | 99 | 2719 |
+| 30000 ns | k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_tas_accordin_direct | 0.026 | 0.994x | 0.6829 | 218 | 2487 |
+
+LevelDB, one repeat (Kops/s, `rel` against `baseline`):
+
+| arm | commit | env | backend | fill Kops/s | rel | read Kops/s | rel |
+|---|---|---|---|---:|---:|---:|---:|
+| baseline | `934bd1c` | — | mcs_accordin | 53.981 | 1.000x | 1337.426 | 1.000x |
+| tidy | `ded83aa` | — | mcs_accordin | 226.554 | 4.197x | 1313.132 | 0.982x |
+| own | `cec374b` | — | mcs_accordin | 250.395 | 4.639x | 1295.567 | 0.969x |
+| k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_accordin | 255.004 | 4.724x | 1283.480 | 0.960x |
+| k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_accordin | 258.525 | 4.789x | 1277.318 | 0.955x |
+| baseline | `934bd1c` | — | mcs_tas_accordin | 64.561 | 1.000x | 1104.809 | 1.000x |
+| tidy | `ded83aa` | — | mcs_tas_accordin | 223.281 | 3.458x | 1084.192 | 0.981x |
+| own | `cec374b` | — | mcs_tas_accordin | 253.079 | 3.920x | 1082.289 | 0.980x |
+| k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_tas_accordin | 252.587 | 3.912x | 1036.534 | 0.938x |
+| k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_tas_accordin | 261.155 | 4.045x | 1066.425 | 0.965x |
+
+Counters, `fillrandom`: the bounded arms park what the unbounded one parks —
+7.61 M / 7.52 M for `k2` and 7.72 M / 7.79 M for `k4` against 7.47 M / 7.53 M
+for `own` and 6.78 M / 6.65 M for the tip — with flush calls at 175 k–182 k
+against 171 k / 172 k and 143 k / 138 k, at a miss rate near 52 % for the three
+own-queue arms against 48 % for the tip.
+
+streamcluster, one repeat, seconds (lower is better):
+
+| arm | commit | env | backend | stream s | rel |
+|---|---|---|---|---:|---:|
+| baseline | `934bd1c` | — | mcs_accordin | 151.226 | 1.000x |
+| tidy | `ded83aa` | — | mcs_accordin | 96.015 | 0.635x |
+| own | `cec374b` | — | mcs_accordin | 93.407 | 0.618x |
+| k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_accordin | 92.745 | 0.613x |
+| k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_accordin | 92.820 | 0.614x |
+| baseline | `934bd1c` | — | mcs_tas_accordin | 135.782 | 1.000x |
+| tidy | `ded83aa` | — | mcs_tas_accordin | 92.109 | 0.678x |
+| own | `cec374b` | — | mcs_tas_accordin | 96.301 | 0.709x |
+| k2 | `bf7080f` | `OWN_LIMIT=2` | mcs_tas_accordin | 92.391 | 0.680x |
+| k4 | `bf7080f` | `OWN_LIMIT=4` | mcs_tas_accordin | 89.021 | 0.656x |
+
+All four arms park 8.43 M waits with about 44.4 k flush calls and expire
+45.4 k–49.7 k of them; nothing in the counters separates them.
+
 ### `20260906T180338Z` — LevelDB before the reboot
 
 Same binaries as the `baseline` and `custody` arms of `h2-tail`, plus a
@@ -1020,6 +1122,52 @@ show whether the condvar-workload gain survives without the per-thread spread.
 That variant is untested, and it would need the full multi-repeat sweep across
 all seven workloads before any of this becomes a verdict.
 
+### Bounded own-queue preference — promising, not confirmed
+
+**One run per cell.** The fairness ordering below is larger than the scatter of
+the multi-repeat sessions on the same metric; the throughput figures are not.
+
+Bounding the preference gives back much of what `cec374b` took. At 100 ns the
+factor reads 0.5530 and 0.5552 for `k2` and `k4` on `mcs_accordin_direct` and
+0.5415 and 0.5587 on `mcs_tas_accordin_direct`, against 0.6275 and 0.6133 for
+`own` and 0.5187 and 0.5221 for the tip; at 300 ns, 0.5523 and 0.5801, and
+0.5697 and 0.5593, against 0.6180 and 0.6461 for `own` and 0.5290 and 0.5382
+for the tip. That is between two fifths and four fifths of the gap in a single
+run, most cells around two thirds. The least-served thread moves with it: at
+100 ns the two bounds record between 80030 and 86049 operations, against 49823
+and 45499 for `own`, 90092 and 83330 for the tip, and 100913 and 94075 for
+`934bd1c`. `k2` and `k4` are not separable
+from each other in one run, and at 30000 ns nothing is separable from anything
+(0.6496 to 0.7206 across all five arms).
+
+The throughput side keeps the unbounded arm's gain. `fillrandom` reads 255.004
+and 252.587 Kops/s for `k2` and 258.525 and 261.155 for `k4`, against 250.395
+and 253.079 for `own` and 226.554 and 223.281 for the tip. `readrandom` sits at
+0.960x / 0.955x and 0.938x / 0.965x of `934bd1c` for the bounded arms against
+0.982x / 0.981x for the tip, a single-run difference of a few percent on a
+workload that parks about 200 waits. Streamcluster no longer separates the
+shard-family arms at all — 89.021 to 96.301 s for the four of them against
+151.226 and 135.782 s at baseline — so the streamcluster advantage `own` showed
+in the `percpu` screen did not reproduce here.
+
+**Why a bound helps, by the design's own argument.** For a group of m CPUs,
+the instantaneous service ratio between a lone thread and a thread sharing a
+queue of population n0 is k·n0/(k + m − 1), and the crowded queue drains at
+(m − 1)r/(k + 1), so a smaller bound is fairer by construction and the
+unbounded case is the limit where the ratio grows with n0 without bound. The
+measured factor stops falling at 0.55–0.58 rather than returning to the tip's
+0.52, which the bound cannot explain on its own; the remaining spread is
+attributed to per-CPU slot turnover differing between CPUs and to service
+crossing group boundaries, neither of which k controls. That attribution is
+untested.
+
+The walk is not free: the commit's own validation note reports the dispatch
+program at 8159 instructions with enqueue unchanged at 415, against 256 and 415
+at the tip. Adoption waits on a multi-repeat confirm of `8fe30c4`, which
+restarts the grant count after a fallback own grant and so changes the cadence
+this screen measured; until then `bf7080f` and `8fe30c4` stay on
+`cv_owner_fair` and the tip of `cv_admission` remains `ded83aa`.
+
 ## Machine state, not code: the reboot observation
 
 The `baseline` and `custody` arms of `h2-tail` are the same binaries the two
@@ -1069,8 +1217,8 @@ baseline inside the same session.
 - Three repeats per cell (four in `attrib-2`) is enough to separate the large
   moves and not enough to rank arms that differ by a few percent, which is why
   `readrandom` differences below about 5 % are treated as noise here.
-- **The `percpu` screen is one run per cell.** It was run with reduced repeats
-  to answer a single structural question quickly. Its throughput figures are
-  indicative only; only the fairness ordering there, which is far larger than
-  any spread the multi-repeat sessions show on the same metric, is treated as
-  settled.
+- **The `percpu` and `bounded` screens are one run per cell.** Both were run
+  with reduced repeats to answer a structural question quickly. Their
+  throughput figures are indicative only; only the fairness ordering there,
+  which is far larger than any spread the multi-repeat sessions show on the
+  same metric, is treated as settled.

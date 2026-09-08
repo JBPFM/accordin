@@ -147,6 +147,42 @@ directory, which is resumed when it already holds a `results.jsonl`.
 - `<run>.log` — stdout and stderr of each attempt, named after its cell and
   attempt; `build-<arm>.log` per worktree.
 
+## mutexbench comparison
+
+`mutexbench.py` compares the same arms on the `bench/mutexbench` submodule's
+`mutex_bench`, a pure lock microbenchmark with no condition variables. It
+imports `run.py` as a module, so arm parsing, worktree preparation and build,
+environment scrubbing, the shared lock, the `disabled` wait, the kernel-log
+check and the resume logic are the same code.
+
+Library selection is the one real difference. `mutex_bench` takes no LiTL
+adapter and no `LD_PRELOAD`: its `mcs_accordin_direct` and
+`mcs_tas_accordin_direct` lock kinds `dlopen` the path in
+`MCS_ACCORDIN_DIRECT_LIB` and `MCS_TAS_ACCORDIN_DIRECT_LIB`, so an arm is
+selected by pointing those two variables at its own `target/release`, and
+`/proc/<pid>/maps` must contain exactly that arm's direct library. One
+`mutex_bench` binary, built once from this worktree with
+`make -C bench/mutexbench mutex_bench` and recorded by SHA-256 in
+`metadata.json`, serves every arm; initialise the submodule with
+`git submodule update --init bench/mutexbench` if it is empty.
+
+Each measured point is a `--pairs CRITICAL_NS:OUTSIDE_NS` workload,
+`--threads 192` (`run.py`'s count), `--duration-ms 5000 --warmup-ms 1000`,
+`--workload single --timing-sample-stride 8 --timeslice-extension off`. A run
+is valid under the same rules, with `throughput_ops_per_sec` above zero and the
+`eBPF scheduler loaded successfully` marker in place of the `BENCH_TOTAL`
+check, and `EXIT:` added to the log error pattern. `summary.md` carries one
+throughput table per pair × backend in Mops/s, a mean `avg_lock_hold_ns` /
+`avg_wait_ns_estimated` table, the mean `[accordin_cv]` counters, which stay at
+zero here, and the invalid-run list.
+
+```sh
+sudo -n python3 docs/benchmarks/cv-custody-20260906/mutexbench.py \
+    --arm baseline=934bd1c --arm shard=<sha> --arm tidy=<sha> \
+    --pairs 100:3000 300:3000 --repeats 5 \
+    --out target/cv-custody-20260906/mutexbench-<name>
+```
+
 ## Differences from leveldb-branches-20260906
 
 - Arms come from the command line instead of a hard-coded branch table, and

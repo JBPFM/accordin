@@ -24,6 +24,11 @@ mechanism are under test:
 A fifth change, the admission-walk cleanup (`ded83aa`) that sits on top of the
 sharded queue, is measured for neutrality rather than for a gain.
 
+A fifth workload joined once the tip was chosen: `mutex_bench` from
+`bench/mutexbench` in direct-lock mode, a pure mutex loop with no condition
+variables, run to price the admission-side changes on a workload where custody
+never engages.
+
 The reference point is `934bd1c`, the commit before the series. `9520d7d` is
 the last change of the custody mechanism itself and is carried as an
 intermediate arm.
@@ -39,6 +44,8 @@ session's run-to-run spread and loses on none of the others by more than the
 same spread; it is rejected when it loses against the arm it is meant to
 replace, even if it still beats the baseline. Where two arms differ only by an
 environment override, they are compared to each other, not to the baseline.
+The `mutexbench` sessions came after the arms were chosen, so they enter as a
+cost to weigh against those four workloads rather than as a gate of their own.
 
 ## Decision
 
@@ -64,6 +71,12 @@ slot nor the dispatch-side release passed validation.
   against the `shard` arm of its own session, gains nothing elsewhere beyond
   the spread, and its `scan-off` arm shows that the syscall-only release path
   it builds on was degraded by the change.
+- **The pure-mutex cost is carried.** `mutex_bench` prices the admission-side
+  changes at up to 7 % below `934bd1c`, about half of that already present at
+  `9520d7d`. The sharding tip is kept regardless: on the same commits
+  `fillrandom` runs at 3.77x and 3.73x of the `custody` arm and streamcluster
+  at 0.517x and 0.514x of the baseline's seconds, so the gains on the workloads
+  that park dominate the microbenchmark cost.
 - Both commits, and a tidy-up `da90297` of the release path and its tests, are
   kept on branch `cv_slot_release` for the record; the `readrandom`
   attribution variants are on branch `readrandom-attrib`. Neither branch is
@@ -77,8 +90,8 @@ slot nor the dispatch-side release passed validation.
 - LevelDB databases live on `/tmp` tmpfs, so no figure here is disk
   throughput.
 - The host was rebooted early on 2026-09-07 UTC. Every session in the tables
-  below except the last two ran after that reboot, between 14:45 and 21:23 UTC
-  on 2026-09-07, with the host up for 12 h or more.
+  below except the last two ran after that reboot, between 14:45 UTC on
+  2026-09-07 and 00:20 UTC on 2026-09-08, with the host up for 12 h or more.
 - The machine drifts within a single day. The `fillrandom` / `mcs_accordin`
   baseline anchor alone reads 51.287, 47.100 and 52.551 Kops/s in three
   sessions a few hours apart, and 31.152 Kops/s on the day before the reboot.
@@ -409,6 +422,72 @@ The barrier column carries CV between 53.9 % and 123.8 % and separates nothing.
 Counters match arm for arm: 8.43 M parks, 44.4 k flush calls, expiries at
 0.60–0.66 % of parks and misses at 0.3 % of calls on both.
 
+### `mutexbench-final` — pure mutex loop, retained arms
+
+`mutex_bench` from `bench/mutexbench` in direct-lock mode: 192 threads, 5 s
+measured after a 1 s warmup, five repeats, throughput in Mops/s where higher is
+better. Each pair is a critical-section / outside-section nanosecond setting.
+The workload uses no condition variables, so the custody counters read zero on
+every arm and are omitted here. `hold` and `wait` are the run's mean
+`avg_lock_hold_ns` and `avg_wait_ns_estimated`.
+
+Pair 100 ns / 3000 ns:
+
+| arm | commit | backend | n | Mops/s | CV% | rel | hold ns | wait ns |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| baseline | `934bd1c` | mcs_accordin_direct | 5/0 | 2.697 | 2.20 | 1.000x | 147.4 | 70863.9 |
+| shard | `46180cd` | mcs_accordin_direct | 5/0 | 2.616 | 2.08 | 0.970x | 146.5 | 73240.7 |
+| tidy | `ded83aa` | mcs_accordin_direct | 5/0 | 2.548 | 3.27 | 0.945x | 146.6 | 75193.4 |
+| baseline | `934bd1c` | mcs_tas_accordin_direct | 5/0 | 2.384 | 3.67 | 1.000x | 147.9 | 80261.2 |
+| shard | `46180cd` | mcs_tas_accordin_direct | 5/0 | 2.291 | 2.55 | 0.961x | 147.5 | 83611.9 |
+| tidy | `ded83aa` | mcs_tas_accordin_direct | 5/0 | 2.288 | 5.22 | 0.960x | 147.5 | 83866.2 |
+
+Pair 300 ns / 3000 ns:
+
+| arm | commit | backend | n | Mops/s | CV% | rel | hold ns | wait ns |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| baseline | `934bd1c` | mcs_accordin_direct | 5/0 | 1.565 | 2.89 | 1.000x | 390.5 | 122291.3 |
+| shard | `46180cd` | mcs_accordin_direct | 5/0 | 1.468 | 2.29 | 0.938x | 387.8 | 130137.1 |
+| tidy | `ded83aa` | mcs_accordin_direct | 5/0 | 1.475 | 3.07 | 0.942x | 387.7 | 129562.1 |
+| baseline | `934bd1c` | mcs_tas_accordin_direct | 5/0 | 1.351 | 7.42 | 1.000x | 391.6 | 141985.4 |
+| shard | `46180cd` | mcs_tas_accordin_direct | 5/0 | 1.383 | 5.50 | 1.023x | 390.3 | 138555.3 |
+| tidy | `ded83aa` | mcs_tas_accordin_direct | 5/0 | 1.328 | 5.66 | 0.983x | 390.1 | 144204.7 |
+
+No attempt in this session was invalid.
+
+### `mutexbench-attrib` — pure mutex loop, with the custody arm
+
+The same points with `9520d7d` added, to place the cost before and after
+sharding.
+
+Pair 100 ns / 3000 ns:
+
+| arm | commit | backend | n | Mops/s | CV% | rel | hold ns | wait ns |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| baseline | `934bd1c` | mcs_accordin_direct | 5/0 | 2.674 | 1.31 | 1.000x | 147.2 | 71478.1 |
+| custody | `9520d7d` | mcs_accordin_direct | 5/0 | 2.617 | 7.83 | 0.979x | 146.9 | 73426.1 |
+| shard | `46180cd` | mcs_accordin_direct | 5/0 | 2.648 | 1.63 | 0.990x | 146.4 | 72268.3 |
+| tidy | `ded83aa` | mcs_accordin_direct | 5/0 | 2.654 | 2.90 | 0.993x | 146.3 | 72069.6 |
+| baseline | `934bd1c` | mcs_tas_accordin_direct | 5/0 | 2.336 | 5.94 | 1.000x | 147.6 | 82104.0 |
+| custody | `9520d7d` | mcs_tas_accordin_direct | 5/0 | 2.231 | 3.76 | 0.955x | 147.8 | 85552.8 |
+| shard | `46180cd` | mcs_tas_accordin_direct | 5/0 | 2.300 | 2.44 | 0.984x | 147.6 | 83138.5 |
+| tidy | `ded83aa` | mcs_tas_accordin_direct | 5/0 | 2.333 | 5.90 | 0.999x | 147.9 | 82123.2 |
+
+Pair 300 ns / 3000 ns:
+
+| arm | commit | backend | n | Mops/s | CV% | rel | hold ns | wait ns |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| baseline | `934bd1c` | mcs_accordin_direct | 5/0 | 1.548 | 4.72 | 1.000x | 391.2 | 123485.5 |
+| custody | `9520d7d` | mcs_accordin_direct | 5/0 | 1.505 | 5.86 | 0.972x | 387.8 | 127228.9 |
+| shard | `46180cd` | mcs_accordin_direct | 5/0 | 1.483 | 2.98 | 0.958x | 387.7 | 128924.3 |
+| tidy | `ded83aa` | mcs_accordin_direct | 5/0 | 1.501 | 5.05 | 0.970x | 387.8 | 127388.6 |
+| baseline | `934bd1c` | mcs_tas_accordin_direct | 5/0 | 1.418 | 3.01 | 1.000x | 390.9 | 134901.8 |
+| custody | `9520d7d` | mcs_tas_accordin_direct | 5/0 | 1.382 | 4.52 | 0.975x | 390.1 | 138576.6 |
+| shard | `46180cd` | mcs_tas_accordin_direct | 5/0 | 1.320 | 3.70 | 0.931x | 390.5 | 144741.3 |
+| tidy | `ded83aa` | mcs_tas_accordin_direct | 5/0 | 1.335 | 2.25 | 0.941x | 391.1 | 143083.6 |
+
+No attempt in this session was invalid.
+
 ### `20260906T180338Z` — LevelDB before the reboot
 
 Same binaries as the `baseline` and `custody` arms of `h2-tail`, plus a
@@ -572,6 +651,42 @@ workloads. The cleanup is kept for what the verifier reports rather than for
 throughput: it takes the dispatch program from 342 instructions to 256 and
 leaves enqueue and the flush at their `46180cd` counts. `ded83aa` is the
 accepted tip of `cv_admission`.
+
+### Pure-mutex cost of the admission-side changes — carried
+
+`mutex_bench` holds no condition variable, so nothing here parks in custody and
+the counters stay at zero; what it measures is the admission path alone. Across
+the two sessions the admission-side changes cost up to 7 % of `934bd1c`, and
+nothing at all in some cells, with CV between 1.3 % and 7.8 %.
+
+At 100 ns / 3000 ns the two sessions disagree on how much. `mutexbench-final`
+reads 0.970x / 0.945x on `mcs_accordin_direct` and 0.961x / 0.960x on
+`mcs_tas_accordin_direct` for `shard` and `tidy`; `mutexbench-attrib` puts the
+same two commits within 1–2 % of its own baseline (0.990x / 0.993x and
+0.984x / 0.999x). The spread of that point covers the difference.
+
+At 300 ns / 3000 ns seven of the eight `shard` and `tidy` cells lose, six of
+them by 3–7 %: 0.938x / 0.942x and 0.958x / 0.970x on `mcs_accordin_direct`,
+0.931x / 0.941x for `mutexbench-attrib` on `mcs_tas_accordin_direct`. The
+seventh, `tidy` in `mutexbench-final` on that backend, loses 1.7 % (0.983x).
+Roughly half of the loss predates sharding: the `custody` arm of
+`mutexbench-attrib` already reads 0.972x and 0.975x at `9520d7d`, on a commit
+with no shards at all.
+
+The lock itself is not slower. Mean hold time is 146.3–147.9 ns at the 100 ns
+point and 387.7–391.6 ns at the 300 ns point, identical across arms to within a
+nanosecond or two, and the whole difference sits in the estimated wait: at
+300 ns / 3000 ns on `mcs_tas_accordin_direct`, 134.9 µs at baseline against
+144.7 µs at `shard`, and on `mcs_accordin_direct` 123.5 µs against 128.9 µs.
+The one cell that moves the other way, `shard` at 1.023x on
+`mcs_tas_accordin_direct` in `mutexbench-final` — where its wait is also the
+shorter one, 138.6 µs against 142.0 µs — does not reproduce: the same cell
+reads 0.931x in `mutexbench-attrib`, and that baseline carries the session's
+widest spread at CV 7.42 %.
+
+The cost is carried rather than answered. Against it stand the `h1-shard`
+moves on the workloads that do park: `fillrandom` at 3.77x and 3.73x of the
+`custody` arm, streamcluster at 0.517x and 0.514x of the baseline's seconds.
 
 ## Machine state, not code: the reboot observation
 

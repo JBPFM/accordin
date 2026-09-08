@@ -97,12 +97,12 @@ static unsigned int env_u32(const char *name, unsigned int fallback)
 }
 
 /* Group geometry defaults: eight CPUs to a group cover a slice of one node's
- * last-level cache, and a CPU may take four grants in a row out of its own
- * queue before its group gets a turn. The slack is the head-age margin the own
- * queue keeps over the group, wide enough to cover one handover and narrow
- * enough that a queue left behind is served next. */
+ * last-level cache. The slack is the head-age margin the own queue keeps over
+ * the group, wide enough to cover one handover and narrow enough that a queue
+ * left behind is served next. Which queue is served follows from the head ages,
+ * so the count bound over the own queue is left off. */
 #define GROUP_SIZE_DEFAULT 8
-#define OWN_LIMIT_DEFAULT 4
+#define OWN_LIMIT_DEFAULT 0
 #define OWN_SLACK_US_DEFAULT 100
 
 static bool read_sysfs(const char *path, char *text, size_t size)
@@ -401,10 +401,10 @@ __attribute__((constructor)) static void scheduler_start(void)
     cv_counters_on = env_flag("ACCORDIN_CV_COUNTERS");
     cv_flush_width = env_u32("ACCORDIN_CV_FLUSH_WIDTH", 0);
     /* Notified waits leave custody through the flush; the timer keeps expiry.
-     * Reverse iteration walks the custody queue from its tail; where a released
-     * wait lands in the admission queue is set by its park stamp. */
-    cv_flush_flags = env_u32("ACCORDIN_CV_FLUSH_FLAGS",
-                             CV_FLUSH_MOVE | CV_FLUSH_REV);
+     * Where a released wait lands in the admission queue is set by its park
+     * stamp, so the walk order shows only under a width cap, and walking the
+     * custody queue from its head hands the oldest parks over first. */
+    cv_flush_flags = env_u32("ACCORDIN_CV_FLUSH_FLAGS", CV_FLUSH_MOVE);
     SCX_BUG_ON(pthread_atfork(NULL, NULL, forget_flush),
                "Failed to register fork cleanup");
     skel = SCX_OPS_OPEN(accordin_ops, accordin);

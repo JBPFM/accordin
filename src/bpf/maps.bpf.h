@@ -85,9 +85,9 @@ volatile __u32 group_count;
 volatile __u32 group_size[MAX_GROUPS];
 volatile __u32 group_member[MAX_GROUPS][MAX_GROUP_SIZE];
 /* How many grants in a row a CPU may take out of its own queue before it has
- * to look at its group; zero lifts the bound. With the age rule choosing the
- * queue, the own queue gives way as soon as the group holds an older head, so
- * this bound rarely engages and is kept as a ceiling rather than as the rule. */
+ * to look at its group; zero lifts the bound, which is how the runtime ships
+ * it. The own queue already gives way as soon as the group holds an older head,
+ * so the count is a ceiling to fall back on rather than the rule. */
 volatile __u32 own_limit;
 /* How much younger than the oldest head of its group the head of a CPU's own
  * queue may be and still be served; zero holds the group in strict age order. */

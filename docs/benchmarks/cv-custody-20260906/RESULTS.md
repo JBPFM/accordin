@@ -115,12 +115,13 @@ the noise of these single runs.
 - The multi-repeat confirmation of the tip across the seven workloads is still
   owed; every figure supporting the merge comes from one run per cell.
 - The tip is unchanged at `4b3b0a8` after the streamcluster diagnosis below.
-  The progress backstop stays on `cv_owner_fair`: it buys streamcluster 4–20 %
-  and costs `readrandom` on `mcs_accordin` 12–13 % even with its timer
-  unarmed, which is the code-volume question rather than a property of the
-  rule, so it waits on that. The never-skip flush change is rejected — waiting
-  for a pass in flight makes streamcluster 6–9 % slower and raises expiries by
-  a third.
+  **The progress backstop is not merged**, at the user's decision: it buys
+  streamcluster 4–20 % but costs `readrandom` on `mcs_accordin` 12–13 % even
+  with its timer unarmed, which is the code-volume effect rather than anything
+  the rule does. Its three commits — `455edb9`, `515813e` and `c211073` — stay
+  on branch `cv_owner_fair` as the record of what was tried. The never-skip
+  flush change is rejected too: waiting for a pass in flight makes
+  streamcluster 6–9 % slower and raises expiries by a third.
 - `readrandom` on `mcs_accordin` loses 10–16 % to the volume of BPF text
   loaded into the kernel, reachable or not, with no data-layout, userspace or
   instruction-fetch cause found. It bounds what any further scheduler code can
@@ -1702,6 +1703,76 @@ The scratch branches carrying these arms, each one commit on top of the tip:
 | `rodata-ballast` | `917b9fa` | carries read-only ballast the size of a larger object |
 | `tls-align` | `a7ae4f3` | keeps the admission word on a cache line of its own |
 
+### Idle, wake and clock — `layout-idle`
+
+`4b3b0a8` against `D1` (`425b757`, the unreached bank walk behind setup) on
+`readrandom` / `mcs_accordin`, one run each, with system-wide counters over a
+20 s window inside the 30 s run and a separate traced run for wake latency.
+
+| measure | tip `4b3b0a8` | D1 `425b757` |
+|---|---:|---:|
+| throughput, Kops/s | 1289.647 | 1125.392 |
+| C6 share of CPU time | 0.0453 | 0.0446 |
+| C6 entries per CPU per second | 9.8 | 9.2 |
+| C1E share / entries | 0.0015 / 2.3 | 0.0014 / 2.2 |
+| `aperf` / `mperf` | 1.000 | 1.000 |
+| cycles | 2014477779922 | 2014683845458 |
+| instructions | 1447765504900 | 1255912860653 |
+| instructions per cycle | 0.72 | 0.62 |
+| cycles per operation | 77870 | 89343 |
+| instructions per operation | 55960 | 55694 |
+| kick-to-switch mean, ns | 1036 | 1025 |
+| kicks per second | 2.36 M | 1.84 M |
+
+The idle path is not the answer. C6 residency and entry rate are the same to
+within 2 %, the cores run at one frequency on both arms, and a kick lands
+in the same time — 1036 against 1025 ns on average, with D1's distribution
+slightly tighter (7374018 of 8414611 landings under 1 µs against 9211792 of
+10906351). The arm doing less work issues fewer kicks, not slower ones. What
+changes is the cycle count an operation takes, 77870 against 89343, while the
+instructions it retires stay level, which is a machine spending more cycles on
+the same work rather than a machine going to sleep.
+
+### Where the cycles go — `layout-prof`
+
+The same pair, profiled and then re-run with memory counters.
+
+| measure | tip `4b3b0a8` | D1 `425b757` |
+|---|---:|---:|
+| `libmcs_accordin_direct.so` share of cycles | 57.54 % | 63.25 % |
+| `mcs_tas_accordin_direct_mutex_lock` | 55.05 % | 60.91 % |
+| kernel | 22.29 % | 18.90 % |
+| `db_bench` | 5.24 % | 4.77 % |
+| `libsnappy` | 4.69 % | 4.17 % |
+| `libc` | 3.75 % | 3.23 % |
+| LLC-load-misses, share of LL-cache accesses | 26.05 % | 26.39 % |
+| remote share of L3-miss retired loads | 37.2 % | 38.2 % |
+| instructions per operation | 55726 | 57288 |
+| cycles per operation | 76424 | 88833 |
+
+Inside the lock symbol the profile puts the successor spin — the `raw_lock.h`
+pause loop together with the `node->waiting` load — at 50.0 % of all cycles on
+the tip and 56.5 % on D1, while `admission_wait`'s own spin falls from 0.48 %
+to 0.36 %. Everything else shrinks in proportion: kernel time, LevelDB,
+snappy, libc and tcmalloc all take a smaller share because the spin takes a
+larger one. Memory behaviour does not move — the LLC miss rate and the remote
+share of L3-miss loads differ by well under a percentage point, in the
+direction of fewer misses in absolute terms on the slower arm. Instructions
+per operation rise 2.8 %, about 1562 more per operation, which at four
+instructions a pause iteration is roughly 390 extra spin iterations and
+accounts for the roughly 12400 extra cycles an operation costs.
+
+So the slowdown is lock holders advancing more slowly: every waiter spins
+longer for its predecessor's release, while everything timed from outside —
+the kick, the wake, the frequency, the cache and memory path — is unchanged. Why loading unreachable BPF text should slow the holders down is
+not answered here, and the mechanism was not pursued further.
+
+**Tooling note.** `trace/run_traced.sh` takes the shared benchmark lock. On
+this host the lock file has to be opened read-only for `flock`:
+`fs.protected_regular` refuses an append-open of another user's file in a
+sticky directory, so opening it for append fails before the lock is ever
+taken.
+
 ## Machine state, not code: the reboot observation
 
 The `baseline` and `custody` arms of `h2-tail` are the same binaries the two
@@ -1751,6 +1822,15 @@ baseline inside the same session.
 - Three repeats per cell (four in `attrib-2`) is enough to separate the large
   moves and not enough to rank arms that differ by a few percent, which is why
   `readrandom` differences below about 5 % are treated as noise here.
+- **A few hundred BPF instructions cost about 10–15 % of `readrandom` on
+  `mcs_accordin`, whether or not anything reaches them.** The `layout` series
+  measures it on dead code, unarmed timers and objects with no knob to arm
+  them, and the profile places the loss in longer successor spins with the
+  idle path, the clock, the wake latency and the memory counters all
+  unchanged. Two rules follow: every scheduler change needs a `readrandom`
+  A/B on `mcs_accordin` before it is judged on anything else, and an optional
+  feature must not be compiled into the object by default, since carrying it
+  costs whether or not it runs.
 - **The `percpu`, `bounded`, `age` and `peek` screens are one run per cell.**
   All four were run with reduced repeats to answer a structural question
   quickly. Their throughput figures are indicative only; only fairness

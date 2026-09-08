@@ -47,6 +47,50 @@ static __always_inline struct task_scx_ctx *task_ctx(struct task_struct *p) {
   return bpf_task_storage_get(&task_ctx_map, p, 0, 0);
 }
 
+static __always_inline bool lock_routing(void) {
+  return !stats_only_mode && (!auto_admission || admission.active);
+}
+
+/* Runnable/quiescent are paired across sleep and CPU migration; enqueue is
+ * not a runnable transition and must not inflate the count on every slice.
+ * The per-task mark also makes initial attachment and cleanup idempotent. */
+void BPF_STRUCT_OPS(accordin_runnable, struct task_struct *p, u64 enq_flags) {
+  struct task_scx_ctx *tctx;
+  __u32 count, capacity;
+
+  (void)enq_flags;
+  if (!auto_admission || admission.active || p->tgid != auto_tgid)
+    return;
+  tctx = bpf_task_storage_get(&task_ctx_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+  if (!tctx) {
+    admission.active = 1;
+    return;
+  }
+  if (__sync_lock_test_and_set(&tctx->auto_runnable, 1))
+    return;
+  count = __sync_fetch_and_add(&auto_runnable, 1) + 1;
+  capacity = auto_capacity;
+  /* A narrower affinity is handled conservatively: never use the full-host
+   * CPU count to decide that a pinned group cannot be oversubscribed. */
+  if (p->nr_cpus_allowed < capacity)
+    capacity = p->nr_cpus_allowed;
+  if (count > capacity && __sync_bool_compare_and_swap(&admission.active, 0, 1)) {
+    auto_trigger_runnable = count;
+    auto_activated_at = scx_bpf_now();
+  }
+}
+
+void BPF_STRUCT_OPS(accordin_quiescent, struct task_struct *p, u64 deq_flags) {
+  struct task_scx_ctx *tctx;
+
+  (void)deq_flags;
+  if (!auto_admission || admission.active || p->tgid != auto_tgid)
+    return;
+  tctx = task_ctx(p);
+  if (tctx && __sync_lock_test_and_set(&tctx->auto_runnable, 0))
+    __sync_fetch_and_sub(&auto_runnable, 1);
+}
+
 static __always_inline bool user_state(struct task_struct *p, __u32 *state) {
   __u32 tid = p->pid;
   __u64 *address = bpf_map_lookup_elem(&thread_ctx_addr_map, &tid);
@@ -89,14 +133,22 @@ static __always_inline void refresh_episode(struct task_struct *p,
 
 s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
-  struct task_scx_ctx *tctx = task_ctx(p);
+  bool inactive = auto_admission && !admission.active;
+  struct task_scx_ctx *tctx = inactive ? 0 : task_ctx(p);
   bool idle = false;
+  s32 cpu;
 
   if (!stats_only_mode && tctx && tctx->admission_cpu &&
       allowed(p, tctx->admission_cpu - 1))
     return tctx->admission_cpu - 1;
-  /* All tasks pass enqueue, including wakeups on an idle CPU. */
-  return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &idle);
+  cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &idle);
+  /* Before overload there are no grants to preserve. Send an idle wakeup
+   * straight to its CPU, avoiding the normal DSQ and a redundant idle kick.
+   * If activation races with this wakeup, a new WAITING request still confirms
+   * its ticket in userspace before it can enter a raw lock queue. */
+  if (inactive && idle)
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+  return cpu;
 }
 
 void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
@@ -105,7 +157,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   __u32 cpu = scx_bpf_task_cpu(p);
   __u32 state;
 
-  if (!stats_only_mode) {
+  if (lock_routing()) {
     bool known = user_state(p, &state);
     tctx = bpf_task_storage_get(&task_ctx_map, p, 0,
                               BPF_LOCAL_STORAGE_GET_F_CREATE);
@@ -300,13 +352,13 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   /* Serve ordinary work alongside the reserved waiter. This also lets an
    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
   scx_bpf_dsq_move_to_local(NORMAL_DSQ);
-  if (stats_only_mode || cpu < 0 || cpu >= MAX_CPUS)
+  if (!lock_routing() || cpu < 0 || cpu >= MAX_CPUS)
     return;
   admit_waiter((__u32)cpu);
 }
 
 bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
-  struct task_scx_ctx *tctx = task_ctx(from);
+  struct task_scx_ctx *tctx = lock_routing() ? task_ctx(from) : 0;
   __u32 cpu = bpf_get_smp_processor_id(), state;
   volatile __u64 *owner = owner_slot(cpu);
 
@@ -324,7 +376,7 @@ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct
 }
 
 void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
-  struct task_scx_ctx *tctx = task_ctx(p);
+  struct task_scx_ctx *tctx = lock_routing() ? task_ctx(p) : 0;
   __u32 state;
 
   if (stats_only_mode || !tctx || !user_state(p, &state))
@@ -342,7 +394,7 @@ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
 }
 
 void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
-  struct task_scx_ctx *tctx = task_ctx(p);
+  struct task_scx_ctx *tctx = lock_routing() ? task_ctx(p) : 0;
   __u32 state;
 
   if (stats_only_mode || !tctx || !user_state(p, &state))
@@ -444,6 +496,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   if (ret)
     return ret;
   admission.enabled = !stats_only_mode;
+  admission.active = !auto_admission;
   return 0;
 }
 
@@ -562,6 +615,8 @@ SCX_OPS_DEFINE(accordin_ops,
                .dispatch = (void *)accordin_dispatch,
                .yield = (void *)accordin_yield,
                .tick = (void *)accordin_tick,
+               .runnable = (void *)accordin_runnable,
+               .quiescent = (void *)accordin_quiescent,
                .stopping = (void *)accordin_stopping,
                .exit_task = (void *)accordin_exit_task,
                .dump = (void *)accordin_dump,

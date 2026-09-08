@@ -50,6 +50,15 @@ struct {
 volatile __u32 stats_only_mode;
 struct admission_state admission;
 
+/* Auto mode counts runnable tasks of the loading process, including tasks
+ * waiting in a DSQ. Once activated, the detector stops updating the count. */
+const volatile __u32 auto_admission;
+const volatile __u32 auto_tgid;
+const volatile __u32 auto_capacity;
+__u32 auto_runnable;
+__u32 auto_trigger_runnable;
+__u64 auto_activated_at;
+
 /* Custody configuration, published by the runtime before the scheduler loads. */
 volatile __u32 cv_custody_enabled;
 volatile __u64 cv_custody_limit_ns;

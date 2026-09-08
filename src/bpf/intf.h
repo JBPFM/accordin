@@ -26,10 +26,13 @@
 /* Mapped read-only by the direct runtime to confirm admission after yielding. */
 struct admission_state {
   unsigned int enabled;
+  /* Auto admission latches this on at the first overload event. */
+  unsigned int active;
   unsigned long long owners[MAX_CPUS];
 };
 
 struct task_scx_ctx {
+  unsigned int auto_runnable;
   /* CPU + 1, or zero without an admission slot. */
   unsigned int admission_cpu;
   unsigned long long ticket;

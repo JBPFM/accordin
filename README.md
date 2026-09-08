@@ -102,7 +102,14 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 | --- | --- |
 | `<PREFIX>_DISABLE_BPF` | 默认关闭；设为 `1` 时不加载 BPF。 |
 | `ACCORDIN_DISABLE_ADMISSION` | 默认关闭；设为 `1` 时不发布 admission 标志。 |
+| `ACCORDIN_AUTO_ADMISSION` | 实验性，默认 `0`。设为 `1` 时，首次检测到加载进程的可运行线程数超过可用 CPU 数后启用准入，并保持开启直到卸载。BPF 始终挂载。 |
 | `<PREFIX>_STATS_ONLY` | 保留历史名称的对照模式；设为 `1` 时加载普通 sched_ext 调度，不进行锁感知路由，也不采样锁时间。 |
+
+自动准入模式在 `runnable/quiescent` 事件中统计加载进程的可运行线程；睡眠线程不计入。初始 CPU 容量取加载线程的 affinity，遇到更窄的线程 affinity 时保守使用较小容量。未触发时，竞争慢路径直接进入原始锁，空闲 CPU 上的唤醒直接投递到 local DSQ。触发后，线程缓存启用状态，新竞争者恢复原准入路径；已经进入 raw 队列的线程保持可运行。无竞争路径保持原来的 epoch/持锁发布，动态判断只放在慢路径。
+
+这是按需启用原型：首次过载后不会自动关闭，不会反复挂载/卸载调度器。未启用准入时也不接管新的条件变量睡眠；跨越启用事件的 relock 仍使用原请求的 epoch。退出时的 `[accordin_auto]` 行记录是否触发、CPU 容量和触发计数。`make check-auto-bpf` 验证两 CPU 下从未过载到过载的持锁、排队和 relock 交接。
+
+目前检测范围是加载进程及其线程，未覆盖其它进程造成的 CPU 竞争、cgroup CPU quota 和完整的异构 affinity 容量计算。因此保持实验性开关，不能将单进程、统一 affinity 的 raytrace 验证推广为通用过载检测保证。
 
 旧 CV、width、固定 width、依赖图、动态 CPU 和采样环境变量已不再解析。CV/writer-event 和动态 CPU 控制的 C 符号及旧时间统计输出已移除。旧 `DEBUG_COUNTERS`、`INACTIVE_PREVIOUS_LOCK_PERCENT` 参数和 `[lock_stats]` 计数输出也已移除。调度异常时，BPF dump 保留队列长度和 CPU owner 信息。
 

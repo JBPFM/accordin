@@ -31,7 +31,7 @@ ACCORDIN_CV_ENV := ACCORDIN_CV_CUSTODY="$(ACCORDIN_CV_CUSTODY)" \
 	ACCORDIN_CV_FLUSH_WIDTH="$(ACCORDIN_CV_FLUSH_WIDTH)" \
 	ACCORDIN_DISABLE_ADMISSION="$(ACCORDIN_DISABLE_ADMISSION)"
 
-.PHONY: all $(BACKENDS) check check-bpf litl check-litl check-litl-bpf verify-insns clean compile-commands
+.PHONY: all $(BACKENDS) check check-bpf check-auto-bpf litl check-litl check-litl-bpf verify-insns clean compile-commands
 .DELETE_ON_ERROR:
 all: $(LIBRARIES)
 $(BACKENDS): %: $(OUT)/lib%.so
@@ -62,6 +62,9 @@ check: all
 
 check-bpf: all
 	DIRECT_LIB_DIR=$(abspath $(OUT)) bash scripts/test_direct_api.sh --bpf
+
+check-auto-bpf: all
+	DIRECT_LIB_DIR=$(abspath $(OUT)) bash scripts/test_auto_admission.sh
 
 litl: all
 	$(MAKE) -C third_party/litl ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all

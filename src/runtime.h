@@ -13,11 +13,13 @@ struct thread_state {
     uint32_t depth;
     uint32_t tid;
     bool registered;
+    bool auto_active;
 };
 
 extern _Thread_local struct thread_state thread_state;
 extern struct admission_state *scheduler_admission;
 extern bool admission_enabled;
+extern bool auto_admission;
 void register_thread(void);
 
 /* True while the scheduler can hold a condvar wait instead of a futex sleep. */
@@ -34,6 +36,22 @@ static inline void ensure_registered(void)
 }
 
 /* All nested locks share the outer episode, including out-of-order unlocks. */
+static inline bool admission_active(void)
+{
+    if (!admission_enabled)
+        return false;
+    if (!auto_admission || thread_state.auto_active)
+        return true;
+    struct admission_state *state = scheduler_admission;
+    if (state && __atomic_load_n(&state->active, __ATOMIC_ACQUIRE)) {
+        /* Activation is monotonic for this library's lifetime. Once seen,
+         * keep the steady overloaded path off the shared mapping. */
+        thread_state.auto_active = true;
+        return true;
+    }
+    return false;
+}
+
 static inline bool admission_begin(void)
 {
     bool managed = thread_state.depth++ == 0 && admission_enabled;
@@ -47,6 +65,15 @@ static inline bool admission_begin(void)
 
 static inline void admission_wait(bool prequeued)
 {
+    /* Only the contended path consults the policy. An off-mode contender
+     * publishes SPINNING before entering the raw queue, so activation cannot
+     * mistake an existing queue predecessor for a new admission request. */
+    if (!admission_active()) {
+        uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
+        atomic_store_explicit(&thread_state.word, (word & ~USER_META) | USER_SPINNING,
+                              memory_order_relaxed);
+        return;
+    }
     uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
                                                memory_order_relaxed) & ~USER_META;
     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;

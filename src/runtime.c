@@ -21,6 +21,7 @@
 _Thread_local struct thread_state thread_state;
 struct admission_state *scheduler_admission;
 bool admission_enabled;
+bool auto_admission;
 static struct accordin *skel;
 static struct bpf_link *scheduler_link;
 static int thread_map_fd = -1;
@@ -99,7 +100,7 @@ bool accordin_cv_custody_ready(void)
 {
     struct admission_state *state;
 
-    if (!cv_custody_on || cv_flush_prog_fd < 0 ||
+    if (!admission_active() || !cv_custody_on || cv_flush_prog_fd < 0 ||
         !__atomic_load_n(&cv_custody_live, __ATOMIC_ACQUIRE))
         return false;
     state = scheduler_admission;
@@ -144,7 +145,7 @@ int accordin_cv_flush_now(unsigned int width, unsigned int flags)
     unsigned int passes = 0;
     int moved = 0;
 
-    if (cv_flush_prog_fd < 0)
+    if (cv_flush_prog_fd < 0 || !admission_active())
         return 0;
     /* Counted after the notification it belongs to is published, so a pass
      * that begins after reading this count carries that notification. */
@@ -267,8 +268,10 @@ static void report_counters(void)
 __attribute__((constructor)) static void scheduler_start(void)
 {
     uint64_t limit_ns;
+    cpu_set_t cpus;
 
     admission_enabled = !env_flag("ACCORDIN_DISABLE_ADMISSION");
+    auto_admission = env_flag("ACCORDIN_AUTO_ADMISSION");
     if (env_flag(PREFIX "_DISABLE_BPF")) {
         __atomic_store_n(&registry_opening, false, __ATOMIC_RELEASE);
         return;
@@ -290,6 +293,11 @@ __attribute__((constructor)) static void scheduler_start(void)
                "Failed to register fork cleanup");
     skel = SCX_OPS_OPEN(accordin_ops, accordin);
     skel->bss->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
+    skel->rodata->auto_admission = auto_admission && admission_enabled &&
+                                  !skel->bss->stats_only_mode;
+    skel->rodata->auto_tgid = getpid();
+    SCX_BUG_ON(sched_getaffinity(0, sizeof(cpus), &cpus), "Failed to read affinity");
+    skel->rodata->auto_capacity = CPU_COUNT(&cpus);
     skel->bss->cv_custody_enabled = cv_custody_on;
     limit_ns = (uint64_t)env_u32("ACCORDIN_CV_CUSTODY_MS", 20) * 1000000ULL;
     skel->bss->cv_custody_limit_ns = limit_ns;
@@ -332,6 +340,11 @@ __attribute__((destructor)) static void scheduler_stop(void)
         __atomic_store_n(&state->enabled, 0, __ATOMIC_RELEASE);
     if (cv_counters_on)
         report_counters();
+    if (auto_admission)
+        fprintf(stderr, "[accordin_auto] active=%u capacity=%u trigger_runnable=%u at_ns=%llu\n",
+                skel->bss->admission.active, skel->rodata->auto_capacity,
+                skel->bss->auto_trigger_runnable,
+                (unsigned long long)skel->bss->auto_activated_at);
     pthread_key_delete(registration_key);
     thread_map_fd = -1;
     accordin__destroy(skel);

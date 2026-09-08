@@ -251,31 +251,92 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
   return ADMIT_NONE;
 }
 
-/* The cursor is shared by every CPU and holds the queue after the last grant,
- * so every walk starts there. Rotating past the queue that granted keeps one
- * busy queue from starving the rest of the bank. The rotation covers every
- * queue whenever the own queue yields nothing, so a queue can only wait while
- * every dispatching CPU keeps finding work in its own queue; the home-CPU kick
- * on release and the tick keep that CPU dispatching. */
+/* Grant order for a CPU that has a free slot. The CPU's own queue comes first,
+ * for the cache footprint a waiter left behind on it, bounded by a count of
+ * consecutive own grants so that one busy queue cannot keep a CPU to itself.
+ * The deepest queue of the CPU's topology group comes next and is the
+ * population balancer inside one last-level cache and NUMA domain: a waiter
+ * granted by another CPU is filed under that CPU when it next waits, so
+ * populations drain from deep queues toward the CPUs that have slots. The
+ * rotation over the whole bank is the cross-group backstop; its cursor is
+ * shared by every CPU and holds the queue after the last grant, so rotating
+ * past the queue that granted keeps one busy queue from starving the rest of
+ * the bank.
+ */
 static __always_inline void admit_waiter(__u32 cpu) {
   volatile __u64 *owner = owner_slot(cpu);
   __u32 queues = waiting_queues, start, probe;
-  int own;
+  __u32 limit = own_limit, granted = own_grants[cpu];
+  __u32 group = cpu_group[cpu];
+  bool own_first;
+  int result;
 
   if (!owner || *owner || !queues)
     return;
-  /* A waiter that last ran here is filed in this CPU's queue, so that queue is
-   * probed first for cache locality, and a grant there leaves the shared cursor
-   * alone because a locality preference must not disturb the rotation. */
-  own = admit_from(cpu, owner, cpu);
-  if (own != ADMIT_NONE)
-    return;
+  own_first = !limit || granted < limit;
+  if (own_first) {
+    result = admit_from(cpu, owner, cpu);
+    if (result == ADMIT_GRANTED) {
+      own_grants[cpu] = granted + 1;
+      return;
+    }
+    if (result == ADMIT_SLOT_LOST)
+      return;
+  }
+  if (group < MAX_GROUPS) {
+    __u32 members = group_size[group], cursor = group_cursor[group];
+    __u32 slot, best = 0, best_slot = 0;
+    s32 depth = 0;
+
+    if (members > MAX_GROUP_SIZE)
+      members = MAX_GROUP_SIZE;
+    if (cursor >= members)
+      cursor = 0;
+    bpf_for(slot, 0, members) {
+      __u32 pick = cursor + slot, member;
+      s32 nr;
+
+      if (pick >= members)
+        pick -= members;
+      if (pick >= MAX_GROUP_SIZE)
+        continue;
+      member = group_member[group][pick];
+      /* The own queue has either been offered already or been passed over on
+       * purpose to serve the group, so it is not what is looked for here. */
+      if (member == cpu || member >= queues)
+        continue;
+      nr = scx_bpf_dsq_nr_queued(waiting_dsq(member));
+      if (nr > depth) {
+        depth = nr;
+        best = member;
+        best_slot = pick;
+      }
+    }
+    if (depth > 0) {
+      result = admit_from(cpu, owner, best);
+      if (result == ADMIT_GRANTED) {
+        own_grants[cpu] = 0;
+        best_slot++;
+        group_cursor[group] = best_slot >= members ? 0 : best_slot;
+        return;
+      }
+      if (result == ADMIT_SLOT_LOST)
+        return;
+    }
+  }
+  /* The bound orders the queues, it does not close the own queue: with the
+   * group offering nothing, serving it still beats leaving the slot idle. Such
+   * a grant leaves the count where the bound put it. */
+  if (!own_first) {
+    result = admit_from(cpu, owner, cpu);
+    if (result != ADMIT_NONE)
+      return;
+  }
   start = admit_cursor;
   if (start >= queues)
     start = 0;
   bpf_for(probe, 0, queues) {
     __u32 index = start + probe;
-    int result;
 
     if (index >= queues)
       index -= queues;
@@ -283,6 +344,7 @@ static __always_inline void admit_waiter(__u32 cpu) {
       continue;
     result = admit_from(cpu, owner, index);
     if (result == ADMIT_GRANTED) {
+      own_grants[cpu] = 0;
       index++;
       admit_cursor = index >= queues ? 0 : index;
       return;
@@ -454,10 +516,17 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
                cv_parked, cv_parked_now, cv_flushed, cv_expired);
   scx_bpf_dump("accordin cv calls=%llu misses=%llu drained=%llu\n",
                cv_flush_calls, cv_flush_misses, cv_drained);
+  scx_bpf_dump("accordin groups=%u own_limit=%u\n", group_count, own_limit);
   bpf_for(cpu, 0, MAX_CPUS) {
     volatile __u64 *owner = owner_slot(cpu);
     if (owner && *owner)
       scx_bpf_dump("accordin cpu=%u owner=%u\n", cpu, (__u32)*owner);
+  }
+  /* Only the CPUs a group claims are worth a line; the rest carry no mapping. */
+  bpf_for(cpu, 0, MAX_CPUS) {
+    __u32 group = cpu_group[cpu];
+    if (group < MAX_GROUPS)
+      scx_bpf_dump("accordin cpu=%u group=%u\n", cpu, group);
   }
 }
 

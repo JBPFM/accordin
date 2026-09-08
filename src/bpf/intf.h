@@ -6,6 +6,14 @@
 #define WAITFORSIGNAL_DSQ 0x102ULL
 #define MAX_TASKS 65536U
 #define MAX_CPUS 256U
+
+/* CPUs are collected into topology groups, each group inside one NUMA node and
+ * small enough to share a last-level cache. A group never spans more CPUs than
+ * MAX_GROUP_SIZE, and the worst case of one CPU per group needs as many groups
+ * as there are CPUs. */
+#define MAX_GROUPS MAX_CPUS
+#define MAX_GROUP_SIZE 16U
+#define CPU_NO_GROUP 0xffffffffU
 /* Lock admission is served from a bank of queues, one per CPU, so that dispatch
  * on different CPUs rarely contends on the same queue lock. A waiter is filed
  * in the queue of the CPU it woke on. The bank spans every CPU id the kernel

@@ -96,6 +96,114 @@ static unsigned int env_u32(const char *name, unsigned int fallback)
     return (unsigned int)parsed;
 }
 
+/* Group geometry defaults: eight CPUs to a group cover a slice of one node's
+ * last-level cache, and a CPU may take four grants in a row out of its own
+ * queue before its group gets a turn. */
+#define GROUP_SIZE_DEFAULT 8
+#define OWN_LIMIT_DEFAULT 4
+
+static bool read_sysfs(const char *path, char *text, size_t size)
+{
+    FILE *file = fopen(path, "re");
+    size_t got;
+
+    if (!file)
+        return false;
+    got = fread(text, 1, size - 1, file);
+    fclose(file);
+    text[got] = '\0';
+    return true;
+}
+
+/* Mark the CPUs named by a sysfs list such as "0-3,8,10-11". */
+static void mark_cpu_list(const char *text, bool *marked)
+{
+    while (*text) {
+        unsigned long first, last, cpu;
+        char *end;
+
+        if (!isdigit((unsigned char)*text)) {
+            text++;
+            continue;
+        }
+        first = last = strtoul(text, &end, 10);
+        if (*end == '-')
+            last = strtoul(end + 1, &end, 10);
+        for (cpu = first; cpu <= last && cpu < MAX_CPUS; cpu++)
+            marked[cpu] = true;
+        text = end;
+    }
+}
+
+/* Cut the online CPUs of each NUMA node, in ascending order, into groups of
+ * equal size, so that the members of one group share a last-level cache and a
+ * memory node. A node whose CPU count is not a multiple of the size ends in a
+ * shorter group, and a CPU no node claims stands alone. */
+static void publish_groups(void)
+{
+    bool online[MAX_CPUS] = {0}, placed[MAX_CPUS] = {0}, nodes[MAX_CPUS] = {0};
+    unsigned int size = env_u32("ACCORDIN_GROUP_SIZE", GROUP_SIZE_DEFAULT);
+    unsigned int own_limit = env_u32("ACCORDIN_OWN_LIMIT", OWN_LIMIT_DEFAULT);
+    unsigned int count = 0, cpu, node;
+    char text[4096];
+
+    if (size > MAX_GROUP_SIZE) {
+        fprintf(stderr, "[accordin] group size %u exceeds %u, using %u\n", size,
+                MAX_GROUP_SIZE, MAX_GROUP_SIZE);
+        size = MAX_GROUP_SIZE;
+    }
+    if (!size)
+        size = 1;
+    for (cpu = 0; cpu < MAX_CPUS; cpu++)
+        skel->bss->cpu_group[cpu] = CPU_NO_GROUP;
+    if (read_sysfs("/sys/devices/system/cpu/online", text, sizeof(text)))
+        mark_cpu_list(text, online);
+    if (read_sysfs("/sys/devices/system/node/online", text, sizeof(text)))
+        mark_cpu_list(text, nodes);
+    for (node = 0; node < MAX_CPUS; node++) {
+        bool members[MAX_CPUS] = {0};
+        /* A full count opens a group at the node's first CPU. */
+        unsigned int filled = size;
+        char path[128];
+
+        if (!nodes[node])
+            continue;
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpulist",
+                 node);
+        if (!read_sysfs(path, text, sizeof(text)))
+            continue;
+        mark_cpu_list(text, members);
+        for (cpu = 0; cpu < MAX_CPUS; cpu++) {
+            if (!members[cpu] || !online[cpu] || placed[cpu])
+                continue;
+            if (filled >= size) {
+                if (count >= MAX_GROUPS)
+                    break;
+                count++;
+                filled = 0;
+            }
+            skel->bss->cpu_group[cpu] = count - 1;
+            skel->bss->group_member[count - 1][filled++] = cpu;
+            skel->bss->group_size[count - 1] = filled;
+            placed[cpu] = true;
+        }
+    }
+    for (cpu = 0; cpu < MAX_CPUS && count < MAX_GROUPS; cpu++) {
+        if (!online[cpu] || placed[cpu])
+            continue;
+        skel->bss->cpu_group[cpu] = count;
+        skel->bss->group_member[count][0] = cpu;
+        skel->bss->group_size[count] = 1;
+        placed[cpu] = true;
+        count++;
+    }
+    skel->bss->group_count = count;
+    skel->bss->own_limit = own_limit;
+    if (cv_counters_on)
+        fprintf(stderr, "[accordin_groups] size=%u groups=%u own_limit=%u\n",
+                size, count, own_limit);
+}
+
 bool accordin_cv_custody_ready(void)
 {
     struct admission_state *state;
@@ -302,6 +410,7 @@ __attribute__((constructor)) static void scheduler_start(void)
     limit_ns = (uint64_t)env_u32("ACCORDIN_CV_CUSTODY_MS", 20) * 1000000ULL;
     skel->bss->cv_custody_limit_ns = limit_ns;
     skel->bss->cv_scan_period_ns = clamp_u64(limit_ns / 2, 1000000ULL, 10000000ULL);
+    publish_groups();
     if (env_flag("ACCORDIN_VERIFY_ONLY")) {
         verify_programs();
         admission_enabled = false;

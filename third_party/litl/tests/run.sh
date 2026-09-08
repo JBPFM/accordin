@@ -66,6 +66,8 @@ run_case() {
         ACCORDIN_CV_COUNTERS="$counters" \
         ACCORDIN_CV_FLUSH_FLAGS="${ACCORDIN_CV_FLUSH_FLAGS:-}" \
         ACCORDIN_CV_FLUSH_WIDTH="${ACCORDIN_CV_FLUSH_WIDTH:-}" \
+        ACCORDIN_OWN_LIMIT="${ACCORDIN_OWN_LIMIT:-}" \
+        ACCORDIN_GROUP_SIZE="${ACCORDIN_GROUP_SIZE:-}" \
         "$@" >"$log" 2>&1
     status=$?
     set -e
@@ -139,6 +141,15 @@ for backend in mcsaccordin_original mcstasaccordin_original; do
     if [[ "$disable" == 0 ]]; then
         echo "  lock taken during the library load"
         preload="$PWD/obj/tests/libearlylock.so" \
+        run_case bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
+            "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
+        check_counters 1
+    fi
+    # A CPU allowed a single grant from its own queue has to serve its topology
+    # group for every other grant, so this case drives the group probe.
+    if [[ "$disable" == 0 ]]; then
+        echo "  own-queue grants bounded at one"
+        ACCORDIN_OWN_LIMIT=1 \
         run_case bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
             "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
         check_counters 1

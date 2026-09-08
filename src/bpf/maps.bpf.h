@@ -78,4 +78,22 @@ __u32 admit_cursor;
 /* Admission queues the machine has, one per possible CPU id. */
 __u32 waiting_queues;
 
+/* Admission topology, published by the runtime before the scheduler loads. A
+ * CPU whose group is CPU_NO_GROUP is served by the rotation alone. */
+volatile __u32 cpu_group[MAX_CPUS];
+volatile __u32 group_count;
+volatile __u32 group_size[MAX_GROUPS];
+volatile __u32 group_member[MAX_GROUPS][MAX_GROUP_SIZE];
+/* How many grants in a row a CPU may take out of its own queue before it has
+ * to look at its group; zero lifts the bound. */
+volatile __u32 own_limit;
+
+/* Rotating start of the group scan, so members of equal depth take turns
+ * instead of always losing to the lowest CPU id. */
+__u32 group_cursor[MAX_GROUPS];
+/* Grants a CPU has taken from its own queue since it last served another
+ * queue. Only that CPU's dispatch reads or writes its entry, and the worst a
+ * torn update could cost is one misordered probe, so plain accesses suffice. */
+__u32 own_grants[MAX_CPUS];
+
 #endif

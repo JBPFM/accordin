@@ -253,12 +253,22 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
 
 /* The cursor is shared by every CPU and holds the queue after the last grant,
  * so every walk starts there. Rotating past the queue that granted keeps one
- * busy queue from starving the rest of the bank. */
+ * busy queue from starving the rest of the bank. The rotation covers every
+ * queue whenever the own queue yields nothing, so a queue can only wait while
+ * every dispatching CPU keeps finding work in its own queue; the home-CPU kick
+ * on release and the tick keep that CPU dispatching. */
 static __always_inline void admit_waiter(__u32 cpu) {
   volatile __u64 *owner = owner_slot(cpu);
   __u32 queues = waiting_queues, start, probe;
+  int own;
 
   if (!owner || *owner || !queues)
+    return;
+  /* A waiter that last ran here is filed in this CPU's queue, so that queue is
+   * probed first for cache locality, and a grant there leaves the shared cursor
+   * alone because a locality preference must not disturb the rotation. */
+  own = admit_from(cpu, owner, cpu);
+  if (own != ADMIT_NONE)
     return;
   start = admit_cursor;
   if (start >= queues)
@@ -269,6 +279,8 @@ static __always_inline void admit_waiter(__u32 cpu) {
 
     if (index >= queues)
       index -= queues;
+    if (index == cpu)
+      continue;
     result = admit_from(cpu, owner, index);
     if (result == ADMIT_GRANTED) {
       index++;

@@ -46,8 +46,18 @@ row, then the deepest queue of its topology group, then its own queue again if
 the group was empty, and the global rotation last. The groups come from the
 NUMA node CPU lists chunked into eights, six groups of eight on this host —
 the even CPUs 0–14, 16–30 and 32–46 and their odd counterparts. `8fe30c4`
-follows it and restarts the grant count after a fallback own grant; it is not
-part of the screen below.
+follows it and restarts the grant count after a fallback own grant. Two further
+commits on the same branch replace population with waiting time as the thing
+the choice follows. `f1a5cf3` stamps every waiter filed into the admission bank
+with its request time in the task's vtime field and serves the own queue only
+while its head is no more than `ACCORDIN_OWN_SLACK_US` younger than the oldest
+head of the topology group, otherwise the queue holding the oldest head, with
+the count bound kept as an optional second limiter; it reads the heads through
+the queue iterator. `5b25e15` then makes the bank a set of priority queues
+ordered by that stamp — the lock-waiter insert and the flush's move both place
+by age, so the head is the oldest by construction and the flush's head and tail
+flags no longer place anything — and reads the heads through the kernel's
+lockless queue peek where it resolves.
 
 The reference point is `934bd1c`, the commit before the series. `9520d7d` is
 the last change of the custody mechanism itself and is carried as an
@@ -105,7 +115,11 @@ slot nor the dispatch-side release passed validation.
   bounded form of that probe, `bf7080f` on branch `cv_owner_fair`, screens well
   — it keeps the `fillrandom` gain and gives back much of the fairness — but
   its follow-up `8fe30c4` has not been measured, so nothing from that branch
-  joins the tip either. The sharding tip
+  joins the tip either. Two later commits there, `f1a5cf3` and `5b25e15`,
+  replace population with waiting time as the thing a grant follows and screen
+  better than the bounded count on fairness while keeping most of the
+  `fillrandom` gain; they too await a multi-repeat confirm, so the tip is
+  unchanged. The sharding tip
   is kept regardless: on the same commits `fillrandom` runs at 3.77x and 3.73x
   of the `custody` arm and streamcluster at 0.517x and 0.514x of the baseline's
   seconds, so the gains on the workloads that park dominate the microbenchmark
@@ -124,7 +138,7 @@ slot nor the dispatch-side release passed validation.
   throughput.
 - The host was rebooted early on 2026-09-07 UTC. Every session in the tables
   below except the last two ran after that reboot, between 14:45 UTC on
-  2026-09-07 and 04:45 UTC on 2026-09-08, with the host up for 12 h or more.
+  2026-09-07 and 06:39 UTC on 2026-09-08, with the host up for 12 h or more.
 - The machine drifts within a single day. The `fillrandom` / `mcs_accordin`
   baseline anchor alone reads 51.287, 47.100 and 52.551 Kops/s in three
   sessions a few hours apart, and 31.152 Kops/s on the day before the reboot.
@@ -817,6 +831,184 @@ streamcluster, one repeat, seconds (lower is better):
 All four arms park 8.43 M waits with about 44.4 k flush calls and expire
 45.4 k–49.7 k of them; nothing in the counters separates them.
 
+### `age` — grants ordered by queue-head age, single repeat
+
+`f1a5cf3` under two slack settings, against `934bd1c`, the retained tip and the
+bounded-count arm. **One run per cell.** `age100` and `age0` also carry
+`ACCORDIN_OWN_LIMIT=0`, so the age rule is the only limiter in those arms.
+
+Per-thread fairness, 192 threads, one repeat:
+
+| critical | arm | commit | env | backend | Mops/s | rel | fairness | min ops | max ops |
+|---|---|---|---|---|---:|---:|---:|---:|---:|
+| 100 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 2.597 | 1.000x | 0.5134 | 99472 | 117205 |
+| 100 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 2.644 | 1.018x | 0.5175 | 95166 | 123060 |
+| 100 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin_direct | 2.668 | 1.027x | 0.5472 | 80845 | 132838 |
+| 100 ns | age100 | `f1a5cf3` | `SLACK_US=100` | mcs_accordin_direct | 2.576 | 0.992x | 0.5299 | 88100 | 124986 |
+| 100 ns | age0 | `f1a5cf3` | `SLACK_US=0` | mcs_accordin_direct | 2.547 | 0.981x | 0.5270 | 92652 | 124677 |
+| 100 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 2.242 | 1.000x | 0.5167 | 83423 | 115925 |
+| 100 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 2.215 | 0.988x | 0.5253 | 79108 | 112588 |
+| 100 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 2.264 | 1.010x | 0.5936 | 62074 | 140335 |
+| 100 ns | age100 | `f1a5cf3` | `SLACK_US=100` | mcs_tas_accordin_direct | 2.315 | 1.032x | 0.5472 | 72377 | 119431 |
+| 100 ns | age0 | `f1a5cf3` | `SLACK_US=0` | mcs_tas_accordin_direct | 2.408 | 1.074x | 0.5447 | 75816 | 125932 |
+| 300 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 1.494 | 1.000x | 0.5191 | 53883 | 71198 |
+| 300 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 0.753 | 0.504x | 0.5426 | 23997 | 40156 |
+| 300 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin_direct | 1.436 | 0.961x | 0.5671 | 35516 | 82359 |
+| 300 ns | age100 | `f1a5cf3` | `SLACK_US=100` | mcs_accordin_direct | 1.480 | 0.991x | 0.5301 | 50899 | 72574 |
+| 300 ns | age0 | `f1a5cf3` | `SLACK_US=0` | mcs_accordin_direct | 1.422 | 0.952x | 0.5487 | 46818 | 76240 |
+| 300 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 1.073 | 1.000x | 0.5439 | 35524 | 64063 |
+| 300 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 1.273 | 1.187x | 0.5410 | 39175 | 66905 |
+| 300 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 1.374 | 1.280x | 0.5626 | 41084 | 81434 |
+| 300 ns | age100 | `f1a5cf3` | `SLACK_US=100` | mcs_tas_accordin_direct | 1.340 | 1.249x | 0.5405 | 46690 | 79781 |
+| 300 ns | age0 | `f1a5cf3` | `SLACK_US=0` | mcs_tas_accordin_direct | 1.289 | 1.201x | 0.5479 | 37726 | 70529 |
+| 1000 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 0.619 | 1.000x | 0.5279 | 20587 | 31163 |
+| 1000 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 0.565 | 0.913x | 0.5470 | 15161 | 31551 |
+| 1000 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin_direct | 0.637 | 1.029x | 0.5471 | 17768 | 34589 |
+| 1000 ns | age100 | `f1a5cf3` | `SLACK_US=100` | mcs_accordin_direct | 0.576 | 0.931x | 0.5639 | 14843 | 31677 |
+| 1000 ns | age0 | `f1a5cf3` | `SLACK_US=0` | mcs_accordin_direct | 0.553 | 0.894x | 0.5718 | 14751 | 33881 |
+| 1000 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 0.590 | 1.000x | 0.5494 | 19427 | 38634 |
+| 1000 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 0.537 | 0.911x | 0.5782 | 11741 | 36805 |
+| 1000 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 0.581 | 0.985x | 0.5706 | 14104 | 38084 |
+| 1000 ns | age100 | `f1a5cf3` | `SLACK_US=100` | mcs_tas_accordin_direct | 0.607 | 1.029x | 0.5927 | 16546 | 41356 |
+| 1000 ns | age0 | `f1a5cf3` | `SLACK_US=0` | mcs_tas_accordin_direct | 0.567 | 0.962x | 0.5760 | 15379 | 37976 |
+| 30000 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 0.022 | 1.000x | 0.6649 | 216 | 2026 |
+| 30000 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 0.024 | 1.094x | 0.6923 | 163 | 3149 |
+| 30000 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin_direct | 0.022 | 1.035x | 0.6834 | 145 | 2569 |
+| 30000 ns | age100 | `f1a5cf3` | `SLACK_US=100` | mcs_accordin_direct | 0.021 | 0.979x | 0.6695 | 241 | 1906 |
+| 30000 ns | age0 | `f1a5cf3` | `SLACK_US=0` | mcs_accordin_direct | 0.024 | 1.099x | 0.6502 | 147 | 2012 |
+| 30000 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 0.027 | 1.000x | 0.6475 | 286 | 2792 |
+| 30000 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 0.026 | 0.996x | 0.6958 | 137 | 3041 |
+| 30000 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 0.027 | 1.011x | 0.6662 | 214 | 2455 |
+| 30000 ns | age100 | `f1a5cf3` | `SLACK_US=100` | mcs_tas_accordin_direct | 0.026 | 0.996x | 0.6508 | 222 | 2306 |
+| 30000 ns | age0 | `f1a5cf3` | `SLACK_US=0` | mcs_tas_accordin_direct | 0.027 | 1.005x | 0.6668 | 312 | 2671 |
+
+Two cells of this table are outliers rather than measurements of the arm: the
+tip at 300 ns on `mcs_accordin_direct` ran at 0.753 Mops/s, about half of every
+other arm at that point, and the `mcs_tas_accordin_direct` baseline at the same
+point reads 1.073 Mops/s against 1.36–1.37 in the neighbouring sessions, which
+is what puts the other arms of that row above 1.18x.
+
+LevelDB, one repeat (Kops/s, `rel` against `baseline`):
+
+| arm | commit | env | backend | fill Kops/s | rel | read Kops/s | rel |
+|---|---|---|---|---:|---:|---:|---:|
+| baseline | `934bd1c` | — | mcs_accordin | 59.116 | 1.000x | 1385.868 | 1.000x |
+| tidy | `ded83aa` | — | mcs_accordin | 225.789 | 3.819x | 1319.004 | 0.952x |
+| k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin | 252.781 | 4.276x | 1312.078 | 0.947x |
+| age100 | `f1a5cf3` | `SLACK_US=100` | mcs_accordin | 246.502 | 4.170x | 1321.559 | 0.954x |
+| age0 | `f1a5cf3` | `SLACK_US=0` | mcs_accordin | 245.468 | 4.152x | 1298.893 | 0.937x |
+| baseline | `934bd1c` | — | mcs_tas_accordin | 65.531 | 1.000x | 1101.028 | 1.000x |
+| tidy | `ded83aa` | — | mcs_tas_accordin | 224.671 | 3.428x | 1063.606 | 0.966x |
+| k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin | 256.827 | 3.919x | 1077.011 | 0.978x |
+| age100 | `f1a5cf3` | `SLACK_US=100` | mcs_tas_accordin | 244.936 | 3.738x | 1115.740 | 1.013x |
+| age0 | `f1a5cf3` | `SLACK_US=0` | mcs_tas_accordin | 248.697 | 3.795x | 1074.985 | 0.976x |
+
+One attempt was invalid, `baseline` on `mcs_accordin` `fillrandom`, a 120 s
+timeout. Counters, `fillrandom`: the age arms park 7.33–7.41 M waits against
+7.55 M / 7.63 M for `k2` and 6.75 M / 6.69 M for the tip, with flush calls at
+162 k–168 k against 174 k / 181 k and 144 k / 145 k.
+
+streamcluster, one repeat, seconds:
+
+| arm | commit | env | backend | stream s | rel |
+|---|---|---|---|---:|---:|
+| baseline | `934bd1c` | — | mcs_accordin | 155.576 | 1.000x |
+| tidy | `ded83aa` | — | mcs_accordin | 96.215 | 0.618x |
+| k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin | 89.506 | 0.575x |
+| age100 | `f1a5cf3` | `SLACK_US=100` | mcs_accordin | 92.298 | 0.593x |
+| age0 | `f1a5cf3` | `SLACK_US=0` | mcs_accordin | 95.060 | 0.611x |
+| baseline | `934bd1c` | — | mcs_tas_accordin | 149.380 | 1.000x |
+| tidy | `ded83aa` | — | mcs_tas_accordin | 91.733 | 0.614x |
+| k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin | 97.709 | 0.654x |
+| age100 | `f1a5cf3` | `SLACK_US=100` | mcs_tas_accordin | 90.075 | 0.603x |
+| age0 | `f1a5cf3` | `SLACK_US=0` | mcs_tas_accordin | 95.227 | 0.637x |
+
+### `peek` — age-ordered bank read without locking, single repeat
+
+`5b25e15` under the same two slack settings and the same reference arms.
+**One run per cell.**
+
+Per-thread fairness, 192 threads, one repeat:
+
+| critical | arm | commit | env | backend | Mops/s | rel | fairness | min ops | max ops |
+|---|---|---|---|---|---:|---:|---:|---:|---:|
+| 100 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 2.753 | 1.000x | 0.5127 | 102962 | 125528 |
+| 100 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 2.651 | 0.963x | 0.5184 | 95571 | 123284 |
+| 100 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin_direct | 2.516 | 0.914x | 0.5457 | 80059 | 125010 |
+| 100 ns | peek100 | `5b25e15` | `SLACK_US=100` | mcs_accordin_direct | 2.664 | 0.968x | 0.5260 | 90039 | 124290 |
+| 100 ns | peek0 | `5b25e15` | `SLACK_US=0` | mcs_accordin_direct | 2.598 | 0.944x | 0.5217 | 92849 | 122966 |
+| 100 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 2.322 | 1.000x | 0.5203 | 86906 | 114431 |
+| 100 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 2.294 | 0.988x | 0.5230 | 80565 | 110489 |
+| 100 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 2.353 | 1.014x | 0.5628 | 74859 | 170703 |
+| 100 ns | peek100 | `5b25e15` | `SLACK_US=100` | mcs_tas_accordin_direct | 2.327 | 1.002x | 0.5528 | 73329 | 123577 |
+| 100 ns | peek0 | `5b25e15` | `SLACK_US=0` | mcs_tas_accordin_direct | 2.353 | 1.013x | 0.5529 | 78516 | 121213 |
+| 300 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 1.516 | 1.000x | 0.5170 | 56769 | 70392 |
+| 300 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 1.477 | 0.974x | 0.5344 | 49580 | 76561 |
+| 300 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin_direct | 1.489 | 0.982x | 0.5629 | 47779 | 102935 |
+| 300 ns | peek100 | `5b25e15` | `SLACK_US=100` | mcs_accordin_direct | 1.474 | 0.973x | 0.5535 | 43552 | 77463 |
+| 300 ns | peek0 | `5b25e15` | `SLACK_US=0` | mcs_accordin_direct | 1.478 | 0.975x | 0.5505 | 45094 | 77291 |
+| 300 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 1.360 | 1.000x | 0.5299 | 48272 | 72057 |
+| 300 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 1.357 | 0.998x | 0.5350 | 42222 | 74929 |
+| 300 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 1.440 | 1.059x | 0.5516 | 48669 | 87569 |
+| 300 ns | peek100 | `5b25e15` | `SLACK_US=100` | mcs_tas_accordin_direct | 1.325 | 0.974x | 0.5507 | 42055 | 79272 |
+| 300 ns | peek0 | `5b25e15` | `SLACK_US=0` | mcs_tas_accordin_direct | 1.560 | 1.147x | 0.5505 | 49567 | 78680 |
+| 1000 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 0.603 | 1.000x | 0.5271 | 19856 | 29833 |
+| 1000 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 0.600 | 0.994x | 0.5491 | 15641 | 32519 |
+| 1000 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin_direct | 0.660 | 1.093x | 0.5454 | 20919 | 34620 |
+| 1000 ns | peek100 | `5b25e15` | `SLACK_US=100` | mcs_accordin_direct | 0.655 | 1.085x | 0.5782 | 17767 | 41078 |
+| 1000 ns | peek0 | `5b25e15` | `SLACK_US=0` | mcs_accordin_direct | 0.633 | 1.049x | 0.5596 | 18847 | 36920 |
+| 1000 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 0.604 | 1.000x | 0.5485 | 18717 | 34694 |
+| 1000 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 0.640 | 1.059x | 0.5592 | 16163 | 40983 |
+| 1000 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 0.654 | 1.083x | 0.5769 | 16753 | 45372 |
+| 1000 ns | peek100 | `5b25e15` | `SLACK_US=100` | mcs_tas_accordin_direct | 0.606 | 1.003x | 0.5780 | 16175 | 37423 |
+| 1000 ns | peek0 | `5b25e15` | `SLACK_US=0` | mcs_tas_accordin_direct | 0.592 | 0.980x | 0.5940 | 11392 | 39009 |
+| 30000 ns | baseline | `934bd1c` | — | mcs_accordin_direct | 0.023 | 1.000x | 0.6719 | 237 | 2271 |
+| 30000 ns | tidy | `ded83aa` | — | mcs_accordin_direct | 0.022 | 0.977x | 0.7162 | 114 | 2379 |
+| 30000 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin_direct | 0.022 | 0.994x | 0.6854 | 146 | 2216 |
+| 30000 ns | peek100 | `5b25e15` | `SLACK_US=100` | mcs_accordin_direct | 0.025 | 1.129x | 0.6337 | 356 | 2107 |
+| 30000 ns | peek0 | `5b25e15` | `SLACK_US=0` | mcs_accordin_direct | 0.023 | 1.026x | 0.6558 | 193 | 2144 |
+| 30000 ns | baseline | `934bd1c` | — | mcs_tas_accordin_direct | 0.026 | 1.000x | 0.6655 | 275 | 2664 |
+| 30000 ns | tidy | `ded83aa` | — | mcs_tas_accordin_direct | 0.027 | 1.014x | 0.6871 | 129 | 3042 |
+| 30000 ns | k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin_direct | 0.027 | 1.012x | 0.6838 | 145 | 4150 |
+| 30000 ns | peek100 | `5b25e15` | `SLACK_US=100` | mcs_tas_accordin_direct | 0.027 | 1.012x | 0.6573 | 196 | 2767 |
+| 30000 ns | peek0 | `5b25e15` | `SLACK_US=0` | mcs_tas_accordin_direct | 0.026 | 1.007x | 0.6715 | 150 | 2764 |
+
+LevelDB, one repeat (Kops/s, `rel` against `baseline`):
+
+| arm | commit | env | backend | fill Kops/s | rel | read Kops/s | rel |
+|---|---|---|---|---:|---:|---:|---:|
+| baseline | `934bd1c` | — | mcs_accordin | 56.601 | 1.000x | 1313.018 | 1.000x |
+| tidy | `ded83aa` | — | mcs_accordin | 224.397 | 3.965x | 1306.754 | 0.995x |
+| k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin | 252.301 | 4.458x | 1296.857 | 0.988x |
+| peek100 | `5b25e15` | `SLACK_US=100` | mcs_accordin | 250.956 | 4.434x | 1287.813 | 0.981x |
+| peek0 | `5b25e15` | `SLACK_US=0` | mcs_accordin | 245.789 | 4.342x | 1311.780 | 0.999x |
+| baseline | `934bd1c` | — | mcs_tas_accordin | 51.059 | 1.000x | 1115.323 | 1.000x |
+| tidy | `ded83aa` | — | mcs_tas_accordin | 220.059 | 4.310x | 999.062 | 0.896x |
+| k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin | 261.140 | 5.114x | 1092.576 | 0.980x |
+| peek100 | `5b25e15` | `SLACK_US=100` | mcs_tas_accordin | 246.056 | 4.819x | 1094.471 | 0.981x |
+| peek0 | `5b25e15` | `SLACK_US=0` | mcs_tas_accordin | 245.116 | 4.801x | 1105.357 | 0.991x |
+
+The tip's `readrandom` on `mcs_tas_accordin` reads 0.896x here, well below the
+0.95x–0.99x it holds in every other session, and is an outlier of this single
+run rather than a property of the arm. Counters, `fillrandom`: the peek arms
+park 7.29–7.49 M waits with 162 k–169 k flush calls, between the tip
+(6.70 M / 6.56 M, 145 k / 144 k) and `k2` (7.52 M / 7.74 M, 174 k / 184 k).
+
+streamcluster, one repeat, seconds:
+
+| arm | commit | env | backend | stream s | rel |
+|---|---|---|---|---:|---:|
+| baseline | `934bd1c` | — | mcs_accordin | 183.134 | 1.000x |
+| tidy | `ded83aa` | — | mcs_accordin | 90.224 | 0.493x |
+| k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_accordin | 92.274 | 0.504x |
+| peek100 | `5b25e15` | `SLACK_US=100` | mcs_accordin | 97.855 | 0.534x |
+| peek0 | `5b25e15` | `SLACK_US=0` | mcs_accordin | 101.529 | 0.554x |
+| baseline | `934bd1c` | — | mcs_tas_accordin | 176.156 | 1.000x |
+| tidy | `ded83aa` | — | mcs_tas_accordin | 105.891 | 0.601x |
+| k2 | `8fe30c4` | `OWN_LIMIT=2` | mcs_tas_accordin | 91.212 | 0.518x |
+| peek100 | `5b25e15` | `SLACK_US=100` | mcs_tas_accordin | 89.691 | 0.509x |
+| peek0 | `5b25e15` | `SLACK_US=0` | mcs_tas_accordin | 92.486 | 0.525x |
+
 ### `20260906T180338Z` — LevelDB before the reboot
 
 Same binaries as the `baseline` and `custody` arms of `h2-tail`, plus a
@@ -1168,6 +1360,49 @@ restarts the grant count after a fallback own grant and so changes the cadence
 this screen measured; until then `bf7080f` and `8fe30c4` stay on
 `cv_owner_fair` and the tip of `cv_admission` remains `ded83aa`.
 
+### Age-ordered grants — the best screen so far, still unconfirmed
+
+**One run per cell in both sessions.** The two screens agree with each other,
+which is the only reason the reading below is offered at all.
+
+Choosing by waiting time instead of by population moves the fairness factor off
+the bounded-count level and back toward the tip. At 100 ns the age arms read
+0.5299 and 0.5270 on `mcs_accordin_direct` and 0.5472 and 0.5447 on
+`mcs_tas_accordin_direct`, and the peek arms 0.5260 and 0.5217 and 0.5528 and
+0.5529, against 0.5457–0.5936 for `k2` in the same two sessions and
+0.5175–0.5253 for the tip. At 300 ns they read 0.5301–0.5535 and 0.5405–0.5507,
+against 0.5516–0.5671 for `k2` and 0.5344–0.5426 for the tip. Slack 100 and
+slack 0 are not separable from each other anywhere in either session, so the
+tolerance is doing less than the ordering is.
+
+Two places do not follow. At 1000 ns the arms are intermingled — the age and
+peek arms reach 0.5639–0.5940 against 0.5454–0.5769 for `k2` and 0.5470–0.5592
+for the tip — so nothing is settled there in one run. At 30000 ns `peek100` is
+the only arm of the whole series to sit below the reference, 0.6337 and 0.6573
+against 0.6719 and 0.6655 for `934bd1c` and 0.7162 and 0.6871 for the tip.
+
+Throughput keeps most of the own-queue gain. `fillrandom` reads 246.502 and
+244.936 Kops/s for `age100`, 245.468 and 248.697 for `age0`, 250.956 and
+246.056 for `peek100` and 245.789 and 245.116 for `peek0`, against 252.781 and
+256.827 for `k2` in the first session, 252.301 and 261.140 in the second, and
+225.789 and 224.671 and then 224.397 and 220.059 for the tip. `readrandom` sits between 0.937x and
+1.013x of `934bd1c` on every arm of both sessions. Streamcluster stays inside
+the 89–102 s band that the shard family has occupied since the tip, with the
+ordering inside that band changing between the two sessions, so it separates
+nothing.
+
+The cost is in the dispatch program. The commit messages report `f1a5cf3` at
+15419 instructions with enqueue at 428, and `5b25e15` at 15480 with enqueue at
+389 — against 256 and 415 at the tip and 8159 at `bf7080f` — and `5b25e15`
+records that the lockless queue peek resolved on every load, so the fallback
+iterator was never needed on this kernel. The ordering it adds is structural
+rather than heuristic: with the bank held as priority queues, the head is the
+oldest request by construction and the flush's placement flags stop mattering.
+
+Adoption waits on a multi-repeat confirm of `5b25e15` at slack 100 across the
+workloads that decided the series, since everything above rests on one run per
+cell. Until then the branch stays off `cv_admission`.
+
 ## Machine state, not code: the reboot observation
 
 The `baseline` and `custody` arms of `h2-tail` are the same binaries the two
@@ -1217,8 +1452,11 @@ baseline inside the same session.
 - Three repeats per cell (four in `attrib-2`) is enough to separate the large
   moves and not enough to rank arms that differ by a few percent, which is why
   `readrandom` differences below about 5 % are treated as noise here.
-- **The `percpu` and `bounded` screens are one run per cell.** Both were run
-  with reduced repeats to answer a structural question quickly. Their
-  throughput figures are indicative only; only the fairness ordering there,
-  which is far larger than any spread the multi-repeat sessions show on the
-  same metric, is treated as settled.
+- **The `percpu`, `bounded`, `age` and `peek` screens are one run per cell.**
+  All four were run with reduced repeats to answer a structural question
+  quickly. Their throughput figures are indicative only; only fairness
+  orderings that are far larger than any spread the multi-repeat sessions show
+  on that metric, and that repeat across two of these screens, are treated as
+  settled. Individual cells in them go visibly wrong — the tip at half
+  throughput at one `age` point, its `readrandom` at 0.896x in `peek` — without
+  invalidating the session around them.

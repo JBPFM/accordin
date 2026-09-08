@@ -4,13 +4,13 @@
 
 #define NORMAL_DSQ 0x100ULL
 #define WAITFORSIGNAL_DSQ 0x102ULL
-/* Lock admission is served from a bank of queues, one per shard, so that
- * dispatch on different CPUs rarely contends on the same queue lock. A waiter
- * is filed in the shard of the CPU it woke on. */
-#define WAITING_DSQ 0x200ULL
-#define WAITING_SHARDS 32U
 #define MAX_TASKS 65536U
 #define MAX_CPUS 256U
+/* Lock admission is served from a bank of queues, one per CPU, so that dispatch
+ * on different CPUs rarely contends on the same queue lock. A waiter is filed
+ * in the queue of the CPU it woke on. The bank spans every CPU id the kernel
+ * may report; the scheduler creates the queues the machine actually has. */
+#define WAITING_DSQ 0x200ULL
 
 /* Admission word: bits 0-1 hold the state value (0 idle, USER_HELD,
  * USER_WAITING, USER_SPINNING), bit 2 marks a condvar wait, and bits 3 and

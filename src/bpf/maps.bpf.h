@@ -75,5 +75,7 @@ __u64 cv_flush_misses;
 __u64 cv_drained;
 __u32 flush_cursor;
 __u32 admit_cursor;
+/* Admission queues the machine has, one per possible CPU id. */
+__u32 waiting_queues;
 
 #endif

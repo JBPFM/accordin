@@ -5,28 +5,29 @@
 char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
-/* The shard a waiter is filed in. The index is a CPU id at the enqueue and
- * release sites and a shard number when the bank itself is walked. */
+/* The admission queue a waiter is filed in. The index is a CPU id at the
+ * enqueue and release sites and a queue number when the bank itself is walked;
+ * the wrap keeps it inside the bank whatever the caller reports. */
 static __always_inline __u64 waiting_dsq(__u32 index) {
-  return WAITING_DSQ + index % WAITING_SHARDS;
+  return WAITING_DSQ + index % MAX_CPUS;
 }
 
 static __always_inline bool is_waiting(__u64 dsq) {
-  return dsq >= WAITING_DSQ && dsq < WAITING_DSQ + WAITING_SHARDS;
+  return dsq >= WAITING_DSQ && dsq < WAITING_DSQ + MAX_CPUS;
 }
 
-/* The shard bank owns a contiguous id range that the other queues stay out of. */
-_Static_assert(NORMAL_DSQ < WAITING_DSQ || NORMAL_DSQ >= WAITING_DSQ + WAITING_SHARDS,
-               "NORMAL_DSQ overlaps the admission shards");
+/* The bank owns a contiguous id range that the other queues stay out of. */
+_Static_assert(NORMAL_DSQ < WAITING_DSQ || NORMAL_DSQ >= WAITING_DSQ + MAX_CPUS,
+               "NORMAL_DSQ overlaps the admission queues");
 _Static_assert(WAITFORSIGNAL_DSQ < WAITING_DSQ ||
-                   WAITFORSIGNAL_DSQ >= WAITING_DSQ + WAITING_SHARDS,
-               "WAITFORSIGNAL_DSQ overlaps the admission shards");
+                   WAITFORSIGNAL_DSQ >= WAITING_DSQ + MAX_CPUS,
+               "WAITFORSIGNAL_DSQ overlaps the admission queues");
 
 static __always_inline __u32 nr_waiting(void) {
-  __u32 total = 0, shard;
+  __u32 total = 0, index;
 
-  bpf_for(shard, 0, WAITING_SHARDS) {
-    s32 nr = scx_bpf_dsq_nr_queued(waiting_dsq(shard));
+  bpf_for(index, 0, waiting_queues) {
+    s32 nr = scx_bpf_dsq_nr_queued(waiting_dsq(index));
 
     if (nr > 0)
       total += nr;
@@ -213,20 +214,20 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
-/* Outcome of examining one shard: a waiter was granted this CPU's slot, the
- * shard held nothing for it, or the slot was taken while the grant was being
+/* Outcome of examining one queue: a waiter was granted this CPU's slot, the
+ * queue held nothing for it, or the slot was taken while the grant was being
  * made and there is nothing left to hand out. */
 #define ADMIT_NONE 0
 #define ADMIT_GRANTED 1
 #define ADMIT_SLOT_LOST 2
 
 /* Reserve both the task and this CPU before moving a candidate. Different CPUs
- * may examine the same shard concurrently; a failed move rolls back both
+ * may examine the same queue concurrently; a failed move rolls back both
  * reservations. There is no path that admits a new waiter onto an occupied CPU.
- * An empty shard costs one depth query and no iteration. */
+ * An empty queue costs one depth query and no iteration. */
 static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
-                                      __u32 shard) {
-  __u64 dsq = waiting_dsq(shard);
+                                      __u32 index) {
+  __u64 dsq = waiting_dsq(index);
   struct task_struct *p;
 
   if (scx_bpf_dsq_nr_queued(dsq) <= 0)
@@ -250,22 +251,28 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
   return ADMIT_NONE;
 }
 
-/* The cursor is shared by every CPU and holds the shard after the last grant,
- * so every walk starts there. Rotating past the shard that granted keeps one
- * busy shard from starving the rest of the bank. */
+/* The cursor is shared by every CPU and holds the queue after the last grant,
+ * so every walk starts there. Rotating past the queue that granted keeps one
+ * busy queue from starving the rest of the bank. */
 static __always_inline void admit_waiter(__u32 cpu) {
   volatile __u64 *owner = owner_slot(cpu);
-  __u32 start, shard;
+  __u32 queues = waiting_queues, start, probe;
 
-  if (!owner || *owner)
+  if (!owner || *owner || !queues)
     return;
   start = admit_cursor;
-  bpf_for(shard, 0, WAITING_SHARDS) {
-    __u32 index = (start + shard) % WAITING_SHARDS;
-    int result = admit_from(cpu, owner, index);
+  if (start >= queues)
+    start = 0;
+  bpf_for(probe, 0, queues) {
+    __u32 index = start + probe;
+    int result;
 
+    if (index >= queues)
+      index -= queues;
+    result = admit_from(cpu, owner, index);
     if (result == ADMIT_GRANTED) {
-      admit_cursor = (index + 1) % WAITING_SHARDS;
+      index++;
+      admit_cursor = index >= queues ? 0 : index;
       return;
     }
     if (result == ADMIT_SLOT_LOST)
@@ -469,17 +476,21 @@ static __always_inline struct cv_timer_state *cv_timer(void) {
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   struct cv_timer_state *timer;
-  __u32 shard;
+  __u32 queues = scx_bpf_nr_cpu_ids(), index;
   s32 ret;
 
   ret = scx_bpf_create_dsq(NORMAL_DSQ, -1);
   if (ret)
     return ret;
-  bpf_for(shard, 0, WAITING_SHARDS) {
-    ret = scx_bpf_create_dsq(waiting_dsq(shard), -1);
+  if (queues > MAX_CPUS)
+    queues = MAX_CPUS;
+  bpf_for(index, 0, queues) {
+    ret = scx_bpf_create_dsq(waiting_dsq(index), -1);
     if (ret)
       return ret;
   }
+  /* Every walk over the bank is bounded by the queues that exist. */
+  waiting_queues = queues;
   ret = scx_bpf_create_dsq(WAITFORSIGNAL_DSQ, -1);
   if (ret)
     return ret;
@@ -581,8 +592,8 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       } else {
         __sync_fetch_and_add(&cv_flushed, 1);
         tally->moved++;
-        /* The wait is filed in the shard of the CPU it last ran on. Any CPU
-         * with a free slot may grant it while walking the shards; waking that
+        /* The wait is filed in the queue of the CPU it last ran on. Any CPU
+         * with a free slot may grant it while walking the bank; waking that
          * CPU is the cheapest attempt, since it is the one most likely to still
          * hold the waiter's cache footprint. */
         scx_bpf_kick_cpu(task_cpu, SCX_KICK_IDLE);

@@ -180,16 +180,20 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
                  tctx->custody_denied != request_ticket(p, state)) {
         /* A condvar wait is held until it is notified or its custody expires,
          * never admitted onto a CPU slot. */
+        __u64 parked = scx_bpf_now();
+
         tctx->ticket = request_ticket(p, state);
         /* The low bit keeps the mark non-zero whatever the clock reads, so an
          * unset mark is the only way to read as unparked. */
-        tctx->parked_at = scx_bpf_now() | 1;
+        tctx->parked_at = parked | 1;
+        p->scx.dsq_vtime = parked;
         dsq = WAITFORSIGNAL_DSQ;
         __sync_fetch_and_add(&cv_parked, 1);
         __sync_fetch_and_add(&cv_parked_now, 1);
       } else if (known && !(state & USER_CV) &&
                  (state & USER_FLAGS) == USER_WAITING) {
         tctx->ticket = request_ticket(p, state);
+        p->scx.dsq_vtime = scx_bpf_now();
         dsq = waiting_dsq(cpu);
       }
     }
@@ -251,31 +255,93 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
   return ADMIT_NONE;
 }
 
+/* How long the waiter at the head of a queue has been in line, which is the
+ * longest wait that queue holds. The stamp a waiter carries is written by the
+ * CPU that queued it and read here by another, so the difference is taken
+ * signed and a head stamped slightly ahead of this CPU reads as no wait at all
+ * rather than as an enormous one. An empty queue costs one depth query and has
+ * no age to report. */
+static __always_inline bool head_age(__u64 dsq, __u64 now, __u64 *age) {
+  struct task_struct *p;
+  bool found = false;
+
+  if (scx_bpf_dsq_nr_queued(dsq) <= 0)
+    return false;
+  bpf_for_each(scx_dsq, p, dsq, 0) {
+    s64 waited = (s64)(now - p->scx.dsq_vtime);
+
+    *age = waited > 0 ? (__u64)waited : 0;
+    found = true;
+    break;
+  }
+  return found;
+}
+
 /* Grant order for a CPU that has a free slot. The CPU's own queue comes first,
- * for the cache footprint a waiter left behind on it, bounded by a count of
- * consecutive own grants so that one busy queue cannot keep a CPU to itself.
- * The deepest queue of the CPU's topology group comes next and is the
- * population balancer inside one slice of a memory node: a waiter
- * granted by another CPU is filed under that CPU when it next waits, so
- * populations drain from deep queues toward the CPUs that have slots. The
- * rotation over the whole bank is the cross-group backstop; its cursor is
- * shared by every CPU and holds the queue after the last grant, so rotating
- * past the queue that granted keeps one busy queue from starving the rest of
- * the bank. The rotation is reached only once both the own queue and the group
- * yield nothing, so how fast a waiter is picked up from outside its group is
- * set by the turnover of its own group rather than by the rotation.
+ * for the cache footprint a waiter left behind on it, and is served while its
+ * head is not younger than the oldest head of the CPU's topology group by more
+ * than the slack; a count of consecutive own grants bounds that preference as
+ * a second limiter. The oldest head of the group comes next, and is the
+ * population balancer and the fairness rule in one: a waiter granted by another
+ * CPU is filed under that CPU when it next waits, so populations drain from
+ * crowded queues toward the CPUs that have slots, while ordering grants by
+ * waiting time keeps no thread at the back of the line. The rotation over the
+ * whole bank is the cross-group backstop; its cursor is shared by every CPU and
+ * holds the queue after the last grant, so rotating past the queue that granted
+ * keeps one busy queue from starving the rest of the bank. The rotation is
+ * reached only once both the own queue and the group yield nothing, so how fast
+ * a waiter is picked up from outside its group is set by the turnover of its
+ * own group rather than by the rotation.
  */
 static __always_inline void admit_waiter(__u32 cpu) {
   volatile __u64 *owner = owner_slot(cpu);
   __u32 queues = waiting_queues, start, probe;
   __u32 limit = own_limit, granted = own_grants[cpu];
-  __u32 group = cpu_group[cpu];
+  __u32 group = cpu_group[cpu], members = 0, best = 0, best_slot = 0;
+  __u64 now, own_wait = 0, group_wait = 0;
+  bool own_head, group_head = false;
   bool own_first;
   int result;
 
   if (!owner || *owner || !queues)
     return;
-  own_first = !limit || granted < limit;
+  now = scx_bpf_now();
+  own_head = head_age(waiting_dsq(cpu), now, &own_wait);
+  if (group < MAX_GROUPS) {
+    __u32 cursor = group_cursor[group], slot;
+
+    members = group_size[group];
+    if (members > MAX_GROUP_SIZE)
+      members = MAX_GROUP_SIZE;
+    if (cursor >= members)
+      cursor = 0;
+    bpf_for(slot, 0, members) {
+      __u32 pick = cursor + slot, member;
+      __u64 age;
+
+      if (pick >= members)
+        pick -= members;
+      if (pick >= MAX_GROUP_SIZE)
+        continue;
+      member = group_member[group][pick];
+      /* The own queue is weighed on its own terms, not as a group member. */
+      if (member == cpu || member >= queues)
+        continue;
+      if (!head_age(waiting_dsq(member), now, &age))
+        continue;
+      /* The scan starts at the cursor, so members whose heads are the same age
+       * take turns instead of always losing to the earliest slot. */
+      if (!group_head || age > group_wait) {
+        group_wait = age;
+        best = member;
+        best_slot = pick;
+        group_head = true;
+      }
+    }
+  }
+  own_first = own_head && (!group_head || own_wait + own_slack_ns >= group_wait);
+  if (own_first && limit && granted >= limit)
+    own_first = false;
   if (own_first) {
     result = admit_from(cpu, owner, cpu);
     if (result == ADMIT_GRANTED) {
@@ -285,52 +351,23 @@ static __always_inline void admit_waiter(__u32 cpu) {
     if (result == ADMIT_SLOT_LOST)
       return;
   }
-  if (group < MAX_GROUPS) {
-    __u32 members = group_size[group], cursor = group_cursor[group];
-    __u32 slot, best = 0, best_slot = 0;
-    s32 depth = 0;
-
-    if (members > MAX_GROUP_SIZE)
-      members = MAX_GROUP_SIZE;
-    if (cursor >= members)
-      cursor = 0;
-    bpf_for(slot, 0, members) {
-      __u32 pick = cursor + slot, member;
-      s32 nr;
-
-      if (pick >= members)
-        pick -= members;
-      if (pick >= MAX_GROUP_SIZE)
-        continue;
-      member = group_member[group][pick];
-      /* The own queue has either been offered already or been passed over on
-       * purpose to serve the group, so it is not what is looked for here. */
-      if (member == cpu || member >= queues)
-        continue;
-      nr = scx_bpf_dsq_nr_queued(waiting_dsq(member));
-      if (nr > depth) {
-        depth = nr;
-        best = member;
-        best_slot = pick;
-      }
+  if (group_head && group < MAX_GROUPS) {
+    result = admit_from(cpu, owner, best);
+    if (result == ADMIT_GRANTED) {
+      own_grants[cpu] = 0;
+      best_slot++;
+      group_cursor[group] = best_slot >= members ? 0 : best_slot;
+      return;
     }
-    if (depth > 0) {
-      result = admit_from(cpu, owner, best);
-      if (result == ADMIT_GRANTED) {
-        own_grants[cpu] = 0;
-        best_slot++;
-        group_cursor[group] = best_slot >= members ? 0 : best_slot;
-        return;
-      }
-      if (result == ADMIT_SLOT_LOST)
-        return;
-    }
+    if (result == ADMIT_SLOT_LOST)
+      return;
   }
-  /* The bound orders the queues, it does not close the own queue: with the
-   * group offering nothing, serving it still beats leaving the slot idle. The
-   * group was seen empty, so a grant here costs the group nothing and the count
-   * starts over; leaving it at the bound would make every later dispatch repeat
-   * a scan of a group that has nothing to give. */
+  /* Age order and the count bound order the queues, they do not close the own
+   * queue: with the group offering nothing this CPU may take, serving the own
+   * queue still beats leaving the slot idle. The group gave nothing up, so a
+   * grant here costs it nothing and the count starts over; leaving the count at
+   * the bound would make every later dispatch repeat a scan of a group that has
+   * nothing to give. */
   if (!own_first) {
     result = admit_from(cpu, owner, cpu);
     if (result == ADMIT_GRANTED) {
@@ -524,7 +561,8 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
                cv_parked, cv_parked_now, cv_flushed, cv_expired);
   scx_bpf_dump("accordin cv calls=%llu misses=%llu drained=%llu\n",
                cv_flush_calls, cv_flush_misses, cv_drained);
-  scx_bpf_dump("accordin groups=%u own_limit=%u\n", group_count, own_limit);
+  scx_bpf_dump("accordin groups=%u own_limit=%u own_slack_ns=%llu\n",
+               group_count, own_limit, own_slack_ns);
   bpf_for(cpu, 0, MAX_CPUS) {
     volatile __u64 *owner = owner_slot(cpu);
     if (owner && *owner)
@@ -645,6 +683,9 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       if (!tctx || !tctx->parked_at)
         continue;
       task_cpu = scx_bpf_task_cpu(p);
+      /* The age stamp a released wait carries into the admission queue is the
+       * moment it parked, so the grant rule ranks it by the wait it has already
+       * served rather than by the moment it was handed over. */
       target = waiting_dsq(task_cpu);
       /* Running in the process's own context, an unreadable word is not a
        * notification and cannot be confirmed later either. */

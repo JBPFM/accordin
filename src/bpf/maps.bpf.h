@@ -87,6 +87,9 @@ volatile __u32 group_member[MAX_GROUPS][MAX_GROUP_SIZE];
 /* How many grants in a row a CPU may take out of its own queue before it has
  * to look at its group; zero lifts the bound. */
 volatile __u32 own_limit;
+/* How much younger than the oldest head of its group the head of a CPU's own
+ * queue may be and still be served; zero holds the group in strict age order. */
+volatile __u64 own_slack_ns;
 
 /* Rotating start of the group scan, so members of equal depth take turns
  * instead of always losing to the lowest CPU id. */

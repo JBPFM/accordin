@@ -57,7 +57,9 @@ the queue iterator. `5b25e15` then makes the bank a set of priority queues
 ordered by that stamp — the lock-waiter insert and the flush's move both place
 by age, so the head is the oldest by construction and the flush's head and tail
 flags no longer place anything — and reads the heads through the kernel's
-lockless queue peek where it resolves.
+lockless queue peek where it resolves. All of these were later rebased onto
+`ded83aa` and merged; the sessions below name their pre-rebase identities, and
+the Decision section maps each to the commit that carries it now.
 
 The reference point is `934bd1c`, the commit before the series. `9520d7d` is
 the last change of the custody mechanism itself and is carried as an
@@ -79,14 +81,66 @@ cost to weigh against those four workloads rather than as a gate of their own.
 
 ## Decision
 
-Under that rule the series ends at `ded83aa`, the sharded admission queue plus
-the admission-walk cleanup measured on top of it: neither the shared notify
-slot nor the dispatch-side release passed validation.
+**The accepted tip of `cv_admission` is `4b3b0a8`.** The custody series itself
+ended at `ded83aa`, the sharded admission queue plus the admission-walk
+cleanup: neither the shared notify slot nor the dispatch-side release passed
+validation. The own-queue work that followed was then rebased onto `ded83aa`
+and the branch fast-forwarded, so the code tip is now `4b3b0a8`. The merge was
+made on the strength of the single-repeat screens, at the user's decision,
+without the multi-repeat confirmation the acceptance rule above asks for; that
+confirmation is still owed.
+
+**The shipped configuration.** One admission queue per CPU rather than
+thirty-two hash shards. A CPU with a free slot serves its own queue while that
+queue's head is within `ACCORDIN_OWN_SLACK_US` of the oldest head in its
+topology group, otherwise the queue holding the oldest head; the groups are
+eight CPUs of one NUMA node. The defaults at the tip are a slack of 100 µs, a
+group size of 8 and `ACCORDIN_OWN_LIMIT` at 0, so no count bound limits
+consecutive own-queue grants and the head ages decide alone. The bank is held
+as age-ordered priority queues, so a queue head is the oldest request by
+construction; the flush walks the custody queue from its head and its tail
+placement flag is gone.
+
+**The measured trade**, from the `peek` screen, one run per cell. `fillrandom`
+gains about 11–12 % over `ded83aa` on both backends (250.956 against 224.397
+Kops/s and 246.056 against 220.059). Per-thread fairness on a saturated mutex
+lands between `ded83aa` and the unbounded own-queue preference: at 100 ns the
+factor reads 0.5260 and 0.5528 against 0.5184 and 0.5230 for `ded83aa` in the
+same session, and against 0.6275 and 0.6133 for the unbounded own-queue arm as
+the `bounded` session measured it. `readrandom` and streamcluster stay inside
+the noise of these single runs.
+
+**Open items.**
+
+- The multi-repeat confirmation of the tip across the seven workloads is still
+  owed; every figure supporting the merge comes from one run per cell.
+- Cross-group service is reached only when both the own queue and the topology
+  group have nothing, so a queue starved by its own group's traffic is served
+  late.
+- A released condvar waiter carries its park time, so an old park outranks the
+  lock waiters of its group; the effect of that on lock-heavy phases is not
+  measured.
+- The flush's walk order interacts with a width cap: walking from the head
+  hands over the oldest parks first, and no session has measured a capped
+  width against the uncapped default.
+
+**The map from the screens' commits to the tip's history.** The screened
+commits were rebased, so the sessions above name their pre-rebase identities.
+
+| in the sessions | on `cv_admission` | what it is |
+|---|---|---|
+| `1189963` | `158f798` | one admission queue per CPU |
+| `cec374b` | `8f1bbcb` | own queue served first, unbounded |
+| `bf7080f` | `e537dbb` | bounded own preference with topology groups |
+| `8fe30c4` | `37d2ef2` | grant count restarted after a fallback grant |
+| `f1a5cf3` | `a9a4338` | grants ordered by queue-head age |
+| `5b25e15` | `0e92abe` | age-ordered bank read through the lockless peek |
+| — | `4b3b0a8` | shipped defaults: no count bound, flush from the head |
 
 - **`46180cd`, sharding with the home-CPU idle kick, is kept.** Branch
-  `cv_admission` was reset to it and now carries the cleanup commit `ded83aa`
-  on top, which the `final` session measures as neutral. `ded83aa` is the
-  accepted tip.
+  `cv_admission` was reset to it and then carried the cleanup commit `ded83aa`
+  on top, which the `final` session measures as neutral. `ded83aa` was the
+  accepted tip of the custody series and is the base of everything above.
 - **`5c53e20`, the shared notify slot, was not kept on its own.** Against the
   `shard` arm of its own session it takes `fillrandom` from 225.443 to 229.930
   Kops/s and from 226.603 to 233.110 (1.020x and 1.029x) at a CV of 3.6–4.4 %,
@@ -109,21 +163,14 @@ slot nor the dispatch-side release passed validation.
   192 threads, most of it on the least-served thread. A single-repeat screen of
   two follow-up commits on `cv_percpu_queue` shows one queue per CPU id
   reproducing that spread, so it is not the shard geometry; the spread stays an
-  open cost of sharding, and neither follow-up commit joins `cv_admission`,
-  whose tip remains `ded83aa`. The own-queue probe of `cec374b` is left on that
-  branch as a throughput-against-fairness trade for the user to decide. The
-  bounded form of that probe, `bf7080f` on branch `cv_owner_fair`, screens well
-  — it keeps the `fillrandom` gain and gives back much of the fairness — but
-  its follow-up `8fe30c4` has not been measured, so nothing from that branch
-  joins the tip either. Two later commits there, `f1a5cf3` and `5b25e15`,
-  replace population with waiting time as the thing a grant follows and screen
-  better than the bounded count on fairness while keeping most of the
-  `fillrandom` gain; they too await a multi-repeat confirm, so the tip is
-  unchanged. The sharding tip
-  is kept regardless: on the same commits `fillrandom` runs at 3.77x and 3.73x
-  of the `custody` arm and streamcluster at 0.517x and 0.514x of the baseline's
-  seconds, so the gains on the workloads that park dominate the microbenchmark
-  cost.
+  open cost of sharding that the per-CPU queues alone do not remove. The
+  own-queue screens that follow answer it instead: the unbounded probe buys
+  throughput at a clear fairness cost, the count bound gives much of it back,
+  and the age rule of the shipped tip gives back more while keeping most of
+  the throughput. Sharding itself is kept regardless: on the same commits
+  `fillrandom` runs at 3.77x and 3.73x of the `custody` arm and streamcluster
+  at 0.517x and 0.514x of the baseline's seconds, so the gains on the workloads
+  that park dominate the microbenchmark cost.
 - Both commits, and a tidy-up `da90297` of the release path and its tests, are
   kept on branch `cv_slot_release` for the record; the `readrandom`
   attribution variants are on branch `readrandom-attrib`. Neither branch is
@@ -433,8 +480,9 @@ from.
 
 ### `final/leveldb` — admission-walk cleanup, LevelDB
 
-`tidy` is `ded83aa`, the tip of `cv_admission`: `46180cd` plus the
-admission-walk cleanup and nothing else — an early stop when a slot is lost, an
+`tidy` is `ded83aa`, which was the tip of `cv_admission` when this session ran
+and is now the base of the merged own-queue work described in the Decision
+section: `46180cd` plus the admission-walk cleanup and nothing else — an early stop when a slot is lost, an
 unbiased cursor, and a shard-id helper.
 
 | arm | commit | env | backend | fill n | fill Kops/s | CV% | rel | read n | read Kops/s | CV% | rel |
@@ -1170,8 +1218,9 @@ the same band (1.032x and 0.976x, CV at or below 1.61 %). Streamcluster is
 nothing at CV 54–124 %. The custody counters match arm for arm on all four
 workloads. The cleanup is kept for what the verifier reports rather than for
 throughput: it takes the dispatch program from 342 instructions to 256 and
-leaves enqueue and the flush at their `46180cd` counts. `ded83aa` is the
-accepted tip of `cv_admission`.
+leaves enqueue and the flush at their `46180cd` counts. `ded83aa` closed the
+custody series as the accepted tip; the Decision section records the merge that
+has since moved the branch past it.
 
 ### Pure-mutex cost of the admission-side changes — carried
 
@@ -1305,8 +1354,9 @@ against 114.653 on `mcs_accordin` — though on `mcs_tas_accordin` it reads
 0.954x of the tip. `percpu` on its own lands inside single-run noise on every
 workload.
 
-Neither commit is on `cv_admission`; the tip stays `ded83aa` and both stay on
-`cv_percpu_queue`. The own-queue probe is recorded as a throughput-against-
+Neither commit was on `cv_admission` when this was written; the tip was
+`ded83aa` and both stayed on `cv_percpu_queue`. Both are in the branch's
+history now, rebased, as the Decision section records. The own-queue probe is recorded as a throughput-against-
 fairness trade to be decided by whoever needs one or the other, not settled
 here. The experiment it suggests is a bounded form — serve the dispatching
 CPU's own queue at most a few times before advancing the rotation — which would
@@ -1357,8 +1407,9 @@ The walk is not free: the commit's own validation note reports the dispatch
 program at 8159 instructions with enqueue unchanged at 415, against 256 and 415
 at the tip. Adoption waits on a multi-repeat confirm of `8fe30c4`, which
 restarts the grant count after a fallback own grant and so changes the cadence
-this screen measured; until then `bf7080f` and `8fe30c4` stay on
-`cv_owner_fair` and the tip of `cv_admission` remains `ded83aa`.
+this screen measured; at the time of writing `bf7080f` and `8fe30c4` stayed on
+`cv_owner_fair` and the tip of `cv_admission` was `ded83aa`. Both were later
+merged, in rebased form, with the count bound off by default.
 
 ### Age-ordered grants — the best screen so far, still unconfirmed
 
@@ -1401,7 +1452,8 @@ oldest request by construction and the flush's placement flags stop mattering.
 
 Adoption waits on a multi-repeat confirm of `5b25e15` at slack 100 across the
 workloads that decided the series, since everything above rests on one run per
-cell. Until then the branch stays off `cv_admission`.
+cell. That confirmation is still owed: the branch was merged before it, on the
+strength of these screens, and the Decision section records what was shipped.
 
 ## Machine state, not code: the reboot observation
 

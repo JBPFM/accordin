@@ -38,11 +38,23 @@ worktree's `lib<adapter>_original.so`, `LD_LIBRARY_PATH` is the worktree's
 the matching direct library.
 
 `ACCORDIN_CV_FLUSH_FLAGS` carries most of the per-arm overrides used so far.
-It is the bit set of `src/bpf/intf.h` — `EXPIRE` 1, `REV` 2, `TAIL` 4,
-`MOVE` 8, `SPREAD` 16 — and defaults to `MOVE|REV` = 10. The `custody-tail`
-arm passes 12 (`MOVE|TAIL`, appending moved waits to the admission queue
-instead of inserting them at its head) and the `shard-spread` arm passes 26
-(`MOVE|REV|SPREAD`, sweeping every free admission slot after a release).
+At the branch tip it is the bit set of `src/bpf/intf.h` — `EXPIRE` 1, `REV` 2,
+`MOVE` 8, `SPREAD` 16, with bit 4 carrying no meaning any more — and
+`src/runtime.c` defaults it to `MOVE` = 8. The values recorded in
+[RESULTS.md](RESULTS.md) were measured on the commits named there, where bit 4
+selected tail placement: the `custody-tail` arm passed 12 (`MOVE|TAIL`,
+appending moved waits to the admission queue instead of inserting them at its
+head) and the `shard-spread` arm passed 26 (`MOVE|REV|SPREAD`, sweeping every
+free admission slot after a release, which the tip still accepts). Placement in
+the admission bank now follows the age stamp a waiter carries, so no flag
+selects it.
+
+Three knobs come with the merged own-queue rule. `ACCORDIN_OWN_SLACK_US`
+(default 100) is how much younger a CPU's own queue head may be than the oldest
+head of its topology group before the grant goes to that oldest head instead.
+`ACCORDIN_OWN_LIMIT` (default 0) optionally caps consecutive own-queue grants,
+and 0 leaves the head ages as the only rule. `ACCORDIN_GROUP_SIZE` (default 8)
+is how many CPUs of one NUMA node share a topology group.
 
 `ACCORDIN_CV_SCAN=0`, which the `scan-off` arm uses to switch off the release
 passes running from `ops.dispatch` and the custody timer and leave the

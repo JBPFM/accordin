@@ -166,21 +166,109 @@ selected by pointing those two variables at its own `target/release`, and
 `metadata.json`, serves every arm; initialise the submodule with
 `git submodule update --init bench/mutexbench` if it is empty.
 
-Each measured point is a `--pairs CRITICAL_NS:OUTSIDE_NS` workload,
-`--threads 192` (`run.py`'s count), `--duration-ms 5000 --warmup-ms 1000`,
-`--workload single --timing-sample-stride 8 --timeslice-extension off`. A run
-is valid under the same rules, with `throughput_ops_per_sec` above zero and the
-`eBPF scheduler loaded successfully` marker in place of the `BENCH_TOTAL`
-check, and `EXIT:` added to the log error pattern. `summary.md` carries one
-throughput table per pair × backend in Mops/s, a mean `avg_lock_hold_ns` /
-`avg_wait_ns_estimated` table, the mean `[accordin_cv]` counters, which stay at
-zero here, and the invalid-run list.
+Two workload shapes share the harness, selected by `--workload`, and both run at
+`--duration-ms 5000 --warmup-ms 1000 --timeslice-extension off` by default. A
+run is valid under the same rules, with `throughput_ops_per_sec` above zero and
+the `eBPF scheduler loaded successfully` marker in place of the `BENCH_TOTAL`
+check, and `EXIT:` added to the log error pattern.
+
+`--threads` takes a list, `192` (`run.py`'s count) alone by default, and every
+count multiplies the workload points: each point is one shape at one thread
+count, labelled `<shape>-t<count>`, and that label is stored as the sample's
+`benchmark`, so resuming a session and the per-cell attempt budget stay per
+point and per thread count for both shapes.
+
+### Single lock
+
+`--workload single` (the default) measures one contended lock. Each shape is a
+`--pairs CRITICAL_NS:OUTSIDE_NS` timing.
+
+Every run also prints how many operations each thread completed, and the
+harness turns that line into the sample's fairness factor: the share of all
+operations taken by the busier half of the threads. A perfectly even split
+gives 0.5, and 1.0 means half the threads never acquired the lock, so the
+factor separates a scheduler that spreads the lock across all waiters from one
+that keeps handing it back to a subset at the same throughput. The per-thread
+minimum, maximum and mean operation counts are recorded alongside it, and the
+raw counters stay in the sample. These fields are recorded whenever the line is
+present; `--per-thread` additionally makes a run invalid unless the line covers
+exactly the requested thread count.
+
+`summary.md` carries one throughput table per point × backend in Mops/s, a mean
+`avg_lock_hold_ns` / `avg_wait_ns_estimated` table, a fairness table with the
+mean, minimum and maximum factor over the runs, the mean per-thread minimum and
+maximum operation counts and the per-run factors, the mean `[accordin_cv]`
+counters, which stay at zero here, and the invalid-run list.
 
 ```sh
 sudo -n python3 docs/benchmarks/cv-custody-20260906/mutexbench.py \
     --arm baseline=934bd1c --arm shard=<sha> --arm tidy=<sha> \
     --pairs 100:3000 300:3000 --repeats 5 \
     --out target/cv-custody-20260906/mutexbench-<name>
+```
+
+The fairness sweep of the multi-lock experiment's seventh experiment is the
+same shape at four critical sections and three thread counts:
+
+```sh
+sudo -n python3 docs/benchmarks/cv-custody-20260906/mutexbench.py \
+    --arm baseline=934bd1c --arm custody=<sha> --arm shard=<sha> --arm tidy=<sha> \
+    --pairs 100:3000 300:3000 1000:3000 30000:3000 --threads 48 96 192 \
+    --warmup-ms 2000 --duration-ms 8000 --repeats 3 --per-thread \
+    --out target/cv-custody-20260906/exp7-<name>
+```
+
+### Two locks, two groups
+
+`--workload two-lock --cases ...` measures fairness between two thread groups
+that never share a lock. The threads are split in half — 96 and 96 at 192 — and
+each half loops on its own mutex with its own critical and outside timing, so
+the only thing the groups compete for is CPU. A group that the scheduler starves
+loses throughput without any lock handoff explaining it, which is what makes
+this shape a fairness probe rather than a contention probe.
+
+Each `--cases` name selects one timing combination, matching the two-lock cases
+of the multi-lock experiment:
+
+| case | group A critical / outside ns | group B critical / outside ns |
+|---|---|---|
+| `homogeneous` | 300 / 3000 | 300 / 3000 |
+| `heterogeneous_mild` | 3000 / 3000 | 300 / 3000 |
+| `heterogeneous_extreme` | 3000 / 300 | 100 / 3000 |
+
+`homogeneous` gives both groups the same shape, so any split away from an even
+one comes from the scheduler. The heterogeneous cases give group A the longer
+critical section, and `heterogeneous_extreme` also makes group A far more lock
+hungry by shortening its outside work, which is where a policy that favours
+long holders or high arrival rates shows up as a group-level shift.
+
+The metrics parsed from each run are the total `throughput_ops_per_sec`,
+`fairness_jain`, and per group `throughput_ops_per_sec`,
+`normalized_efficiency`, `normalized_slowdown` and `avg_wait_ns_estimated`.
+A group's normalized efficiency is its measured throughput over the throughput
+its timing would allow with no contention, and its normalized slowdown is the
+reciprocal, so a slowdown of 10 means the group ran an order of magnitude below
+its own ideal. `fairness_jain` is the Jain index of the two normalized
+efficiencies: 1.0 when both groups are held back to the same degree, and
+approaching 0.5 when one group keeps its share while the other is squeezed out.
+The index compares the two groups against their own ideals rather than against
+each other, so a case whose groups have different ideal rates can still reach
+1.0. A run is additionally invalid when either group finished with no
+operations or when the fairness line is missing.
+
+`summary.md` carries one table per case × backend with the arm, its commit, the
+valid and invalid counts, mean total Mops/s with CV% and the ratio against the
+first arm, the mean, minimum and maximum `fairness_jain` with the per-run
+values, the mean per-group throughput, and the mean per-group normalized
+slowdown. `summary.json` keeps every parsed metric, including the per-group wait
+estimates, as a mean and as the list of per-run values.
+
+```sh
+sudo -n python3 docs/benchmarks/cv-custody-20260906/mutexbench.py \
+    --arm baseline=934bd1c --arm custody=<sha> --arm shard=<sha> --arm tidy=<sha> \
+    --workload two-lock \
+    --cases homogeneous heterogeneous_mild heterogeneous_extreme \
+    --repeats 5 --out target/cv-custody-20260906/fairness-<name>
 ```
 
 ## Differences from leveldb-branches-20260906

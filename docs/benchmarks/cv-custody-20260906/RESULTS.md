@@ -27,7 +27,13 @@ sharded queue, is measured for neutrality rather than for a gain.
 A fifth workload joined once the tip was chosen: `mutex_bench` from
 `bench/mutexbench` in direct-lock mode, a pure mutex loop with no condition
 variables, run to price the admission-side changes on a workload where custody
-never engages.
+never engages. A sixth asks whether that price is paid evenly: the two-lock
+fairness workload of `experiments/run_experiment_six.py`, driven through the
+same runner, splits the threads into two groups on two locks and reads the Jain
+index of their normalized efficiencies alongside total throughput. A seventh
+asks the same question one level down, between individual threads on a single
+lock: the shape of `experiments/run_experiment_seven.py`, which counts each
+thread's operations and reports the share taken by the busier half.
 
 The reference point is `934bd1c`, the commit before the series. `9520d7d` is
 the last change of the custody mechanism itself and is carried as an
@@ -73,10 +79,15 @@ slot nor the dispatch-side release passed validation.
   it builds on was degraded by the change.
 - **The pure-mutex cost is carried.** `mutex_bench` prices the admission-side
   changes at up to 7 % below `934bd1c`, about half of that already present at
-  `9520d7d`. The sharding tip is kept regardless: on the same commits
-  `fillrandom` runs at 3.77x and 3.73x of the `custody` arm and streamcluster
-  at 0.517x and 0.514x of the baseline's seconds, so the gains on the workloads
-  that park dominate the microbenchmark cost.
+  `9520d7d`, and the two-lock fairness workload shows that cost falling on one
+  group rather than on both, with no arm unfair on any case. Between individual
+  threads the picture is different: sharding widens the per-thread spread at
+  192 threads, most of it on the least-served thread, and that is recorded here
+  as an open cost of sharding rather than something this series resolves. The sharding tip
+  is kept regardless: on the same commits `fillrandom` runs at 3.77x and 3.73x
+  of the `custody` arm and streamcluster at 0.517x and 0.514x of the baseline's
+  seconds, so the gains on the workloads that park dominate the microbenchmark
+  cost.
 - Both commits, and a tidy-up `da90297` of the release path and its tests, are
   kept on branch `cv_slot_release` for the record; the `readrandom`
   attribution variants are on branch `readrandom-attrib`. Neither branch is
@@ -91,7 +102,7 @@ slot nor the dispatch-side release passed validation.
   throughput.
 - The host was rebooted early on 2026-09-07 UTC. Every session in the tables
   below except the last two ran after that reboot, between 14:45 UTC on
-  2026-09-07 and 00:20 UTC on 2026-09-08, with the host up for 12 h or more.
+  2026-09-07 and 01:04 UTC on 2026-09-08, with the host up for 12 h or more.
 - The machine drifts within a single day. The `fillrandom` / `mcs_accordin`
   baseline anchor alone reads 51.287, 47.100 and 52.551 Kops/s in three
   sessions a few hours apart, and 31.152 Kops/s on the day before the reboot.
@@ -488,6 +499,130 @@ Pair 300 ns / 3000 ns:
 
 No attempt in this session was invalid.
 
+### `fairness-final` — two-lock fairness
+
+The two-lock workload of `experiments/run_experiment_six.py` run through the
+same runner: 192 threads split into two groups of 96, each group on its own
+lock, five repeats of 5 s after a 1 s warmup, all 120 runs valid. `Mops/s` is
+the total of both groups and `rel` is against `baseline`. `Jain` is the index
+over the two groups' normalized efficiencies, where 1.0000 means both groups
+are held back equally against their own contention-free ideal; the parenthesis
+gives the minimum and maximum over the five runs. `A` and `B` are the two
+groups, and a slowdown is a group's own factor against that ideal. There are no
+condition variables here either, so the custody counters read zero on every
+arm.
+
+Homogeneous — both groups at 300 ns critical / 3000 ns outside:
+
+| arm | commit | backend | n | Mops/s | CV% | rel | Jain (min–max) | A Mops/s | B Mops/s | A slow | B slow |
+|---|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|
+| baseline | `934bd1c` | mcs_accordin_direct | 5/0 | 3.224 | 4.20 | 1.000x | 1.0000 (1.0000–1.0000) | 1.613 | 1.611 | 18.07 | 18.08 |
+| custody | `9520d7d` | mcs_accordin_direct | 5/0 | 2.978 | 4.23 | 0.924x | 1.0000 (0.9999–1.0000) | 1.482 | 1.496 | 19.66 | 19.48 |
+| shard | `46180cd` | mcs_accordin_direct | 5/0 | 3.026 | 3.32 | 0.939x | 1.0000 (0.9999–1.0000) | 1.517 | 1.509 | 19.20 | 19.29 |
+| tidy | `ded83aa` | mcs_accordin_direct | 5/0 | 3.005 | 6.63 | 0.932x | 1.0000 (0.9999–1.0000) | 1.506 | 1.499 | 19.37 | 19.49 |
+| baseline | `934bd1c` | mcs_tas_accordin_direct | 5/0 | 2.922 | 4.36 | 1.000x | 1.0000 (1.0000–1.0000) | 1.465 | 1.457 | 19.89 | 19.99 |
+| custody | `9520d7d` | mcs_tas_accordin_direct | 5/0 | 2.857 | 2.04 | 0.978x | 0.9999 (0.9998–1.0000) | 1.424 | 1.433 | 20.43 | 20.31 |
+| shard | `46180cd` | mcs_tas_accordin_direct | 5/0 | 2.811 | 4.32 | 0.962x | 1.0000 (1.0000–1.0000) | 1.406 | 1.405 | 20.72 | 20.74 |
+| tidy | `ded83aa` | mcs_tas_accordin_direct | 5/0 | 2.871 | 6.92 | 0.982x | 0.9999 (0.9997–1.0000) | 1.433 | 1.438 | 20.41 | 20.29 |
+
+Heterogeneous, mild — group A at 3000 ns / 3000 ns against group B at
+300 ns / 3000 ns:
+
+| arm | commit | backend | n | Mops/s | CV% | rel | Jain (min–max) | A Mops/s | B Mops/s | A slow | B slow |
+|---|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|
+| baseline | `934bd1c` | mcs_accordin_direct | 5/0 | 0.823 | 7.71 | 1.000x | 0.9412 (0.9222–0.9568) | 0.205 | 0.618 | 78.95 | 47.25 |
+| custody | `9520d7d` | mcs_accordin_direct | 5/0 | 0.840 | 6.22 | 1.021x | 0.9480 (0.9355–0.9553) | 0.214 | 0.626 | 75.10 | 46.59 |
+| shard | `46180cd` | mcs_accordin_direct | 5/0 | 0.781 | 1.70 | 0.949x | 0.9726 (0.9666–0.9817) | 0.220 | 0.561 | 72.73 | 51.87 |
+| tidy | `ded83aa` | mcs_accordin_direct | 5/0 | 0.750 | 6.21 | 0.912x | 0.9641 (0.9540–0.9755) | 0.204 | 0.546 | 78.95 | 53.36 |
+| baseline | `934bd1c` | mcs_tas_accordin_direct | 5/0 | 0.918 | 3.37 | 1.000x | 0.9469 (0.9457–0.9494) | 0.233 | 0.685 | 68.84 | 42.49 |
+| custody | `9520d7d` | mcs_tas_accordin_direct | 5/0 | 0.922 | 2.99 | 1.004x | 0.9480 (0.9435–0.9514) | 0.234 | 0.687 | 68.26 | 42.38 |
+| shard | `46180cd` | mcs_tas_accordin_direct | 5/0 | 0.826 | 6.00 | 0.900x | 0.9681 (0.9623–0.9743) | 0.228 | 0.598 | 70.37 | 48.82 |
+| tidy | `ded83aa` | mcs_tas_accordin_direct | 5/0 | 0.818 | 4.37 | 0.891x | 0.9666 (0.9631–0.9701) | 0.224 | 0.594 | 71.46 | 49.09 |
+
+Heterogeneous, extreme — group A at 3000 ns / 300 ns against group B at
+100 ns / 3000 ns:
+
+| arm | commit | backend | n | Mops/s | CV% | rel | Jain (min–max) | A Mops/s | B Mops/s | A slow | B slow |
+|---|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|
+| baseline | `934bd1c` | mcs_accordin_direct | 5/0 | 0.574 | 7.99 | 1.000x | 0.8718 (0.8383–0.8905) | 0.170 | 0.404 | 173.51 | 76.91 |
+| custody | `9520d7d` | mcs_accordin_direct | 5/0 | 0.556 | 9.85 | 0.969x | 0.8576 (0.8104–0.8768) | 0.159 | 0.397 | 188.34 | 78.29 |
+| shard | `46180cd` | mcs_accordin_direct | 5/0 | 0.593 | 7.40 | 1.034x | 0.8850 (0.8545–0.9147) | 0.183 | 0.410 | 161.76 | 75.56 |
+| tidy | `ded83aa` | mcs_accordin_direct | 5/0 | 0.589 | 5.17 | 1.026x | 0.8877 (0.8642–0.8993) | 0.182 | 0.407 | 160.64 | 76.20 |
+| baseline | `934bd1c` | mcs_tas_accordin_direct | 5/0 | 0.699 | 3.89 | 1.000x | 0.9445 (0.9244–0.9540) | 0.255 | 0.445 | 114.19 | 69.83 |
+| custody | `9520d7d` | mcs_tas_accordin_direct | 5/0 | 0.705 | 1.80 | 1.007x | 0.9427 (0.9343–0.9476) | 0.255 | 0.449 | 114.00 | 68.95 |
+| shard | `46180cd` | mcs_tas_accordin_direct | 5/0 | 0.706 | 2.76 | 1.010x | 0.9422 (0.9283–0.9496) | 0.255 | 0.451 | 113.93 | 68.78 |
+| tidy | `ded83aa` | mcs_tas_accordin_direct | 5/0 | 0.693 | 1.93 | 0.991x | 0.9479 (0.9432–0.9545) | 0.255 | 0.438 | 114.06 | 70.78 |
+
+### `exp7-final` — per-thread fairness
+
+The single-lock workload of `experiments/run_experiment_seven.py` run through
+the same runner with per-thread accounting: critical sections of 100, 300, 1000
+and 30000 ns against a 3000 ns outside section, thread counts 48, 96 and 192,
+8 s measured after a 2 s warmup, three repeats, all 288 runs valid. `fairness`
+is the share of all operations taken by the busier half of the threads, so
+0.5000 is an even split and 1.0000 is one half of the threads doing everything;
+the parenthesis gives the minimum and maximum over the three runs. `min ops`
+and `max ops` are the mean least-served and best-served thread counts. No
+condition variables are involved, so the custody counters read zero.
+
+At 192 threads:
+
+| critical | arm | commit | backend | n | Mops/s | rel | fairness (min–max) | min ops | max ops |
+|---|---|---|---|---|---:|---:|---|---:|---:|
+| 100 ns | baseline | `934bd1c` | mcs_accordin_direct | 3/0 | 2.662 | 1.000x | 0.5130 (0.5126–0.5134) | 101727 | 120254 |
+| 100 ns | custody | `9520d7d` | mcs_accordin_direct | 3/0 | 2.603 | 0.978x | 0.5132 (0.5121–0.5137) | 98873 | 117668 |
+| 100 ns | shard | `46180cd` | mcs_accordin_direct | 3/0 | 2.648 | 0.995x | 0.5183 (0.5177–0.5186) | 97869 | 125348 |
+| 100 ns | tidy | `ded83aa` | mcs_accordin_direct | 3/0 | 2.628 | 0.987x | 0.5188 (0.5180–0.5194) | 97062 | 123663 |
+| 100 ns | baseline | `934bd1c` | mcs_tas_accordin_direct | 3/0 | 2.396 | 1.000x | 0.5171 (0.5159–0.5196) | 88146 | 117795 |
+| 100 ns | custody | `9520d7d` | mcs_tas_accordin_direct | 3/0 | 2.275 | 0.949x | 0.5201 (0.5185–0.5230) | 84085 | 112401 |
+| 100 ns | shard | `46180cd` | mcs_tas_accordin_direct | 3/0 | 2.304 | 0.961x | 0.5251 (0.5222–0.5289) | 84253 | 115962 |
+| 100 ns | tidy | `ded83aa` | mcs_tas_accordin_direct | 3/0 | 2.354 | 0.982x | 0.5229 (0.5210–0.5247) | 84998 | 118089 |
+| 300 ns | baseline | `934bd1c` | mcs_accordin_direct | 3/0 | 1.544 | 1.000x | 0.5197 (0.5177–0.5213) | 56425 | 73469 |
+| 300 ns | custody | `9520d7d` | mcs_accordin_direct | 3/0 | 1.487 | 0.963x | 0.5191 (0.5178–0.5203) | 54449 | 70750 |
+| 300 ns | shard | `46180cd` | mcs_accordin_direct | 3/0 | 1.476 | 0.956x | 0.5301 (0.5267–0.5338) | 49880 | 75273 |
+| 300 ns | tidy | `ded83aa` | mcs_accordin_direct | 3/0 | 1.517 | 0.982x | 0.5282 (0.5266–0.5312) | 51865 | 76441 |
+| 300 ns | baseline | `934bd1c` | mcs_tas_accordin_direct | 3/0 | 1.357 | 1.000x | 0.5281 (0.5270–0.5291) | 47375 | 74280 |
+| 300 ns | custody | `9520d7d` | mcs_tas_accordin_direct | 3/0 | 1.321 | 0.973x | 0.5309 (0.5289–0.5331) | 46993 | 72331 |
+| 300 ns | shard | `46180cd` | mcs_tas_accordin_direct | 3/0 | 1.379 | 1.016x | 0.5348 (0.5311–0.5376) | 44503 | 74444 |
+| 300 ns | tidy | `ded83aa` | mcs_tas_accordin_direct | 3/0 | 1.322 | 0.974x | 0.5388 (0.5347–0.5414) | 42759 | 74722 |
+| 1000 ns | baseline | `934bd1c` | mcs_accordin_direct | 3/0 | 0.610 | 1.000x | 0.5285 (0.5263–0.5300) | 20958 | 30742 |
+| 1000 ns | custody | `9520d7d` | mcs_accordin_direct | 3/0 | 0.593 | 0.973x | 0.5277 (0.5266–0.5291) | 20152 | 29709 |
+| 1000 ns | shard | `46180cd` | mcs_accordin_direct | 3/0 | 0.607 | 0.995x | 0.5456 (0.5442–0.5480) | 18168 | 34764 |
+| 1000 ns | tidy | `ded83aa` | mcs_accordin_direct | 3/0 | 0.604 | 0.991x | 0.5455 (0.5425–0.5487) | 17630 | 33509 |
+| 1000 ns | baseline | `934bd1c` | mcs_tas_accordin_direct | 3/0 | 0.617 | 1.000x | 0.5432 (0.5379–0.5496) | 20110 | 36939 |
+| 1000 ns | custody | `9520d7d` | mcs_tas_accordin_direct | 3/0 | 0.608 | 0.986x | 0.5466 (0.5421–0.5520) | 19894 | 36436 |
+| 1000 ns | shard | `46180cd` | mcs_tas_accordin_direct | 3/0 | 0.611 | 0.990x | 0.5602 (0.5567–0.5626) | 17172 | 38292 |
+| 1000 ns | tidy | `ded83aa` | mcs_tas_accordin_direct | 3/0 | 0.590 | 0.956x | 0.5591 (0.5550–0.5640) | 17320 | 36635 |
+| 30000 ns | baseline | `934bd1c` | mcs_accordin_direct | 3/0 | 0.023 | 1.000x | 0.6509 (0.6446–0.6543) | 279 | 2212 |
+| 30000 ns | custody | `9520d7d` | mcs_accordin_direct | 3/0 | 0.024 | 1.010x | 0.6477 (0.6447–0.6507) | 176 | 2217 |
+| 30000 ns | shard | `46180cd` | mcs_accordin_direct | 3/0 | 0.022 | 0.947x | 0.6952 (0.6821–0.7033) | 93 | 2537 |
+| 30000 ns | tidy | `ded83aa` | mcs_accordin_direct | 3/0 | 0.024 | 1.005x | 0.6970 (0.6865–0.7027) | 94 | 2790 |
+| 30000 ns | baseline | `934bd1c` | mcs_tas_accordin_direct | 3/0 | 0.027 | 1.000x | 0.6466 (0.6434–0.6484) | 250 | 2393 |
+| 30000 ns | custody | `9520d7d` | mcs_tas_accordin_direct | 3/0 | 0.027 | 1.003x | 0.6455 (0.6362–0.6542) | 300 | 2414 |
+| 30000 ns | shard | `46180cd` | mcs_tas_accordin_direct | 3/0 | 0.026 | 0.996x | 0.6900 (0.6772–0.6996) | 155 | 2972 |
+| 30000 ns | tidy | `ded83aa` | mcs_tas_accordin_direct | 3/0 | 0.026 | 0.989x | 0.7035 (0.6823–0.7142) | 122 | 2917 |
+
+Mean fairness at the two lower thread counts, one column per arm:
+
+| threads | critical | backend | baseline | custody | shard | tidy |
+|---|---|---|---:|---:|---:|---:|
+| 48 | 100 ns | mcs_accordin_direct | 0.5037 | 0.5021 | 0.5025 | 0.5025 |
+| 48 | 100 ns | mcs_tas_accordin_direct | 0.5047 | 0.5034 | 0.5058 | 0.5043 |
+| 48 | 300 ns | mcs_accordin_direct | 0.5034 | 0.5019 | 0.5022 | 0.5022 |
+| 48 | 300 ns | mcs_tas_accordin_direct | 0.5045 | 0.5063 | 0.5069 | 0.5072 |
+| 48 | 1000 ns | mcs_accordin_direct | 0.5023 | 0.5024 | 0.5022 | 0.5021 |
+| 48 | 1000 ns | mcs_tas_accordin_direct | 0.5073 | 0.5143 | 0.5138 | 0.5155 |
+| 48 | 30000 ns | mcs_accordin_direct | 0.5029 | 0.5027 | 0.5030 | 0.5033 |
+| 48 | 30000 ns | mcs_tas_accordin_direct | 0.5332 | 0.5455 | 0.5432 | 0.5429 |
+| 96 | 100 ns | mcs_accordin_direct | 0.5065 | 0.5068 | 0.5079 | 0.5078 |
+| 96 | 100 ns | mcs_tas_accordin_direct | 0.5111 | 0.5134 | 0.5129 | 0.5131 |
+| 96 | 300 ns | mcs_accordin_direct | 0.5091 | 0.5088 | 0.5115 | 0.5113 |
+| 96 | 300 ns | mcs_tas_accordin_direct | 0.5157 | 0.5172 | 0.5210 | 0.5217 |
+| 96 | 1000 ns | mcs_accordin_direct | 0.5142 | 0.5126 | 0.5201 | 0.5211 |
+| 96 | 1000 ns | mcs_tas_accordin_direct | 0.5287 | 0.5294 | 0.5315 | 0.5375 |
+| 96 | 30000 ns | mcs_accordin_direct | 0.5732 | 0.5718 | 0.6104 | 0.6096 |
+| 96 | 30000 ns | mcs_tas_accordin_direct | 0.5950 | 0.5881 | 0.6232 | 0.6173 |
+
 ### `20260906T180338Z` — LevelDB before the reboot
 
 Same binaries as the `baseline` and `custody` arms of `h2-tail`, plus a
@@ -687,6 +822,77 @@ widest spread at CV 7.42 %.
 The cost is carried rather than answered. Against it stand the `h1-shard`
 moves on the workloads that do park: `fillrandom` at 3.77x and 3.73x of the
 `custody` arm, streamcluster at 0.517x and 0.514x of the baseline's seconds.
+
+### Two-lock fairness — no arm is unfair
+
+Nothing in the series makes one group of threads pay for the other. Where the
+two groups run the same parameters, every arm on both backends reads a Jain
+index of 0.9999 or 1.0000, minimum 0.9997 over 40 runs. Where they differ, all
+four arms sit in a band from 0.8576 to 0.9726, and the arms of the retained tip
+are at its top rather than its bottom.
+
+In the mild case sharding and the cleanup raise the index — 0.9726 and 0.9641
+on `mcs_accordin_direct`, 0.9681 and 0.9666 on `mcs_tas_accordin_direct`,
+against 0.9412 and 0.9469 at baseline — by taking throughput away from the
+short-critical group B while leaving the long-critical group A where it was.
+Group B falls from 0.618 to 0.561 and 0.546 Mops/s on `mcs_accordin_direct` and
+from 0.685 to 0.598 and 0.594 on `mcs_tas_accordin_direct`, while group A moves
+between 0.204 and 0.220 and between 0.224 and 0.234. That transfer is the whole
+of the total-throughput loss in this case: 0.949x and 0.912x, 0.900x and
+0.891x. A fairer split at a lower total is what the index is built to show, and
+it is not an argument for the change.
+
+In the extreme case the same commits gain a little on `mcs_accordin_direct`
+(0.8850 and 0.8877 against 0.8718 at baseline and 0.8576 at `9520d7d`, total
+throughput 1.034x and 1.026x) and match the baseline on
+`mcs_tas_accordin_direct` (0.9422 and 0.9479 against 0.9445, 1.010x and
+0.991x). The homogeneous case costs 0.92x to 0.98x of baseline on every arm
+including `9520d7d`, in line with the single-lock 300 ns / 3000 ns cost of the
+`mutexbench` sessions. Run-to-run spread is 1.7 % to 9.9 %, wide enough that
+the extreme-case ordering carries less weight than the mild-case one, where the
+Jain separation is larger than the spread of either arm.
+
+### Per-thread fairness — an open cost of sharding
+
+At 192 threads the sharded arms take a larger share of the operations into the
+busier half of the threads than the unsharded ones, in all eight cells of that
+thread count on both backends. At 1000 ns and 30000 ns the separation is
+cleaner than the run-to-run range: on `mcs_accordin_direct` at 30000 ns,
+`baseline` spans 0.6446–0.6543 and `custody` 0.6447–0.6507, against
+0.6821–0.7033 for `shard` and 0.6865–0.7027 for `tidy`, with no overlap; the
+same holds on `mcs_tas_accordin_direct` there (0.6434–0.6484 and 0.6362–0.6542
+against 0.6772–0.6996 and 0.6823–0.7142) and at 1000 ns on both backends. The
+split follows the sharding boundary and nothing else: in every one of those
+cells the two unsharded arms sit together and the two sharded arms sit together
+above them, `custody` with `baseline` and `tidy` with `shard`.
+
+The effect scales with the thread count and with the critical section. At 48
+threads no arm is separable from another — every mean sits between 0.5019 and
+0.5155 except the 30000 ns `mcs_tas_accordin_direct` point, where the highest
+figure belongs to `custody` rather than to a sharded arm. At 96 threads and
+30000 ns it is 0.5732 against 0.6104 on `mcs_accordin_direct` and 0.5950
+against 0.6232 on `mcs_tas_accordin_direct`, about 0.03 to 0.04. At 192 threads
+and 30000 ns it is 0.6509 against 0.6952 and 0.6466 against 0.6900, and 0.7035
+for `tidy` on `mcs_tas_accordin_direct`, so between 0.04 and 0.06.
+
+It is the least-served thread that moves. At 192 threads and 30000 ns on
+`mcs_accordin_direct` the mean per-thread minimum is 279 and 176 operations for
+`baseline` and `custody` against 93 and 94 for `shard` and `tidy`, while the
+maxima go the other way, 2212 and 2217 against 2537 and 2790. Throughput
+carries no matching ordering: every 192-thread arm lands within about 5 % of
+its baseline with the sign changing from cell to cell (0.947x to 1.016x), so
+this is a distribution effect and not a slower lock.
+
+**Hypothesis, untested here.** The machine has 48 online CPUs and the
+admission queue has 32 shards, so CPUs 0–15 share a shard with CPUs 32–47 while
+shards 16–31 hold one CPU each. The admission walk rotates over shards and
+grants one waiter per visit, so a thread whose last CPU falls in a two-CPU
+shard competes with twice the population for the same grant rate, which would
+produce exactly this pattern: unchanged throughput, a wider per-thread spread,
+and an effect that grows as threads outnumber CPUs and as the critical section
+lengthens. A bank of one shard per online CPU, or a rotation weighted by shard
+population, would remove it. Neither is measured here, and either would have to
+be validated with the same four-arm sweep before it counts.
 
 ## Machine state, not code: the reboot observation
 

@@ -35,6 +35,13 @@ asks the same question one level down, between individual threads on a single
 lock: the shape of `experiments/run_experiment_seven.py`, which counts each
 thread's operations and reports the share taken by the busier half.
 
+Two follow-up commits were screened after the series closed and are kept on
+branch `cv_percpu_queue`: `1189963` gives every possible CPU id its own
+admission queue in place of the thirty-two hash shards, with the walk rotating
+over the queues that exist — 96 on this host, which has 96 possible CPU ids and
+48 online — and `cec374b` adds a probe of the dispatching CPU's own queue ahead
+of that rotation.
+
 The reference point is `934bd1c`, the commit before the series. `9520d7d` is
 the last change of the custody mechanism itself and is carried as an
 intermediate arm.
@@ -82,8 +89,12 @@ slot nor the dispatch-side release passed validation.
   `9520d7d`, and the two-lock fairness workload shows that cost falling on one
   group rather than on both, with no arm unfair on any case. Between individual
   threads the picture is different: sharding widens the per-thread spread at
-  192 threads, most of it on the least-served thread, and that is recorded here
-  as an open cost of sharding rather than something this series resolves. The sharding tip
+  192 threads, most of it on the least-served thread. A single-repeat screen of
+  two follow-up commits on `cv_percpu_queue` shows one queue per CPU id
+  reproducing that spread, so it is not the shard geometry; the spread stays an
+  open cost of sharding, and neither follow-up commit joins `cv_admission`,
+  whose tip remains `ded83aa`. The own-queue probe of `cec374b` is left on that
+  branch as a throughput-against-fairness trade for the user to decide. The sharding tip
   is kept regardless: on the same commits `fillrandom` runs at 3.77x and 3.73x
   of the `custody` arm and streamcluster at 0.517x and 0.514x of the baseline's
   seconds, so the gains on the workloads that park dominate the microbenchmark
@@ -102,7 +113,7 @@ slot nor the dispatch-side release passed validation.
   throughput.
 - The host was rebooted early on 2026-09-07 UTC. Every session in the tables
   below except the last two ran after that reboot, between 14:45 UTC on
-  2026-09-07 and 01:04 UTC on 2026-09-08, with the host up for 12 h or more.
+  2026-09-07 and 02:53 UTC on 2026-09-08, with the host up for 12 h or more.
 - The machine drifts within a single day. The `fillrandom` / `mcs_accordin`
   baseline anchor alone reads 51.287, 47.100 and 52.551 Kops/s in three
   sessions a few hours apart, and 31.152 Kops/s on the day before the reboot.
@@ -623,6 +634,87 @@ Mean fairness at the two lower thread counts, one column per arm:
 | 96 | 30000 ns | mcs_accordin_direct | 0.5732 | 0.5718 | 0.6104 | 0.6096 |
 | 96 | 30000 ns | mcs_tas_accordin_direct | 0.5950 | 0.5881 | 0.6232 | 0.6173 |
 
+### `percpu` — per-CPU admission queues, single repeat
+
+A screen of the two `cv_percpu_queue` commits against `934bd1c` and the
+retained tip. **Every figure in these three tables comes from a single run per
+cell**, so no spread is available and nothing here separates arms that differ
+by a few percent. The three sessions ran back to back: per-thread fairness at
+192 threads over the four critical sections, LevelDB `fillrandom` and
+`readrandom`, and streamcluster without the barrier.
+
+Per-thread fairness, 192 threads, one repeat:
+
+| critical | arm | commit | backend | Mops/s | rel | fairness | min ops | max ops |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| 100 ns | baseline | `934bd1c` | mcs_accordin_direct | 2.521 | 1.000x | 0.5131 | 97521 | 114574 |
+| 100 ns | tidy | `ded83aa` | mcs_accordin_direct | 2.650 | 1.051x | 0.5171 | 97470 | 123799 |
+| 100 ns | percpu | `1189963` | mcs_accordin_direct | 2.605 | 1.033x | 0.5174 | 95590 | 124272 |
+| 100 ns | own | `cec374b` | mcs_accordin_direct | 2.654 | 1.053x | 0.6170 | 58437 | 229319 |
+| 100 ns | baseline | `934bd1c` | mcs_tas_accordin_direct | 2.260 | 1.000x | 0.5202 | 82234 | 114685 |
+| 100 ns | tidy | `ded83aa` | mcs_tas_accordin_direct | 2.307 | 1.021x | 0.5240 | 83118 | 115765 |
+| 100 ns | percpu | `1189963` | mcs_tas_accordin_direct | 2.305 | 1.020x | 0.5234 | 77396 | 110744 |
+| 100 ns | own | `cec374b` | mcs_tas_accordin_direct | 2.364 | 1.046x | 0.6172 | 54150 | 193404 |
+| 300 ns | baseline | `934bd1c` | mcs_accordin_direct | 1.463 | 1.000x | 0.5201 | 54691 | 68807 |
+| 300 ns | tidy | `ded83aa` | mcs_accordin_direct | 1.491 | 1.019x | 0.5268 | 48893 | 72330 |
+| 300 ns | percpu | `1189963` | mcs_accordin_direct | 1.558 | 1.065x | 0.5250 | 55011 | 76106 |
+| 300 ns | own | `cec374b` | mcs_accordin_direct | 1.470 | 1.005x | 0.6392 | 30169 | 128871 |
+| 300 ns | baseline | `934bd1c` | mcs_tas_accordin_direct | 1.392 | 1.000x | 0.5294 | 49455 | 71669 |
+| 300 ns | tidy | `ded83aa` | mcs_tas_accordin_direct | 1.344 | 0.965x | 0.5419 | 40624 | 75260 |
+| 300 ns | percpu | `1189963` | mcs_tas_accordin_direct | 1.403 | 1.008x | 0.5315 | 48536 | 74724 |
+| 300 ns | own | `cec374b` | mcs_tas_accordin_direct | 1.214 | 0.872x | 0.6125 | 29231 | 99540 |
+| 1000 ns | baseline | `934bd1c` | mcs_accordin_direct | 0.616 | 1.000x | 0.5322 | 21352 | 30484 |
+| 1000 ns | tidy | `ded83aa` | mcs_accordin_direct | 0.614 | 0.998x | 0.5473 | 18056 | 34729 |
+| 1000 ns | percpu | `1189963` | mcs_accordin_direct | 0.630 | 1.023x | 0.5436 | 19162 | 36148 |
+| 1000 ns | own | `cec374b` | mcs_accordin_direct | 0.558 | 0.906x | 0.5970 | 13320 | 50027 |
+| 1000 ns | baseline | `934bd1c` | mcs_tas_accordin_direct | 0.598 | 1.000x | 0.5505 | 18631 | 36728 |
+| 1000 ns | tidy | `ded83aa` | mcs_tas_accordin_direct | 0.570 | 0.952x | 0.5644 | 14688 | 40010 |
+| 1000 ns | percpu | `1189963` | mcs_tas_accordin_direct | 0.621 | 1.038x | 0.5482 | 16097 | 36798 |
+| 1000 ns | own | `cec374b` | mcs_tas_accordin_direct | 0.598 | 1.000x | 0.6195 | 12078 | 45913 |
+| 30000 ns | baseline | `934bd1c` | mcs_accordin_direct | 0.023 | 1.000x | 0.6576 | 199 | 2202 |
+| 30000 ns | tidy | `ded83aa` | mcs_accordin_direct | 0.022 | 0.950x | 0.7032 | 136 | 2510 |
+| 30000 ns | percpu | `1189963` | mcs_accordin_direct | 0.023 | 0.968x | 0.7086 | 147 | 2418 |
+| 30000 ns | own | `cec374b` | mcs_accordin_direct | 0.024 | 1.041x | 0.6886 | 163 | 3060 |
+| 30000 ns | baseline | `934bd1c` | mcs_tas_accordin_direct | 0.027 | 1.000x | 0.6520 | 170 | 2599 |
+| 30000 ns | tidy | `ded83aa` | mcs_tas_accordin_direct | 0.027 | 1.002x | 0.6793 | 128 | 2871 |
+| 30000 ns | percpu | `1189963` | mcs_tas_accordin_direct | 0.026 | 0.982x | 0.6974 | 121 | 2596 |
+| 30000 ns | own | `cec374b` | mcs_tas_accordin_direct | 0.026 | 0.987x | 0.6910 | 66 | 3033 |
+
+LevelDB, one repeat (`fill` and `read` in Kops/s, `rel` against `baseline`):
+
+| arm | commit | backend | fill Kops/s | rel | read Kops/s | rel |
+|---|---|---|---:|---:|---:|---:|
+| baseline | `934bd1c` | mcs_accordin | 59.009 | 1.000x | 1341.266 | 1.000x |
+| tidy | `ded83aa` | mcs_accordin | 225.140 | 3.815x | 1303.925 | 0.972x |
+| percpu | `1189963` | mcs_accordin | 223.748 | 3.792x | 1287.287 | 0.960x |
+| own | `cec374b` | mcs_accordin | 255.149 | 4.324x | 1324.679 | 0.988x |
+| baseline | `934bd1c` | mcs_tas_accordin | 55.854 | 1.000x | 1141.822 | 1.000x |
+| tidy | `ded83aa` | mcs_tas_accordin | 221.413 | 3.964x | 1127.916 | 0.988x |
+| percpu | `1189963` | mcs_tas_accordin | 225.600 | 4.039x | 1113.470 | 0.975x |
+| own | `cec374b` | mcs_tas_accordin | 256.956 | 4.600x | 1075.664 | 0.942x |
+
+Counters, `fillrandom`: `own` parks 7.61 M / 7.65 M waits against 6.73 M /
+6.60 M for `tidy` and 6.68 M / 6.73 M for `percpu`, and calls the flush 180 k /
+180 k times against 144 k / 140 k and 141 k / 145 k, at a miss rate near 53 %
+against 49 % — more parks for more completed operations, on the same shape of
+release traffic.
+
+streamcluster, one repeat, seconds (lower is better, `rel` against `baseline`):
+
+| arm | commit | backend | stream s | rel |
+|---|---|---|---:|---:|
+| baseline | `934bd1c` | mcs_accordin | 136.622 | 1.000x |
+| tidy | `ded83aa` | mcs_accordin | 114.653 | 0.839x |
+| percpu | `1189963` | mcs_accordin | 115.167 | 0.843x |
+| own | `cec374b` | mcs_accordin | 93.261 | 0.683x |
+| baseline | `934bd1c` | mcs_tas_accordin | 144.843 | 1.000x |
+| tidy | `ded83aa` | mcs_tas_accordin | 111.716 | 0.771x |
+| percpu | `1189963` | mcs_tas_accordin | 102.243 | 0.706x |
+| own | `cec374b` | mcs_tas_accordin | 105.645 | 0.729x |
+
+All arms park the same 8.43 M waits with 44.4 k flush calls; `own` expires
+41.2 k of them on `mcs_accordin` against 62.0 k for `tidy`.
+
 ### `20260906T180338Z` — LevelDB before the reboot
 
 Same binaries as the `baseline` and `custody` arms of `h2-tail`, plus a
@@ -883,16 +975,50 @@ carries no matching ordering: every 192-thread arm lands within about 5 % of
 its baseline with the sign changing from cell to cell (0.947x to 1.016x), so
 this is a distribution effect and not a slower lock.
 
-**Hypothesis, untested here.** The machine has 48 online CPUs and the
-admission queue has 32 shards, so CPUs 0–15 share a shard with CPUs 32–47 while
-shards 16–31 hold one CPU each. The admission walk rotates over shards and
-grants one waiter per visit, so a thread whose last CPU falls in a two-CPU
-shard competes with twice the population for the same grant rate, which would
-produce exactly this pattern: unchanged throughput, a wider per-thread spread,
-and an effect that grows as threads outnumber CPUs and as the critical section
-lengthens. A bank of one shard per online CPU, or a rotation weighted by shard
-population, would remove it. Neither is measured here, and either would have to
-be validated with the same four-arm sweep before it counts.
+The first reading of this was geometric: 48 online CPUs against 32 hash
+shards leaves CPUs 0–15 sharing a shard with CPUs 32–47 while shards 16–31 hold
+one CPU each, so a thread landing in a two-CPU shard would compete with twice
+the population for the same grant rate. The `percpu` screen below refutes it —
+a bank with one queue per CPU id, where no two CPUs share a queue, reproduces
+the same spread — and that explanation is withdrawn.
+
+### Per-CPU admission queues — screened, not adopted
+
+**One run per cell.** Nothing below separates arms that differ by a few
+percent, and no figure here carries the weight of the multi-repeat sessions.
+
+The screen settles one question. `percpu` gives every CPU id its own queue, so
+no two CPUs share one, and its fairness factor still matches the tip in every
+cell: 0.5174 / 0.5234 against 0.5171 / 0.5240 at 100 ns, 0.5250 / 0.5315
+against 0.5268 / 0.5419 at 300 ns, 0.5436 / 0.5482 against 0.5473 / 0.5644 at
+1000 ns, and 0.7086 / 0.6974 against 0.7032 / 0.6793 at 30000 ns, where
+`934bd1c` reads 0.6576 / 0.6520. Removing the shared shards changes nothing, so
+the per-thread spread follows from granting one waiter per queue visit while
+the queues hold unequal numbers of waiters, not from the shard geometry.
+
+`own` trades that fairness for throughput. Probing the dispatching CPU's own
+queue first raises the fairness factor from 0.5171 / 0.5240 to 0.6170 / 0.6172
+at 100 ns, from 0.5268 / 0.5419 to 0.6392 / 0.6125 at 300 ns and from
+0.5473 / 0.5644 to 0.5970 / 0.6195 at 1000 ns, with the least-served thread on
+`mcs_accordin_direct` at 100 ns falling from 97470 to 58437 operations while
+the best-served rises from 123799 to 229319. Only at 30000 ns does it sit
+level with the tip, on the fairer side on one backend and the less fair side on
+the other (0.6886 against 0.7032, 0.6910 against 0.6793). On the workloads that
+park it is the fastest arm in the screen: `fillrandom` at 255.149 and 256.956
+Kops/s against 225.140 and 221.413 for the tip, streamcluster at 93.261 s
+against 114.653 on `mcs_accordin` — though on `mcs_tas_accordin` it reads
+105.645 s against 102.243 for `percpu` — and `readrandom` between 1.016x and
+0.954x of the tip. `percpu` on its own lands inside single-run noise on every
+workload.
+
+Neither commit is on `cv_admission`; the tip stays `ded83aa` and both stay on
+`cv_percpu_queue`. The own-queue probe is recorded as a throughput-against-
+fairness trade to be decided by whoever needs one or the other, not settled
+here. The experiment it suggests is a bounded form — serve the dispatching
+CPU's own queue at most a few times before advancing the rotation — which would
+show whether the condvar-workload gain survives without the per-thread spread.
+That variant is untested, and it would need the full multi-repeat sweep across
+all seven workloads before any of this becomes a verdict.
 
 ## Machine state, not code: the reboot observation
 
@@ -943,3 +1069,8 @@ baseline inside the same session.
 - Three repeats per cell (four in `attrib-2`) is enough to separate the large
   moves and not enough to rank arms that differ by a few percent, which is why
   `readrandom` differences below about 5 % are treated as noise here.
+- **The `percpu` screen is one run per cell.** It was run with reduced repeats
+  to answer a single structural question quickly. Its throughput figures are
+  indicative only; only the fairness ordering there, which is far larger than
+  any spread the multi-repeat sessions show on the same metric, is treated as
+  settled.

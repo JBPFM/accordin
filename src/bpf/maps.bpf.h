@@ -92,8 +92,9 @@ volatile __u32 own_limit;
  * instead of always losing to the lowest CPU id. */
 __u32 group_cursor[MAX_GROUPS];
 /* Grants a CPU has taken from its own queue since it last served another
- * queue. Only that CPU's dispatch reads or writes its entry, and the worst a
- * torn update could cost is one misordered probe, so plain accesses suffice. */
+ * queue. Only that CPU's dispatch touches its entry, and dispatch runs under
+ * the rq lock of the CPU it serves, so the entry has a single writer; the count
+ * only orders probes, which is why plain accesses carry it. */
 __u32 own_grants[MAX_CPUS];
 
 #endif

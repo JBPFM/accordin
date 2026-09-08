@@ -7,8 +7,8 @@
 #define MAX_TASKS 65536U
 #define MAX_CPUS 256U
 
-/* CPUs are collected into topology groups, each group inside one NUMA node and
- * small enough to share a last-level cache. A group never spans more CPUs than
+/* CPUs are collected into topology groups, each group a slice of one NUMA node
+ * small enough to stay cache-friendly. A group never spans more CPUs than
  * MAX_GROUP_SIZE, and the worst case of one CPU per group needs as many groups
  * as there are CPUs. */
 #define MAX_GROUPS MAX_CPUS

@@ -136,9 +136,9 @@ static void mark_cpu_list(const char *text, bool *marked)
 }
 
 /* Cut the online CPUs of each NUMA node, in ascending order, into groups of
- * equal size, so that the members of one group share a last-level cache and a
- * memory node. A node whose CPU count is not a multiple of the size ends in a
- * shorter group, and a CPU no node claims stands alone. */
+ * equal size, so that the members of one group share one memory node, in slices
+ * small enough to stay cache-friendly. A node whose CPU count is not a multiple
+ * of the size ends in a shorter group, and a CPU no node claims stands alone. */
 static void publish_groups(void)
 {
     bool online[MAX_CPUS] = {0}, placed[MAX_CPUS] = {0}, nodes[MAX_CPUS] = {0};

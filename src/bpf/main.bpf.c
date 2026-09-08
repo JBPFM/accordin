@@ -255,13 +255,15 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
  * for the cache footprint a waiter left behind on it, bounded by a count of
  * consecutive own grants so that one busy queue cannot keep a CPU to itself.
  * The deepest queue of the CPU's topology group comes next and is the
- * population balancer inside one last-level cache and NUMA domain: a waiter
+ * population balancer inside one slice of a memory node: a waiter
  * granted by another CPU is filed under that CPU when it next waits, so
  * populations drain from deep queues toward the CPUs that have slots. The
  * rotation over the whole bank is the cross-group backstop; its cursor is
  * shared by every CPU and holds the queue after the last grant, so rotating
  * past the queue that granted keeps one busy queue from starving the rest of
- * the bank.
+ * the bank. The rotation is reached only once both the own queue and the group
+ * yield nothing, so how fast a waiter is picked up from outside its group is
+ * set by the turnover of its own group rather than by the rotation.
  */
 static __always_inline void admit_waiter(__u32 cpu) {
   volatile __u64 *owner = owner_slot(cpu);
@@ -325,11 +327,17 @@ static __always_inline void admit_waiter(__u32 cpu) {
     }
   }
   /* The bound orders the queues, it does not close the own queue: with the
-   * group offering nothing, serving it still beats leaving the slot idle. Such
-   * a grant leaves the count where the bound put it. */
+   * group offering nothing, serving it still beats leaving the slot idle. The
+   * group was seen empty, so a grant here costs the group nothing and the count
+   * starts over; leaving it at the bound would make every later dispatch repeat
+   * a scan of a group that has nothing to give. */
   if (!own_first) {
     result = admit_from(cpu, owner, cpu);
-    if (result != ADMIT_NONE)
+    if (result == ADMIT_GRANTED) {
+      own_grants[cpu] = 0;
+      return;
+    }
+    if (result == ADMIT_SLOT_LOST)
       return;
   }
   start = admit_cursor;

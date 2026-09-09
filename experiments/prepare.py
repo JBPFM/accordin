@@ -11,6 +11,8 @@ import subprocess
 import tarfile
 import urllib.request
 
+import litl_locks
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 FG = ROOT / "bench/flexguard"
@@ -122,8 +124,10 @@ def main():
         replace(rocks / "tools/db_bench_tool.cc", "    double throughput = (double)done_ / elapsed;",
                 '    double throughput = (double)done_ / elapsed;\n    fprintf(stdout, "EXP_RESULT name=%s ops=%llu seconds=%.9f\\n", name.ToString().c_str(), (unsigned long long)done_, elapsed);')
         (rocks / ".experiment-patched").touch()
+    # RocksDB v9.10.0 reaches uint64_t through headers that recent C++ libraries no
+    # longer include transitively.
     run(["cmake", "-S", rocks, "-B", out / "rocksdb-build", "-DCMAKE_BUILD_TYPE=Release",
-         "-DWITH_TESTS=OFF", "-DWITH_BENCHMARK_TOOLS=ON", "-DWITH_TOOLS=OFF", "-DWITH_GFLAGS=ON",
+         "-DCMAKE_CXX_FLAGS=-include cstdint", "-DWITH_TESTS=OFF", "-DWITH_BENCHMARK_TOOLS=ON", "-DWITH_TOOLS=OFF", "-DWITH_GFLAGS=ON",
          "-DWITH_SNAPPY=OFF", "-DWITH_LZ4=OFF", "-DWITH_ZSTD=OFF", "-DWITH_ZLIB=OFF",
          "-DWITH_BZ2=OFF", "-DFAIL_ON_WARNINGS=OFF", "-DPORTABLE=ON"], label="rocksdb")
     run(["cmake", "--build", out / "rocksdb-build", "--target", "db_bench", f"-j{args.jobs}"], label="rocksdb")
@@ -166,6 +170,23 @@ def main():
          kyoto / "libkyotocabinet.a", "-lz", "-lrt", "-o", out / "kyoto_cachedb"], label="kyoto-driver")
 
     run(["make", f"-j{args.jobs}", f"OUT={out}/accordin", "all"], label="accordin")
+    # FlexGuard contributes the runtime archive its LiTL algorithm links; the lock,
+    # its queue nodes and its BPF program all live in that archive.
+    flexguard = out / "flexguard"
+    if not (flexguard / ".sources-ready").exists():
+        flexguard.mkdir(exist_ok=True)
+        for name in ["include", "src", "bmarks", "vmlinux"]:
+            if (flexguard / name).exists():
+                shutil.rmtree(flexguard / name)
+            shutil.copytree(FG / name, flexguard / name)
+        for name in ["Makefile", "interpose.in"]:
+            shutil.copy2(FG / name, flexguard / name)
+        run(["patch", "-p1", "-i", HERE / "patches/flexguard-arm.patch"], flexguard, "flexguard")
+        for name in ["libbpf", "bpftool"]:
+            if not (flexguard / name).exists():
+                (flexguard / name).symlink_to(FG / name, target_is_directory=True)
+        (flexguard / ".sources-ready").touch()
+
     litl = out / "litl"
     litl.mkdir(exist_ok=True)
     for name in ["src", "include"]:
@@ -173,74 +194,25 @@ def main():
                         ignore=shutil.ignore_patterns("topology.h"))
     for name in ["Makefile", "Makefile.config"]:
         shutil.copy2(ROOT / "third_party/litl" / name, litl / name)
+    algorithms = litl_locks.build_algorithms(litl_locks.EXPERIMENT_LOCKS)
     run(["make", f"-j{args.jobs}", f"ACCORDIN_ROOT={ROOT}", f"ACCORDIN_LIB_DIR={out}/accordin",
-         "ALGORITHMS=mcstasaccordin_original", "all"], litl, "accordin-litl")
-    libs = out / "locks"; libs.mkdir(exist_ok=True)
+         f"FLEXGUARD_DIR={flexguard}", "FLEXGUARD=1", "ALGORITHMS=" + " ".join(algorithms), "all"], litl, "litl")
+    locks = {lock: litl_locks.litl_library(lock, litl) for lock in litl_locks.EXPERIMENT_LOCKS}
+    for lock, library in locks.items():
+        if not library.is_file():
+            raise RuntimeError(f"LiTL build did not produce the library for {lock}: {library}")
     run(["gcc", "-O2", "-pthread", HERE / "sources/lock_probe.c", "-ldl", "-o", out / "lock_probe"], label="probe")
-    shutil.copy2(litl / "lib/libmcstasaccordin_original.so", libs / "accordin.so")
-    run(["gcc", "-O3", "-std=gnu11", "-fPIC", "-shared", "-pthread", "-DOTHERLOCK_KIND_GCR",
-         ROOT / "bench/otherlocks/otherlocks_pthread_interpose.c", ROOT / "bench/otherlocks/gcr_mcs.c",
-         "-ldl", "-o", libs / "gcr.so"], label="gcr")
-    include_tse = ROOT / "bench/mutexbench/bench/locks_bench"
-    run(["g++", "-O3", "-std=c++20", "-DTSE_PROBE", f"-I{include_tse}", HERE / "sources/tse.cc", "-o", out / "tse_probe"], label="tse")
-    run(["g++", "-O3", "-fPIC", "-std=c++20", f"-I{include_tse}", "-c", HERE / "sources/tse.cc", "-o", out / "tse.o"], label="tse")
-    for lock, version in [("mcs", "MCS"), ("mcs-tas", "MCSTAS"), ("mcs-tse", "MCS"), ("flexguard", "FLEXGUARD")]:
-        dest = out / f"lock-{lock}"
-        if not (dest / ".sources-ready").exists():
-            dest.mkdir(exist_ok=True)
-            for name in ["include", "src", "bmarks", "vmlinux"]:
-                if (dest / name).exists():
-                    shutil.rmtree(dest / name)
-                shutil.copytree(FG / name, dest / name)
-            for name in ["Makefile", "interpose.in"]:
-                shutil.copy2(FG / name, dest / name)
-            run(["patch", "-p1", "-i", HERE / "patches/flexguard-arm.patch"], dest, lock)
-            for name in ["libbpf", "bpftool"]:
-                if not (dest / name).exists():
-                    (dest / name).symlink_to(FG / name, target_is_directory=True)
-            # All backends retain native rwlocks/spinlocks/barriers, as Accordin does.
-            export_map = "{ global: pthread_mutex_*; pthread_cond_*; pthread_create; local: *; };\n"
-            (dest / "src/interpose-arm64.map").write_text(export_map)
-            (dest / "src/interpose.map").write_text(export_map)
-            # The x86 upstream MCS files use volatile publication. Make acquire/release
-            # explicit on ARM, without changing queue policy or waiting behavior.
-            p = dest / "src/mcs.c"
-            replace(p, "    pred->next = local;", "    __atomic_store_n(&pred->next, local, __ATOMIC_RELEASE);")
-            replace(p, "while (local->waiting != 0)", "while (__atomic_load_n(&local->waiting, __ATOMIC_ACQUIRE) != 0)")
-            replace(p, "succ = local->next", "succ = __atomic_load_n(&local->next, __ATOMIC_ACQUIRE)", 2)
-            replace(p, "    succ->waiting = 0;", "    __atomic_store_n(&succ->waiting, 0, __ATOMIC_RELEASE);")
-            p = dest / "src/mcstas.c"
-            replace(p, "pred->next = &local;", "__atomic_store_n(&pred->next, &local, __ATOMIC_RELEASE);")
-            replace(p, "while (local.waiting != 0)", "while (__atomic_load_n(&local.waiting, __ATOMIC_ACQUIRE) != 0)")
-            replace(p, "succ = local.next", "succ = __atomic_load_n(&local.next, __ATOMIC_ACQUIRE)", 2)
-            replace(p, "    succ->waiting = 0;", "    __atomic_store_n(&succ->waiting, 0, __ATOMIC_RELEASE);")
-            replace(p, "    the_lock->lock = 0;\n\n#ifdef TIMESLICE_EXTENSION", "    __atomic_store_n(&the_lock->lock, 0, __ATOMIC_RELEASE);\n\n#ifdef TIMESLICE_EXTENSION")
-            if lock == "mcs-tse":
-                p = dest / "src/mcs.c"
-                data = p.read_text()
-                data = data.replace('#include "mcs.h"', '#include "mcs.h"\nextern void experiment_tse_prepare(void), experiment_tse_enter(void), experiment_tse_exit(void);')
-                data = data.replace("    volatile mcs_qnode *local = get_me(the_lock);", "    volatile mcs_qnode *local = get_me(the_lock);\n    experiment_tse_prepare();", 2)
-                data = data.replace("        return 0; // Success", "    { experiment_tse_enter(); return 0; } // Success")
-                data = data.replace("        return;\n    local->waiting", "    { experiment_tse_enter(); return; }\n    local->waiting")
-                data = data.replace("\n}\n\nvoid mcs_unlock", "\n    experiment_tse_enter();\n}\n\nvoid mcs_unlock")
-                data = data.replace("            return;\n        do", "        { experiment_tse_exit(); return; }\n        do")
-                data = data.replace("__atomic_store_n(&succ->waiting, 0, __ATOMIC_RELEASE);", "__atomic_store_n(&succ->waiting, 0, __ATOMIC_RELEASE);\n    experiment_tse_exit();")
-                p.write_text(data)
-            (dest / ".sources-ready").touch()
-        command = ["make", f"-j{args.jobs}", f"LOCK_VERSION={version}", "HYBRID_VERSION=MCS", "CONDVARSWAIT=BLOCK", "ADD_PADDING=1", "DEBUG=0", "interpose.so"]
-        if lock == "mcs-tse":
-            command.append(f"LIBS=-lrt -lpthread -l:libnuma.so.1 {out}/tse.o -lstdc++")
-        run(command, dest, lock)
-        shutil.copy2(dest / "interpose.so", libs / f"{lock}.so")
+    run(["g++", "-O3", "-std=c++20", f"-I{litl}/include", HERE / "sources/tse_probe.cc",
+         "-o", out / "tse_probe"], label="tse-probe")
 
     binaries = {"leveldb": out / "leveldb-build/db_bench", "rocksdb": out / "rocksdb-build/db_bench",
                 "streamcluster": sc / "streamcluster", "raytrace": ray / "raytrace", "kyoto-cachedb": out / "kyoto_cachedb"}
-    files = list(binaries.values()) + list(libs.glob("*.so")) + list((out / "accordin").glob("*.so"))
+    files = list(binaries.values()) + list(locks.values()) + list((out / "accordin").glob("*.so"))
     files += list((out / "rocksdb-build").glob("*.so*")) + [out / "tse_probe", out / "lock_probe"]
     files += list(inputs.glob("car.*")) + list(HERE.glob("*.py")) + list((HERE / "sources").glob("*")) + list((HERE / "patches").glob("*"))
     import re
     dependencies = set()
-    for binary in list(binaries.values()) + list(libs.glob("*.so")):
+    for binary in list(binaries.values()) + list(locks.values()):
         output = subprocess.check_output(["ldd", str(binary)], text=True)
         dependencies.update(re.findall(r"(?:=>\s+|^\s*)(/[^\s]+)\s+\(", output, re.M))
     files += [Path(p) for p in dependencies]
@@ -249,15 +221,14 @@ def main():
                               "accordin": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()},
                 "git_status": subprocess.check_output(["git", "status", "--short"], text=True),
                 "binaries": {k: str(v) for k, v in binaries.items()},
-                "locks": {p.stem: str(p) for p in libs.glob("*.so")},
+                "locks": {lock: str(path) for lock, path in locks.items()},
                 "sha256": {str(p): sha(p) for p in files}}
     # Record the exact source snapshot, including pre-existing local edits.
     sources = list((ROOT / "src").rglob("*.c")) + list((ROOT / "src").rglob("*.h"))
-    sources += [p for base in [ldb, rocks / "tools", sc, ray, kyoto, FG / "src", FG / "include", ROOT / "third_party/litl/src", ROOT / "bench/otherlocks"]
+    sources += [p for base in [ldb, rocks / "tools", sc, ray, kyoto, FG / "src", FG / "include",
+                               flexguard / "src", flexguard / "include",
+                               ROOT / "third_party/litl/src", ROOT / "third_party/litl/include"]
                 for p in base.rglob("*") if p.is_file() and p.suffix in {".cc", ".cpp", ".c", ".C", ".h", ".H", ".hpp"}]
-    sources += [p for base in out.glob("lock-*") if (base / ".sources-ready").exists()
-                for folder in (base / "src", base / "include") for p in folder.rglob("*")
-                if p.is_file() and p.suffix in {".c", ".h", ".map"}]
     manifest["source_sha256"] = {str(p): sha(p) for p in sources}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Ready: {out / 'manifest.json'}", flush=True)

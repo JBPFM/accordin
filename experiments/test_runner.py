@@ -5,7 +5,27 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import litl_locks
 import run
+
+
+class LockTableTests(unittest.TestCase):
+    def test_every_compared_lock_has_a_distinct_litl_algorithm(self):
+        algorithms = [litl_locks.litl_algorithm(lock) for lock in run.LOCKS]
+        self.assertEqual(len(set(algorithms)), len(run.LOCKS))
+        self.assertEqual(litl_locks.litl_algorithm("mcs-tse"), "mbmcstse_original")
+        self.assertEqual(litl_locks.litl_algorithm("accordin"), "mcstasaccordin_original")
+
+    def test_unmapped_lock_is_rejected(self):
+        with self.assertRaises(ValueError):
+            litl_locks.litl_algorithm("cna")
+
+    def test_library_and_launcher_follow_the_named_checkout(self):
+        directory = Path("/build/litl")
+        self.assertEqual(litl_locks.litl_library("gcr", directory),
+                         directory / "lib" / "libgcr_original.so")
+        self.assertEqual(litl_locks.litl_launcher("gcr", directory),
+                         directory / "libgcr_original.sh")
 
 
 class MeasurementTests(unittest.TestCase):

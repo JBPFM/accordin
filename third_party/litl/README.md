@@ -156,6 +156,14 @@ their `pthread_mutex_trylock` always reports `EBUSY`. FlexGuard has a real one.
 A program that polls `trylock` until it succeeds will not make progress under
 the former group.
 
+The FlexGuard archive is built with `HYBRID_VERSION=MCS`, `ADD_PADDING` and
+`NOBPF=0`, which are the defaults of the FlexGuard checkout, and the adapter is
+compiled with the matching `-DHYBRID_MCS -DADD_PADDING -DBPF` so that both agree
+on the lock layout. `FLEXGUARD_DIR` selects the checkout, so a patched copy can
+supply the archive. FlexGuard's own `CONDVARSWAIT` build switch is not used:
+condition variables come from `src/directcond.c` like every other algorithm on
+this front end, and FlexGuard's own interposer is not built.
+
 `bash tests/run-direct.sh` exercises interposition, mutex counters with static
 and explicit initialization, condition-variable handoffs, a timed wait and a
 C++ `std::condition_variable`. With no argument it runs every algorithm that

@@ -19,10 +19,12 @@ import subprocess
 import sys
 import time
 
+import litl_locks
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 WORKLOADS = ("leveldb-readrandom", "leveldb-fillrandom", "streamcluster", "raytrace", "kyoto-cachedb", "rocksdb")
-LOCKS = ("mcs", "mcs-tas", "gcr", "flexguard", "mcs-tse", "accordin")
+LOCKS = litl_locks.EXPERIMENT_LOCKS
 PROFILES = {
     "full": dict(keys=100000, read_ops=1966080, write_ops=983040, kyoto_ops=1966080,
                  value_bytes=32, stream=[10, 30, 512, 32768, 32768, 2000]),

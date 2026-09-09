@@ -11,6 +11,8 @@ Accordin 将用户态锁与 Linux eBPF `sched_ext` admission 调度器结合。�
 
 普通 pthread 程序可使用 `third_party/litl` 中的标准 [LiTL](https://github.com/multicore-locks/litl) 适配器。该目录保存官方源码及 Accordin 集成，来源版本见 [UPSTREAM.md](third_party/litl/UPSTREAM.md)。`mcsaccordin_original` 和 `mcstasaccordin_original` 分别链接当前的 MCS / MCS-TAS direct 库，共用直接 futex 条件变量，不使用 shadow mutex。
 
+对比用的 baseline 锁（MCS、MCS-TAS、MCS-TSE、GCR、CNA、FlexGuard 等）同样是该目录中的 LiTL 算法，共用 `src/directlock.c` / `src/directcond.c` 前端；用 `make litl-baselines` 构建、`make check-litl-baselines` 测试，算法清单见 [third_party/litl/README.md](third_party/litl/README.md) 的“Baseline lock algorithms”。
+
 ## 构建与验证
 
 ```sh

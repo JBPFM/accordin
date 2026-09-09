@@ -1,8 +1,9 @@
 # 短临界区与线程过载实验
 
 六个应用配置统一比较 `mcs / mcs-tas / gcr / flexguard / mcs-tse / accordin`。
-Accordin 使用当前工作区的 `libmcs_tas_accordin_direct.so` 和标准 LiTL pthread 适配器，
-BPF、admission、CV custody 开启；不引用旧 Rust 后端或历史实验的预编译库。
+六种锁都是 `third_party/litl` 中的算法，经同一 LiTL 前端接入被测进程，配置之间只差
+锁算法本身。Accordin 使用当前工作区的 `libmcs_tas_accordin_direct.so`，BPF、admission、
+CV custody 开启；不引用旧 Rust 后端或历史实验的预编译库。
 
 已经实际构建、试跑；见 [本机验证记录](VALIDATION.md)。
 
@@ -39,7 +40,7 @@ python3 -m unittest discover -s experiments -p 'test_*.py'
 
 默认 P 是进程 affinity 内的物理核数量，每个物理核只选一个硬件线程，所有配置固定使用
 这一组 CPU。不会随线程数缩小 CPU 集合，也不会只给 Accordin 绑定更少 CPU。
-当前机器 P=96，因此线程数是 **24、48、96、192、384**。若 P 不能被 4 整除，
+当前机器 P=48（2 socket × 24 核、无 SMT），因此线程数是 **12、24、48、96、192**。若 P 不能被 4 整除，
 P/4、P/2 向下取整且最小为 1，重复点去重。可用 `--cpus 0-23` 将实验限定为一个
 24 核分区，此时 P=24；可用 `--threads` 选择诊断子集，该选项不改变 P。
 
@@ -94,26 +95,47 @@ Streamcluster 在 384 线程时，即使原始程序可以正常完成，也可�
 若修改生成补丁或 baseline 编译选项，请用新的 `--build` 目录重新构建；第三方副本在
 补丁成功后固定，普通重复执行用于继续构建及重新构建当前 Accordin/LiTL 源码。
 
-- MCS/MCS-TAS/FlexGuard 来自 FlexGuard commit
-  `951c9417393574d5918c08b5f54ecca0df18d872`。使用仓库已有 ARM64 移植补丁；
-  MCS/MCS-TAS 的队列发布和交接补充 acquire/release 原子操作，保留队列策略。
-- GCR 使用 `bench/otherlocks/gcr_mcs.c` 和其 pthread 适配器，是仓库现有 GCR-on-MCS 实现。
-- FlexGuard 为 `LOCK_VERSION=FLEXGUARD HYBRID_VERSION=MCS`，BPF 开启，
-  `CONDVARSWAIT=BLOCK ADD_PADDING=1 DEBUG=0`。
-- MCS-TSE 为同一 MCS 加 `bench/mutexbench` 已有的 **rseq slice extension** 支持，
-  require 模式；包含嵌套临界区计数及独立 `tse_probe`。当前 ARM64 6.14 内核/用户态 ABI
-  不支持该扩展，明确记录 `unsupported`，不会降级成普通 MCS。FlexGuard 旧式
-  `/sys/kernel/extend_sched` 接口在本机也不存在；新脚本采用仓库现有 rseq 路径。
+六种锁都是 LiTL 算法，共用 `src/directlock.c` / `src/directcond.c` 前端：算法实例指针
+存放在被拦截的 `pthread_mutex_t` 中，条件变量是被拦截 `pthread_cond_t` 内的 futex 序列，
+`pthread_cond_clockwait` 一并拦截，因此 C++ `std::condition_variable` 也留在库内。
+`prepare.py` 在私有副本 `<build>/litl` 中一次构建全部六个算法，manifest 的锁路径直接指向
+`<build>/litl/lib/lib<algo>.so`。仓库根目录的 `make litl-baselines` 和
+`make check-litl-baselines` 构建并测试树内同一批算法。
+
+| 实验锁名 | LiTL 算法 | 说明 |
+|---|---|---|
+| `mcs` | `mbmcs_original` | mutex 微基准的 MCS |
+| `mcs-tas` | `mbmcstas_original` | 带 test-and-set 快路径的 MCS |
+| `mcs-tse` | `mbmcstse_original` | `mbmcs` 加 rseq slice extension |
+| `gcr` | `gcr_original` | MCS 队列之上的 generic concurrency restriction |
+| `flexguard` | `flexguard_original` | FlexGuard（SOSP'25），链接其运行时归档 |
+| `accordin` | `mcstasaccordin_original` | 链接当前工作区的 MCS-TAS direct 库 |
+
+- MCS/MCS-TAS/MCS-TSE 是 `bench/mutexbench` 的实现移入 LiTL 后的版本，算法未改；
+  队列节点和每次获取的状态从进程内共享的 `thread_local` 改为按 (线程, 锁) 私有存储，
+  使一个线程可以同时持有多把同类锁。
+- MCS-TSE 在临界区前后请求并归还 rseq slice extension。LiTL 版本在内核不提供该扩展时
+  静默变为无操作，因此 `run.py` 先运行独立的 `tse_probe`（与库使用同一份
+  `include/mbtimeslice.hpp` 检测逻辑），不可用时把 mcs-tse 的全部配置记为 `unsupported`，
+  不会当成普通 MCS 测量。本机内核不提供该扩展。
+- GCR 是仓库原有的 GCR-on-MCS 实现（源码移入 LiTL，算法未改），默认
+  active_limit=1、signal_period=16384、passive_spins=1024。
+- FlexGuard 链接由 FlexGuard 私有副本构建的 `libsync.a`，该副本已应用
+  `experiments/patches/flexguard-arm.patch`；编译参数为 `HYBRID_VERSION=MCS`、
+  `ADD_PADDING`、`NOBPF=0`，与 FlexGuard 自身默认一致。锁、队列节点和 BPF 运行时都在
+  归档内，首次拦截 mutex 时启动，`run.py` 据此检查 BPF fd。不再传 `CONDVARSWAIT=BLOCK`：
+  条件变量改由 LiTL 的 `directcond.c` 提供，FlexGuard 自己的 interpose 条件变量路径
+  不参与本实验。
 - Accordin 默认参数显式固定：group=8、own_limit=0、own_slack=100 us、custody=20 ms、
   flush_flags=8（MOVE）、flush_width=0、auto admission=0。对应当前运行时默认值。
+- trylock：GCR 和三个微基准锁没有非阻塞获取，其 `pthread_mutex_trylock` 始终返回
+  `EBUSY`；FlexGuard 和 Accordin 有真正的 trylock。轮询 trylock 直到成功的程序在前一组下
+  不会推进。`pthread_mutex_timedlock` 返回 `ENOTSUP`。
 
-六种后端都只替换 mutex/条件变量，保留 libc rwlock、spinlock、barrier；FlexGuard
-系列通过导出符号表限制。Streamcluster 的 PARSEC barrier 自身用 mutex/cond 实现，
-因此仍由被测锁保护。每种实现的条件变量机制并不完全相同，结果是整套适配器的比较。
-同一负载的所有锁共用同一应用二进制。
-GCR 保留仓库的默认 active_limit=1、signal_period=16384、passive_spins=1024，
-其现有 pthread 适配器的 trylock 总返回 EBUSY；涉及 trylock 的应用不能将它视为
-完整 POSIX mutex 实现。这六个固定配置经过实际试跑，未据此承诺其他 API/工作负载兼容。
+六种后端都只替换 mutex/条件变量，保留 libc rwlock、spinlock、barrier。
+Streamcluster 的 PARSEC barrier 自身用 mutex/cond 实现，因此仍由被测锁保护。
+同一负载的所有锁共用同一应用二进制。这六个固定配置经过实际试跑，未据此承诺其他
+API/工作负载兼容。
 
 计时补丁只增加聚合结果输出、LevelDB 固定工作量/单线程 cache 预热，以及 Streamcluster
 `CLOCK_MONOTONIC` 纳秒计时，避免把 ARM counter 当作 x86 GHz 换算。上游来源：

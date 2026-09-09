@@ -1,0 +1,161 @@
+{
+  "baseline_arm": "bpfbase",
+  "metric": "throughput_ops_per_sec",
+  "lower_is_better": false,
+  "cells": [
+    {
+      "case": "low-t2-c100-o0",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        3359337.17,
+        3563367.45,
+        3569913.75
+      ],
+      "mean_ops_per_sec": 3497539.4566666665,
+      "stdev": 119731.43923316113,
+      "cv_percent": 3.423304889525715,
+      "relative_to_bpfbase": 1.0
+    },
+    {
+      "case": "low-t2-c100-o0",
+      "arm": "bpftip",
+      "commit": "432bee601da9b5ccf89de0936b977c238e01a826",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        3410180.95,
+        3290894.79,
+        3549548.76
+      ],
+      "mean_ops_per_sec": 3416874.8333333335,
+      "stdev": 129456.8464962375,
+      "cv_percent": 3.7887500365339934,
+      "relative_to_bpfbase": 0.9769367510123215
+    },
+    {
+      "case": "low-t4-c100-o0",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        4011504.2,
+        3994043.48,
+        4019124.32
+      ],
+      "mean_ops_per_sec": 4008224.0,
+      "stdev": 12858.145970799953,
+      "cv_percent": 0.32079409660737407,
+      "relative_to_bpfbase": 1.0
+    },
+    {
+      "case": "low-t4-c100-o0",
+      "arm": "bpftip",
+      "commit": "432bee601da9b5ccf89de0936b977c238e01a826",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        4016999.79,
+        4046873.83,
+        4099694.12
+      ],
+      "mean_ops_per_sec": 4054522.58,
+      "stdev": 41874.40251465211,
+      "cv_percent": 1.0327825702885125,
+      "relative_to_bpfbase": 1.0115508963570898
+    },
+    {
+      "case": "low-t4-c100-o3000",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        1075188.22,
+        1072407.16,
+        1070785.0
+      ],
+      "mean_ops_per_sec": 1072793.46,
+      "stdev": 2226.882879632417,
+      "cv_percent": 0.20757796935417716,
+      "relative_to_bpfbase": 1.0
+    },
+    {
+      "case": "low-t4-c100-o3000",
+      "arm": "bpftip",
+      "commit": "432bee601da9b5ccf89de0936b977c238e01a826",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        1071667.92,
+        1071690.4,
+        1073905.36
+      ],
+      "mean_ops_per_sec": 1072421.2266666666,
+      "stdev": 1285.3463155638676,
+      "cv_percent": 0.11985461343011845,
+      "relative_to_bpfbase": 0.9996530242332635
+    },
+    {
+      "case": "overload-t96-c100-o3000",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        2604493.5,
+        2602016.32,
+        2586317.29
+      ],
+      "mean_ops_per_sec": 2597609.0366666666,
+      "stdev": 9857.066616201402,
+      "cv_percent": 0.379466905029338,
+      "relative_to_bpfbase": 1.0
+    },
+    {
+      "case": "overload-t96-c100-o3000",
+      "arm": "bpftip",
+      "commit": "432bee601da9b5ccf89de0936b977c238e01a826",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        2607727.67,
+        2622406.12,
+        2621008.77
+      ],
+      "mean_ops_per_sec": 2617047.52,
+      "stdev": 8101.4103569996605,
+      "cv_percent": 0.30956298252466047,
+      "relative_to_bpfbase": 1.0074832213235128
+    }
+  ],
+  "invalid_runs": [],
+  "cells_without_valid_sample": []
+}

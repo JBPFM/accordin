@@ -1,0 +1,13 @@
+id,benchmark,case,backend,arm,repeat,attempt,valid,reason,ops_per_second,throughput_ops_per_sec,sched_yield_entries,operations,roi_seconds,seconds,wall_seconds,max_process_threads,output_sha256
+stream-192-bpfbase-mcs_accordin-r1-a1,stream,,mcs_accordin,bpfbase,1,1,True,,,,,,,36.79071478,37.0485608879826,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_tas_accordin-r1-a1,stream,,mcs_tas_accordin,bpfbase,1,1,True,,,,,,,36.25351172,36.54237310399185,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpftip-mcs_accordin-r1-a1,stream,,mcs_accordin,bpftip,1,1,True,,,,,,,35.06302413,35.34721818298567,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpftip-mcs_tas_accordin-r1-a1,stream,,mcs_tas_accordin,bpftip,1,1,True,,,,,,,34.47661694,34.834791968984064,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpftip-mcs_accordin-r2-a1,stream,,mcs_accordin,bpftip,2,1,True,,,,,,,35.41473262,35.75369496201165,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpftip-mcs_tas_accordin-r2-a1,stream,,mcs_tas_accordin,bpftip,2,1,True,,,,,,,35.77886262,36.05132602099911,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_accordin-r2-a1,stream,,mcs_accordin,bpfbase,2,1,True,,,,,,,35.14473378,35.43825773001299,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_tas_accordin-r2-a1,stream,,mcs_tas_accordin,bpfbase,2,1,True,,,,,,,36.33389852,36.642793642007746,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_accordin-r3-a1,stream,,mcs_accordin,bpfbase,3,1,True,,,,,,,36.76925614,37.04349624199676,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_tas_accordin-r3-a1,stream,,mcs_tas_accordin,bpfbase,3,1,True,,,,,,,36.7867898,37.04620385498856,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpftip-mcs_accordin-r3-a1,stream,,mcs_accordin,bpftip,3,1,True,,,,,,,35.11121197,35.45436051301658,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpftip-mcs_tas_accordin-r3-a1,stream,,mcs_tas_accordin,bpftip,3,1,True,,,,,,,35.56570129,35.84720698700403,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84

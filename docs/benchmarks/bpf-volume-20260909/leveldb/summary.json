@@ -1,0 +1,175 @@
+{
+  "baseline_arm": "bpfbase",
+  "cells": [
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_accordin",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 267619.41133333335,
+      "stdev": 3867.283941215887,
+      "cv_percent": 1.445068547886084,
+      "relative_to_bpfbase": 1.0,
+      "runs_ops_per_second": [
+        271000.327,
+        268455.402,
+        263402.505
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_accordin",
+      "arm": "bpftip",
+      "commit": "432bee601da9b5ccf89de0936b977c238e01a826",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 275282.924,
+      "stdev": 4877.7493872662235,
+      "cv_percent": 1.7719040892148559,
+      "relative_to_bpfbase": 1.0286358625052103,
+      "runs_ops_per_second": [
+        272827.328,
+        272120.964,
+        280900.48
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 265029.275,
+      "stdev": 11848.790596681672,
+      "cv_percent": 4.47074784349075,
+      "relative_to_bpfbase": 1.0,
+      "runs_ops_per_second": [
+        272497.921,
+        271222.607,
+        251367.297
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "bpftip",
+      "commit": "432bee601da9b5ccf89de0936b977c238e01a826",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 276652.8163333333,
+      "stdev": 8097.528327387723,
+      "cv_percent": 2.9269639957798863,
+      "relative_to_bpfbase": 1.043857575104989,
+      "runs_ops_per_second": [
+        271868.779,
+        272087.486,
+        286002.184
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_accordin",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1338796.7596666666,
+      "stdev": 9970.174484506655,
+      "cv_percent": 0.7447115787006406,
+      "relative_to_bpfbase": 1.0,
+      "runs_ops_per_second": [
+        1329529.703,
+        1337514.578,
+        1349345.998
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_accordin",
+      "arm": "bpftip",
+      "commit": "432bee601da9b5ccf89de0936b977c238e01a826",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1211524.9096666668,
+      "stdev": 6458.642612989165,
+      "cv_percent": 0.5331002739981768,
+      "relative_to_bpfbase": 0.9049356453240237,
+      "runs_ops_per_second": [
+        1217799.872,
+        1211877.801,
+        1204897.056
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1162158.0163333332,
+      "stdev": 21829.60035383674,
+      "cv_percent": 1.8783676614571074,
+      "relative_to_bpfbase": 1.0,
+      "runs_ops_per_second": [
+        1142346.228,
+        1185560.252,
+        1158567.569
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "bpftip",
+      "commit": "432bee601da9b5ccf89de0936b977c238e01a826",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1101614.9013333332,
+      "stdev": 14319.972324085953,
+      "cv_percent": 1.2999072821867113,
+      "relative_to_bpfbase": 0.9479045756694804,
+      "runs_ops_per_second": [
+        1099836.731,
+        1116740.917,
+        1088267.056
+      ],
+      "mean_counters": null
+    }
+  ],
+  "invalid_runs": [],
+  "cells_without_valid_sample": []
+}

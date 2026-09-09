@@ -1,0 +1,5 @@
+id,benchmark,case,backend,arm,repeat,attempt,valid,reason,ops_per_second,throughput_ops_per_sec,sched_yield_entries,operations,roi_seconds,seconds,wall_seconds,max_process_threads,output_sha256
+stream-192-claim-mcs_accordin-r1-a1,stream,,mcs_accordin,claim,1,1,True,,,,,,,38.26396785,38.557467827020446,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-claim-mcs_tas_accordin-r1-a1,stream,,mcs_tas_accordin,claim,1,1,True,,,,,,,37.1952371,37.46106268200674,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-yield-mcs_accordin-r1-a1,stream,,mcs_accordin,yield,1,1,True,,,,,,,39.26665476,39.55833928499487,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-yield-mcs_tas_accordin-r1-a1,stream,,mcs_tas_accordin,yield,1,1,True,,,,,,,37.92564085,38.165048402006505,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84

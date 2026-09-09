@@ -1,0 +1,167 @@
+{
+  "baseline_arm": "yield",
+  "cells": [
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_accordin",
+      "arm": "yield",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_USER_CLAIM": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1195015.8036666666,
+      "stdev": 19244.450535538075,
+      "cv_percent": 1.6103929735900007,
+      "relative_to_yield": 1.0,
+      "runs_ops_per_second": [
+        1195867.044,
+        1213820.509,
+        1175359.858
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_accordin",
+      "arm": "claim",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {},
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1180799.7916666667,
+      "stdev": 29075.692304830933,
+      "cv_percent": 2.4623727502349393,
+      "relative_to_yield": 0.9881039129722127,
+      "runs_ops_per_second": [
+        1148181.355,
+        1190222.496,
+        1203995.524
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "yield",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_USER_CLAIM": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1101587.1696666668,
+      "stdev": 4960.330626039544,
+      "cv_percent": 0.4502894335216802,
+      "relative_to_yield": 1.0,
+      "runs_ops_per_second": [
+        1096155.174,
+        1102729.971,
+        1105876.364
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "claim",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {},
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1065457.4533333334,
+      "stdev": 34969.388421505726,
+      "cv_percent": 3.282100877149281,
+      "relative_to_yield": 0.967202126778341,
+      "runs_ops_per_second": [
+        1025777.337,
+        1078818.746,
+        1091776.277
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_accordin",
+      "arm": "yield",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_USER_CLAIM": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 263180.47033333336,
+      "stdev": 3307.068251065645,
+      "cv_percent": 1.2565781370012186,
+      "relative_to_yield": 1.0,
+      "runs_ops_per_second": [
+        266619.396,
+        260023.286,
+        262898.729
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_accordin",
+      "arm": "claim",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {},
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 256273.13733333332,
+      "stdev": 9840.194343024805,
+      "cv_percent": 3.8397291442316512,
+      "relative_to_yield": 0.973754386139475,
+      "runs_ops_per_second": [
+        267602.734,
+        249860.272,
+        251356.406
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "yield",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_USER_CLAIM": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 261554.49233333333,
+      "stdev": 12742.869673376772,
+      "cv_percent": 4.87197507475301,
+      "relative_to_yield": 1.0,
+      "runs_ops_per_second": [
+        264483.657,
+        247602.087,
+        272577.733
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "claim",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {},
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_ops_per_second": 258963.79866666667,
+      "stdev": 12424.716768479246,
+      "cv_percent": 4.797858554921843,
+      "relative_to_yield": 0.9900950136869949,
+      "runs_ops_per_second": [
+        267336.986,
+        244688.058,
+        264866.352
+      ],
+      "mean_counters": null
+    }
+  ],
+  "invalid_runs": [],
+  "cells_without_valid_sample": []
+}

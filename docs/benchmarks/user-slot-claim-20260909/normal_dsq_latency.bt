@@ -1,0 +1,46 @@
+/* Time from a task being inserted into NORMAL_DSQ (0x100) to it next running.
+ *
+ * $1 is the traced tgid. The insert timestamp is keyed by tid and consumed by
+ * the next sched_switch that puts that tid on a CPU, so the histograms measure
+ * the ordinary-task queueing delay the accordin scheduler imposes. Two
+ * histograms are kept: @wait_us for the traced process only, and @wait_all_us
+ * for every task the scheduler puts in NORMAL_DSQ, because the traced process
+ * may contribute almost nothing while other tasks do.
+ *
+ * The linear histograms cover 0-2000 us in 10 us buckets, which is the range
+ * where a HZ=1000 tick-length wait would show up; larger values fall in the
+ * overflow bucket and are also counted by @over_2ms / @all_over_2ms.
+ */
+kprobe:scx_bpf_dsq_insert
+/arg1 == 0x100/
+{
+  $p = (struct task_struct *)arg0;
+  @ins[$p->pid] = nsecs;
+  @tgid[$p->pid] = $p->tgid;
+  @inserts_all = count();
+  if ($p->tgid == $1) { @inserts = count(); }
+}
+
+tracepoint:sched:sched_switch
+{
+  $t = @ins[args->next_pid];
+  if ($t) {
+    $us = (nsecs - $t) / 1000;
+    @wait_all_us = lhist($us, 0, 2000, 10);
+    @all_stats = stats($us);
+    @all_max_us = max($us);
+    if ($us > 2000) { @all_over_2ms = count(); }
+    if (@tgid[args->next_pid] == $1) {
+      @wait_us = lhist($us, 0, 2000, 10);
+      @wait_stats = stats($us);
+      @wait_max_us = max($us);
+      if ($us > 2000) { @over_2ms = count(); }
+      @matched = count();
+    }
+    delete(@ins[args->next_pid]);
+    delete(@tgid[args->next_pid]);
+    @matched_all = count();
+  }
+}
+
+END { clear(@ins); clear(@tgid); }

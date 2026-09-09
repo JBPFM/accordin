@@ -1,0 +1,235 @@
+{
+  "baseline_arm": "yield-counters",
+  "cells": [
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_accordin",
+      "arm": "yield-counters",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_USER_CLAIM": "0",
+        "ACCORDIN_CV_COUNTERS": "1"
+      },
+      "n_valid": 1,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1212637.88,
+      "stdev": 0.0,
+      "cv_percent": 0.0,
+      "relative_to_yield-counters": 1.0,
+      "runs_ops_per_second": [
+        1212637.88
+      ],
+      "mean_counters": {
+        "renews": 0,
+        "claims": 0,
+        "undone": 0,
+        "queued": 84392799,
+        "adopted": 0,
+        "swept": 0,
+        "slots_left": 0,
+        "demand": 0
+      }
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_accordin",
+      "arm": "claim-counters",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "1"
+      },
+      "n_valid": 1,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1202928.404,
+      "stdev": 0.0,
+      "cv_percent": 0.0,
+      "relative_to_yield-counters": 0.9919930952511563,
+      "runs_ops_per_second": [
+        1202928.404
+      ],
+      "mean_counters": {
+        "renews": 2,
+        "claims": 2,
+        "undone": 0,
+        "queued": 83723366,
+        "adopted": 3,
+        "swept": 0,
+        "slots_left": 0,
+        "demand": 0
+      }
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "yield-counters",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_USER_CLAIM": "0",
+        "ACCORDIN_CV_COUNTERS": "1"
+      },
+      "n_valid": 1,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1086368.139,
+      "stdev": 0.0,
+      "cv_percent": 0.0,
+      "relative_to_yield-counters": 1.0,
+      "runs_ops_per_second": [
+        1086368.139
+      ],
+      "mean_counters": {
+        "renews": 0,
+        "claims": 0,
+        "undone": 0,
+        "queued": 61831614,
+        "adopted": 0,
+        "swept": 0,
+        "slots_left": 0,
+        "demand": 0
+      }
+    },
+    {
+      "benchmark": "readrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "claim-counters",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "1"
+      },
+      "n_valid": 1,
+      "n_invalid": 0,
+      "mean_ops_per_second": 1102468.424,
+      "stdev": 0.0,
+      "cv_percent": 0.0,
+      "relative_to_yield-counters": 1.0148202845996759,
+      "runs_ops_per_second": [
+        1102468.424
+      ],
+      "mean_counters": {
+        "renews": 8,
+        "claims": 3,
+        "undone": 0,
+        "queued": 66114688,
+        "adopted": 11,
+        "swept": 0,
+        "slots_left": 0,
+        "demand": 0
+      }
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_accordin",
+      "arm": "yield-counters",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_USER_CLAIM": "0",
+        "ACCORDIN_CV_COUNTERS": "1"
+      },
+      "n_valid": 1,
+      "n_invalid": 0,
+      "mean_ops_per_second": 273623.727,
+      "stdev": 0.0,
+      "cv_percent": 0.0,
+      "relative_to_yield-counters": 1.0,
+      "runs_ops_per_second": [
+        273623.727
+      ],
+      "mean_counters": {
+        "renews": 0,
+        "claims": 0,
+        "undone": 0,
+        "queued": 2058836,
+        "adopted": 0,
+        "swept": 0,
+        "slots_left": 0,
+        "demand": 0
+      }
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_accordin",
+      "arm": "claim-counters",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "1"
+      },
+      "n_valid": 1,
+      "n_invalid": 0,
+      "mean_ops_per_second": 272465.972,
+      "stdev": 0.0,
+      "cv_percent": 0.0,
+      "relative_to_yield-counters": 0.995768806262916,
+      "runs_ops_per_second": [
+        272465.972
+      ],
+      "mean_counters": {
+        "renews": 27086,
+        "claims": 2206,
+        "undone": 0,
+        "queued": 2049805,
+        "adopted": 29291,
+        "swept": 0,
+        "slots_left": 0,
+        "demand": 0
+      }
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "yield-counters",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_USER_CLAIM": "0",
+        "ACCORDIN_CV_COUNTERS": "1"
+      },
+      "n_valid": 1,
+      "n_invalid": 0,
+      "mean_ops_per_second": 271755.659,
+      "stdev": 0.0,
+      "cv_percent": 0.0,
+      "relative_to_yield-counters": 1.0,
+      "runs_ops_per_second": [
+        271755.659
+      ],
+      "mean_counters": {
+        "renews": 0,
+        "claims": 0,
+        "undone": 0,
+        "queued": 1481511,
+        "adopted": 0,
+        "swept": 0,
+        "slots_left": 0,
+        "demand": 0
+      }
+    },
+    {
+      "benchmark": "fillrandom",
+      "backend": "mcs_tas_accordin",
+      "arm": "claim-counters",
+      "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "1"
+      },
+      "n_valid": 1,
+      "n_invalid": 0,
+      "mean_ops_per_second": 258008.759,
+      "stdev": 0.0,
+      "cv_percent": 0.0,
+      "relative_to_yield-counters": 0.9494144848700281,
+      "runs_ops_per_second": [
+        258008.759
+      ],
+      "mean_counters": {
+        "renews": 15306,
+        "claims": 2114,
+        "undone": 0,
+        "queued": 1512773,
+        "adopted": 17419,
+        "swept": 0,
+        "slots_left": 0,
+        "demand": 0
+      }
+    }
+  ],
+  "invalid_runs": [],
+  "cells_without_valid_sample": []
+}

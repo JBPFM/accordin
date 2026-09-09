@@ -1,0 +1,51 @@
+[
+  {
+    "id": "readrandom-192-claim-mcs_accordin",
+    "arm": "claim",
+    "backend": "mcs_accordin",
+    "ops_per_second": 1195424.507,
+    "histogram": {
+      "buckets": [
+        [
+          0,
+          10,
+          1
+        ],
+        [
+          10,
+          20,
+          1
+        ]
+      ],
+      "samples": 2,
+      "p50": 10,
+      "p99": 20,
+      "max_us": 12,
+      "inserts": 2,
+      "matched": 2,
+      "over_2ms": 0
+    }
+  },
+  {
+    "id": "readrandom-192-yield-mcs_accordin",
+    "arm": "yield",
+    "backend": "mcs_accordin",
+    "ops_per_second": 1203281.325,
+    "histogram": {
+      "buckets": [
+        [
+          10,
+          20,
+          3
+        ]
+      ],
+      "samples": 3,
+      "p50": 20,
+      "p99": 20,
+      "max_us": 15,
+      "inserts": 3,
+      "matched": 3,
+      "over_2ms": 0
+    }
+  }
+]

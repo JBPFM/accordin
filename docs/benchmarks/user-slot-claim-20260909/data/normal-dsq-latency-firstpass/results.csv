@@ -1,0 +1,3 @@
+id,benchmark,case,backend,arm,repeat,attempt,valid,reason,ops_per_second,throughput_ops_per_sec,sched_yield_entries,operations,roi_seconds,seconds,wall_seconds,max_process_threads,output_sha256
+readrandom-192-claim-mcs_accordin,,,mcs_accordin,claim,,,,,1195424.507,,,35891056,30.023691,,30.290173002984375,,
+readrandom-192-yield-mcs_accordin,,,mcs_accordin,yield,,,,,1203281.325,,,36122290,30.019821,,30.28274322699872,,

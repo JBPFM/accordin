@@ -1,0 +1,116 @@
+{
+  "started_utc": "2026-09-09T07:36:08.021684+00:00",
+  "commit": "ef669b73e0277a7201a81b5b753ba4d41f692a35",
+  "uname": [
+    "Linux",
+    "nku-PowerEdge-R750",
+    "7.0.0-30-generic",
+    "#30-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 31 18:22:54 UTC 2026",
+    "x86_64"
+  ],
+  "cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47
+  ],
+  "hashes": {
+    "/mnt/data/home/jz/accordin-simplify/bench/mutexbench/mutex_bench": "ed4a3e09df7214bd432c0b740aec1c383491d1f2defbe052cf096ca9020dc04c",
+    "/mnt/data/home/jz/accordin-simplify/third_party/litl/lib/libmcsaccordin_original.so": "73271659890984fcf3db539802ed50052fa0634e5c79373a92a7c46a30356beb",
+    "/mnt/data/home/jz/accordin-simplify/target/release/libmcs_accordin_direct.so": "17bf1bb7e296c5fdfa77bdda0ea5f9f372eee5ddeaa168ffad7da883f4c18024",
+    "/mnt/data/home/jz/accordin-simplify/docs/benchmarks/user-slot-claim-20260909/mutexbench_yield.py": "36c9dd9940c4e58fb1338d01c07c675fb3f93f9ac5f4303f355ecfd423d8b5cf"
+  },
+  "configuration": {
+    "LC_ALL": "C",
+    "MCS_ACCORDIN_DIRECT_DISABLE_BPF": "0",
+    "MCS_ACCORDIN_DIRECT_STATS_ONLY": "0",
+    "ACCORDIN_DISABLE_ADMISSION": "0",
+    "ACCORDIN_HOOK_STATS": "0"
+  },
+  "preload": {
+    "LD_PRELOAD": "/mnt/data/home/jz/accordin-simplify/third_party/litl/lib/libmcsaccordin_original.so",
+    "LD_LIBRARY_PATH": "/mnt/data/home/jz/accordin-simplify/target/release"
+  },
+  "arms": {
+    "claim": {},
+    "yield": {
+      "ACCORDIN_USER_CLAIM": "0"
+    }
+  },
+  "cases": {
+    "low-t2-c100-o0": [
+      2,
+      100,
+      0
+    ],
+    "low-t4-c100-o0": [
+      4,
+      100,
+      0
+    ],
+    "low-t4-c100-o3000": [
+      4,
+      100,
+      3000
+    ],
+    "overload-t96-c100-o3000": [
+      96,
+      100,
+      3000
+    ]
+  },
+  "tracepoint": "syscalls:sys_enter_sched_yield",
+  "repeats": 3,
+  "duration_ms": 5000,
+  "warmup_ms": 1000,
+  "cpu_governors": [
+    "performance"
+  ],
+  "completed_utc": "2026-09-09T07:39:32.664260+00:00",
+  "inputs_changed": [],
+  "state_after": "disabled"
+}

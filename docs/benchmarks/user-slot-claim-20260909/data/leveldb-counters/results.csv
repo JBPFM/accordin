@@ -1,0 +1,9 @@
+id,benchmark,case,backend,arm,repeat,attempt,valid,reason,ops_per_second,throughput_ops_per_sec,sched_yield_entries,operations,roi_seconds,seconds,wall_seconds,max_process_threads,output_sha256,adopted,claims,demand,queued,renews,slots_left,swept,undone
+readrandom-192-claim-mcs_accordin-counters-r1-a1,readrandom,,mcs_accordin,claim-counters,1,1,True,,1202928.404,,,36088711,30.000714,,30.322518141008914,193,,3,2,0,83723366,2,0,0,0
+readrandom-192-yield-mcs_accordin-counters-r1-a1,readrandom,,mcs_accordin,yield-counters,1,1,True,,1212637.88,,,36397138,30.014845,,30.32157515597646,193,,0,0,0,84392799,0,0,0,0
+readrandom-192-claim-mcs_tas_accordin-counters-r1-a1,readrandom,,mcs_tas_accordin,claim-counters,1,1,True,,1102468.424,,,33074809,30.000686,,30.32074259899673,193,,11,3,0,66114688,8,0,0,0
+readrandom-192-yield-mcs_tas_accordin-counters-r1-a1,readrandom,,mcs_tas_accordin,yield-counters,1,1,True,,1086368.139,,,32607419,30.015073,,30.319337560998974,193,,0,0,0,61831614,0,0,0,0
+fillrandom-192-claim-mcs_accordin-counters-r1-a1,fillrandom,,mcs_accordin,claim-counters,1,1,True,,272465.972,,,8175575,30.005857,,30.409523718000855,194,,29291,2206,0,2049805,27086,0,0,0
+fillrandom-192-yield-mcs_accordin-counters-r1-a1,fillrandom,,mcs_accordin,yield-counters,1,1,True,,273623.727,,,8209102,30.001426,,30.308755781996297,194,,0,0,0,2058836,0,0,0,0
+fillrandom-192-claim-mcs_tas_accordin-counters-r1-a1,fillrandom,,mcs_tas_accordin,claim-counters,1,1,True,,258008.759,,,7740560,30.001152,,30.304926673008595,194,,17419,2114,0,1512773,15306,0,0,0
+fillrandom-192-yield-mcs_tas_accordin-counters-r1-a1,fillrandom,,mcs_tas_accordin,yield-counters,1,1,True,,271755.659,,,8154868,30.008089,,30.30370877101086,194,,0,0,0,1481511,0,0,0,0

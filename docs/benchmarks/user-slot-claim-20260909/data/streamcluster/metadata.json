@@ -1,0 +1,120 @@
+{
+  "started_utc": "2026-09-09T08:09:58.865056+00:00",
+  "commit": "9fc1b0aed281a2a3ee820e1c171319bb35055109",
+  "arms": {
+    "claim": {},
+    "yield": {
+      "ACCORDIN_USER_CLAIM": "0"
+    }
+  },
+  "counters": false,
+  "uname": [
+    "Linux",
+    "nku-PowerEdge-R750",
+    "7.0.0-30-generic",
+    "#30-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 31 18:22:54 UTC 2026",
+    "x86_64"
+  ],
+  "hashes": {
+    "/mnt/data/home/jz/accordin-simplify/docs/benchmarks/user-slot-claim-20260909/streamcluster.py": "78763f8b76755ec65820339cbae09c4d4e7debfa51c776c32fad648b72c07124",
+    "/mnt/data/home/jz/accordin-simplify/target/flexguard-suite-20260905/streamcluster/streamcluster": "6be5114974d37f471e9c43659381d2b0b84faaa37d75030f62bae1197184ce14",
+    "/mnt/data/home/jz/accordin-simplify/target/release/libmcs_accordin_direct.so": "17bf1bb7e296c5fdfa77bdda0ea5f9f372eee5ddeaa168ffad7da883f4c18024",
+    "/mnt/data/home/jz/accordin-simplify/target/release/libmcs_tas_accordin_direct.so": "b233b181ed8d0d1ef63696abc7a1009667593e1fc4c0de61c0d1a39c17413098",
+    "/mnt/data/home/jz/accordin-simplify/target/streamcluster-analysis-20260905/barrier": "2162e1ec48920d6322f98ed6f3f9b4eef0cf396dda201c45cc40274e204f7fc1",
+    "/mnt/data/home/jz/accordin-simplify/third_party/litl/lib/libmcsaccordin_original.so": "73271659890984fcf3db539802ed50052fa0634e5c79373a92a7c46a30356beb",
+    "/mnt/data/home/jz/accordin-simplify/third_party/litl/lib/libmcstasaccordin_original.so": "0fa1c9a3174195566abf1b82d65031cf0682ae3415982b6c763efb5b27097809"
+  },
+  "benchmark_binaries": {
+    "stream": {
+      "path": "/mnt/data/home/jz/accordin-simplify/target/flexguard-suite-20260905/streamcluster/streamcluster",
+      "sha256": "6be5114974d37f471e9c43659381d2b0b84faaa37d75030f62bae1197184ce14"
+    },
+    "barrier": {
+      "path": "/mnt/data/home/jz/accordin-simplify/target/streamcluster-analysis-20260905/barrier",
+      "sha256": "2162e1ec48920d6322f98ed6f3f9b4eef0cf396dda201c45cc40274e204f7fc1"
+    }
+  },
+  "accepted_stream_output_sha256": [
+    "13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84",
+    "dfeea2357203cceeb8bcdac4984ffc9da9c953f1f1d19c06990626a4575ef01f"
+  ],
+  "configuration": {
+    "LC_ALL": "C",
+    "MCS_ACCORDIN_DIRECT_DISABLE_BPF": "0",
+    "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF": "0",
+    "MCS_ACCORDIN_DIRECT_STATS_ONLY": "0",
+    "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY": "0",
+    "ACCORDIN_DISABLE_ADMISSION": "0",
+    "ACCORDIN_HOOK_STATS": "0",
+    "OMP_PROC_BIND": "false",
+    "OMP_WAIT_POLICY": "PASSIVE"
+  },
+  "threads": 192,
+  "cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47
+  ],
+  "cpu_online_spec": "0-47",
+  "repeats": 1,
+  "modes": [
+    "stream"
+  ],
+  "backends": [
+    "mcs_accordin",
+    "mcs_tas_accordin"
+  ],
+  "max_attempts": 2,
+  "cpu_governors": [
+    "performance"
+  ],
+  "dmesg_available": true,
+  "completed_utc": "2026-09-09T08:12:32.706989+00:00",
+  "inputs_changed": [],
+  "state_after": "disabled"
+}

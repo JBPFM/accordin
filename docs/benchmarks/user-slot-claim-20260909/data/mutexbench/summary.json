@@ -1,0 +1,250 @@
+[
+  {
+    "case": "low-t2-c100-o0",
+    "arm": "claim",
+    "n_valid": 3,
+    "n_invalid": 0,
+    "sched_yield_entries": [
+      74615,
+      9778,
+      9357
+    ],
+    "mean_sched_yield_entries": 31250,
+    "throughput_ops_per_sec": [
+      3789901.2,
+      3442314.11,
+      3437444.12
+    ],
+    "mean_throughput_ops_per_sec": 3556553.1433333335,
+    "counter_run": "low-t2-c100-o0-claim-r1-counters",
+    "claim_counters": {
+      "renews": 18256907,
+      "claims": 1933,
+      "undone": 0,
+      "queued": 13699,
+      "adopted": 15857,
+      "swept": 1,
+      "slots_left": 0,
+      "demand": 0
+    },
+    "yields_relative_to_yield_arm": 0.022171737668256884,
+    "throughput_relative_to_yield_arm": 0.561597871136949
+  },
+  {
+    "case": "low-t2-c100-o0",
+    "arm": "yield",
+    "n_valid": 3,
+    "n_invalid": 0,
+    "sched_yield_entries": [
+      1394721,
+      1421994,
+      1411641
+    ],
+    "mean_sched_yield_entries": 1409452,
+    "throughput_ops_per_sec": [
+      6328286.6,
+      6341048.13,
+      6329418.61
+    ],
+    "mean_throughput_ops_per_sec": 6332917.78,
+    "counter_run": "low-t2-c100-o0-yield-r1-counters",
+    "claim_counters": {
+      "renews": 0,
+      "claims": 0,
+      "undone": 0,
+      "queued": 1392904,
+      "adopted": 0,
+      "swept": 0,
+      "slots_left": 0,
+      "demand": 0
+    },
+    "yields_relative_to_yield_arm": 1.0,
+    "throughput_relative_to_yield_arm": 1.0
+  },
+  {
+    "case": "low-t4-c100-o0",
+    "arm": "claim",
+    "n_valid": 3,
+    "n_invalid": 0,
+    "sched_yield_entries": [
+      47916,
+      57430,
+      69302
+    ],
+    "mean_sched_yield_entries": 58216,
+    "throughput_ops_per_sec": [
+      4002317.87,
+      3960421.51,
+      4021386.55
+    ],
+    "mean_throughput_ops_per_sec": 3994708.643333333,
+    "counter_run": "low-t4-c100-o0-claim-r1-counters",
+    "claim_counters": {
+      "renews": 23230089,
+      "claims": 2192,
+      "undone": 0,
+      "queued": 65959,
+      "adopted": 45433,
+      "swept": 2,
+      "slots_left": 0,
+      "demand": 0
+    },
+    "yields_relative_to_yield_arm": 0.013678598211540983,
+    "throughput_relative_to_yield_arm": 0.7083907933269777
+  },
+  {
+    "case": "low-t4-c100-o0",
+    "arm": "yield",
+    "n_valid": 3,
+    "n_invalid": 0,
+    "sched_yield_entries": [
+      4138589,
+      4306574,
+      4322812
+    ],
+    "mean_sched_yield_entries": 4255991.666666667,
+    "throughput_ops_per_sec": [
+      5595504.68,
+      5632402.57,
+      5689486.43
+    ],
+    "mean_throughput_ops_per_sec": 5639131.226666667,
+    "counter_run": "low-t4-c100-o0-yield-r1-counters",
+    "claim_counters": {
+      "renews": 0,
+      "claims": 0,
+      "undone": 0,
+      "queued": 4181999,
+      "adopted": 0,
+      "swept": 0,
+      "slots_left": 0,
+      "demand": 0
+    },
+    "yields_relative_to_yield_arm": 1.0,
+    "throughput_relative_to_yield_arm": 1.0
+  },
+  {
+    "case": "low-t4-c100-o3000",
+    "arm": "claim",
+    "n_valid": 3,
+    "n_invalid": 0,
+    "sched_yield_entries": [
+      2316,
+      1067,
+      1022
+    ],
+    "mean_sched_yield_entries": 1468.3333333333333,
+    "throughput_ops_per_sec": [
+      1054912.91,
+      1076994.25,
+      1077149.59
+    ],
+    "mean_throughput_ops_per_sec": 1069685.5833333333,
+    "counter_run": "low-t4-c100-o3000-claim-r1-counters",
+    "claim_counters": {
+      "renews": 20362,
+      "claims": 4227,
+      "undone": 0,
+      "queued": 746,
+      "adopted": 4371,
+      "swept": 1,
+      "slots_left": 0,
+      "demand": 0
+    },
+    "yields_relative_to_yield_arm": 0.024916003936785183,
+    "throughput_relative_to_yield_arm": 1.009539609380452
+  },
+  {
+    "case": "low-t4-c100-o3000",
+    "arm": "yield",
+    "n_valid": 3,
+    "n_invalid": 0,
+    "sched_yield_entries": [
+      6180,
+      67488,
+      103126
+    ],
+    "mean_sched_yield_entries": 58931.333333333336,
+    "throughput_ops_per_sec": [
+      1075739.22,
+      1057513.93,
+      1045479.73
+    ],
+    "mean_throughput_ops_per_sec": 1059577.6266666667,
+    "counter_run": "low-t4-c100-o3000-yield-r1-counters",
+    "claim_counters": {
+      "renews": 0,
+      "claims": 0,
+      "undone": 0,
+      "queued": 29916,
+      "adopted": 0,
+      "swept": 0,
+      "slots_left": 0,
+      "demand": 0
+    },
+    "yields_relative_to_yield_arm": 1.0,
+    "throughput_relative_to_yield_arm": 1.0
+  },
+  {
+    "case": "overload-t96-c100-o3000",
+    "arm": "claim",
+    "n_valid": 3,
+    "n_invalid": 0,
+    "sched_yield_entries": [
+      15626146,
+      15583720,
+      15589816
+    ],
+    "mean_sched_yield_entries": 15599894,
+    "throughput_ops_per_sec": [
+      2589892.63,
+      2580913.42,
+      2583215.09
+    ],
+    "mean_throughput_ops_per_sec": 2584673.7133333334,
+    "counter_run": "overload-t96-c100-o3000-claim-r1-counters",
+    "claim_counters": {
+      "renews": 0,
+      "claims": 0,
+      "undone": 0,
+      "queued": 15600356,
+      "adopted": 0,
+      "swept": 0,
+      "slots_left": 0,
+      "demand": 0
+    },
+    "yields_relative_to_yield_arm": 0.9933668749758422,
+    "throughput_relative_to_yield_arm": 0.993186767596403
+  },
+  {
+    "case": "overload-t96-c100-o3000",
+    "arm": "yield",
+    "n_valid": 3,
+    "n_invalid": 0,
+    "sched_yield_entries": [
+      15661783,
+      15766290,
+      15684110
+    ],
+    "mean_sched_yield_entries": 15704061,
+    "throughput_ops_per_sec": [
+      2595723.91,
+      2612213.12,
+      2599276.47
+    ],
+    "mean_throughput_ops_per_sec": 2602404.5,
+    "counter_run": "overload-t96-c100-o3000-yield-r1-counters",
+    "claim_counters": {
+      "renews": 0,
+      "claims": 0,
+      "undone": 0,
+      "queued": 15633416,
+      "adopted": 0,
+      "swept": 0,
+      "slots_left": 0,
+      "demand": 0
+    },
+    "yields_relative_to_yield_arm": 1.0,
+    "throughput_relative_to_yield_arm": 1.0
+  }
+]

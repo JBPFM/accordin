@@ -121,7 +121,7 @@ static __always_inline bool user_state(struct task_struct *p,
   return !bpf_probe_read_user(word, sizeof(*word), (const void *)*address);
 }
 
-static __noinline void release_slot(struct task_scx_ctx *tctx) {
+static __always_inline void release_slot(struct task_scx_ctx *tctx) {
   __u32 assigned = tctx->admission_cpu;
   volatile __u64 *owner;
   bool freed = false;
@@ -154,9 +154,9 @@ static __always_inline __u64 request_ticket(struct task_struct *p, __u32 state) 
  * request comparison the idle-word rule below would then retire an entry the
  * thread has only just taken. Request numbers only grow, which is what makes
  * the comparison decide it. */
-static __noinline void adopt_slot(struct task_struct *p,
-                                  struct task_scx_ctx *tctx,
-                                  struct admission_word word) {
+static __always_inline void adopt_slot(struct task_struct *p,
+                                       struct task_scx_ctx *tctx,
+                                       struct admission_word word) {
   volatile __u64 *owner;
   __u64 value;
 
@@ -183,9 +183,9 @@ static __noinline void adopt_slot(struct task_struct *p,
  * A changed affinity cannot park an existing MCS node behind its successor.
  * Adoption comes first: a slot has to be on the record before the rules that
  * weigh it, the affinity rule included. */
-static __noinline void refresh_episode(struct task_struct *p,
-                                       struct task_scx_ctx *tctx,
-                                       struct admission_word word) {
+static __always_inline void refresh_episode(struct task_struct *p,
+                                            struct task_scx_ctx *tctx,
+                                            struct admission_word word) {
   adopt_slot(p, tctx, word);
   if (!(word.state & USER_FLAGS) ||
       tctx->ticket != request_ticket(p, word.state) ||
@@ -311,7 +311,7 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
  * An empty queue costs one depth query and no iteration. The queue is ordered
  * by the age stamp and the iterator walks that order, so the first candidate
  * offered is the oldest request the queue holds. */
-static __noinline int admit_from(__u32 cpu, __u32 index) {
+static __always_inline int admit_from(__u32 cpu, __u32 index) {
   volatile __u64 *owner = owner_slot(cpu);
   __u64 dsq = waiting_dsq(index);
   struct task_struct *p;
@@ -353,7 +353,7 @@ static __noinline int admit_from(__u32 cpu, __u32 index) {
  * all rather than as an enormous one; a persistent offset between two CPUs
  * wider than the slack would bias the order in favour of the CPU that runs
  * behind, which assumes a host whose clock is stable across CPUs. */
-static __noinline s64 head_age(__u64 dsq, __u64 now) {
+static __always_inline s64 head_age(__u64 dsq, __u64 now) {
   struct task_struct *p = scx_bpf_dsq_peek(dsq);
 
   return p ? time_delta(now, p->scx.dsq_vtime) : -1;

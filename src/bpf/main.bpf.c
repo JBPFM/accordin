@@ -97,44 +97,92 @@ void BPF_STRUCT_OPS(accordin_quiescent, struct task_struct *p, u64 deq_flags) {
     __sync_fetch_and_sub(&auto_runnable, 1);
 }
 
-static __always_inline bool user_state(struct task_struct *p, __u32 *state) {
+/* The word and the slot the runtime keeps for a thread, taken together: the
+ * scheduler has to see the slot a thread recorded beside the request it
+ * recorded it for, and one read of the aligned pair is what gives it both. */
+static __always_inline bool user_state(struct task_struct *p,
+                                       struct admission_word *word) {
   __u32 tid = p->pid;
   __u64 *address = bpf_map_lookup_elem(&thread_ctx_addr_map, &tid);
-  *state = 0;
+  word->state = 0;
+  word->slot = 0;
   if (!address)
     return true;
   /* A failed read is not a release, and must not revoke a spinning waiter. */
-  return !bpf_probe_read_user(state, sizeof(*state), (const void *)*address);
+  return !bpf_probe_read_user(word, sizeof(*word), (const void *)*address);
 }
 
 static __always_inline void release_slot(struct task_struct *p,
                                         struct task_scx_ctx *tctx) {
   __u32 assigned = tctx->admission_cpu;
   volatile __u64 *owner;
+  bool freed = false;
 
   if (!assigned)
     return;
   owner = owner_slot(assigned - 1);
   if (owner)
-    __sync_val_compare_and_swap(owner, tctx->ticket, 0);
+    freed = __sync_val_compare_and_swap(owner, tctx->ticket, 0) == tctx->ticket;
   tctx->admission_cpu = 0;
-  scx_bpf_kick_cpu(assigned - 1, 0);
+  /* A record adopted from the runtime may name a slot this task no longer owns.
+   * The kick exists to make the freed slot's CPU look for a waiter, so it
+   * belongs to the exchange that freed it and to no other. */
+  if (freed)
+    scx_bpf_kick_cpu(assigned - 1, 0);
 }
 
 static __always_inline __u64 request_ticket(struct task_struct *p, __u32 state) {
   return ((__u64)(state & ~USER_META) << 32) | (__u32)p->pid;
 }
 
+/* Take over the slot the runtime records for this thread, so that pinning,
+ * local routing and reclaim all read one record whichever side wrote the table.
+ * The slot is user-writable, hence the bound: an out-of-range CPU handed to a
+ * kick takes the whole scheduler down.
+ *
+ * The entry is read once and adopted only if it names this thread and carries a
+ * request no newer than the word it came with. The word and the slot are
+ * written separately, so an old word may arrive beside a fresh slot; without the
+ * request comparison the idle-word rule below would then retire an entry the
+ * thread has only just taken. Request numbers only grow, which is what makes
+ * the comparison decide it. */
+static __always_inline void adopt_slot(struct task_struct *p,
+                                       struct task_scx_ctx *tctx,
+                                       struct admission_word word) {
+  volatile __u64 *owner;
+  __u64 value;
+
+  if (!word.slot || word.slot - 1 >= scx_bpf_nr_cpu_ids())
+    return;
+  owner = owner_slot(word.slot - 1);
+  if (!owner)
+    return;
+  value = *owner;
+  if ((__u32)value != (__u32)p->pid ||
+      (s32)((__u32)(value >> 32) - (word.state & ~USER_META)) > 0 ||
+      (tctx->admission_cpu == word.slot && tctx->ticket == value))
+    return;
+  /* A record left on another CPU is released here or nowhere: its ticket is
+   * still in that entry, so this exchange is what frees it. */
+  if (tctx->admission_cpu != word.slot)
+    release_slot(p, tctx);
+  tctx->admission_cpu = word.slot;
+  tctx->ticket = value;
+  __sync_fetch_and_add(&claims_adopted, 1);
+}
+
 /* Unless renewed at yield, a new request retires the old slot.
- * A changed affinity cannot park an existing MCS node behind its successor. */
+ * A changed affinity cannot park an existing MCS node behind its successor.
+ * Adoption comes first: a slot has to be on the record before the rules that
+ * weigh it, the affinity rule included. */
 static __always_inline void refresh_episode(struct task_struct *p,
                                             struct task_scx_ctx *tctx,
-                                            __u32 state) {
-  if (!(state & USER_FLAGS) || tctx->ticket != request_ticket(p, state)) {
+                                            struct admission_word word) {
+  adopt_slot(p, tctx, word);
+  if (!(word.state & USER_FLAGS) ||
+      tctx->ticket != request_ticket(p, word.state) ||
+      (tctx->admission_cpu && !allowed(p, tctx->admission_cpu - 1)))
     release_slot(p, tctx);
-  } else if (tctx->admission_cpu && !allowed(p, tctx->admission_cpu - 1)) {
-    release_slot(p, tctx);
-  }
 }
 
 s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -161,15 +209,15 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   struct task_scx_ctx *tctx;
   __u64 dsq = NORMAL_DSQ;
   __u32 cpu = scx_bpf_task_cpu(p);
-  __u32 state;
+  struct admission_word word;
 
   if (lock_routing()) {
-    bool known = user_state(p, &state);
+    bool known = user_state(p, &word);
     tctx = bpf_task_storage_get(&task_ctx_map, p, 0,
                               BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (tctx) {
       if (known)
-        refresh_episode(p, tctx, state);
+        refresh_episode(p, tctx, word);
       /* A task entering enqueue is queued nowhere, so a custody mark left on it
        * belongs to a wait the core has already taken out of the queue. Clearing
        * the mark claims the wait, the same way a scan claims one. */
@@ -180,14 +228,14 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
       if (tctx->admission_cpu) {
         cpu = tctx->admission_cpu - 1;
         dsq = SCX_DSQ_LOCAL_ON | cpu;
-      } else if (known && cv_custody_enabled &&
-                 (state & USER_CV) && (state & USER_FLAGS) == USER_WAITING &&
-                 tctx->custody_denied != request_ticket(p, state)) {
+      } else if (known && cv_custody_enabled && (word.state & USER_CV) &&
+                 (word.state & USER_FLAGS) == USER_WAITING &&
+                 tctx->custody_denied != request_ticket(p, word.state)) {
         /* A condvar wait is held until it is notified or its custody expires,
          * never admitted onto a CPU slot. */
         __u64 parked = scx_bpf_now();
 
-        tctx->ticket = request_ticket(p, state);
+        tctx->ticket = request_ticket(p, word.state);
         /* The low bit keeps the mark non-zero whatever the clock reads, so an
          * unset mark is the only way to read as unparked. */
         tctx->parked_at = parked | 1;
@@ -195,9 +243,9 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
         dsq = WAITFORSIGNAL_DSQ;
         __sync_fetch_and_add(&cv_parked, 1);
         __sync_fetch_and_add(&cv_parked_now, 1);
-      } else if (known && !(state & USER_CV) &&
-                 (state & USER_FLAGS) == USER_WAITING) {
-        tctx->ticket = request_ticket(p, state);
+      } else if (known && !(word.state & USER_CV) &&
+                 (word.state & USER_FLAGS) == USER_WAITING) {
+        tctx->ticket = request_ticket(p, word.state);
         p->scx.dsq_vtime = scx_bpf_now();
         dsq = waiting_dsq(cpu);
       }
@@ -211,6 +259,10 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
    * of its admission CPU. */
   if ((enq_flags & SCX_ENQ_LAST) && dsq == NORMAL_DSQ)
     dsq = SCX_DSQ_LOCAL;
+  /* Everything the runtime treats as a competitor is queued in the ordinary
+   * queue or in the bank, and nowhere else. */
+  if (dsq == NORMAL_DSQ || is_waiting(dsq))
+    __sync_fetch_and_add(&admission.demand, 1);
   /* The admission bank is ordered by the age stamp, which makes the head of a
    * queue its oldest request by construction. A queue holds either ordered or
    * plain insertions and never both, so the bank takes these and nothing else,
@@ -270,8 +322,10 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
       tctx->admission_cpu = 0;
       return ADMIT_SLOT_LOST;
     }
-    if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
+    if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0)) {
+      __sync_fetch_and_add(&admission.demand, -1);
       return ADMIT_GRANTED;
+    }
     release_slot(p, tctx);
   }
   return ADMIT_NONE;
@@ -468,6 +522,7 @@ __noinline int cv_expire_parked(__u64 now) {
     __sync_fetch_and_sub(&cv_parked_now, 1);
     if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, NORMAL_DSQ, 0)) {
       __sync_fetch_and_add(&cv_expired, 1);
+      __sync_fetch_and_add(&admission.demand, 1);
       expired++;
     } else if (__sync_bool_compare_and_swap(&tctx->parked_at, 0, parked)) {
       __sync_fetch_and_add(&cv_parked_now, 1);
@@ -512,7 +567,8 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
   (void)prev;
   /* Serve ordinary work alongside the reserved waiter. This also lets an
    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
-  scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+  if (scx_bpf_dsq_move_to_local(NORMAL_DSQ))
+    __sync_fetch_and_add(&admission.demand, -1);
   if (!lock_routing() || cpu < 0 || cpu >= MAX_CPUS)
     return;
   admit_waiter((__u32)cpu);
@@ -520,15 +576,16 @@ void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
 
 bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct *to) {
   struct task_scx_ctx *tctx = lock_routing() ? task_ctx(from) : 0;
-  __u32 cpu = bpf_get_smp_processor_id(), state;
+  __u32 cpu = bpf_get_smp_processor_id();
   volatile __u64 *owner = owner_slot(cpu);
+  struct admission_word word;
 
   (void)to;
   /* Renew only our existing slot; userspace still confirms the new ticket. */
-  if (!stats_only_mode && tctx && owner && user_state(from, &state) &&
-      !(state & USER_CV) && (state & USER_FLAGS) == USER_WAITING &&
+  if (!stats_only_mode && tctx && owner && user_state(from, &word) &&
+      !(word.state & USER_CV) && (word.state & USER_FLAGS) == USER_WAITING &&
       tctx->admission_cpu == cpu + 1) {
-    __u64 next = request_ticket(from, state);
+    __u64 next = request_ticket(from, word.state);
     if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
       tctx->ticket = next;
   }
@@ -538,33 +595,61 @@ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct
 
 void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
   struct task_scx_ctx *tctx = lock_routing() ? task_ctx(p) : 0;
-  __u32 state;
+  struct admission_word word;
 
-  if (stats_only_mode || !tctx || !user_state(p, &state))
+  if (stats_only_mode || !tctx || !user_state(p, &word))
     return;
-  refresh_episode(p, tctx, state);
+  refresh_episode(p, tctx, word);
   /* An admitted thread that spins never empties its CPU, so ops.dispatch is
    * never called there and the global queue is never consumed. Ending the
    * slice hands the CPU to one queued ordinary task; the spinner keeps its
    * slot and is re-enqueued behind it. */
   if (tctx->admission_cpu &&
-      ((state & USER_FLAGS) == USER_WAITING ||
-       (state & USER_FLAGS) == USER_SPINNING) &&
+      ((word.state & USER_FLAGS) == USER_WAITING ||
+       (word.state & USER_FLAGS) == USER_SPINNING) &&
       scx_bpf_dsq_nr_queued(NORMAL_DSQ))
     p->scx.slice = 0;
 }
 
 void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   struct task_scx_ctx *tctx = lock_routing() ? task_ctx(p) : 0;
-  __u32 state;
+  struct admission_word word;
 
-  if (stats_only_mode || !tctx || !user_state(p, &state))
+  if (stats_only_mode || !tctx || !user_state(p, &word))
     return;
-  refresh_episode(p, tctx, state);
+  refresh_episode(p, tctx, word);
   /* A holder or an existing raw-lock node must be allowed to resume. */
-  if (!runnable && (state & USER_FLAGS) != USER_HELD &&
-      (state & USER_FLAGS) != USER_SPINNING)
+  if (!runnable && (word.state & USER_FLAGS) != USER_HELD &&
+      (word.state & USER_FLAGS) != USER_SPINNING)
     release_slot(p, tctx);
+}
+
+/* A thread may leave holding a slot the scheduler never recorded, and its
+ * memory is gone by then, so the table itself is the only record left to clear.
+ * Only entries naming this thread are touched, and only the exchange that frees
+ * one asks its CPU to look for a waiter. */
+__noinline int sweep_slots(__u32 tid) {
+  __u32 cpu, cpus = scx_bpf_nr_cpu_ids();
+
+  if (cpus > MAX_CPUS)
+    cpus = MAX_CPUS;
+  /* The tally goes straight to the counter: a running total in a variable has
+   * to be tracked exactly by the verifier, which then cannot fold the walk. */
+  bpf_for(cpu, 0, cpus) {
+    volatile __u64 *owner = owner_slot(cpu);
+    __u64 value;
+
+    if (!owner)
+      continue;
+    value = *owner;
+    if (!value || (__u32)value != tid)
+      continue;
+    if (__sync_val_compare_and_swap(owner, value, 0) != value)
+      continue;
+    __sync_fetch_and_add(&slots_swept, 1);
+    scx_bpf_kick_cpu(cpu, 0);
+  }
+  return 0;
 }
 
 void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
@@ -581,6 +666,7 @@ void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
       __sync_fetch_and_sub(&cv_parked_now, 1);
     }
   }
+  sweep_slots(tid);
   bpf_map_delete_elem(&thread_ctx_addr_map, &tid);
   bpf_task_storage_delete(&task_ctx_map, p);
 }
@@ -598,6 +684,8 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
                cv_flush_calls, cv_flush_misses, cv_drained);
   scx_bpf_dump("accordin groups=%u own_limit=%u own_slack_ns=%llu peek=%u\n",
                group_count, own_limit, own_slack_ns, dsq_peek_ready);
+  scx_bpf_dump("accordin demand=%d adopted=%llu swept=%llu left=%u\n",
+               admission.demand, claims_adopted, slots_swept, slots_left);
   bpf_for(cpu, 0, MAX_CPUS) {
     volatile __u64 *owner = owner_slot(cpu);
     if (owner && *owner)
@@ -620,8 +708,17 @@ static __always_inline __u64 cv_scan_period(void) {
 }
 
 static int cv_scan(void *map, int *key, struct cv_timer_state *value) {
+  int snapshot = admission.demand;
+  int counted = scx_bpf_dsq_nr_queued(NORMAL_DSQ) + (int)nr_waiting();
+
   (void)map;
   (void)key;
+  /* A task may leave a queue by a path that passes none of the sites which
+   * discount it, so the advisory count is corrected against the queues here.
+   * The correction is a difference and never a store: a store would erase the
+   * enqueues made while the queues were being counted, leaving a populated bank
+   * reading as empty. */
+  __sync_fetch_and_add(&admission.demand, counted - snapshot);
   /* The queue depth, not a counter, decides: a drifted counter must never keep
    * a wait past its limit. */
   if (scx_bpf_dsq_nr_queued(WAITFORSIGNAL_DSQ))
@@ -678,8 +775,23 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
 
 void BPF_STRUCT_OPS(accordin_exit, struct scx_exit_info *ei) {
   struct cv_timer_state *timer = cv_timer();
+  __u32 cpu, cpus = scx_bpf_nr_cpu_ids(), left = 0;
 
   admission.enabled = 0;
+  admission.demand = 0;
+  if (cpus > MAX_CPUS)
+    cpus = MAX_CPUS;
+  /* Threads still running hold their slots legitimately at unload, so the table
+   * is counted on the way out rather than checked. */
+  bpf_for(cpu, 0, cpus) {
+    volatile __u64 *owner = owner_slot(cpu);
+
+    if (owner && *owner) {
+      left++;
+      *owner = 0;
+    }
+  }
+  slots_left = left;
   if (timer)
     bpf_timer_cancel(&timer->timer);
   UEI_RECORD(uei, ei);
@@ -710,9 +822,10 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
     bpf_rcu_read_lock();
     bpf_for_each(scx_dsq, p, WAITFORSIGNAL_DSQ, iter_flags) {
       struct task_scx_ctx *tctx;
+      struct admission_word word;
       __u64 target, parked;
       bool moved;
-      __u32 task_cpu, state;
+      __u32 task_cpu;
 
       if (p->tgid != tgid)
         continue;
@@ -728,9 +841,9 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       target = waiting_dsq(task_cpu);
       /* Running in the process's own context, an unreadable word is not a
        * notification and cannot be confirmed later either. */
-      if (!user_state(p, &state)) {
+      if (!user_state(p, &word)) {
         target = NORMAL_DSQ;
-      } else if ((state & USER_META) != USER_WAITING) {
+      } else if ((word.state & USER_META) != USER_WAITING) {
         continue;
       } else if (width && tally->moved >= width) {
         tally->pending++;
@@ -744,7 +857,7 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       if (target == NORMAL_DSQ)
         tctx->custody_denied = tctx->ticket;
       else
-        tctx->ticket = request_ticket(p, state);
+        tctx->ticket = request_ticket(p, word.state);
       __sync_fetch_and_sub(&cv_parked_now, 1);
       /* A move can be refused while the wait is still queued, so put the claim
        * back and leave it to the next pass. Only a claim that cannot be put
@@ -763,6 +876,7 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
         tally->expired++;
       } else {
         __sync_fetch_and_add(&cv_flushed, 1);
+        __sync_fetch_and_add(&admission.demand, 1);
         tally->moved++;
         /* The wait is filed in the queue of the CPU it last ran on. Any CPU
          * with a free slot may grant it while walking the bank; waking that

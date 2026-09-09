@@ -95,6 +95,13 @@ volatile __u64 own_slack_ns;
 /* Whether the loaded scheduler resolved the lockless queue-head peek. */
 __u32 dsq_peek_ready;
 
+/* Slots the scheduler took over from a record the runtime wrote, slots cleared
+ * off the table because the thread named in them is gone, and slots still
+ * recorded when the scheduler is unloaded. */
+__u64 claims_adopted;
+__u64 slots_swept;
+__u32 slots_left;
+
 /* Rotating start of the group scan. Members are ranked by the age of their
  * heads, which are equal only rarely; the cursor settles those ties instead of
  * letting the lowest CPU id always win them. */

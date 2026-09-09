@@ -224,11 +224,19 @@ bool accordin_cv_custody_ready(void)
 }
 
 /* A child of fork() inherits the transfer state of a process that may have been
- * mid-flush in another thread, and no thread to finish it. */
+ * mid-flush in another thread, and no thread to finish it. It also inherits the
+ * record of the thread that forked, while sharing that thread's mapping of the
+ * admission table under a thread id of its own: dropping the registration and
+ * the slot makes its one thread publish its word under its own id and leaves
+ * the parent's entry to the parent. */
 static void forget_flush(void)
 {
     __atomic_store_n(&cv_flush_running, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&cv_flush_requests, 0, __ATOMIC_RELAXED);
+    thread_state.slot = 0;
+    thread_state.ticket = 0;
+    thread_state.registered = false;
+    thread_state.tid = 0;
 }
 
 static bool claim_flush(void)
@@ -379,6 +387,13 @@ static void report_counters(void)
             (unsigned long long)skel->bss->cv_parked_now,
             (unsigned long long)skel->bss->cv_flush_calls,
             (unsigned long long)skel->bss->cv_flush_misses);
+    /* Read once the scheduler has been detached: ops.exit counts the table
+     * while threads may still legitimately hold sticky slots. */
+    fprintf(stderr,
+            "[accordin_claim] adopted=%llu swept=%llu slots_left=%u demand=%d\n",
+            (unsigned long long)skel->bss->claims_adopted,
+            (unsigned long long)skel->bss->slots_swept,
+            skel->bss->slots_left, skel->bss->admission.demand);
 }
 
 __attribute__((constructor)) static void scheduler_start(void)

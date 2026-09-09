@@ -3,18 +3,39 @@
 #define ACCORDIN_RUNTIME_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <sched.h>
 #include "bpf/intf.h"
 
 struct thread_state {
-    _Atomic uint32_t word;
+    /* The word and the slot open the record because the scheduler reads them
+     * together with one eight-byte probe. The pair is aligned to its own width:
+     * a four-aligned pair may sit in the last four bytes of a page, and the
+     * single read would then straddle into the next one and fail for the life
+     * of the thread, leaving it neither queued nor reclaimed. */
+    _Alignas(8) _Atomic uint32_t word;
+    /* The CPU whose slot this thread holds, plus one; zero without one. */
+    uint32_t slot;
+    /* The value written in that slot. */
+    uint64_t ticket;
     uint32_t depth;
     uint32_t tid;
     bool registered;
     bool auto_active;
 };
+
+_Static_assert(offsetof(struct thread_state, word) ==
+                   offsetof(struct admission_word, state),
+               "admission word must open the thread record");
+_Static_assert(offsetof(struct thread_state, slot) ==
+                   offsetof(struct admission_word, slot),
+               "the slot must follow the word as the scheduler reads it");
+_Static_assert(_Alignof(struct thread_state) == 8,
+               "the word and the slot must share an eight-byte read");
+_Static_assert(offsetof(struct admission_state, owners) % 8 == 0,
+               "owner records must be eight-byte aligned");
 
 extern _Thread_local struct thread_state thread_state;
 extern struct admission_state *scheduler_admission;
@@ -90,8 +111,13 @@ static inline void admission_wait(bool prequeued)
             break;
         unsigned int cpu = sched_getcpu();
         if (cpu < MAX_CPUS &&
-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket)
+            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket) {
+            /* Record the grant where the scheduler reads it, so its task
+             * record and this table entry name the same slot. */
+            thread_state.slot = cpu + 1;
+            thread_state.ticket = ticket;
             break;
+        }
     }
     atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
                           memory_order_relaxed);

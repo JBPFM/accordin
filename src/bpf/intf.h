@@ -31,11 +31,27 @@
 #define USER_CV 4U
 #define USER_META 7U
 
-/* Mapped read-only by the direct runtime to confirm admission after yielding. */
+/* The pair the scheduler reads out of a registered thread with a single probe:
+ * the admission word and the slot the thread was granted, a CPU id plus one,
+ * zero without one. The halves are written separately and never merged into one
+ * 64-bit atomic, because a notifier on another thread publishes the word alone.
+ * The pair is eight-byte aligned so the single read never straddles a page. */
+struct admission_word {
+  unsigned int state;
+  unsigned int slot;
+} __attribute__((aligned(8)));
+
+/* Mapped writable into the direct runtime, which confirms admission after
+ * yielding and writes owners[] by compare-and-swap on its own ticket value. */
 struct admission_state {
   unsigned int enabled;
   /* Auto admission latches this on at the first overload event. */
   unsigned int active;
+  /* Tasks queued in the ordinary queue and in the whole admission bank.
+   * Advisory: maintained without saturation, signed so a transient undercount
+   * reads as empty rather than as an enormous queue, and corrected against the
+   * queue depths by the periodic scan. */
+  int demand;
   unsigned long long owners[MAX_CPUS];
 };
 

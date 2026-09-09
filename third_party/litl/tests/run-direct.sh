@@ -13,11 +13,20 @@ ${CC:-cc} -std=gnu11 -O2 -Wall -Werror tests/direct.c -pthread -ldl \
 ${CXX:-c++} -std=c++17 -O2 -Wall -Werror tests/condition-variable.cpp -pthread \
     -o obj/tests/condition-variable
 
-# Releasing the last active holder must wake the head of the passive queue.
-${CC:-cc} -std=gnu11 -O2 -Wall -Werror -Iinclude tests/gcr-wakeup.c src/gcrmcs.c \
-    -pthread -o obj/tests/gcr-wakeup
-./obj/tests/gcr-wakeup
-echo "PASS gcr passive-head wakeup"
+# GCR's admission thresholds, its head back-off and its environment overrides
+# are checked against the lock alone, without the interposition layer.
+gcr_tests=(
+    gcr-empty-active-release
+    gcr-rejoin-below-threshold
+    gcr-head-backoff
+    gcr-env-config
+)
+for gcr_test in "${gcr_tests[@]}"; do
+    ${CC:-cc} -std=gnu11 -O2 -Wall -Werror -Iinclude "tests/${gcr_test}.c" \
+        src/gcrmcs.c -pthread -o "obj/tests/${gcr_test}"
+    "./obj/tests/${gcr_test}"
+    echo "PASS ${gcr_test}"
+done
 
 algorithms=("$@")
 if [[ ${#algorithms[@]} -eq 0 ]]; then

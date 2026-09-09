@@ -1,4 +1,4 @@
-#include "../gcr_mcs.h"
+#include <gcrmcs.h>
 
 #include <stdatomic.h>
 #include <stdint.h>

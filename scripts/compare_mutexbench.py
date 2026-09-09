@@ -10,9 +10,13 @@ from pathlib import Path
 import shlex
 import statistics
 import subprocess
+import sys
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'experiments'))
+import litl_locks  # noqa: E402
+
 BACKENDS = ('mcs_accordin_direct', 'mcs_tas_accordin_direct')
 SCX = Path('/sys/kernel/sched_ext')
 
@@ -75,16 +79,22 @@ def main():
                         raise RuntimeError('A sched_ext scheduler is already running')
                     seq = int((SCX / 'enable_seq').read_text())
                     log = args.output / f'{backend}-{implementation}-{repeat}.log'
-                    assignments = [f'{name.upper()}_LIB={libraries[implementation] / ("lib" + name + ".so")}'
-                                   for name in BACKENDS]
+                    # The LiTL launcher links the direct runtime by soname with a RUNPATH,
+                    # so the search path is what picks the implementation under test.
+                    assignments = [f'LD_LIBRARY_PATH={libraries[implementation]}']
+                    assignments += [f'{name.upper()}_LIB={libraries[implementation] / ("lib" + name + ".so")}'
+                                    for name in BACKENDS]
                     assignments += [f'{key}={env[key]}' for key in env
                                     if key.startswith(('ACCORDIN_', 'MCS_ACCORDIN_', 'MCS_TAS_ACCORDIN_'))]
+                    # The backend reaches the benchmark through its LiTL launcher, so the
+                    # benchmark itself only ever sees a plain pthread mutex.
                     command = sudo + ['env', *assignments, 'taskset', '-c', args.cpus,
                         'timeout', '--kill-after=3s', f'{30 + (args.duration_ms + args.warmup_ms) / 1000}s',
-                        str(binary), '--lock-kind', backend, '--threads', str(args.threads),
+                        str(litl_locks.litl_launcher(backend)),
+                        str(binary), '--lock-kind', 'mutex', '--threads', str(args.threads),
                         '--duration-ms', str(args.duration_ms), '--warmup-duration-ms', str(args.warmup_ms),
                         '--critical-ns', str(args.critical_ns), '--outside-ns', str(args.outside_ns),
-                        '--workload', 'single', '--timing-sample-stride', '8', '--timeslice-extension', 'off']
+                        '--workload', 'single', '--timing-sample-stride', '8']
                     loadavg = Path('/proc/loadavg').read_text().strip()
                     active_samples, last_enabled = 0, 0.0
                     with log.open('w') as handle:

@@ -32,12 +32,9 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdlib.h>
-#if !defined(MCSACCORDIN) && !defined(MCSTASACCORDIN)
-#include <atomic_ops.h>
-#include <clht.h>
-#endif
-
-#if defined(MCSACCORDIN) || defined(MCSTASACCORDIN)
+#if defined(LITL_DIRECT_ALGORITHM)
+#include <directalgo.h>
+#elif defined(MCSACCORDIN) || defined(MCSTASACCORDIN)
 #include <accordin.h>
 #elif defined(MCS)
 #include <mcs.h>
@@ -95,6 +92,12 @@
 #include <mutexee.h>
 #else
 #error "No lock algorithm known"
+#endif
+
+// The pthread-to-lock hash table is the only user of CLHT.
+#if !NO_INDIRECTION
+#include <atomic_ops.h>
+#include <clht.h>
 #endif
 
 #include "waiting_policy.h"
@@ -470,7 +473,7 @@ int pthread_mutex_lock(pthread_mutex_t *mutex) {
 
 int __pthread_mutex_timedlock(pthread_mutex_t *mutex,
                             const struct timespec *abstime) {
-#if defined(MCSACCORDIN) || defined(MCSTASACCORDIN)
+#if defined(MCSACCORDIN) || defined(MCSTASACCORDIN) || defined(LITL_DIRECT_ALGORITHM)
     return ENOTSUP;
 #else
     assert(0 && "Timed locks not supported");
@@ -540,15 +543,19 @@ int __pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
 }
 __asm__(".symver __pthread_cond_wait,pthread_cond_wait@@" GLIBC_2_3_2);
 
-#if defined(MCSACCORDIN) || defined(MCSTASACCORDIN)
+#if defined(MCSACCORDIN) || defined(MCSTASACCORDIN) || defined(LITL_DIRECT_COND)
 /* Modern libstdc++ uses clockwait for steady-clock condition_variable waits.
  * It must not pass our private condvar storage into native glibc. */
-int accordin_pthread_cond_clockwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
-                                    clockid_t clock, const struct timespec *ts) {
+int interposed_pthread_cond_clockwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
+                                      clockid_t clock, const struct timespec *ts) {
+#if defined(LITL_DIRECT_COND)
+    return directlock_cond_clockwait(cond, mutex, clock, ts);
+#else
     return accordin_cond_clockwait(cond, mutex, clock, ts);
+#endif
 }
-__asm__(".symver accordin_pthread_cond_clockwait,pthread_cond_clockwait@GLIBC_2.30");
-__asm__(".symver accordin_pthread_cond_clockwait,pthread_cond_clockwait@@GLIBC_2.34");
+__asm__(".symver interposed_pthread_cond_clockwait,pthread_cond_clockwait@GLIBC_2.30");
+__asm__(".symver interposed_pthread_cond_clockwait,pthread_cond_clockwait@@GLIBC_2.34");
 #endif
 
 int __pthread_cond_signal(pthread_cond_t *cond) {
@@ -573,8 +580,9 @@ __asm__(
 
 
 
-// Accordin keeps native spinlocks and rwlocks.
-#if !defined(MCSACCORDIN) && !defined(MCSTASACCORDIN)
+// Algorithms that declare LITL_NATIVE_SPIN_RWLOCK keep native spinlocks and
+// rwlocks instead of routing them through the mutex algorithm.
+#if !defined(LITL_NATIVE_SPIN_RWLOCK)
 // Spinlocks
 int pthread_spin_init(pthread_spinlock_t *spin,
                       int pshared) {

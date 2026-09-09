@@ -1,5 +1,5 @@
-#ifndef GCR_MCS_H
-#define GCR_MCS_H
+#ifndef LITL_GCRMCS_H
+#define LITL_GCRMCS_H
 
 /*
  * GCR-MCS: Generic Concurrency Restriction wrapper over an MCS queue lock.
@@ -10,8 +10,7 @@
  * underlying MCS lock, or passive, in which case they wait in a per-lock FIFO
  * passive queue before becoming active.
  *
- * Linux-only because passive wait uses futex.  Compile as C11:
- *   gcc -O3 -std=gnu11 -pthread example_gcr_mcs.c gcr_mcs.c
+ * Linux-only because passive wait uses futex.
  */
 
 #include <stdint.h>
@@ -106,4 +105,4 @@ struct gcr_mcs_mutex {
 }
 #endif
 
-#endif /* GCR_MCS_H */
+#endif /* LITL_GCRMCS_H */

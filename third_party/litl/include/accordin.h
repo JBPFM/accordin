@@ -20,6 +20,7 @@
 #define NO_INDIRECTION 1
 #define NEED_CONTEXT 0
 #define SUPPORT_WAITING 0
+#define LITL_NATIVE_SPIN_RWLOCK 1
 typedef pthread_mutex_t lock_mutex_t;
 typedef pthread_cond_t lock_cond_t;
 typedef void lock_context_t;

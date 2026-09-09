@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "gcr_mcs.h"
+#include <gcrmcs.h>
 
 #include <errno.h>
 #include <linux/futex.h>

@@ -31,7 +31,8 @@ ACCORDIN_CV_ENV := ACCORDIN_CV_CUSTODY="$(ACCORDIN_CV_CUSTODY)" \
 	ACCORDIN_GROUP_SIZE="$(ACCORDIN_GROUP_SIZE)" \
 	ACCORDIN_DISABLE_ADMISSION="$(ACCORDIN_DISABLE_ADMISSION)"
 
-.PHONY: all $(BACKENDS) check check-bpf check-auto-bpf check-claim-bpf litl check-litl check-litl-bpf verify-insns clean compile-commands
+.PHONY: all $(BACKENDS) check check-bpf check-auto-bpf check-claim-bpf litl litl-baselines \
+	check-litl check-litl-bpf check-litl-baselines verify-insns clean compile-commands
 .DELETE_ON_ERROR:
 all: $(LIBRARIES)
 $(BACKENDS): %: $(OUT)/lib%.so
@@ -71,6 +72,14 @@ check-claim-bpf: all
 
 litl: all
 	$(MAKE) -C third_party/litl ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
+
+# Baseline lock algorithms. They carry no Accordin runtime dependency, so they
+# build and run without the direct libraries.
+litl-baselines:
+	$(MAKE) -C third_party/litl ALGORITHMS="$$($(MAKE) --no-print-directory -C third_party/litl print-direct-algorithms)" all
+
+check-litl-baselines:
+	$(MAKE) -C third_party/litl check-direct
 
 check-litl: litl
 	cd third_party/litl && ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) \

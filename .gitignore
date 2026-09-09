@@ -1,7 +1,6 @@
 # Build artifacts
 /target
 /build/
-bench/otherlocks/build/
 
 # Python bytecode
 /.venv/

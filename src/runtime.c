@@ -103,10 +103,8 @@ static unsigned int env_u32(const char *name, unsigned int fallback)
 /* Group geometry defaults: eight CPUs to a group cover a slice of one node's
  * last-level cache. The slack is the head-age margin the own queue keeps over
  * the group, wide enough to cover one handover and narrow enough that a queue
- * left behind is served next. Which queue is served follows from the head ages,
- * so the count bound over the own queue is left off. */
+ * left behind is served next. */
 #define GROUP_SIZE_DEFAULT 8
-#define OWN_LIMIT_DEFAULT 0
 #define OWN_SLACK_US_DEFAULT 100
 
 static bool read_sysfs(const char *path, char *text, size_t size)
@@ -150,7 +148,6 @@ static void publish_groups(void)
 {
     bool online[MAX_CPUS] = {0}, placed[MAX_CPUS] = {0}, nodes[MAX_CPUS] = {0};
     unsigned int size = env_u32("ACCORDIN_GROUP_SIZE", GROUP_SIZE_DEFAULT);
-    unsigned int own_limit = env_u32("ACCORDIN_OWN_LIMIT", OWN_LIMIT_DEFAULT);
     unsigned int own_slack_us =
         env_u32("ACCORDIN_OWN_SLACK_US", OWN_SLACK_US_DEFAULT);
     unsigned int count = 0, cpu, node;
@@ -207,13 +204,10 @@ static void publish_groups(void)
         count++;
     }
     skel->bss->group_count = count;
-    skel->bss->own_limit = own_limit;
     skel->bss->own_slack_ns = (uint64_t)own_slack_us * 1000;
     if (runtime_diagnostics)
-        fprintf(stderr,
-                "[accordin_groups] size=%u groups=%u own_limit=%u"
-                " own_slack_us=%u\n",
-                size, count, own_limit, own_slack_us);
+        fprintf(stderr, "[accordin_groups] size=%u groups=%u own_slack_us=%u\n",
+                size, count, own_slack_us);
 }
 
 bool accordin_cv_custody_ready(void)
@@ -463,13 +457,8 @@ __attribute__((constructor)) static void scheduler_start(void)
     scheduler_link = SCX_OPS_ATTACH(skel, accordin_ops, accordin);
     scheduler_admission = &skel->bss->admission;
     __atomic_store_n(&cv_custody_live, true, __ATOMIC_RELEASE);
-    /* The head peek is resolved by the loader, so only the attached scheduler
-     * can say whether the running kernel offers it. */
-    if (runtime_diagnostics) {
-        fprintf(stderr, "[accordin_peek] dsq_peek=%s\n",
-                skel->bss->dsq_peek_ready ? "yes" : "no");
+    if (runtime_diagnostics)
         fprintf(stderr, "[accordin_rseq] area=%s\n", user_rseq ? "yes" : "no");
-    }
     fprintf(stderr, "[%s] eBPF scheduler loaded successfully\n", PREFIX);
 }
 

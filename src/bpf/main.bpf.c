@@ -100,8 +100,8 @@ void BPF_STRUCT_OPS(accordin_quiescent, struct task_struct *p, u64 deq_flags) {
 /* The word and the slot the runtime keeps for a thread, taken together: the
  * scheduler has to see the slot a thread recorded beside the request it
  * recorded it for, and one read of the aligned pair is what gives it both. */
-static __always_inline bool user_state(struct task_struct *p,
-                                       struct admission_word *word) {
+static __noinline bool user_state(struct task_struct *p,
+                                  struct admission_word *word) {
   __u32 tid = p->pid;
   __u64 *address = bpf_map_lookup_elem(&thread_ctx_addr_map, &tid);
   word->state = 0;
@@ -112,8 +112,7 @@ static __always_inline bool user_state(struct task_struct *p,
   return !bpf_probe_read_user(word, sizeof(*word), (const void *)*address);
 }
 
-static __always_inline void release_slot(struct task_struct *p,
-                                        struct task_scx_ctx *tctx) {
+static __noinline void release_slot(struct task_scx_ctx *tctx) {
   __u32 assigned = tctx->admission_cpu;
   volatile __u64 *owner;
   bool freed = false;
@@ -146,9 +145,9 @@ static __always_inline __u64 request_ticket(struct task_struct *p, __u32 state) 
  * request comparison the idle-word rule below would then retire an entry the
  * thread has only just taken. Request numbers only grow, which is what makes
  * the comparison decide it. */
-static __always_inline void adopt_slot(struct task_struct *p,
-                                       struct task_scx_ctx *tctx,
-                                       struct admission_word word) {
+static __noinline void adopt_slot(struct task_struct *p,
+                                  struct task_scx_ctx *tctx,
+                                  struct admission_word word) {
   volatile __u64 *owner;
   __u64 value;
 
@@ -165,7 +164,7 @@ static __always_inline void adopt_slot(struct task_struct *p,
   /* A record left on another CPU is released here or nowhere: its ticket is
    * still in that entry, so this exchange is what frees it. */
   if (tctx->admission_cpu != word.slot)
-    release_slot(p, tctx);
+    release_slot(tctx);
   tctx->admission_cpu = word.slot;
   tctx->ticket = value;
   __sync_fetch_and_add(&claims_adopted, 1);
@@ -175,14 +174,24 @@ static __always_inline void adopt_slot(struct task_struct *p,
  * A changed affinity cannot park an existing MCS node behind its successor.
  * Adoption comes first: a slot has to be on the record before the rules that
  * weigh it, the affinity rule included. */
-static __always_inline void refresh_episode(struct task_struct *p,
-                                            struct task_scx_ctx *tctx,
-                                            struct admission_word word) {
+static __noinline void refresh_episode(struct task_struct *p,
+                                       struct task_scx_ctx *tctx,
+                                       struct admission_word word) {
   adopt_slot(p, tctx, word);
   if (!(word.state & USER_FLAGS) ||
       tctx->ticket != request_ticket(p, word.state) ||
       (tctx->admission_cpu && !allowed(p, tctx->admission_cpu - 1)))
-    release_slot(p, tctx);
+    release_slot(tctx);
+}
+
+/* A custody mark on a task the custody queue no longer holds belongs to a wait
+ * the core has already taken out of that queue. Clearing the mark claims the
+ * wait, the same way a scan claims one, and the claim is what accounts it. */
+static __always_inline void drain_custody(struct task_scx_ctx *tctx) {
+  if (tctx->parked_at && __sync_lock_test_and_set(&tctx->parked_at, 0)) {
+    __sync_fetch_and_add(&cv_drained, 1);
+    __sync_fetch_and_sub(&cv_parked_now, 1);
+  }
 }
 
 s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -219,13 +228,9 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     if (tctx) {
       if (known)
         refresh_episode(p, tctx, word);
-      /* A task entering enqueue is queued nowhere, so a custody mark left on it
-       * belongs to a wait the core has already taken out of the queue. Clearing
-       * the mark claims the wait, the same way a scan claims one. */
-      if (tctx->parked_at && __sync_lock_test_and_set(&tctx->parked_at, 0)) {
-        __sync_fetch_and_add(&cv_drained, 1);
-        __sync_fetch_and_sub(&cv_parked_now, 1);
-      }
+      /* A task entering enqueue is queued nowhere, so any mark it carries
+       * is one of those. */
+      drain_custody(tctx);
       if (tctx->admission_cpu) {
         cpu = tctx->admission_cpu - 1;
         dsq = SCX_DSQ_LOCAL_ON | cpu;
@@ -284,14 +289,6 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
     scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
-/* Time between two stamps, floored at zero so a stamp taken slightly ahead of
- * the reader reads as no time at all. */
-static __always_inline __u64 elapsed(__u64 now, __u64 stamp) {
-  s64 span = (s64)(now - stamp);
-
-  return span > 0 ? (__u64)span : 0;
-}
-
 /* Outcome of examining one queue: a waiter was granted this CPU's slot, the
  * queue held nothing for it, or the slot was taken while the grant was being
  * made and there is nothing left to hand out. */
@@ -305,12 +302,12 @@ static __always_inline __u64 elapsed(__u64 now, __u64 stamp) {
  * An empty queue costs one depth query and no iteration. The queue is ordered
  * by the age stamp and the iterator walks that order, so the first candidate
  * offered is the oldest request the queue holds. */
-static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
-                                      __u32 index) {
+static __noinline int admit_from(__u32 cpu, __u32 index) {
+  volatile __u64 *owner = owner_slot(cpu);
   __u64 dsq = waiting_dsq(index);
   struct task_struct *p;
 
-  if (scx_bpf_dsq_nr_queued(dsq) <= 0)
+  if (!owner || scx_bpf_dsq_nr_queued(dsq) <= 0)
     return ADMIT_NONE;
   bpf_for_each(scx_dsq, p, dsq, 0) {
     struct task_scx_ctx *tctx;
@@ -328,17 +325,18 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
       __sync_fetch_and_add(&admission.demand, -1);
       return ADMIT_GRANTED;
     }
-    release_slot(p, tctx);
+    release_slot(tctx);
   }
   return ADMIT_NONE;
 }
 
-/* How long the waiter at the head of an admission queue has been in line. The
- * bank is ordered by the age stamp, so its head is the oldest request the queue
- * holds. Reading it through the head peek touches no queue lock; opening an
- * iterator would take the queue's raw spinlock and write its list twice, which
- * a group scan would pay for on every member of the group. The iterator is kept
- * for a kernel without the peek.
+/* How long the waiter at the head of an admission queue has been in line, or -1
+ * for a queue that holds none. The bank is ordered by the age stamp, so its head
+ * is the oldest request the queue holds, and no head is how an empty queue
+ * reports itself, so the age costs no depth query. Reading it through the head
+ * peek touches no queue lock; opening an iterator would take the queue's raw
+ * spinlock and write its list twice, which a group scan would pay for on every
+ * member of the group.
  *
  * A stamp is written by the clock of the CPU that queued the waiter, and only
  * the group scan compares stamps taken on different CPUs. The difference is
@@ -346,37 +344,22 @@ static __always_inline int admit_from(__u32 cpu, volatile __u64 *owner,
  * all rather than as an enormous one; a persistent offset between two CPUs
  * wider than the slack would bias the order in favour of the CPU that runs
  * behind, which assumes a host whose clock is stable across CPUs. */
-static __always_inline bool head_age(__u64 dsq, __u64 now, __u64 *age) {
-  struct task_struct *p;
-  bool found = false;
+static __noinline s64 head_age(__u64 dsq, __u64 now) {
+  struct task_struct *p = scx_bpf_dsq_peek(dsq);
 
-  if (bpf_ksym_exists(scx_bpf_dsq_peek)) {
-    /* No head is how an empty queue reports itself, so no depth query. */
-    p = scx_bpf_dsq_peek(dsq);
-    if (!p)
-      return false;
-    *age = elapsed(now, p->scx.dsq_vtime);
-    return true;
-  }
-  if (scx_bpf_dsq_nr_queued(dsq) <= 0)
-    return false;
-  bpf_for_each(scx_dsq, p, dsq, 0) {
-    *age = elapsed(now, p->scx.dsq_vtime);
-    found = true;
-    break;
-  }
-  return found;
+  return p ? time_delta(now, p->scx.dsq_vtime) : -1;
 }
 
 /* Grant order for a CPU that has a free slot. The CPU's own queue comes first,
  * for the cache footprint a waiter left behind on it, and is served while its
  * head is not younger than the oldest head of the CPU's topology group by more
- * than the slack; a count of consecutive own grants bounds that preference as
- * a second limiter. The oldest head of the group comes next, and is the
+ * than the slack. The oldest head of the group comes next, and is the
  * population balancer and the fairness rule in one: a waiter granted by another
  * CPU is filed under that CPU when it next waits, so populations drain from
  * crowded queues toward the CPUs that have slots, while ordering grants by
- * waiting time keeps no thread at the back of the line. The rotation over the
+ * waiting time keeps no thread at the back of the line. Age order ranks those
+ * two, it does not close either: whichever of them loses the comparison is
+ * still offered the slot before the slot is left idle. The rotation over the
  * whole bank is the cross-group backstop; its cursor is shared by every CPU and
  * holds the queue after the last grant, so rotating past the queue that granted
  * keeps one busy queue from starving the rest of the bank. The rotation is
@@ -387,17 +370,16 @@ static __always_inline bool head_age(__u64 dsq, __u64 now, __u64 *age) {
 static __always_inline void admit_waiter(__u32 cpu) {
   volatile __u64 *owner = owner_slot(cpu);
   __u32 queues = waiting_queues, start, probe;
-  __u32 limit = own_limit, granted = own_grants[cpu];
   __u32 group = cpu_group[cpu], members = 0, best = 0, best_slot = 0;
-  __u64 now, own_wait = 0, group_wait = 0;
-  bool own_head, group_head = false;
+  s64 own_wait, group_wait = -1;
   bool own_first;
+  __u64 now;
   int result;
 
   if (!owner || *owner || !queues)
     return;
   now = scx_bpf_now();
-  own_head = head_age(waiting_dsq(cpu), now, &own_wait);
+  own_wait = head_age(waiting_dsq(cpu), now);
   if (group < MAX_GROUPS) {
     __u32 cursor = group_cursor[group], slot;
 
@@ -408,7 +390,7 @@ static __always_inline void admit_waiter(__u32 cpu) {
       cursor = 0;
     bpf_for(slot, 0, members) {
       __u32 pick = cursor + slot, member;
-      __u64 age;
+      s64 age;
 
       if (pick >= members)
         pick -= members;
@@ -418,56 +400,36 @@ static __always_inline void admit_waiter(__u32 cpu) {
       /* The own queue is weighed on its own terms, not as a group member. */
       if (member == cpu || member >= queues)
         continue;
-      if (!head_age(waiting_dsq(member), now, &age))
-        continue;
+      age = head_age(waiting_dsq(member), now);
       /* The scan starts at the cursor, so members whose heads are the same age
-       * take turns instead of always losing to the earliest slot. */
-      if (!group_head || age > group_wait) {
+       * take turns instead of always losing to the earliest slot. An empty
+       * queue reports -1 and never wins. */
+      if (age > group_wait) {
         group_wait = age;
         best = member;
         best_slot = pick;
-        group_head = true;
       }
     }
   }
-  own_first = own_head && (!group_head || own_wait + own_slack_ns >= group_wait);
-  if (own_first && limit && granted >= limit)
-    own_first = false;
-  if (own_first) {
-    result = admit_from(cpu, owner, cpu);
+  own_first = own_wait >= 0 && (group_wait < 0 ||
+                                (__u64)own_wait + own_slack_ns >=
+                                    (__u64)group_wait);
+  if (own_first && admit_from(cpu, cpu) != ADMIT_NONE)
+    return;
+  if (group_wait >= 0 && group < MAX_GROUPS) {
+    result = admit_from(cpu, best);
     if (result == ADMIT_GRANTED) {
-      own_grants[cpu] = granted + 1;
-      return;
-    }
-    if (result == ADMIT_SLOT_LOST)
-      return;
-  }
-  if (group_head && group < MAX_GROUPS) {
-    result = admit_from(cpu, owner, best);
-    if (result == ADMIT_GRANTED) {
-      own_grants[cpu] = 0;
       best_slot++;
       group_cursor[group] = best_slot >= members ? 0 : best_slot;
-      return;
     }
-    if (result == ADMIT_SLOT_LOST)
+    if (result != ADMIT_NONE)
       return;
   }
-  /* Age order and the count bound order the queues, they do not close the own
-   * queue: with the group offering nothing this CPU may take, serving the own
-   * queue still beats leaving the slot idle. The group gave nothing up, so a
-   * grant here costs it nothing and the count starts over; leaving the count at
-   * the bound would make every later dispatch repeat a scan of a group that has
-   * nothing to give. */
-  if (!own_first) {
-    result = admit_from(cpu, owner, cpu);
-    if (result == ADMIT_GRANTED) {
-      own_grants[cpu] = 0;
-      return;
-    }
-    if (result == ADMIT_SLOT_LOST)
-      return;
-  }
+  /* The own queue is offered the slot whenever the group did not take it,
+   * whichever way the age comparison went: with the group holding nothing this
+   * CPU may take, serving the own queue still beats leaving the slot idle. */
+  if (!own_first && admit_from(cpu, cpu) != ADMIT_NONE)
+    return;
   start = admit_cursor;
   if (start >= queues)
     start = 0;
@@ -478,14 +440,12 @@ static __always_inline void admit_waiter(__u32 cpu) {
       index -= queues;
     if (index == cpu)
       continue;
-    result = admit_from(cpu, owner, index);
+    result = admit_from(cpu, index);
     if (result == ADMIT_GRANTED) {
-      own_grants[cpu] = 0;
       index++;
       admit_cursor = index >= queues ? 0 : index;
-      return;
     }
-    if (result == ADMIT_SLOT_LOST)
+    if (result != ADMIT_NONE)
       return;
   }
 }
@@ -516,7 +476,7 @@ __noinline int cv_expire_parked(__u64 now) {
     parked = tctx->parked_at;
     /* The clock is per-CPU: a wait parked on a CPU running slightly ahead of
      * this one must not read as older than any limit. */
-    if (!parked || (__s64)(now - parked) <= (__s64)cv_custody_limit_ns)
+    if (!parked || time_delta(now, parked) <= (s64)cv_custody_limit_ns)
       continue;
     if (!__sync_bool_compare_and_swap(&tctx->parked_at, parked, 0))
       continue;
@@ -588,9 +548,9 @@ bool BPF_STRUCT_OPS(accordin_yield, struct task_struct *from, struct task_struct
 
   (void)to;
   /* Renew only our existing slot; userspace still confirms the new ticket. */
-  if (!stats_only_mode && tctx && owner && user_state(from, &word) &&
-      !(word.state & USER_CV) && (word.state & USER_FLAGS) == USER_WAITING &&
-      tctx->admission_cpu == cpu + 1) {
+  if (tctx && owner && tctx->admission_cpu == cpu + 1 &&
+      user_state(from, &word) && !(word.state & USER_CV) &&
+      (word.state & USER_FLAGS) == USER_WAITING) {
     __u64 next = request_ticket(from, word.state);
     if (__sync_val_compare_and_swap(owner, tctx->ticket, next) == tctx->ticket)
       tctx->ticket = next;
@@ -603,7 +563,7 @@ void BPF_STRUCT_OPS(accordin_tick, struct task_struct *p) {
   struct task_scx_ctx *tctx = lock_routing() ? task_ctx(p) : 0;
   struct admission_word word;
 
-  if (stats_only_mode || !tctx || !user_state(p, &word))
+  if (!tctx || !user_state(p, &word))
     return;
   refresh_episode(p, tctx, word);
   /* An admitted thread that spins never empties its CPU, so ops.dispatch is
@@ -621,13 +581,13 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
   struct task_scx_ctx *tctx = lock_routing() ? task_ctx(p) : 0;
   struct admission_word word;
 
-  if (stats_only_mode || !tctx || !user_state(p, &word))
+  if (!tctx || !user_state(p, &word))
     return;
   refresh_episode(p, tctx, word);
   /* A holder or an existing raw-lock node must be allowed to resume. */
   if (!runnable && (word.state & USER_FLAGS) != USER_HELD &&
       (word.state & USER_FLAGS) != USER_SPINNING)
-    release_slot(p, tctx);
+    release_slot(tctx);
 }
 
 /* Clear the entries a thread left behind, or the whole table when no tid is
@@ -671,10 +631,8 @@ void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
 
   (void)args;
   /* A wait that leaves without a flush or an expiry still leaves custody. */
-  if (tctx && tctx->parked_at && __sync_lock_test_and_set(&tctx->parked_at, 0)) {
-    __sync_fetch_and_add(&cv_drained, 1);
-    __sync_fetch_and_sub(&cv_parked_now, 1);
-  }
+  if (tctx)
+    drain_custody(tctx);
   /* The sweep frees every entry the recorded slot could name and the ones no
    * record ever reached, so a release of the record adds nothing; the record
    * itself goes with the storage below. A forked child holds its entries under
@@ -695,8 +653,8 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
                cv_parked, cv_parked_now, cv_flushed, cv_expired);
   scx_bpf_dump("accordin cv calls=%llu misses=%llu drained=%llu\n",
                cv_flush_calls, cv_flush_misses, cv_drained);
-  scx_bpf_dump("accordin groups=%u own_limit=%u own_slack_ns=%llu peek=%u\n",
-               group_count, own_limit, own_slack_ns, dsq_peek_ready);
+  scx_bpf_dump("accordin groups=%u own_slack_ns=%llu\n", group_count,
+               own_slack_ns);
   scx_bpf_dump("accordin demand=%d adopted=%llu swept=%llu left=%u\n",
                admission.demand, claims_adopted, slots_swept, slots_left);
   bpf_for(cpu, 0, waiting_queues) {
@@ -705,8 +663,13 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
       scx_bpf_dump("accordin cpu=%u owner=%u\n", cpu, (__u32)*owner);
   }
   /* Only the CPUs a group claims are worth a line; the rest carry no mapping. */
-  bpf_for(cpu, 0, MAX_CPUS) {
-    __u32 group = cpu_group[cpu];
+  bpf_for(cpu, 0, waiting_queues) {
+    __u32 group;
+
+    barrier_var(cpu);
+    if (cpu >= MAX_CPUS)
+      break;
+    group = cpu_group[cpu];
     if (group < MAX_GROUPS)
       scx_bpf_dump("accordin cpu=%u group=%u\n", cpu, group);
   }
@@ -751,6 +714,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   __u32 queues = scx_bpf_nr_cpu_ids(), index;
   s32 ret;
 
+  /* Ranking queue heads is the whole grant order, and the lockless head peek is
+   * the only read of a head cheap enough to do it with. */
+  if (!bpf_ksym_exists(scx_bpf_dsq_peek))
+    return -EOPNOTSUPP;
   ret = scx_bpf_create_dsq(NORMAL_DSQ, -1);
   if (ret)
     return ret;
@@ -778,9 +745,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   ret = bpf_timer_start(&timer->timer, cv_scan_period(), 0);
   if (ret)
     return ret;
-  /* Which head read the loaded program took is only knowable here, so the
-   * runtime is told rather than left to guess at the kernel's version. */
-  dsq_peek_ready = bpf_ksym_exists(scx_bpf_dsq_peek);
   admission.enabled = !stats_only_mode;
   admission.active = !auto_admission;
   return 0;
@@ -816,7 +780,7 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
   __u64 iter_flags = (ctx->flags & CV_FLUSH_REV) ? SCX_DSQ_ITER_REV : 0;
 
   ctx->moved = ctx->expired = ctx->pending = ctx->queued = 0;
-  if (stats_only_mode || !admission.enabled)
+  if (!admission.enabled)
     return 0;
   tally = bpf_map_lookup_elem(&cv_tally_map, &key);
   if (!tally)

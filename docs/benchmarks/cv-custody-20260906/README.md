@@ -49,12 +49,11 @@ free admission slot after a release, which the tip still accepts). Placement in
 the admission bank now follows the age stamp a waiter carries, so no flag
 selects it.
 
-Three knobs come with the merged own-queue rule. `ACCORDIN_OWN_SLACK_US`
+Two knobs come with the merged own-queue rule. `ACCORDIN_OWN_SLACK_US`
 (default 100) is how much younger a CPU's own queue head may be than the oldest
 head of its topology group before the grant goes to that oldest head instead.
-`ACCORDIN_OWN_LIMIT` (default 0) optionally caps consecutive own-queue grants,
-and 0 leaves the head ages as the only rule. `ACCORDIN_GROUP_SIZE` (default 8)
-is how many CPUs of one NUMA node share a topology group.
+`ACCORDIN_GROUP_SIZE` (default 8) is how many CPUs of one NUMA node share a
+topology group.
 
 `ACCORDIN_CV_SCAN=0`, which the `scan-off` arm uses to switch off the release
 passes running from `ops.dispatch` and the custody timer and leave the

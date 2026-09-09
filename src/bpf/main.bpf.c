@@ -17,6 +17,14 @@ static __always_inline __u64 waiting_dsq(__u32 index) {
   return WAITING_DSQ + index % MAX_CPUS;
 }
 
+/* Tally into a counter nothing but the diagnostic report reads. The gate is a
+ * load-time constant, so the update is dropped from a scheduler loaded without
+ * diagnostics; the claim or exchange a tally sits beside is never gated. */
+static __always_inline void count_stat(__u64 *counter, s64 delta) {
+  if (diagnostics)
+    __sync_fetch_and_add(counter, delta);
+}
+
 static __always_inline bool is_waiting(__u64 dsq) {
   return dsq >= WAITING_DSQ && dsq < WAITING_DSQ + MAX_CPUS;
 }
@@ -167,7 +175,7 @@ static __noinline void adopt_slot(struct task_struct *p,
     release_slot(tctx);
   tctx->admission_cpu = word.slot;
   tctx->ticket = value;
-  __sync_fetch_and_add(&claims_adopted, 1);
+  count_stat(&claims_adopted, 1);
 }
 
 /* Unless renewed at yield, a new request retires the old slot.
@@ -189,8 +197,8 @@ static __noinline void refresh_episode(struct task_struct *p,
  * wait, the same way a scan claims one, and the claim is what accounts it. */
 static __always_inline void drain_custody(struct task_scx_ctx *tctx) {
   if (tctx->parked_at && __sync_lock_test_and_set(&tctx->parked_at, 0)) {
-    __sync_fetch_and_add(&cv_drained, 1);
-    __sync_fetch_and_sub(&cv_parked_now, 1);
+    count_stat(&cv_drained, 1);
+    count_stat(&cv_parked_now, -1);
   }
 }
 
@@ -247,8 +255,8 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
         tctx->parked_at = parked | 1;
         p->scx.dsq_vtime = parked;
         dsq = WAITFORSIGNAL_DSQ;
-        __sync_fetch_and_add(&cv_parked, 1);
-        __sync_fetch_and_add(&cv_parked_now, 1);
+        count_stat(&cv_parked, 1);
+        count_stat(&cv_parked_now, 1);
       } else if (known && !(word.state & USER_CV) &&
                  (word.state & USER_FLAGS) == USER_WAITING) {
         tctx->ticket = request_ticket(p, word.state);
@@ -481,15 +489,15 @@ __noinline int cv_expire_parked(__u64 now) {
     if (!__sync_bool_compare_and_swap(&tctx->parked_at, parked, 0))
       continue;
     tctx->custody_denied = tctx->ticket;
-    __sync_fetch_and_sub(&cv_parked_now, 1);
+    count_stat(&cv_parked_now, -1);
     if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, NORMAL_DSQ, 0)) {
-      __sync_fetch_and_add(&cv_expired, 1);
+      count_stat(&cv_expired, 1);
       __sync_fetch_and_add(&admission.demand, 1);
       expired++;
     } else if (__sync_bool_compare_and_swap(&tctx->parked_at, 0, parked)) {
-      __sync_fetch_and_add(&cv_parked_now, 1);
+      count_stat(&cv_parked_now, 1);
     } else {
-      __sync_fetch_and_add(&cv_drained, 1);
+      count_stat(&cv_drained, 1);
     }
   }
   bpf_rcu_read_unlock();
@@ -615,10 +623,10 @@ __noinline int sweep_slots(__u32 tid) {
     if (__sync_val_compare_and_swap(owner, value, 0) != value)
       continue;
     if (!tid) {
-      __sync_fetch_and_add(&slots_left, 1);
+      count_stat(&slots_left, 1);
       continue;
     }
-    __sync_fetch_and_add(&slots_swept, 1);
+    count_stat(&slots_swept, 1);
     scx_bpf_kick_cpu(cpu, 0);
   }
   return 0;
@@ -655,23 +663,12 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
                cv_flush_calls, cv_flush_misses, cv_drained);
   scx_bpf_dump("accordin groups=%u own_slack_ns=%llu\n", group_count,
                own_slack_ns);
-  scx_bpf_dump("accordin demand=%d adopted=%llu swept=%llu left=%u\n",
+  scx_bpf_dump("accordin demand=%d adopted=%llu swept=%llu left=%llu\n",
                admission.demand, claims_adopted, slots_swept, slots_left);
   bpf_for(cpu, 0, waiting_queues) {
     volatile __u64 *owner = owner_slot(cpu);
     if (owner && *owner)
       scx_bpf_dump("accordin cpu=%u owner=%u\n", cpu, (__u32)*owner);
-  }
-  /* Only the CPUs a group claims are worth a line; the rest carry no mapping. */
-  bpf_for(cpu, 0, waiting_queues) {
-    __u32 group;
-
-    barrier_var(cpu);
-    if (cpu >= MAX_CPUS)
-      break;
-    group = cpu_group[cpu];
-    if (group < MAX_GROUPS)
-      scx_bpf_dump("accordin cpu=%u group=%u\n", cpu, group);
   }
 }
 
@@ -810,7 +807,7 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       if (!parked)
         continue;
       tctx->ticket = request_ticket(p, word.state);
-      __sync_fetch_and_sub(&cv_parked_now, 1);
+      count_stat(&cv_parked_now, -1);
       /* A released wait keeps the stamp it took when it parked, and the
        * admission queue is ordered by that stamp, so its place in line is the
        * wait it has already served rather than the moment it was handed over.
@@ -821,12 +818,12 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       if (!__COMPAT_scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
                                            waiting_dsq(task_cpu), 0)) {
         if (__sync_bool_compare_and_swap(&tctx->parked_at, 0, parked))
-          __sync_fetch_and_add(&cv_parked_now, 1);
+          count_stat(&cv_parked_now, 1);
         else
-          __sync_fetch_and_add(&cv_drained, 1);
+          count_stat(&cv_drained, 1);
         continue;
       }
-      __sync_fetch_and_add(&cv_flushed, 1);
+      count_stat(&cv_flushed, 1);
       __sync_fetch_and_add(&admission.demand, 1);
       tally->moved++;
       /* The wait is filed in the queue of the CPU it last ran on. Any CPU
@@ -842,9 +839,9 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
   /* Waits handed back to the ordinary queue may be served by any free CPU and
    * need the sweep. A flushed wait has had its own idle kick instead. */
   kick_free_slots(tally->expired);
-  __sync_fetch_and_add(&cv_flush_calls, 1);
+  count_stat(&cv_flush_calls, 1);
   if (!tally->moved)
-    __sync_fetch_and_add(&cv_flush_misses, 1);
+    count_stat(&cv_flush_misses, 1);
   ctx->moved = tally->moved;
   ctx->expired = tally->expired;
   ctx->queued = scx_bpf_dsq_nr_queued(WAITFORSIGNAL_DSQ);

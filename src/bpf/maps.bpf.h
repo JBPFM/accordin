@@ -46,8 +46,13 @@ struct {
   __type(value, struct cv_flush_tally);
 } cv_tally_map SEC(".maps");
 
-volatile __u32 stats_only_mode;
+const volatile __u32 stats_only_mode;
 struct admission_state admission;
+
+/* Counters that nothing but the runtime's report reads are kept behind this
+ * gate. It is a load-time constant, so a scheduler loaded without diagnostics
+ * carries none of their updates. */
+const volatile __u32 diagnostics;
 
 /* Auto mode counts runnable tasks of the loading process, including tasks
  * waiting in a DSQ. Once activated, the detector stops updating the count. */
@@ -59,9 +64,9 @@ __u32 auto_trigger_runnable;
 __u64 auto_activated_at;
 
 /* Custody configuration, published by the runtime before the scheduler loads. */
-volatile __u32 cv_custody_enabled;
-volatile __u64 cv_custody_limit_ns;
-volatile __u64 cv_scan_period_ns;
+const volatile __u32 cv_custody_enabled;
+const volatile __u64 cv_custody_limit_ns;
+const volatile __u64 cv_scan_period_ns;
 
 /* Every park leaves custody exactly once: through a flush, through expiry, or
  * drained when the waiter or the scheduler goes away. */
@@ -79,20 +84,20 @@ __u32 waiting_queues;
 
 /* Admission topology, published by the runtime before the scheduler loads. A
  * CPU whose group is CPU_NO_GROUP is served by the rotation alone. */
-volatile __u32 cpu_group[MAX_CPUS];
-volatile __u32 group_count;
-volatile __u32 group_size[MAX_GROUPS];
-volatile __u32 group_member[MAX_GROUPS][MAX_GROUP_SIZE];
+const volatile __u32 cpu_group[MAX_CPUS];
+const volatile __u32 group_count;
+const volatile __u32 group_size[MAX_GROUPS];
+const volatile __u32 group_member[MAX_GROUPS][MAX_GROUP_SIZE];
 /* How much younger than the oldest head of its group the head of a CPU's own
  * queue may be and still be served; zero holds the group in strict age order. */
-volatile __u64 own_slack_ns;
+const volatile __u64 own_slack_ns;
 
 /* Slots the scheduler took over from a record the runtime wrote, slots cleared
  * off the table because the thread named in them is gone, and slots still
  * recorded when the scheduler is unloaded. */
 __u64 claims_adopted;
 __u64 slots_swept;
-__u32 slots_left;
+__u64 slots_left;
 
 /* Rotating start of the group scan. Members are ranked by the age of their
  * heads, which are equal only rarely; the cursor settles those ties instead of

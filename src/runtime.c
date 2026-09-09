@@ -160,7 +160,7 @@ static void publish_groups(void)
     if (!size)
         size = 1;
     for (cpu = 0; cpu < MAX_CPUS; cpu++)
-        skel->bss->cpu_group[cpu] = CPU_NO_GROUP;
+        skel->rodata->cpu_group[cpu] = CPU_NO_GROUP;
     if (read_sysfs("/sys/devices/system/cpu/online", text, sizeof(text)))
         mark_cpu_list(text, online);
     if (read_sysfs("/sys/devices/system/node/online", text, sizeof(text)))
@@ -187,23 +187,23 @@ static void publish_groups(void)
                 count++;
                 filled = 0;
             }
-            skel->bss->cpu_group[cpu] = count - 1;
-            skel->bss->group_member[count - 1][filled++] = cpu;
-            skel->bss->group_size[count - 1] = filled;
+            skel->rodata->cpu_group[cpu] = count - 1;
+            skel->rodata->group_member[count - 1][filled++] = cpu;
+            skel->rodata->group_size[count - 1] = filled;
             placed[cpu] = true;
         }
     }
     for (cpu = 0; cpu < MAX_CPUS && count < MAX_GROUPS; cpu++) {
         if (!online[cpu] || placed[cpu])
             continue;
-        skel->bss->cpu_group[cpu] = count;
-        skel->bss->group_member[count][0] = cpu;
-        skel->bss->group_size[count] = 1;
+        skel->rodata->cpu_group[cpu] = count;
+        skel->rodata->group_member[count][0] = cpu;
+        skel->rodata->group_size[count] = 1;
         placed[cpu] = true;
         count++;
     }
-    skel->bss->group_count = count;
-    skel->bss->own_slack_ns = (uint64_t)own_slack_us * 1000;
+    skel->rodata->group_count = count;
+    skel->rodata->own_slack_ns = (uint64_t)own_slack_us * 1000;
     if (runtime_diagnostics)
         fprintf(stderr, "[accordin_groups] size=%u groups=%u own_slack_us=%u\n",
                 size, count, own_slack_us);
@@ -387,12 +387,13 @@ static void report_counters(void)
      * while threads may still legitimately hold sticky slots. */
     fprintf(stderr,
             "[accordin_claim] renews=%llu claims=%llu undone=%llu aborts=%llu "
-            "queued=%llu adopted=%llu swept=%llu slots_left=%u\n",
+            "queued=%llu adopted=%llu swept=%llu slots_left=%llu\n",
             (unsigned long long)claim_renews, (unsigned long long)claim_claims,
             (unsigned long long)claim_undone, (unsigned long long)claim_aborts,
             (unsigned long long)claim_queued,
             (unsigned long long)skel->bss->claims_adopted,
-            (unsigned long long)skel->bss->slots_swept, skel->bss->slots_left);
+            (unsigned long long)skel->bss->slots_swept,
+            (unsigned long long)skel->bss->slots_left);
 }
 
 __attribute__((constructor)) static void scheduler_start(void)
@@ -418,16 +419,18 @@ __attribute__((constructor)) static void scheduler_start(void)
     SCX_BUG_ON(pthread_atfork(NULL, NULL, reset_after_fork),
                "Failed to register fork cleanup");
     skel = SCX_OPS_OPEN(accordin_ops, accordin);
-    skel->bss->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
+    skel->rodata->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
+    skel->rodata->diagnostics = runtime_diagnostics;
     skel->rodata->auto_admission = auto_admission && admission_enabled &&
-                                  !skel->bss->stats_only_mode;
+                                  !skel->rodata->stats_only_mode;
     skel->rodata->auto_tgid = getpid();
     SCX_BUG_ON(sched_getaffinity(0, sizeof(cpus), &cpus), "Failed to read affinity");
     skel->rodata->auto_capacity = CPU_COUNT(&cpus);
-    skel->bss->cv_custody_enabled = cv_custody_on;
+    skel->rodata->cv_custody_enabled = cv_custody_on;
     limit_ns = (uint64_t)env_u32("ACCORDIN_CV_CUSTODY_MS", 20) * 1000000ULL;
-    skel->bss->cv_custody_limit_ns = limit_ns;
-    skel->bss->cv_scan_period_ns = clamp_u64(limit_ns / 2, 1000000ULL, 10000000ULL);
+    skel->rodata->cv_custody_limit_ns = limit_ns;
+    skel->rodata->cv_scan_period_ns =
+        clamp_u64(limit_ns / 2, 1000000ULL, 10000000ULL);
     publish_groups();
     if (env_flag("ACCORDIN_VERIFY_ONLY")) {
         verify_programs();

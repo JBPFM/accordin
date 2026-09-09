@@ -95,9 +95,20 @@ Streamcluster 在 384 线程时，即使原始程序可以正常完成，也可�
 若修改生成补丁或 baseline 编译选项，请用新的 `--build` 目录重新构建；第三方副本在
 补丁成功后固定，普通重复执行用于继续构建及重新构建当前 Accordin/LiTL 源码。
 
-六种锁都是 LiTL 算法，共用 `src/directlock.c` / `src/directcond.c` 前端：算法实例指针
-存放在被拦截的 `pthread_mutex_t` 中，条件变量是被拦截 `pthread_cond_t` 内的 futex 序列，
-`pthread_cond_clockwait` 一并拦截，因此 C++ `std::condition_variable` 也留在库内。
+六种锁都是 LiTL 算法，共用 `src/interpose.c` 前端，且编译开关一致：`NO_INDIRECTION=1`、
+`NEED_CONTEXT=0`、`SUPPORT_WAITING=0`、`WAITING_ORIGINAL`；算法实例指针存放在被拦截的
+`pthread_mutex_t` 中；`pthread_spin_*` / `pthread_rwlock_*` 不拦截，直接走 glibc 原生实现；
+`pthread_mutex_timedlock` 一律返回 `ENOTSUP`。
+
+五个 baseline（mcs、mcs-tas、mcs-tse、gcr、flexguard）另外共用 `src/directlock.c` /
+`src/directcond.c`：条件变量是被拦截 `pthread_cond_t` 内的 futex 序列（`pthread_cond_clockwait`
+一并拦截，因此 C++ `std::condition_variable` 也留在库内），`directlock_mutex_init` 忽略
+mutex 属性。Accordin 不用这两个文件：它链接 `interpose.o + accordin.o + accordin-cond.o`，
+条件变量是自己的每等待者 futex FIFO 队列，唤醒要与调度器的 custody / flush 协同（被调度器
+扣住的等待者由通知方的批量 flush 释放，其余等待者转入 mutex 的 parking 队列等待 relock
+交接），这是 `directcond.c` 的通用实现无法提供的；`accordin_mutex_init` 会校验 mutex 属性，
+非 NORMAL / PROCESS_PRIVATE / STALLED / PRIO_NONE 返回 `ENOTSUP`。
+
 `prepare.py` 在私有副本 `<build>/litl` 中一次构建全部六个算法，manifest 的锁路径直接指向
 `<build>/litl/lib/lib<algo>.so`。仓库根目录的 `make litl-baselines` 和
 `make check-litl-baselines` 构建并测试树内同一批算法。
@@ -118,8 +129,14 @@ Streamcluster 在 384 线程时，即使原始程序可以正常完成，也可�
   静默变为无操作，因此 `run.py` 先运行独立的 `tse_probe`（与库使用同一份
   `include/mbtimeslice.hpp` 检测逻辑），不可用时把 mcs-tse 的全部配置记为 `unsupported`，
   不会当成普通 MCS 测量。本机内核不提供该扩展。
-- GCR 是仓库原有的 GCR-on-MCS 实现（源码移入 LiTL，算法未改），默认
-  active_limit=1、signal_period=16384、passive_spins=1024。
+- GCR 是仓库原有的 GCR-on-MCS 实现（源码移入 LiTL），按论文配置编译：active_limit=4、
+  rejoin_limit=2（由 max(active_limit/2, 1) 导出）、signal_period=16384 (0x4000)、
+  passive_spins=1024。passive 队列头不 park，而是自旋等待批准标志，并按 1 起步、逐次
+  翻倍（上限 1<<20）的间隔采样 num_active，读到低于 rejoin_limit 即重新加入 active 集合；
+  release 路径里的周期性批准是一次普通 store，临界区内没有 futex 调用。三个参数可用
+  `GCR_MCS_ACTIVE_LIMIT`、`GCR_MCS_SIGNAL_PERIOD`、`GCR_MCS_PASSIVE_SPINS` 覆盖，
+  每进程解析一次并在 stderr 打印生效值；`run.py` 的 `clean_env` 会清掉 `GCR_` 前缀的
+  变量，实验因此总是跑编译期默认值。
 - FlexGuard 链接由 FlexGuard 私有副本构建的 `libsync.a`，该副本已应用
   `experiments/patches/flexguard-arm.patch`；编译参数为 `HYBRID_VERSION=MCS`、
   `ADD_PADDING`、`NOBPF=0`，与 FlexGuard 自身默认一致。锁、队列节点和 BPF 运行时都在
@@ -128,9 +145,22 @@ Streamcluster 在 384 线程时，即使原始程序可以正常完成，也可�
   不参与本实验。
 - Accordin 默认参数显式固定：group=8、own_limit=0、own_slack=100 us、custody=20 ms、
   flush_flags=8（MOVE）、flush_width=0、auto admission=0。对应当前运行时默认值。
-- trylock：GCR 和三个微基准锁没有非阻塞获取，其 `pthread_mutex_trylock` 始终返回
-  `EBUSY`；FlexGuard 和 Accordin 有真正的 trylock。轮询 trylock 直到成功的程序在前一组下
-  不会推进。`pthread_mutex_timedlock` 返回 `ENOTSUP`。
+
+### 已知差异
+
+- `directcond.c` 的 signal 取票号判断该不该唤醒，但唤醒本身走 futex 等待队列顺序，不是票号
+  顺序：同一个 condvar 上有两个及以上 sleeper 时，一次 signal 可能唤醒票号不匹配的等待者，
+  该次通知因此丢失。这一实现继承自 FlexGuard 的条件变量，只影响五个 baseline，不影响
+  accordin。六个 workload 基本使用每写者一个 condvar 或 broadcast，实际未观察到该路径。
+- trylock：gcr 与 `mb*` 系列（mcs、mcs-tas、mcs-tse）没有非阻塞入口，`directalgo_trylock`
+  一律返回 `EBUSY`，轮询 trylock 直到成功的程序在这四种锁下不会推进；flexguard 与
+  accordin 的 trylock 是真实的试获取。
+- `mbmcstse` 在每次 acquire / release 上调用 slice extension 的 enter / exit，没有嵌套计数，
+  因此一个线程同时持有两把该锁时，释放内层锁就会归还 extension。除了 `run.py` 启动前的
+  `tse_probe` 门控，运行时若 `rseq_slice_yield` 返回“不支持”，该线程会把 extension 关掉，
+  之后按普通 MCS 运行。
+- `mb*` 系列的每 (线程, 锁) context 由 `directlock_context` 分配后不释放：队列节点可能在
+  分配它的线程退出后仍被他人引用，因此保留到进程退出。
 
 六种后端都只替换 mutex/条件变量，保留 libc rwlock、spinlock、barrier。
 Streamcluster 的 PARSEC barrier 自身用 mutex/cond 实现，因此仍由被测锁保护。

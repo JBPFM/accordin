@@ -9,16 +9,46 @@ import litl_locks
 import run
 
 
+# The algorithm each compared lock resolves to, spelled out rather than read
+# back from the table under test.
+EXPECTED_ALGORITHMS = {
+    "mcs": "mbmcs_original",
+    "mcs-tas": "mbmcstas_original",
+    "gcr": "gcr_original",
+    "flexguard": "flexguard_original",
+    "mcs-tse": "mbmcstse_original",
+    "accordin": "mcstasaccordin_original",
+}
+
+
 class LockTableTests(unittest.TestCase):
-    def test_every_compared_lock_has_a_distinct_litl_algorithm(self):
-        algorithms = [litl_locks.litl_algorithm(lock) for lock in run.LOCKS]
-        self.assertEqual(len(set(algorithms)), len(run.LOCKS))
-        self.assertEqual(litl_locks.litl_algorithm("mcs-tse"), "mbmcstse_original")
-        self.assertEqual(litl_locks.litl_algorithm("accordin"), "mcstasaccordin_original")
+    def test_compared_locks_resolve_to_the_expected_algorithms(self):
+        self.assertEqual(set(run.LOCKS), set(EXPECTED_ALGORITHMS))
+        self.assertEqual(len(run.LOCKS), len(EXPECTED_ALGORITHMS))
+        for lock, algorithm in EXPECTED_ALGORITHMS.items():
+            self.assertEqual(litl_locks.litl_algorithm(lock), algorithm)
+        self.assertEqual(len(set(EXPECTED_ALGORITHMS.values())), len(EXPECTED_ALGORITHMS))
 
     def test_unmapped_lock_is_rejected(self):
         with self.assertRaises(ValueError):
             litl_locks.litl_algorithm("cna")
+
+    def test_build_algorithms_drops_repeats(self):
+        # mcs_tas_accordin_direct and accordin share mcstasaccordin_original.
+        self.assertEqual(litl_locks.build_algorithms(["accordin", "mcs_tas_accordin_direct"]),
+                         ["mcstasaccordin_original"])
+        self.assertEqual(litl_locks.build_algorithms(run.LOCKS),
+                         sorted(set(EXPECTED_ALGORITHMS.values())))
+
+    def test_preloaded_library_is_the_one_prepare_records(self):
+        build = Path("/build/experiments-litl")
+        # prepare.py writes exactly this into manifest["locks"].
+        manifest = {"locks": {lock: str(litl_locks.litl_library(lock, build / "litl"))
+                              for lock in litl_locks.EXPERIMENT_LOCKS}}
+        for lock in run.LOCKS:
+            expected = build / "litl" / "lib" / f"lib{EXPECTED_ALGORITHMS[lock]}.so"
+            self.assertEqual(manifest["locks"][lock], str(expected))
+            self.assertEqual(run.lock_env(lock, manifest)["LD_PRELOAD"], str(expected))
 
     def test_library_and_launcher_follow_the_named_checkout(self):
         directory = Path("/build/litl")

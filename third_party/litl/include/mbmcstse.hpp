@@ -3,9 +3,11 @@
 /*
  * MCS lock with an rseq time-slice extension held across the critical section.
  *
- * The mutex microbenchmark used to add the extension around whichever lock it
- * measured, through an option of its own. The benchmark no longer selects
- * locks, so the combination it measured as its MCS extension arm lives here.
+ * lock() requests the extension once the queue has handed the lock over, and
+ * unlock() returns it, so the request covers the span in which a thread owns
+ * the lock. Every acquire requests and every release returns; there is no
+ * nesting counter, so a thread holding two of these locks returns the
+ * extension when it releases the inner one.
  *
  * The queue node and the state returned by lock() live in a per (thread, lock)
  * context supplied by the caller, so a thread may hold several of these locks

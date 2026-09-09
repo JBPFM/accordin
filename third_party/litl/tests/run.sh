@@ -64,7 +64,6 @@ run_case() {
         ACCORDIN_CV_CUSTODY="${ACCORDIN_CV_CUSTODY:-}" \
         ACCORDIN_CV_CUSTODY_MS="$custody_ms" \
         ACCORDIN_CV_COUNTERS="$counters" \
-        ACCORDIN_OWN_LIMIT="${ACCORDIN_OWN_LIMIT:-}" \
         ACCORDIN_OWN_SLACK_US="${ACCORDIN_OWN_SLACK_US:-}" \
         ACCORDIN_GROUP_SIZE="${ACCORDIN_GROUP_SIZE:-}" \
         "$@" >"$log" 2>&1
@@ -144,20 +143,11 @@ for backend in mcsaccordin_original mcstasaccordin_original; do
             "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
         check_counters 1
     fi
-    # A CPU allowed a single grant from its own queue has to serve its topology
-    # group for every other grant, so this case drives the group probe.
-    if [[ "$disable" == 0 ]]; then
-        echo "  own-queue grants bounded at one"
-        ACCORDIN_OWN_LIMIT=1 \
-        run_case bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
-            "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
-        check_counters 1
-    fi
-    # With no slack and no count bound a CPU serves its own queue only while
-    # its head is the oldest of the group, so this case drives the age order.
+    # With no slack a CPU serves its own queue only while its head is the oldest
+    # of the group, so this case drives the group probe and the age order.
     if [[ "$disable" == 0 ]]; then
         echo "  strict age order inside the group"
-        ACCORDIN_OWN_SLACK_US=0 ACCORDIN_OWN_LIMIT=0 \
+        ACCORDIN_OWN_SLACK_US=0 \
         run_case bash "./lib${backend}.sh" ./obj/tests/accordin "lib${backend}.so" \
             "${LITL_TEST_THREADS:-8}" "${LITL_TEST_ITERATIONS:-10000}"
         check_counters 1

@@ -6,9 +6,10 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 /* The lockless read of a dispatch queue's head postdates the vendored scx
- * headers, so the kfunc is declared here and, like the __COMPAT helpers, used
- * only where the running kernel exports it. */
-struct task_struct *scx_bpf_dsq_peek(u64 dsq_id) __ksym __weak;
+ * headers, so the kfunc is declared here. Ranking queue heads is the whole
+ * grant order and the peek is called unguarded, so a kernel that does not
+ * export the kfunc refuses to load the object. */
+struct task_struct *scx_bpf_dsq_peek(u64 dsq_id) __ksym;
 
 /* The admission queue a waiter is filed in. The index is a CPU id at the
  * enqueue and release sites and a queue number when the bank itself is walked;
@@ -711,10 +712,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
   __u32 queues = scx_bpf_nr_cpu_ids(), index;
   s32 ret;
 
-  /* Ranking queue heads is the whole grant order, and the lockless head peek is
-   * the only read of a head cheap enough to do it with. */
-  if (!bpf_ksym_exists(scx_bpf_dsq_peek))
-    return -EOPNOTSUPP;
   ret = scx_bpf_create_dsq(NORMAL_DSQ, -1);
   if (ret)
     return ret;

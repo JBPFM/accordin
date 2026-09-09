@@ -37,17 +37,16 @@ worktree's `lib<adapter>_original.so`, `LD_LIBRARY_PATH` is the worktree's
 `target/release`, and `/proc/<pid>/maps` must contain exactly the adapter plus
 the matching direct library.
 
-`ACCORDIN_CV_FLUSH_FLAGS` carries most of the per-arm overrides used so far.
-At the branch tip it is the bit set of `src/bpf/intf.h` — `EXPIRE` 1, `REV` 2,
-`MOVE` 8, `SPREAD` 16, with bit 4 carrying no meaning any more — and
-`src/runtime.c` defaults it to `MOVE` = 8. The values recorded in
-[RESULTS.md](RESULTS.md) were measured on the commits named there, where bit 4
-selected tail placement: the `custody-tail` arm passed 12 (`MOVE|TAIL`,
-appending moved waits to the admission queue instead of inserting them at its
-head) and the `shard-spread` arm passed 26 (`MOVE|REV|SPREAD`, sweeping every
-free admission slot after a release, which the tip still accepts). Placement in
-the admission bank now follows the age stamp a waiter carries, so no flag
-selects it.
+`ACCORDIN_CV_FLUSH_FLAGS` carries most of the per-arm overrides recorded in
+[RESULTS.md](RESULTS.md) and belongs to the commits named there rather than to
+the retained head: nothing reads the variable, and the flag set of
+`src/bpf/intf.h` is `EXPIRE` 1 and `MOVE` 8, chosen by the caller of the
+`accordin_cv_flush` program. On the measured commits the set also held `REV` 2,
+tail placement in bit 4 and `SPREAD` 16: the `custody-tail` arm passed 12
+(`MOVE|TAIL`, appending moved waits to the admission queue instead of inserting
+them at its head) and the `shard-spread` arm passed 26 (`MOVE|REV|SPREAD`,
+sweeping every free admission slot after a release). Placement in the admission
+bank follows the age stamp a waiter carries, so no flag selects it.
 
 Two knobs come with the merged own-queue rule. `ACCORDIN_OWN_SLACK_US`
 (default 100) is how much younger a CPU's own queue head may be than the oldest

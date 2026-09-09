@@ -112,16 +112,18 @@ BPF 的三项同时进 dump，`demand` 也在 dump 里；它在 `ops.exit` 清 0
 
 `make check`（无 BPF 路径，覆盖空映射时的取值）、`sudo make check-bpf`、`sudo make check-auto-bpf`、`sudo make check-claim-bpf`，以及 `make litl && make check-litl && sudo make check-litl-bpf`。`sudo env DIRECT_SMOKE_MIGRATE=1 bash scripts/test_direct_api.sh --bpf` 覆盖等待期间改 affinity。
 
-`make check-claim-bpf`（`scripts/test_user_claim.sh` 与 `scripts/tests/user_claim.c`）在 `taskset -c 0,1` 下对两个后端各跑四个场景，从 stderr 解析 `[accordin_claim]` 并断言：
+`make check-claim-bpf`（`scripts/test_user_claim.sh` 与 `scripts/tests/user_claim.c`）把进程绑在两个 CPU 上，对两个后端各跑四个场景，从 stderr 按名字解析 `[accordin_claim]` 并断言：
 
 | 场景 | 负载 | 断言 |
 | --- | --- | --- |
-| 低竞争 | 2 线程，临界区短，episode 之间有停顿 | `claims + renews > 0`；`queued < (claims + renews) / 2`；`slots_left == 0` |
+| 低竞争 | 2 线程，临界区短，episode 之间有停顿 | `claims + renews > 0`；`queued < (claims + renews) / 2`；`slots_left == 0`；`swept > 0` 或 `adopted > 0` |
+| 低竞争，`ACCORDIN_USER_RSEQ=0` | 同上 | `claims + renews > 0`；`slots_left == 0` |
 | 过载 | 4 线程持续竞争 | `queued > 0`；`slots_left == 0` |
 | 过载，`ACCORDIN_USER_CLAIM=0` | 同上 | `claims == renews == undone == 0`；`queued > 0` |
-| 退出回收 | 低竞争后直接 `pthread_exit` | `slots_left == 0`；`swept > 0` 或 `adopted > 0` |
 
-退出回收给两个合法结果：tick 可能在线程死掉之前就收养并释放了那一项，此时 `exit_task` 的扫描无事可做，`swept` 为 0。表在卸载时必须是空的，这一条不放宽。
+名额粘性，线程退出时它最后取到的那一项仍在表中，所以低竞争场景要求 `swept` 与 `adopted` 至少有一个非零：tick 可能在线程死掉之前就收养并释放了那一项，此时 `exit_task` 的扫描无事可做，`swept` 为 0。表在卸载时必须是空的，这一条不放宽。
+
+关闭 rseq 的低竞争场景把认领和续用交给交换路径，覆盖写入后重读 CPU 与迁移撤销；这一场景不断言 `undone`，因为迁移不一定发生。
 
 同 CPU 的第一次竞争必然排队一次，`demand` 的短暂抖动还会再添几次，所以低竞争场景要求快路径承担绝大部分，而不是全部。
 

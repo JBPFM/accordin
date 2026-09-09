@@ -2,10 +2,8 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <ctype.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,17 +11,12 @@
 #include <time.h>
 #include "../../include/accordin_relock.h"
 #include "../../src/bpf/intf.h"
+#include "backend.h"
 
 /* Exercise the shipped C ABI, including concurrent first-use registration and
  * TLS cleanup. Run under timeout so a stalled lock handoff fails the test. */
 enum { THREADS = 8, ITERATIONS = 2000, MIXED_ITERATIONS = 20000 };
-static void *library;
-static const char *prefix;
-static void *(*mutex_create)(void);
-static int (*mutex_destroy)(void *);
-static int (*mutex_lock)(void *);
 static int (*mutex_trylock)(void *);
-static int (*mutex_unlock)(void *);
 static void (*relock_prepare)(accordin_relock_request_t *);
 static void (*relock_wake)(accordin_relock_request_t *);
 static int (*relock_park)(accordin_relock_request_t *);
@@ -125,17 +118,6 @@ static int custody_allowed(void) {
              !strcasecmp(value, "no") || !strcasecmp(value, "off"));
 }
 
-static void *symbol(const char *suffix) {
-    char name[160];
-    snprintf(name, sizeof(name), "%s_%s", prefix, suffix);
-    void *result = dlsym(library, name);
-    if (!result) {
-        fprintf(stderr, "missing symbol %s: %s\n", name, dlerror());
-        exit(1);
-    }
-    return result;
-}
-
 static void *contender(void *unused) {
     (void)unused;
     pthread_barrier_wait(&barrier);
@@ -181,25 +163,16 @@ static void *mixed_contender(void *unused) {
 
 int main(int argc, char **argv) {
     assert(argc == 3);
-    prefix = argv[2];
     char disable[96];
-    snprintf(disable, sizeof(disable), "%s_DISABLE_BPF", prefix);
+    snprintf(disable, sizeof(disable), "%s_DISABLE_BPF", argv[2]);
     for (char *c = disable; *c; ++c)
         *c = (char)toupper((unsigned char)*c);
     const char *setting = getenv(disable);
     /* Custody needs both the scheduler and the custody setting, which the
      * runtime reads as enabled unless it is explicitly denied. */
     int scheduled = setting && setting[0] == '0' && custody_allowed();
-    library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
-    if (!library) {
-        fprintf(stderr, "dlopen: %s\n", dlerror());
-        return 1;
-    }
-    mutex_create = symbol("mutex_create");
-    mutex_destroy = symbol("mutex_destroy");
-    mutex_lock = symbol("mutex_lock");
+    load_backend(argv[1], argv[2]);
     mutex_trylock = symbol("mutex_trylock");
-    mutex_unlock = symbol("mutex_unlock");
     relock_prepare = symbol("mutex_relock_prepare");
     relock_wake = symbol("mutex_relock_wake");
     mutex_relock = symbol("mutex_relock");
@@ -230,13 +203,8 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < THREADS; ++i)
         assert(pthread_create(&threads[i], NULL, contender, NULL) == 0);
     if (getenv("DIRECT_SMOKE_MIGRATE")) {
-        cpu_set_t allowed;
-        int cpus[2], count = 0;
-        assert(sched_getaffinity(0, sizeof(allowed), &allowed) == 0);
-        for (int cpu = 0; cpu < CPU_SETSIZE && count < 2; ++cpu)
-            if (CPU_ISSET(cpu, &allowed))
-                cpus[count++] = cpu;
-        assert(count == 2);
+        int cpus[2];
+        backend_cpu_pair(cpus);
         /* Move queued/spinning threads onto CPUs occupied by other waiters. */
         for (unsigned round = 0; round < 16; ++round) {
             cpu_set_t mask;
@@ -264,7 +232,7 @@ int main(int argc, char **argv) {
     assert(mutex_destroy(secondary) == 0);
     assert(mutex_destroy(primary) == 0);
     printf("direct smoke ok: %s acquisitions=%u nested=%u\n",
-           prefix, counter, nested_counter);
+           backend_prefix, counter, nested_counter);
     /* Direct libraries and their registered TLS state live until process exit. */
     return 0;
 }

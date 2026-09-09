@@ -89,7 +89,7 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 
 等待队列按 FIFO 扫描；已有名额的线程可以连续续用，因此不保证严格 FIFO 或有界等待。
 
-`ACCORDIN_CV_COUNTERS=1` 打开运行时计数：加载时打印 `[accordin_rseq]`，卸载时打印 `[accordin_claim]`，逐项含义见[用户态名额认领](docs/plans/2026-09-09-user-slot-claim.md)的计数表。`make check-claim-bpf` 用低竞争、过载、关闭开关的过载和持名额退出四个场景检查这些计数。
+`ACCORDIN_CV_COUNTERS=1` 打开运行时计数：加载时打印 `[accordin_rseq]`，卸载时打印 `[accordin_claim]`，逐项含义见[用户态名额认领](docs/plans/2026-09-09-user-slot-claim.md)的计数表。`make check-claim-bpf` 用低竞争、关闭 rseq 的低竞争、过载和关闭开关的过载四个场景检查这些计数。
 
 普通线程与已获准线程都能继续得到调度，因此被抢占的持锁线程可以恢复并解锁。嵌套锁共享一次 admission，最后一把锁释放才结束；持有外层锁的线程不会因获取内层锁再次被 admission 阻塞。若已进入原始锁队列的线程更改 affinity，则允许它完成当前操作，避免将 MCS 前驱停在后继后面。这两类继续执行的路径不属于新等待者的准入限制。
 

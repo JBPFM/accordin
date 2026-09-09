@@ -53,10 +53,12 @@ CASES = {
     'overload-t96-c100-o3000': (96, 100, 3000),
 }
 
-CLAIM_KEYS = ['renews', 'claims', 'undone', 'queued', 'adopted', 'swept',
-              'slots_left', 'demand']
-CLAIM_PATTERN = re.compile(r'\[accordin_claim\] ' + ' '.join(
-    f'{k}=(-?\\d+)' for k in CLAIM_KEYS))
+CLAIM_KEYS = ['renews', 'claims', 'undone', 'aborts', 'queued', 'adopted',
+              'swept', 'slots_left']
+# Each counter is looked up by name in the rest of the line, so the order the
+# runtime prints them in does not matter.
+CLAIM_PATTERN = re.compile(r'\[accordin_claim\]' + ''.join(
+    f'(?=[^\\n]* {k}=(-?\\d+))' for k in CLAIM_KEYS))
 METRIC_PATTERN = {
     'throughput_ops_per_sec': re.compile(r'^throughput_ops_per_sec: ([\d.]+)$', re.M),
     'total_operations': re.compile(r'^total_operations: (\d+)$', re.M),

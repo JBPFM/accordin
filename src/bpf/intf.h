@@ -41,8 +41,16 @@ struct admission_word {
   unsigned int slot;
 } __attribute__((aligned(8)));
 
+/* One admission slot: the ticket of the request holding that CPU's slot. */
+struct admission_slot {
+  unsigned long long ticket;
+} __attribute__((aligned(64)));
+
 /* Mapped writable into the direct runtime, which confirms admission after
- * yielding and writes owners[] by compare-and-swap on its own ticket value. */
+ * yielding and writes owners[] by compare-and-swap on its own ticket value.
+ * The table is shared by every CPU, the count is written machine-wide, and a
+ * slot is hammered by exactly one thread, so the count and each slot get a
+ * cache line of their own. */
 struct admission_state {
   unsigned int enabled;
   /* Auto admission latches this on at the first overload event. */
@@ -51,9 +59,16 @@ struct admission_state {
    * Advisory: maintained without saturation, signed so a transient undercount
    * reads as empty rather than as an enormous queue, and corrected against the
    * queue depths by the periodic scan. */
-  int demand;
-  unsigned long long owners[MAX_CPUS];
+  int demand __attribute__((aligned(64)));
+  struct admission_slot owners[MAX_CPUS];
 };
+
+_Static_assert(sizeof(struct admission_slot) == 64,
+               "an admission slot must fill a cache line");
+_Static_assert(__builtin_offsetof(struct admission_state, demand) % 64 == 0,
+               "the demand count must start a cache line");
+_Static_assert(__builtin_offsetof(struct admission_state, owners) % 64 == 0,
+               "the slot table must start a cache line");
 
 struct task_scx_ctx {
   unsigned int auto_runnable;

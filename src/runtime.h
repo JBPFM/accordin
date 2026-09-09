@@ -34,8 +34,6 @@ _Static_assert(offsetof(struct thread_state, slot) ==
                "the slot must follow the word as the scheduler reads it");
 _Static_assert(_Alignof(struct thread_state) == 8,
                "the word and the slot must share an eight-byte read");
-_Static_assert(offsetof(struct admission_state, owners) % 8 == 0,
-               "owner records must be eight-byte aligned");
 
 extern _Thread_local struct thread_state thread_state;
 extern struct admission_state *scheduler_admission;
@@ -111,7 +109,7 @@ static inline bool admission_take_slot(struct admission_state *state,
     /* A condvar wake, or a wait a flush filed in the bank and dispatch then
      * served, arrives with the grant already written. */
     if (cpu < MAX_CPUS &&
-        __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket) {
+        __atomic_load_n(&state->owners[cpu].ticket, __ATOMIC_RELAXED) == ticket) {
         /* Record the grant where the scheduler reads it, so its task record
          * and this table entry name the same slot. */
         thread_state.slot = cpu + 1;
@@ -125,7 +123,7 @@ static inline bool admission_take_slot(struct admission_state *state,
         return false;
     if (thread_state.slot) {
         expected = thread_state.ticket;
-        if (__atomic_compare_exchange_n(&state->owners[thread_state.slot - 1],
+        if (__atomic_compare_exchange_n(&state->owners[thread_state.slot - 1].ticket,
                                         &expected, ticket, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             thread_state.ticket = ticket;
@@ -137,13 +135,13 @@ static inline bool admission_take_slot(struct admission_state *state,
     }
     cpu = sched_getcpu();
     if (cpu >= MAX_CPUS ||
-        __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED))
+        __atomic_load_n(&state->owners[cpu].ticket, __ATOMIC_RELAXED))
         return false;
     /* The scheduler adopts a slot through this field, so name the entry before
      * the entry names this thread. */
     thread_state.slot = cpu + 1;
     expected = 0;
-    if (__atomic_compare_exchange_n(&state->owners[cpu], &expected, ticket,
+    if (__atomic_compare_exchange_n(&state->owners[cpu].ticket, &expected, ticket,
                                     false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
         if ((unsigned int)sched_getcpu() == cpu) {
             thread_state.ticket = ticket;
@@ -156,7 +154,7 @@ static inline bool admission_take_slot(struct admission_state *state,
          * scheduler that already adopted it fails its later release and drops
          * the record. */
         expected = ticket;
-        __atomic_compare_exchange_n(&state->owners[cpu], &expected, 0, false,
+        __atomic_compare_exchange_n(&state->owners[cpu].ticket, &expected, 0, false,
                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
         claim_count(&claim_undone);
     }
@@ -208,7 +206,7 @@ static inline void admission_wait(bool prequeued)
             break;
         unsigned int cpu = sched_getcpu();
         if (cpu < MAX_CPUS &&
-            __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket) {
+            __atomic_load_n(&state->owners[cpu].ticket, __ATOMIC_RELAXED) == ticket) {
             /* Record the grant where the scheduler reads it, so its task
              * record and this table entry name the same slot. */
             thread_state.slot = cpu + 1;

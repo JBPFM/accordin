@@ -42,7 +42,7 @@ static __always_inline __u32 nr_waiting(void) {
 
 static __always_inline volatile __u64 *owner_slot(__u32 cpu) {
   barrier_var(cpu);
-  return cpu < MAX_CPUS ? &admission.owners[cpu] : 0;
+  return cpu < MAX_CPUS ? &admission.owners[cpu].ticket : 0;
 }
 
 static __always_inline bool allowed(struct task_struct *p, __u32 cpu) {

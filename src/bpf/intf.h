@@ -78,23 +78,17 @@ struct task_scx_ctx {
  * The caller fills the request fields and reads back the result fields.
  * MOVE hands notified waits to the admission queue and EXPIRE withdraws custody
  * from waits past their limit. The admission queue is ordered by the age stamp
- * a wait carries, so a released wait takes the place its park time gives it and
- * the walk order shows only under a width cap; REV then walks the custody queue
- * from its tail instead of from its head. SPREAD also wakes idle CPUs holding a
- * free admission slot for the moved waits, not only for the waits handed back
- * to the ordinary queue. Bit 4 carries no meaning. */
+ * a wait carries, so a released wait takes the place its park time gives it
+ * rather than the place the walk reached it in. The bit values between the two
+ * flags carry no meaning. */
 #define CV_FLUSH_EXPIRE 1U
-#define CV_FLUSH_REV 2U
 #define CV_FLUSH_MOVE 8U
-#define CV_FLUSH_SPREAD 16U
 
 struct cv_flush_ctx {
-  unsigned int width;
   unsigned int flags;
   unsigned long long now;
   unsigned int moved;
   unsigned int expired;
-  unsigned int pending;
   unsigned int queued;
 };
 

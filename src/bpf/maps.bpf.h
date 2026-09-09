@@ -37,7 +37,6 @@ struct {
 struct cv_flush_tally {
   __u32 moved;
   __u32 expired;
-  __u32 pending;
 };
 
 struct {

@@ -37,7 +37,6 @@ static libbpf_print_fn_t previous_log;
 static int cv_flush_prog_fd = -1;
 static int cv_flush_running;
 static unsigned int cv_flush_requests;
-static unsigned int cv_flush_width, cv_flush_flags;
 static bool cv_custody_on;
 bool runtime_diagnostics;
 /* Set once the scheduler is attached and cleared before it goes away, so a
@@ -255,12 +254,11 @@ static bool claim_flush(void)
  * was reached with work left, or the program failed. The caller keeps its
  * pending mark and retries at its next release point; custody expiry remains
  * the backstop. */
-int accordin_cv_flush_now(unsigned int width, unsigned int flags)
+int accordin_cv_flush_now(unsigned int flags)
 {
-    struct cv_flush_ctx ctx = {
-        .width = width ? width : cv_flush_width,
-        .flags = flags ? flags : cv_flush_flags,
-    };
+    /* Notified waits leave custody through the move pass; the scheduler's timer
+     * keeps expiry, so a caller that names no flags asks only for the move. */
+    struct cv_flush_ctx ctx = {.flags = flags ? flags : CV_FLUSH_MOVE};
     /* A syscall program rejects ctx_out and writes its results back through
      * ctx_in instead. */
     LIBBPF_OPTS(bpf_test_run_opts, opts, .ctx_in = &ctx, .ctx_size_in = sizeof(ctx));
@@ -278,18 +276,15 @@ int accordin_cv_flush_now(unsigned int width, unsigned int flags)
     for (;;) {
         unsigned int seen = __atomic_load_n(&cv_flush_requests, __ATOMIC_SEQ_CST);
         int result = bpf_prog_test_run_opts(cv_flush_prog_fd, &opts);
-        bool complete;
 
         passes++;
-        /* A width-bounded pass leaves a tail parked, and a notification that
-         * landed during the pass may not have been covered by it. */
-        complete = !result && !ctx.pending;
         __atomic_store_n(&cv_flush_running, 0, __ATOMIC_SEQ_CST);
         if (result)
             return -1;
         moved += (int)ctx.moved;
-        if (complete &&
-            __atomic_load_n(&cv_flush_requests, __ATOMIC_SEQ_CST) == seen)
+        /* A notification counted after this pass began may not have been
+         * covered by it, and its notifier saw the claim taken and left. */
+        if (__atomic_load_n(&cv_flush_requests, __ATOMIC_SEQ_CST) == seen)
             return moved;
         if (passes >= CV_FLUSH_MAX_PASSES || !claim_flush())
             return -1;
@@ -420,12 +415,6 @@ __attribute__((constructor)) static void scheduler_start(void)
     runtime_diagnostics = env_flag("ACCORDIN_CV_COUNTERS");
     user_claim = env_allowed("ACCORDIN_USER_CLAIM");
     user_rseq = env_allowed("ACCORDIN_USER_RSEQ") && rseq_area_available();
-    cv_flush_width = env_u32("ACCORDIN_CV_FLUSH_WIDTH", 0);
-    /* Notified waits leave custody through the flush; the timer keeps expiry.
-     * Where a released wait lands in the admission queue is set by its park
-     * stamp, so the walk order shows only under a width cap, and walking the
-     * custody queue from its head hands the oldest parks over first. */
-    cv_flush_flags = env_u32("ACCORDIN_CV_FLUSH_FLAGS", CV_FLUSH_MOVE);
     SCX_BUG_ON(pthread_atfork(NULL, NULL, reset_after_fork),
                "Failed to register fork cleanup");
     skel = SCX_OPS_OPEN(accordin_ops, accordin);

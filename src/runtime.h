@@ -54,9 +54,9 @@ void register_thread(void);
 /* True while the scheduler can hold a condvar wait instead of a futex sleep. */
 bool accordin_cv_custody_ready(void);
 /* Hand notified condvar waits back to lock admission. Returns how many moved,
- * zero without a scheduler, or -1 on error. Zero width or flags select the
- * values configured through the environment. */
-int accordin_cv_flush_now(unsigned int width, unsigned int flags);
+ * zero without a scheduler, or -1 on error. Zero flags ask for the move pass
+ * alone. */
+int accordin_cv_flush_now(unsigned int flags);
 
 static inline void ensure_registered(void)
 {

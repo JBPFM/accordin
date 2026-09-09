@@ -26,7 +26,7 @@ int mcs_tas_accordin_direct_mutex_relock_park(accordin_relock_request_t *request
 int mcs_tas_accordin_direct_mutex_cv_custody_ready(void);
 /* Hand parked, notified requests back to lock admission. Returns how many
  * moved, zero without a scheduler, or -1 on error. */
-int mcs_tas_accordin_direct_mutex_cv_flush(unsigned int width, unsigned int flags);
+int mcs_tas_accordin_direct_mutex_cv_flush(unsigned int flags);
 int mcs_tas_accordin_direct_mutex_relock(mcs_tas_accordin_direct_mutex_t *mutex,
                                        accordin_relock_request_t *request);
 

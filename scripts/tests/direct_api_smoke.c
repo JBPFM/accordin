@@ -20,7 +20,7 @@ static int (*mutex_trylock)(void *);
 static void (*relock_prepare)(accordin_relock_request_t *);
 static void (*relock_wake)(accordin_relock_request_t *);
 static int (*relock_park)(accordin_relock_request_t *);
-static int (*cv_flush)(unsigned int, unsigned int);
+static int (*cv_flush)(unsigned int);
 static int (*mutex_relock)(void *, accordin_relock_request_t *);
 static void *primary, *secondary;
 static unsigned counter, nested_counter;
@@ -104,7 +104,7 @@ static void park_test(int scheduled) {
     assert(mutex_unlock(primary) == 0);
 
     /* Both passes run here: neither has a wait of this thread's to release. */
-    assert(cv_flush(0, CV_FLUSH_MOVE | CV_FLUSH_EXPIRE) >= 0);
+    assert(cv_flush(CV_FLUSH_MOVE | CV_FLUSH_EXPIRE) >= 0);
     printf("direct park ok: custody %s, notified request skips the park\n",
            scheduled ? "expired" : "unavailable");
 }

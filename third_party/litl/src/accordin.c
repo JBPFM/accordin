@@ -78,7 +78,7 @@ static void flush_notified(void) {
      * take the whole batch re-arms it, and this thread retries at its next
      * unlock or notification; custody expiry remains the backstop. */
     flush_pending = 0;
-    if (ACCORDIN_DIRECT(cv_flush)(0, 0) < 0)
+    if (ACCORDIN_DIRECT(cv_flush)(0) < 0)
         flush_pending = 1;
 }
 

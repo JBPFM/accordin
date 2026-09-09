@@ -324,21 +324,13 @@ static long custody_limit_ms(void) {
     return limit > 0 ? limit : 0;
 }
 
-static long flush_width(void) {
-    const char *value = getenv("ACCORDIN_CV_FLUSH_WIDTH");
-    long width = value && *value ? strtol(value, NULL, 0) : 0;
-    return width > 0 ? width : 0;
-}
-
 /* Under a short limit expiry releases every wait long before any deadline worth
  * asserting, so the deadline would hold whether or not a notification ever
  * reached the wait. It says something only when custody would otherwise hold
- * the wait well past it. A release narrower than the batch says nothing either:
- * it hands over as much as it is allowed to and leaves the rest to expiry. */
+ * the wait well past it. */
 #define RELEASE_DEADLINE_MS 500
-static int release_deadline_applies(int batch) {
-    long width = flush_width();
-    return custody_limit_ms() >= RELEASE_DEADLINE_MS && (!width || width >= batch);
+static int release_deadline_applies(void) {
+    return custody_limit_ms() >= RELEASE_DEADLINE_MS;
 }
 
 static long elapsed_ms(const struct timespec *from) {
@@ -453,7 +445,7 @@ static void signal_outside_mutex_test(void) {
         OK(pthread_join(ids[i], NULL));
     long took = elapsed_ms(&start);
     CHECK(outside_woken == OUTSIDE_WAITERS);
-    if (release_deadline_applies(OUTSIDE_WAITERS))
+    if (release_deadline_applies())
         CHECK(took < RELEASE_DEADLINE_MS);
     OK(pthread_cond_destroy(&outside_cv));
     printf("PASS condvar signal outside the mutex: %d waiters released in %ld ms\n",
@@ -494,7 +486,7 @@ static void broadcast_many_test(void) {
         OK(pthread_join(ids[i], NULL));
     long took = elapsed_ms(&start);
     CHECK(many_woken == MANY_WAITERS);
-    if (release_deadline_applies(MANY_WAITERS))
+    if (release_deadline_applies())
         CHECK(took < RELEASE_DEADLINE_MS);
     OK(pthread_cond_destroy(&many_cv));
     printf("PASS condvar broadcast: %d waiters released by one notification in %ld ms\n",
@@ -516,7 +508,7 @@ static void timedwait_shorter_than_custody_test(void) {
     OK(pthread_mutex_unlock(&mutex));
     OK(pthread_cond_destroy(&cv));
     CHECK(took >= 5);
-    if (release_deadline_applies(1))
+    if (release_deadline_applies())
         CHECK(took < RELEASE_DEADLINE_MS);
     printf("PASS timed wait below the custody limit: returned in %ld ms\n", took);
 }

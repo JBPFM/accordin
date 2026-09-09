@@ -100,8 +100,8 @@ void BPF_STRUCT_OPS(accordin_quiescent, struct task_struct *p, u64 deq_flags) {
 /* The word and the slot the runtime keeps for a thread, taken together: the
  * scheduler has to see the slot a thread recorded beside the request it
  * recorded it for, and one read of the aligned pair is what gives it both. */
-static __noinline bool user_state(struct task_struct *p,
-                                  struct admission_word *word) {
+static __always_inline bool user_state(struct task_struct *p,
+                                       struct admission_word *word) {
   __u32 tid = p->pid;
   __u64 *address = bpf_map_lookup_elem(&thread_ctx_addr_map, &tid);
   word->state = 0;
@@ -776,23 +776,21 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
   struct cv_flush_tally *tally;
   struct task_struct *p;
   __u32 tgid = bpf_get_current_pid_tgid() >> 32;
-  __u32 width = ctx->width, key = 0;
-  __u64 iter_flags = (ctx->flags & CV_FLUSH_REV) ? SCX_DSQ_ITER_REV : 0;
+  __u32 key = 0;
 
-  ctx->moved = ctx->expired = ctx->pending = ctx->queued = 0;
+  ctx->moved = ctx->expired = ctx->queued = 0;
   if (!admission.enabled)
     return 0;
   tally = bpf_map_lookup_elem(&cv_tally_map, &key);
   if (!tally)
     return 0;
-  tally->moved = tally->expired = tally->pending = 0;
+  tally->moved = tally->expired = 0;
   if (ctx->flags & CV_FLUSH_MOVE) {
     bpf_rcu_read_lock();
-    bpf_for_each(scx_dsq, p, WAITFORSIGNAL_DSQ, iter_flags) {
+    bpf_for_each(scx_dsq, p, WAITFORSIGNAL_DSQ, 0) {
       struct task_scx_ctx *tctx;
       struct admission_word word;
-      __u64 target, parked;
-      bool moved;
+      __u64 parked;
       __u32 task_cpu;
 
       if (p->tgid != tgid)
@@ -801,75 +799,54 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
       if (!tctx || !tctx->parked_at)
         continue;
       task_cpu = scx_bpf_task_cpu(p);
-      /* A released wait keeps the stamp it took when it parked, and the
-       * admission queue is ordered by that stamp, so its place in line is the
-       * wait it has already served rather than the moment it was handed over.
-       * Where it goes in the queue is therefore no longer a choice the caller's
-       * flags make. */
-      target = waiting_dsq(task_cpu);
       /* Running in the process's own context, an unreadable word is not a
-       * notification and cannot be confirmed later either. */
-      if (!user_state(p, &word)) {
-        target = NORMAL_DSQ;
-      } else if ((word.state & USER_META) != USER_WAITING) {
+       * notification and cannot be confirmed later either, so the wait stays in
+       * custody and the expiry pass is what hands it back. */
+      if (!user_state(p, &word) || (word.state & USER_META) != USER_WAITING)
         continue;
-      } else if (width && tally->moved >= width) {
-        tally->pending++;
-        continue;
-      }
       /* Clearing the custody mark claims the wait; an already cleared mark
        * means the wait belongs to someone else. */
       parked = __sync_lock_test_and_set(&tctx->parked_at, 0);
       if (!parked)
         continue;
-      if (target == NORMAL_DSQ)
-        tctx->custody_denied = tctx->ticket;
-      else
-        tctx->ticket = request_ticket(p, word.state);
+      tctx->ticket = request_ticket(p, word.state);
       __sync_fetch_and_sub(&cv_parked_now, 1);
-      /* A move can be refused while the wait is still queued, so put the claim
+      /* A released wait keeps the stamp it took when it parked, and the
+       * admission queue is ordered by that stamp, so its place in line is the
+       * wait it has already served rather than the moment it was handed over.
+       *
+       * A move can be refused while the wait is still queued, so put the claim
        * back and leave it to the next pass. Only a claim that cannot be put
        * back means the wait left the queue by another path, which counted it. */
-      moved = target == NORMAL_DSQ
-                  ? __COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, target, 0)
-                  : __COMPAT_scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p, target,
-                                                    0);
-      if (!moved) {
+      if (!__COMPAT_scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
+                                           waiting_dsq(task_cpu), 0)) {
         if (__sync_bool_compare_and_swap(&tctx->parked_at, 0, parked))
           __sync_fetch_and_add(&cv_parked_now, 1);
         else
           __sync_fetch_and_add(&cv_drained, 1);
-      } else if (target == NORMAL_DSQ) {
-        __sync_fetch_and_add(&cv_expired, 1);
-        __sync_fetch_and_add(&admission.demand, 1);
-        tally->expired++;
-      } else {
-        __sync_fetch_and_add(&cv_flushed, 1);
-        __sync_fetch_and_add(&admission.demand, 1);
-        tally->moved++;
-        /* The wait is filed in the queue of the CPU it last ran on. Any CPU
-         * with a free slot may grant it while walking the bank; waking that
-         * CPU is the cheapest attempt, since it is the one most likely to still
-         * hold the waiter's cache footprint. */
-        scx_bpf_kick_cpu(task_cpu, SCX_KICK_IDLE);
+        continue;
       }
+      __sync_fetch_and_add(&cv_flushed, 1);
+      __sync_fetch_and_add(&admission.demand, 1);
+      tally->moved++;
+      /* The wait is filed in the queue of the CPU it last ran on. Any CPU
+       * with a free slot may grant it while walking the bank; waking that
+       * CPU is the cheapest attempt, since it is the one most likely to still
+       * hold the waiter's cache footprint. */
+      scx_bpf_kick_cpu(task_cpu, SCX_KICK_IDLE);
     }
     bpf_rcu_read_unlock();
   }
   if (ctx->flags & CV_FLUSH_EXPIRE)
     tally->expired += cv_expire_parked(ctx->now);
   /* Waits handed back to the ordinary queue may be served by any free CPU and
-   * always need the sweep. A flushed wait has had one idle kick aimed at its
-   * own CPU, which is dropped if that CPU is busy; sweeping the free slots for
-   * it as well is what the spread flag asks for. */
-  kick_free_slots((ctx->flags & CV_FLUSH_SPREAD) ? tally->moved + tally->expired
-                                                 : tally->expired);
+   * need the sweep. A flushed wait has had its own idle kick instead. */
+  kick_free_slots(tally->expired);
   __sync_fetch_and_add(&cv_flush_calls, 1);
   if (!tally->moved)
     __sync_fetch_and_add(&cv_flush_misses, 1);
   ctx->moved = tally->moved;
   ctx->expired = tally->expired;
-  ctx->pending = tally->pending;
   ctx->queued = scx_bpf_dsq_nr_queued(WAITFORSIGNAL_DSQ);
   return tally->moved;
 }

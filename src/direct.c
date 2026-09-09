@@ -127,9 +127,9 @@ EXPORT int API(cv_custody_ready)(void)
     return accordin_cv_custody_ready();
 }
 
-EXPORT int API(cv_flush)(unsigned int width, unsigned int flags)
+EXPORT int API(cv_flush)(unsigned int flags)
 {
-    return accordin_cv_flush_now(width, flags);
+    return accordin_cv_flush_now(flags);
 }
 
 EXPORT int API(relock)(struct MUTEX *mutex, accordin_relock_request_t *request)

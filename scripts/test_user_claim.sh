@@ -11,7 +11,8 @@ cc -std=c11 -O2 -Wall -Wextra -Werror -pthread \
 
 context=""
 line=""
-renews=0 claims=0 undone=0 queued=0 adopted=0 swept=0 slots_left=0 demand=0
+renews=0 claims=0 undone=0 aborts=0 queued=0 adopted=0 swept=0 slots_left=0
+demand=0
 
 # Each scenario attaches its own scheduler, so the previous one has to be gone.
 # A host that serializes scheduler loads through a lock takes it around the
@@ -50,8 +51,10 @@ run() {
         echo "FAIL $context: no [accordin_claim] line" >&2
         exit 1
     fi
-    read -r _ renews claims undone queued adopted swept slots_left demand <<<"$line"
-    renews=${renews#*=} claims=${claims#*=} undone=${undone#*=} queued=${queued#*=}
+    read -r _ renews claims undone aborts queued adopted swept slots_left demand \
+        <<<"$line"
+    renews=${renews#*=} claims=${claims#*=} undone=${undone#*=} aborts=${aborts#*=}
+    queued=${queued#*=}
     adopted=${adopted#*=} swept=${swept#*=} slots_left=${slots_left#*=}
     demand=${demand#*=}
     echo "$context: $line"

@@ -10,12 +10,12 @@
 
 ## 规则
 
-`owners[cpu]` 仍是唯一的名额记录，值仍是 `request << 32 | tid`。写它的四方全部用 CAS，且只在自己的 ticket 值上操作：dispatch 的 `admit_from` 做 `0 → ticket`，调度器的 `release_slot`、`exit_task` 扫描和 `ops.exit` 清表做 `ticket → 0`，`ops.yield` 做 `old → new`，用户态做续用、认领和撤销。
+`owners[cpu]` 仍是唯一的名额记录，值仍是 `request << 32 | tid`。写它的四方都只在自己的 ticket 值上操作：dispatch 的 `admit_from` 做 `0 → ticket`，调度器的 `release_slot`、`exit_task` 扫描和 `ops.exit` 清表做 `ticket → 0`，`ops.yield` 做 `old → new`，用户态做续用、认领和撤销。内核侧一律用 CAS；用户态在本 CPU 的表项上改用 rseq，见「用 rseq 写名额」。
 
 慢路径在策略启用时按顺序尝试三件事：
 
 1. **确认已有授权**。condvar 唤醒，或被 flush 送回 bank 后由 dispatch 授权的请求，名额已经写好，读到 `owners[getcpu()] == ticket` 就直接返回，并把 `slot`/`ticket` 记进 `thread_state`，让调度器的记录和这张表指向同一项。
-2. **续用或认领**，条件是 `ACCORDIN_USER_CLAIM` 开启且 `demand <= 0`。续用是把 `owners[slot - 1]` 从自己上次写的 ticket CAS 成本次请求；失败说明名额已被回收或已属他人，清掉记录后退到认领。认领是读 `sched_getcpu()`，该项为 0 时先写 `thread_state.slot`，再 CAS `0 → ticket`；成功后重读 CPU，若已迁移则 CAS `ticket → 0` 撤销。不撤销的话，名额留在一个没人跑的 CPU 上，而线程实际所在的 CPU 上有两个自旋者。撤销总是安全的：这个值只有自己写，调度器若已收养，它稍后的 release CAS 会失败并只清自己的记录。
+2. **续用或认领**，条件是 `ACCORDIN_USER_CLAIM` 开启且 `demand <= 0`。续用是把 `owners[slot - 1]` 从自己上次写的 ticket 换成本次请求；失败说明名额已被回收或已属他人，清掉记录后退到认领。认领是读当前 CPU，该项为 0 时先写 `thread_state.slot`，再把它从 0 换成本次 ticket。交换用 CAS 时，认领成功后还要重读 CPU，若已迁移则 CAS `ticket → 0` 撤销；不撤销的话，名额留在一个没人跑的 CPU 上，而线程实际所在的 CPU 上有两个自旋者。撤销总是安全的：这个值只有自己写，调度器若已收养，它稍后的 release CAS 会失败并只清自己的记录。这两次交换在有 rseq 的机器上不用原子指令，见下节。
 3. **排队**。以上都不成立就发布 `USER_WAITING`，进原有的 yield 确认循环，确认后同样记录 `slot`/`ticket`。
 
 `sched_getcpu()` 是 vDSO/rseq 读，不是 syscall。名额粘性，`admission_finish` 不释放。
@@ -69,17 +69,33 @@
 - `ops.yield` 续用写入的 ticket 用户态没见过：yield 循环确认的正是本请求的 ticket，确认时就记录下来，不会过期。
 - 永久双名额不可达：用户态只写 `owners[slot - 1]`，且只从自己写过或确认过的值 CAS；内核只授权 bank 里的任务，而 bank 里的任务不在运行；进 bank 要求 `admission_cpu == 0`，收养在此之前发生。
 
+## 用 rseq 写名额
+
+续用和认领各自只有一次比较加一次写入，而且写的是本 CPU 的表项，因此不需要原子指令，只需要"没跑完就不算数"。这两步放进一段 restartable sequence：普通 load、比较、单条 store，内核在抢占、迁移和信号投递时把线程从 abort handler 重新拉起来，commit 的 store 永远不会在线程离开这个 CPU 之后才执行。
+
+为什么这样就够：线程在 CPU X 上跑的时候，唯一能把 `owners[X]` 从空变成授权的写者是 X 自己的 `ops.dispatch`——`admit_from` 只授权正在 dispatch 的那个 CPU 的名额——而 X 上要跑 dispatch，必须先把这个线程调度下去，那会重启这段。其余写者只 CAS 自己的 ticket：别的任务的 `release_slot`、`exit_task` 的扫描、`ops.exit` 的清表，认的都是这个线程从没写过的值，碰不到 0，也碰不到本线程持有的项。X 上的 tick 可能不重新调度就把本线程的旧 ticket 清成 0：此时 store 落在一个空项上，正是续用要的结果，调度器随后按 `thread_state.slot` 重新收养。
+
+由此，rseq 路径上认领成功后不再重读 CPU，也没有撤销那一步：迁移在 commit 之前就把这段重启了。CAS 路径两步都保留。线程迁移之后 `slot` 还指着旧 CPU 的情况仍走 CAS：那个 CPU 一直在 dispatch，本段的 CPU 检查管不到它，只有 CAS 能保证不覆盖别人的授权。
+
+描述符按 `struct rseq_cs` 写在 32 字节对齐的 `__rseq_cs` 段里，abort handler 放在 `__rseq_failure` 段，入口前紧挨着签名字（x86_64 `0x53053053`，aarch64 `0xd428bc00`）。这是 PIC 动态库，段里的 `.quad` 会变成动态重定位，librseq 同样如此。每次尝试结束都把 `rseq_cs` 清零，因为这个库可能在线程还活着时被 `dlclose`，字段不能继续指向已卸载的段。
+
+被重启最多再试 3 次，之后退回排队：孤立的一次重启值得重来，一台不停打断的机器不如直接进队列。重启次数计入 `aborts`。
+
+没有 rseq 区域（`__rseq_size == 0`）、不是 x86_64/aarch64、或 `ACCORDIN_USER_RSEQ=0` 时，两次交换都回到原来的 CAS，语义不变。
+
 ## 开关与计数
 
 `ACCORDIN_USER_CLAIM` 默认开启，设为 `0` 时跳过续用与认领，慢路径回到"发布 WAITING 并 yield"，供同场 A/B。
 
+`ACCORDIN_USER_RSEQ` 默认开启，设为 `0` 时续用与认领改回 CAS，慢路径的其余部分不变，供同场 A/B。`ACCORDIN_CV_COUNTERS=1` 时加载后打印一行 `[accordin_rseq] area=yes/no`，说明这一趟是否真的走 rseq。
+
 `ACCORDIN_CV_COUNTERS=1` 时才累加用户态计数，卸载时打印：
 
 ```text
-[accordin_claim] renews= claims= undone= queued= adopted= swept= slots_left= demand=
+[accordin_claim] renews= claims= undone= aborts= queued= adopted= swept= slots_left= demand=
 ```
 
-`renews`、`claims`、`undone`（迁移撤销）、`queued`（退回 yield 循环的次数）来自用户态；`adopted`、`swept`、`slots_left`、`demand` 来自 BPF，同时进 dump。
+`renews`、`claims`、`undone`（迁移撤销，只出现在 CAS 路径）、`aborts`（rseq 段被重启）、`queued`（退回 yield 循环的次数）来自用户态；`adopted`、`swept`、`slots_left`、`demand` 来自 BPF，同时进 dump。
 
 ## 验证
 

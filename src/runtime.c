@@ -23,7 +23,8 @@ struct admission_state *scheduler_admission;
 bool admission_enabled;
 bool auto_admission;
 bool user_claim;
-uint64_t claim_renews, claim_claims, claim_undone, claim_queued;
+bool user_rseq;
+uint64_t claim_renews, claim_claims, claim_undone, claim_aborts, claim_queued;
 static struct accordin *skel;
 static struct bpf_link *scheduler_link;
 static int thread_map_fd = -1;
@@ -393,10 +394,11 @@ static void report_counters(void)
     /* Read once the scheduler has been detached: ops.exit counts the table
      * while threads may still legitimately hold sticky slots. */
     fprintf(stderr,
-            "[accordin_claim] renews=%llu claims=%llu undone=%llu queued=%llu "
-            "adopted=%llu swept=%llu slots_left=%u demand=%d\n",
+            "[accordin_claim] renews=%llu claims=%llu undone=%llu aborts=%llu "
+            "queued=%llu adopted=%llu swept=%llu slots_left=%u demand=%d\n",
             (unsigned long long)claim_renews, (unsigned long long)claim_claims,
-            (unsigned long long)claim_undone, (unsigned long long)claim_queued,
+            (unsigned long long)claim_undone, (unsigned long long)claim_aborts,
+            (unsigned long long)claim_queued,
             (unsigned long long)skel->bss->claims_adopted,
             (unsigned long long)skel->bss->slots_swept,
             skel->bss->slots_left, skel->bss->admission.demand);
@@ -410,6 +412,7 @@ __attribute__((constructor)) static void scheduler_start(void)
     admission_enabled = !env_flag("ACCORDIN_DISABLE_ADMISSION");
     auto_admission = env_flag("ACCORDIN_AUTO_ADMISSION");
     user_claim = env_allowed("ACCORDIN_USER_CLAIM");
+    user_rseq = env_allowed("ACCORDIN_USER_RSEQ") && rseq_area_available();
     if (env_flag(PREFIX "_DISABLE_BPF")) {
         __atomic_store_n(&registry_opening, false, __ATOMIC_RELEASE);
         return;
@@ -460,9 +463,11 @@ __attribute__((constructor)) static void scheduler_start(void)
     __atomic_store_n(&cv_custody_live, true, __ATOMIC_RELEASE);
     /* The head peek is resolved by the loader, so only the attached scheduler
      * can say whether the running kernel offers it. */
-    if (cv_counters_on)
+    if (cv_counters_on) {
         fprintf(stderr, "[accordin_peek] dsq_peek=%s\n",
                 skel->bss->dsq_peek_ready ? "yes" : "no");
+        fprintf(stderr, "[accordin_rseq] area=%s\n", user_rseq ? "yes" : "no");
+    }
     fprintf(stderr, "[%s] eBPF scheduler loaded successfully\n", PREFIX);
 }
 

@@ -1,4 +1,35 @@
-# 2026-09-09 实际构建与试运行
+# 实际构建与试运行
+
+## LiTL 统一前端后的 smoke
+
+机器：Intel Xeon Gold 5318Y，2 socket × 24 核、无 SMT；CPU 0–47，P=48，
+线程数 12/24/48/96/192。六种锁全部经 LiTL `directlock`/`directcond` 前端接入。
+
+```sh
+python3 experiments/prepare.py --jobs 12 --build target/experiments-litl
+sudo -n python3 experiments/run.py --profile smoke --build target/experiments-litl \
+  --out target/results/litl-smoke-20260909
+```
+
+180 个配置全部尝试：**136 个有效样本、14 次超时、30 个 unsupported、0 个 error/invalid**。
+运行前的绑定检查：mcs/mcs-tas/gcr 无 BPF、sched_ext enable_seq 不变；flexguard 观察到
+BPF fd、enable_seq 不变；accordin 观察到 direct 库、BPF fd 且 enable_seq 恰好加一。
+mcs-tse 由 `tse_probe` 判定内核不提供 rseq slice extension，30 个配置全部记为
+`unsupported`。退出时 sched_ext=disabled，所有被测文件哈希不变。
+
+| 锁 | ok | timeout |
+|---|---|---|
+| mcs | 23 | 7 |
+| mcs-tas | 28 | 2 |
+| gcr | 27 | 3 |
+| flexguard | 28 | 2 |
+| mcs-tse | 0 | 0（30 unsupported） |
+| accordin | 30 | 0 |
+
+超时集中在 Streamcluster 和 Raytrace 的 96/192 线程，属于 30 s smoke 预算内未完成，
+不是死锁判定；短样本不作为性能排名。
+
+## 2026-09-09 更早的一轮（旧构建路径）
 
 机器：TaiShan-v110，96 物理核、无 SMT；CPU 0–95，线程数 24/48/96/192/384。
 构建使用当前工作区（包含运行前已有的未提交 Accordin 修改）；精确版本、源文件与动态库

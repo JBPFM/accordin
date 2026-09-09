@@ -41,6 +41,10 @@ extern _Thread_local struct thread_state thread_state;
 extern struct admission_state *scheduler_admission;
 extern bool admission_enabled;
 extern bool auto_admission;
+/* Whether a contender may take a slot out of the table itself. */
+extern bool user_claim;
+extern bool cv_counters_on;
+extern uint64_t claim_renews, claim_claims, claim_undone, claim_queued;
 void register_thread(void);
 
 /* True while the scheduler can hold a condvar wait instead of a futex sleep. */
@@ -84,6 +88,82 @@ static inline bool admission_begin(void)
     return managed;
 }
 
+/* The lock path carries no shared atomic of its own unless the counters were
+ * asked for. */
+static inline void claim_count(uint64_t *counter)
+{
+    if (cv_counters_on)
+        __atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
+}
+
+/* Take the slot this request needs without entering the kernel: consume a grant
+ * the table already carries, renew the slot this thread holds, or claim a free
+ * one on this CPU. Returns false when the request has to be queued instead.
+ * Every write is a compare-and-swap against a value only this thread writes, so
+ * it can neither displace a grant the scheduler made nor a slot another thread
+ * holds. The caller must have published SPINNING first. */
+static inline bool admission_take_slot(struct admission_state *state,
+                                       uint64_t ticket)
+{
+    unsigned int cpu = sched_getcpu();
+    unsigned long long expected;
+
+    /* A condvar wake, or a wait a flush filed in the bank and dispatch then
+     * served, arrives with the grant already written. */
+    if (cpu < MAX_CPUS &&
+        __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED) == ticket) {
+        /* Record the grant where the scheduler reads it, so its task record
+         * and this table entry name the same slot. */
+        thread_state.slot = cpu + 1;
+        thread_state.ticket = ticket;
+        return true;
+    }
+    /* Taking a slot outside the queue order is only fair while nothing is
+     * queued: demand counts the ordinary queue together with the whole bank,
+     * and an undercount lasts no longer than one correction period. */
+    if (!user_claim || __atomic_load_n(&state->demand, __ATOMIC_RELAXED) > 0)
+        return false;
+    if (thread_state.slot) {
+        expected = thread_state.ticket;
+        if (__atomic_compare_exchange_n(&state->owners[thread_state.slot - 1],
+                                        &expected, ticket, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            thread_state.ticket = ticket;
+            claim_count(&claim_renews);
+            return true;
+        }
+        /* The entry was reclaimed, or it already belongs to someone else. */
+        thread_state.slot = 0;
+    }
+    cpu = sched_getcpu();
+    if (cpu >= MAX_CPUS ||
+        __atomic_load_n(&state->owners[cpu], __ATOMIC_RELAXED))
+        return false;
+    /* The scheduler adopts a slot through this field, so name the entry before
+     * the entry names this thread. */
+    thread_state.slot = cpu + 1;
+    expected = 0;
+    if (__atomic_compare_exchange_n(&state->owners[cpu], &expected, ticket,
+                                    false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        if ((unsigned int)sched_getcpu() == cpu) {
+            thread_state.ticket = ticket;
+            claim_count(&claim_claims);
+            return true;
+        }
+        /* Migrated between the read and the claim: left in place the slot would
+         * reserve a CPU nobody runs on while the new CPU carries two spinners.
+         * Only this thread writes this value, so withdrawing it is safe, and a
+         * scheduler that already adopted it fails its later release and drops
+         * the record. */
+        expected = ticket;
+        __atomic_compare_exchange_n(&state->owners[cpu], &expected, 0, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+        claim_count(&claim_undone);
+    }
+    thread_state.slot = 0;
+    return false;
+}
+
 static inline void admission_wait(bool prequeued)
 {
     /* Only the contended path consults the policy. An off-mode contender
@@ -95,10 +175,27 @@ static inline void admission_wait(bool prequeued)
                               memory_order_relaxed);
         return;
     }
-    uint32_t request = atomic_fetch_or_explicit(&thread_state.word, USER_WAITING,
-                                               memory_order_relaxed) & ~USER_META;
+    uint32_t request = atomic_load_explicit(&thread_state.word,
+                                            memory_order_relaxed) & ~USER_META;
     uint64_t ticket = ((uint64_t)request << 32) | thread_state.tid;
     struct admission_state *state = scheduler_admission;
+
+    /* SPINNING comes before any look at the table. WAITING would let a
+     * preemption file this thread in the bank, where a second grant could race
+     * the claim; an idle word would let a tick retire the entry the thread has
+     * just taken. A spinner without a slot is the state the scheduler leaves
+     * alone. */
+    atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
+                          memory_order_relaxed);
+    /* With no mapping, or none the scheduler still reads, there is no slot to
+     * take; the loop below already ends on a scheduler that is gone. */
+    if (state && __atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE)) {
+        if (admission_take_slot(state, ticket))
+            return;
+        claim_count(&claim_queued);
+    }
+    atomic_store_explicit(&thread_state.word, request | USER_WAITING,
+                          memory_order_relaxed);
 
     /* Normal contention submits through yield. A condvar wake may already
      * carry a grant: consume it before yielding, retaining the same epoch.

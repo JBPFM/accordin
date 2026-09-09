@@ -22,6 +22,8 @@ _Thread_local struct thread_state thread_state;
 struct admission_state *scheduler_admission;
 bool admission_enabled;
 bool auto_admission;
+bool user_claim;
+uint64_t claim_renews, claim_claims, claim_undone, claim_queued;
 static struct accordin *skel;
 static struct bpf_link *scheduler_link;
 static int thread_map_fd = -1;
@@ -35,7 +37,8 @@ static int cv_flush_prog_fd = -1;
 static int cv_flush_running;
 static unsigned int cv_flush_requests;
 static unsigned int cv_flush_width, cv_flush_flags;
-static bool cv_custody_on, cv_counters_on;
+static bool cv_custody_on;
+bool cv_counters_on;
 /* Set once the scheduler is attached and cleared before it goes away, so a
  * waiter never reaches the mapped admission state through a stale pointer. */
 static bool cv_custody_live;
@@ -390,7 +393,10 @@ static void report_counters(void)
     /* Read once the scheduler has been detached: ops.exit counts the table
      * while threads may still legitimately hold sticky slots. */
     fprintf(stderr,
-            "[accordin_claim] adopted=%llu swept=%llu slots_left=%u demand=%d\n",
+            "[accordin_claim] renews=%llu claims=%llu undone=%llu queued=%llu "
+            "adopted=%llu swept=%llu slots_left=%u demand=%d\n",
+            (unsigned long long)claim_renews, (unsigned long long)claim_claims,
+            (unsigned long long)claim_undone, (unsigned long long)claim_queued,
             (unsigned long long)skel->bss->claims_adopted,
             (unsigned long long)skel->bss->slots_swept,
             skel->bss->slots_left, skel->bss->admission.demand);
@@ -403,6 +409,7 @@ __attribute__((constructor)) static void scheduler_start(void)
 
     admission_enabled = !env_flag("ACCORDIN_DISABLE_ADMISSION");
     auto_admission = env_flag("ACCORDIN_AUTO_ADMISSION");
+    user_claim = env_allowed("ACCORDIN_USER_CLAIM");
     if (env_flag(PREFIX "_DISABLE_BPF")) {
         __atomic_store_n(&registry_opening, false, __ATOMIC_RELEASE);
         return;

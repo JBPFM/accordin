@@ -103,6 +103,7 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 | `<PREFIX>_DISABLE_BPF` | 默认关闭；设为 `1` 时不加载 BPF。 |
 | `ACCORDIN_DISABLE_ADMISSION` | 默认关闭；设为 `1` 时不发布 admission 标志。 |
 | `ACCORDIN_AUTO_ADMISSION` | 实验性，默认 `0`。设为 `1` 时，首次检测到加载进程的可运行线程数超过可用 CPU 数后启用准入，并保持开启直到卸载。BPF 始终挂载。 |
+| `ACCORDIN_USER_CLAIM` | 默认开启；等待队列为空时，慢路径直接在用户态续用或认领本 CPU 的名额，不再 yield。设为 `0` 时始终发布 WAITING 并 yield。 |
 | `<PREFIX>_STATS_ONLY` | 保留历史名称的对照模式；设为 `1` 时加载普通 sched_ext 调度，不进行锁感知路由，也不采样锁时间。 |
 
 自动准入模式在 `runnable/quiescent` 事件中统计加载进程的可运行线程；睡眠线程不计入。初始 CPU 容量取加载线程的 affinity，遇到更窄的线程 affinity 时保守使用较小容量。未触发时，竞争慢路径直接进入原始锁，空闲 CPU 上的唤醒直接投递到 local DSQ。触发后，线程缓存启用状态，新竞争者恢复原准入路径；已经进入 raw 队列的线程保持可运行。无竞争路径保持原来的 epoch/持锁发布，动态判断只放在慢路径。

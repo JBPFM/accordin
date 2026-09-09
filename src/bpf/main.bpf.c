@@ -873,6 +873,7 @@ int accordin_cv_flush(struct cv_flush_ctx *ctx) {
           __sync_fetch_and_add(&cv_drained, 1);
       } else if (target == NORMAL_DSQ) {
         __sync_fetch_and_add(&cv_expired, 1);
+        __sync_fetch_and_add(&admission.demand, 1);
         tally->expired++;
       } else {
         __sync_fetch_and_add(&cv_flushed, 1);

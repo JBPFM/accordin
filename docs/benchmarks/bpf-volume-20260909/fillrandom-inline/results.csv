@@ -1,0 +1,13 @@
+id,benchmark,case,backend,arm,repeat,attempt,valid,reason,ops_per_second,throughput_ops_per_sec,sched_yield_entries,operations,roi_seconds,seconds,wall_seconds,max_process_threads,output_sha256
+fillrandom-192-bpfbase-mcs_accordin-r1-a1,fillrandom,,mcs_accordin,bpfbase,1,1,True,,239122.644,,,7178979,30.022163,,30.315105935995234,194,
+fillrandom-192-bpfbase-mcs_tas_accordin-r1-a1,fillrandom,,mcs_tas_accordin,bpfbase,1,1,True,,246058.595,,,7385072,30.013469,,30.314478836982744,194,
+fillrandom-192-inline-mcs_accordin-r1-a1,fillrandom,,mcs_accordin,inline,1,1,True,,243474.869,,,7304519,30.001121,,30.413288430019747,194,
+fillrandom-192-inline-mcs_tas_accordin-r1-a1,fillrandom,,mcs_tas_accordin,inline,1,1,True,,239685.553,,,7190888,30.001341,,30.31459121700027,194,
+fillrandom-192-inline-mcs_accordin-r2-a1,fillrandom,,mcs_accordin,inline,2,1,True,,236208.811,,,7091374,30.021632,,30.41076002101181,194,
+fillrandom-192-inline-mcs_tas_accordin-r2-a1,fillrandom,,mcs_tas_accordin,inline,2,1,True,,270342.153,,,8110642,30.001396,,30.414357215981,194,
+fillrandom-192-bpfbase-mcs_accordin-r2-a1,fillrandom,,mcs_accordin,bpfbase,2,1,True,,272538.023,,,8176864,30.002654,,30.315230628009886,194,
+fillrandom-192-bpfbase-mcs_tas_accordin-r2-a1,fillrandom,,mcs_tas_accordin,bpfbase,2,1,True,,265503.661,,,7965468,30.001349,,30.310376031004125,194,
+fillrandom-192-bpfbase-mcs_accordin-r3-a1,fillrandom,,mcs_accordin,bpfbase,3,1,True,,240781.862,,,7228781,30.022116,,30.30508852697676,194,
+fillrandom-192-bpfbase-mcs_tas_accordin-r3-a1,fillrandom,,mcs_tas_accordin,bpfbase,3,1,True,,261914.064,,,7857781,30.001371,,30.30741602301714,194,
+fillrandom-192-inline-mcs_accordin-r3-a1,fillrandom,,mcs_accordin,inline,3,1,True,,258538.579,,,7756464,30.001186,,30.410289545019623,194,
+fillrandom-192-inline-mcs_tas_accordin-r3-a1,fillrandom,,mcs_tas_accordin,inline,3,1,True,,257655.796,,,7730023,30.001355,,30.406291537976358,194,

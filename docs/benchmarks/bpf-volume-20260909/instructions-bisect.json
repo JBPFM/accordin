@@ -1,0 +1,451 @@
+{
+ "arms": {
+  "bpfbase": "fbc463e910e40182bfd81719678f073649266894",
+  "subprog": "be0dd22067b67d9ab27bdc7b401c7e1e0613e86a",
+  "flags": "2a872cef850ec23d8c81addd044294e97abe317e",
+  "bpftip": "432bee601da9b5ccf89de0936b977c238e01a826",
+  "inline": "0082ed7966ab583814ac91a3ef6c2e1da4d8b40c"
+ },
+ "uname": [
+  "Linux",
+  "nku-PowerEdge-R750",
+  "7.0.0-30-generic",
+  "#30-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 31 18:22:54 UTC 2026",
+  "x86_64"
+ ],
+ "loaded": {
+  "bpfbase": {
+   "accordin_runnable": {
+    "xlated_insns": 8,
+    "jited_bytes": 50,
+    "type": "struct_ops"
+   },
+   "accordin_quiescent": {
+    "xlated_insns": 8,
+    "jited_bytes": 48,
+    "type": "struct_ops"
+   },
+   "accordin_select_cpu": {
+    "xlated_insns": 42,
+    "jited_bytes": 201,
+    "type": "struct_ops"
+   },
+   "accordin_enqueue": {
+    "xlated_insns": 327,
+    "jited_bytes": 1507,
+    "type": "struct_ops"
+   },
+   "accordin_dispatch": {
+    "xlated_insns": 733,
+    "jited_bytes": 3212,
+    "type": "struct_ops"
+   },
+   "accordin_yield": {
+    "xlated_insns": 78,
+    "jited_bytes": 372,
+    "type": "struct_ops"
+   },
+   "accordin_tick": {
+    "xlated_insns": 158,
+    "jited_bytes": 726,
+    "type": "struct_ops"
+   },
+   "accordin_stopping": {
+    "xlated_insns": 182,
+    "jited_bytes": 822,
+    "type": "struct_ops"
+   },
+   "accordin_exit_task": {
+    "xlated_insns": 102,
+    "jited_bytes": 501,
+    "type": "struct_ops"
+   },
+   "accordin_dump": {
+    "xlated_insns": 249,
+    "jited_bytes": 1109,
+    "type": "struct_ops"
+   },
+   "accordin_init": {
+    "xlated_insns": 337,
+    "jited_bytes": 1559,
+    "type": "struct_ops"
+   },
+   "accordin_exit": {
+    "xlated_insns": 118,
+    "jited_bytes": 576,
+    "type": "struct_ops"
+   },
+   "accordin_cv_flush": {
+    "xlated_insns": 423,
+    "jited_bytes": 1901,
+    "type": "syscall"
+   }
+  },
+  "subprog": {
+   "accordin_runnable": {
+    "xlated_insns": 8,
+    "jited_bytes": 50,
+    "type": "struct_ops"
+   },
+   "accordin_quiescent": {
+    "xlated_insns": 8,
+    "jited_bytes": 48,
+    "type": "struct_ops"
+   },
+   "accordin_select_cpu": {
+    "xlated_insns": 42,
+    "jited_bytes": 201,
+    "type": "struct_ops"
+   },
+   "accordin_enqueue": {
+    "xlated_insns": 309,
+    "jited_bytes": 1453,
+    "type": "struct_ops"
+   },
+   "accordin_dispatch": {
+    "xlated_insns": 384,
+    "jited_bytes": 1741,
+    "type": "struct_ops"
+   },
+   "accordin_yield": {
+    "xlated_insns": 83,
+    "jited_bytes": 405,
+    "type": "struct_ops"
+   },
+   "accordin_tick": {
+    "xlated_insns": 158,
+    "jited_bytes": 755,
+    "type": "struct_ops"
+   },
+   "accordin_stopping": {
+    "xlated_insns": 156,
+    "jited_bytes": 749,
+    "type": "struct_ops"
+   },
+   "accordin_exit_task": {
+    "xlated_insns": 102,
+    "jited_bytes": 501,
+    "type": "struct_ops"
+   },
+   "accordin_dump": {
+    "xlated_insns": 247,
+    "jited_bytes": 1098,
+    "type": "struct_ops"
+   },
+   "accordin_init": {
+    "xlated_insns": 337,
+    "jited_bytes": 1580,
+    "type": "struct_ops"
+   },
+   "accordin_exit": {
+    "xlated_insns": 118,
+    "jited_bytes": 576,
+    "type": "struct_ops"
+   },
+   "accordin_cv_flush": {
+    "xlated_insns": 433,
+    "jited_bytes": 1963,
+    "type": "syscall"
+   }
+  },
+  "flags": {
+   "accordin_runnable": {
+    "xlated_insns": 8,
+    "jited_bytes": 50,
+    "type": "struct_ops"
+   },
+   "accordin_quiescent": {
+    "xlated_insns": 8,
+    "jited_bytes": 48,
+    "type": "struct_ops"
+   },
+   "accordin_select_cpu": {
+    "xlated_insns": 42,
+    "jited_bytes": 201,
+    "type": "struct_ops"
+   },
+   "accordin_enqueue": {
+    "xlated_insns": 307,
+    "jited_bytes": 1455,
+    "type": "struct_ops"
+   },
+   "accordin_dispatch": {
+    "xlated_insns": 384,
+    "jited_bytes": 1741,
+    "type": "struct_ops"
+   },
+   "accordin_yield": {
+    "xlated_insns": 72,
+    "jited_bytes": 344,
+    "type": "struct_ops"
+   },
+   "accordin_tick": {
+    "xlated_insns": 147,
+    "jited_bytes": 715,
+    "type": "struct_ops"
+   },
+   "accordin_stopping": {
+    "xlated_insns": 145,
+    "jited_bytes": 705,
+    "type": "struct_ops"
+   },
+   "accordin_exit_task": {
+    "xlated_insns": 102,
+    "jited_bytes": 501,
+    "type": "struct_ops"
+   },
+   "accordin_dump": {
+    "xlated_insns": 247,
+    "jited_bytes": 1098,
+    "type": "struct_ops"
+   },
+   "accordin_init": {
+    "xlated_insns": 337,
+    "jited_bytes": 1580,
+    "type": "struct_ops"
+   },
+   "accordin_exit": {
+    "xlated_insns": 118,
+    "jited_bytes": 576,
+    "type": "struct_ops"
+   },
+   "accordin_cv_flush": {
+    "xlated_insns": 361,
+    "jited_bytes": 1647,
+    "type": "syscall"
+   }
+  },
+  "bpftip": {
+   "accordin_runnable": {
+    "xlated_insns": 8,
+    "jited_bytes": 50,
+    "type": "struct_ops"
+   },
+   "accordin_quiescent": {
+    "xlated_insns": 8,
+    "jited_bytes": 48,
+    "type": "struct_ops"
+   },
+   "accordin_select_cpu": {
+    "xlated_insns": 42,
+    "jited_bytes": 201,
+    "type": "struct_ops"
+   },
+   "accordin_enqueue": {
+    "xlated_insns": 281,
+    "jited_bytes": 1315,
+    "type": "struct_ops"
+   },
+   "accordin_dispatch": {
+    "xlated_insns": 384,
+    "jited_bytes": 1741,
+    "type": "struct_ops"
+   },
+   "accordin_yield": {
+    "xlated_insns": 72,
+    "jited_bytes": 344,
+    "type": "struct_ops"
+   },
+   "accordin_tick": {
+    "xlated_insns": 146,
+    "jited_bytes": 707,
+    "type": "struct_ops"
+   },
+   "accordin_stopping": {
+    "xlated_insns": 144,
+    "jited_bytes": 697,
+    "type": "struct_ops"
+   },
+   "accordin_exit_task": {
+    "xlated_insns": 92,
+    "jited_bytes": 448,
+    "type": "struct_ops"
+   },
+   "accordin_dump": {
+    "xlated_insns": 206,
+    "jited_bytes": 929,
+    "type": "struct_ops"
+   },
+   "accordin_init": {
+    "xlated_insns": 326,
+    "jited_bytes": 1527,
+    "type": "struct_ops"
+   },
+   "accordin_exit": {
+    "xlated_insns": 113,
+    "jited_bytes": 552,
+    "type": "struct_ops"
+   },
+   "accordin_cv_flush": {
+    "xlated_insns": 340,
+    "jited_bytes": 1526,
+    "type": "syscall"
+   }
+  },
+  "inline": {
+   "accordin_runnable": {
+    "xlated_insns": 8,
+    "jited_bytes": 50,
+    "type": "struct_ops"
+   },
+   "accordin_quiescent": {
+    "xlated_insns": 8,
+    "jited_bytes": 48,
+    "type": "struct_ops"
+   },
+   "accordin_select_cpu": {
+    "xlated_insns": 42,
+    "jited_bytes": 201,
+    "type": "struct_ops"
+   },
+   "accordin_enqueue": {
+    "xlated_insns": 301,
+    "jited_bytes": 1369,
+    "type": "struct_ops"
+   },
+   "accordin_dispatch": {
+    "xlated_insns": 728,
+    "jited_bytes": 3234,
+    "type": "struct_ops"
+   },
+   "accordin_yield": {
+    "xlated_insns": 72,
+    "jited_bytes": 344,
+    "type": "struct_ops"
+   },
+   "accordin_tick": {
+    "xlated_insns": 152,
+    "jited_bytes": 699,
+    "type": "struct_ops"
+   },
+   "accordin_stopping": {
+    "xlated_insns": 176,
+    "jited_bytes": 790,
+    "type": "struct_ops"
+   },
+   "accordin_exit_task": {
+    "xlated_insns": 92,
+    "jited_bytes": 448,
+    "type": "struct_ops"
+   },
+   "accordin_dump": {
+    "xlated_insns": 206,
+    "jited_bytes": 929,
+    "type": "struct_ops"
+   },
+   "accordin_init": {
+    "xlated_insns": 322,
+    "jited_bytes": 1492,
+    "type": "struct_ops"
+   },
+   "accordin_exit": {
+    "xlated_insns": 113,
+    "jited_bytes": 552,
+    "type": "struct_ops"
+   },
+   "accordin_cv_flush": {
+    "xlated_insns": 340,
+    "jited_bytes": 1526,
+    "type": "syscall"
+   }
+  }
+ },
+ "verifier": {
+  "bpfbase": {
+   "accordin_runnable": 7,
+   "accordin_quiescent": 7,
+   "accordin_select_cpu": 50,
+   "accordin_enqueue": 591,
+   "accordin_dispatch": 14976,
+   "accordin_yield": 88,
+   "accordin_tick": 319,
+   "accordin_stopping": 362,
+   "accordin_exit_task": 317,
+   "accordin_dump": 477,
+   "accordin_init": 3056,
+   "accordin_exit": 305,
+   "accordin_cv_flush": 3311
+  },
+  "subprog": {
+   "accordin_runnable": 7,
+   "accordin_quiescent": 7,
+   "accordin_select_cpu": 50,
+   "accordin_enqueue": 533,
+   "accordin_dispatch": 42457,
+   "accordin_yield": 95,
+   "accordin_tick": 259,
+   "accordin_stopping": 274,
+   "accordin_exit_task": 317,
+   "accordin_dump": 483,
+   "accordin_init": 3115,
+   "accordin_exit": 305,
+   "accordin_cv_flush": 3250
+  },
+  "flags": {
+   "accordin_runnable": 7,
+   "accordin_quiescent": 7,
+   "accordin_select_cpu": 50,
+   "accordin_enqueue": 517,
+   "accordin_dispatch": 42457,
+   "accordin_yield": 81,
+   "accordin_tick": 315,
+   "accordin_stopping": 350,
+   "accordin_exit_task": 317,
+   "accordin_dump": 483,
+   "accordin_init": 3115,
+   "accordin_exit": 305,
+   "accordin_cv_flush": 3275
+  },
+  "bpftip": {
+   "accordin_runnable": 7,
+   "accordin_quiescent": 7,
+   "accordin_select_cpu": 49,
+   "accordin_enqueue": 484,
+   "accordin_dispatch": 42670,
+   "accordin_yield": 77,
+   "accordin_tick": 314,
+   "accordin_stopping": 349,
+   "accordin_exit_task": 323,
+   "accordin_dump": 387,
+   "accordin_init": 3021,
+   "accordin_exit": 313,
+   "accordin_cv_flush": 3221
+  },
+  "inline": {
+   "accordin_runnable": 7,
+   "accordin_quiescent": 7,
+   "accordin_select_cpu": 49,
+   "accordin_enqueue": 534,
+   "accordin_dispatch": 46639,
+   "accordin_yield": 77,
+   "accordin_tick": 358,
+   "accordin_stopping": 405,
+   "accordin_exit_task": 323,
+   "accordin_dump": 387,
+   "accordin_init": 3026,
+   "accordin_exit": 313,
+   "accordin_cv_flush": 3221
+  }
+ },
+ "loaded_total": {
+  "bpfbase": 2765,
+  "subprog": 2385,
+  "flags": 2278,
+  "bpftip": 2162,
+  "inline": 2560
+ },
+ "jited_bytes_total": {
+  "bpfbase": 12584,
+  "subprog": 11120,
+  "flags": 10661,
+  "bpftip": 10085,
+  "inline": 11682
+ },
+ "verifier_total": {
+  "bpfbase": 23866,
+  "subprog": 51152,
+  "flags": 51279,
+  "bpftip": 51222,
+  "inline": 55346
+ }
+}

@@ -1,0 +1,13 @@
+id,benchmark,case,backend,arm,repeat,attempt,valid,reason,ops_per_second,throughput_ops_per_sec,sched_yield_entries,operations,roi_seconds,seconds,wall_seconds,max_process_threads,output_sha256
+stream-192-bpfbase-mcs_accordin-r1-a1,stream,,mcs_accordin,bpfbase,1,1,True,,,,,,,35.79841308,36.055585498019354,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_tas_accordin-r1-a1,stream,,mcs_tas_accordin,bpfbase,1,1,True,,,,,,,35.1821795,35.43893720800406,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-inline-mcs_accordin-r1-a1,stream,,mcs_accordin,inline,1,1,True,,,,,,,34.15684897,34.534051665017614,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-inline-mcs_tas_accordin-r1-a1,stream,,mcs_tas_accordin,inline,1,1,True,,,,,,,34.47064953,34.843358635000186,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-inline-mcs_accordin-r2-a1,stream,,mcs_accordin,inline,2,1,True,,,,,,,33.86409125,34.23547957098344,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-inline-mcs_tas_accordin-r2-a1,stream,,mcs_tas_accordin,inline,2,1,True,,,,,,,34.93336566,35.23792170599336,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_accordin-r2-a1,stream,,mcs_accordin,bpfbase,2,1,True,,,,,,,34.36780383,34.63392319701961,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_tas_accordin-r2-a1,stream,,mcs_tas_accordin,bpfbase,2,1,True,,,,,,,35.42642332,35.74587319701095,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_accordin-r3-a1,stream,,mcs_accordin,bpfbase,3,1,True,,,,,,,34.80831034,35.0365561459912,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-bpfbase-mcs_tas_accordin-r3-a1,stream,,mcs_tas_accordin,bpfbase,3,1,True,,,,,,,34.92572456,35.23675050001475,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-inline-mcs_accordin-r3-a1,stream,,mcs_accordin,inline,3,1,True,,,,,,,35.52963252,35.84014841497992,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84
+stream-192-inline-mcs_tas_accordin-r3-a1,stream,,mcs_tas_accordin,inline,3,1,True,,,,,,,33.53796829,33.83178423601203,193,13b33997906352993b3d67c0d86cf2a984741f96163597990e935d3f72cc5b84

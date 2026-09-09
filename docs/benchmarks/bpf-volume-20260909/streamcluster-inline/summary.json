@@ -1,0 +1,93 @@
+{
+  "baseline_arm": "bpfbase",
+  "metric": "seconds",
+  "lower_is_better": true,
+  "cells": [
+    {
+      "benchmark": "stream",
+      "backend": "mcs_accordin",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_seconds": 34.991509083333334,
+      "stdev": 0.7326882292050132,
+      "cv_percent": 2.093902916447799,
+      "relative_to_bpfbase": 1.0,
+      "runs_seconds": [
+        35.79841308,
+        34.36780383,
+        34.80831034
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "stream",
+      "backend": "mcs_accordin",
+      "arm": "inline",
+      "commit": "0082ed7966ab583814ac91a3ef6c2e1da4d8b40c",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_seconds": 34.51685758,
+      "stdev": 0.8892196466418754,
+      "cv_percent": 2.5761894592545795,
+      "relative_to_bpfbase": 0.9864352376971528,
+      "runs_seconds": [
+        34.15684897,
+        33.86409125,
+        35.52963252
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "stream",
+      "backend": "mcs_tas_accordin",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_seconds": 35.17810912666666,
+      "stdev": 0.2503741959960903,
+      "cv_percent": 0.7117329561249637,
+      "relative_to_bpfbase": 1.0,
+      "runs_seconds": [
+        35.1821795,
+        35.42642332,
+        34.92572456
+      ],
+      "mean_counters": null
+    },
+    {
+      "benchmark": "stream",
+      "backend": "mcs_tas_accordin",
+      "arm": "inline",
+      "commit": "0082ed7966ab583814ac91a3ef6c2e1da4d8b40c",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "mean_seconds": 34.31399449333333,
+      "stdev": 0.7107665266706811,
+      "cv_percent": 2.071360496396803,
+      "relative_to_bpfbase": 0.9754360124865753,
+      "runs_seconds": [
+        34.47064953,
+        34.93336566,
+        33.53796829
+      ],
+      "mean_counters": null
+    }
+  ],
+  "invalid_runs": [],
+  "cells_without_valid_sample": []
+}

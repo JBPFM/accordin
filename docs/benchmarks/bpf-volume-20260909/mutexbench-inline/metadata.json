@@ -1,0 +1,180 @@
+{
+  "started_utc": "2026-09-09T16:37:57.282867+00:00",
+  "arms": [
+    {
+      "name": "bpfbase",
+      "requested": "fbc463e",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "source": "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      }
+    },
+    {
+      "name": "inline",
+      "requested": "0082ed7",
+      "commit": "0082ed7966ab583814ac91a3ef6c2e1da4d8b40c",
+      "source": "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      }
+    }
+  ],
+  "uname": [
+    "Linux",
+    "nku-PowerEdge-R750",
+    "7.0.0-30-generic",
+    "#30-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 31 18:22:54 UTC 2026",
+    "x86_64"
+  ],
+  "compiler": "Ubuntu clang version 21.1.8 (6ubuntu1)\nTarget: x86_64-pc-linux-gnu\nThread model: posix\nInstalledDir: /usr/lib/llvm-21/bin",
+  "litl_compiler": "cc (Ubuntu 14.3.0-14ubuntu1) 14.3.0\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "harness": {
+    "path": "/mnt/data/home/jz/accordin-simplify/bench/mutexbench/mutex_bench",
+    "sha256": "ed4a3e09df7214bd432c0b740aec1c383491d1f2defbe052cf096ca9020dc04c",
+    "submodule": "b314b6d82d78798257a593bae18eed5ac70a536e bench/mutexbench (heads/master)"
+  },
+  "backend": "mcs_accordin",
+  "hashes": {
+    "/mnt/data/home/jz/accordin-simplify/bench/mutexbench/mutex_bench": "ed4a3e09df7214bd432c0b740aec1c383491d1f2defbe052cf096ca9020dc04c",
+    "/mnt/data/home/jz/accordin-simplify/docs/benchmarks/bpf-volume-20260909/mutexbench.py": "32cee882e62d8efa4677bad921b6ccc4baff9f2d473d709da85cd31aee90e2cc",
+    "/mnt/data/home/jz/accordin-simplify/docs/benchmarks/cv-custody-20260906/run.py": "b36dc45ffa25d8f24b7cdbb73937c9c873f54156215b5368738e67fe99924672",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/Makefile": "c4c503468b39cafbe14fedb1f49c91da833f59a3f68bff5f8f8c919014ed6a69",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/include/accordin_relock.h": "cc2ba1ca224df5f30bb7915b259b86e310bc608e1fb3b9d934daa6c03b305657",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/include/mcs_accordin_direct.h": "3d9fcf3437075f4acc0c75eeabea01d7aa4aa390d5a61d3b5d887a8b2463603d",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/include/mcs_tas_accordin_direct.h": "86039f180e4ef624a7786ced52b46068407a6803dff43c57d827f4e54008276c",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/bpf/intf.h": "9033bd783c5f9596607faec0f529cbcd6eab90f60b5076385554f3ea6287fa6d",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/bpf/main.bpf.c": "b61fdf6dad9e17b976a307702314408030e140c6f578b39ae1ef54bfc101faa2",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/bpf/maps.bpf.h": "afe2eb05f25cdca148e7280c690c4214b30b8ef773d18f17c24d01bb0226f5e0",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/direct.c": "2d3e716d1e28b86d0b92c3d45c3a817c9717d693b380b99835f620fea28aecb4",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/mcs.h": "df78f63602e2829889a9f8fc9ebd77b72a22dac6da8d96313eed593a8db6dce0",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/mcs_tas.h": "d0774306b6ebe0c6c3bf20f92f57ccdf3f5a20096c9a9854f542cc602105017c",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/raw_lock.h": "4b28864cf2b72132c9602675746ce7bb762b40ac820df73a9cb8382823e5ede1",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/rseq_slot.h": "3b39474d4bf642b5a3e75a354e4c9ef946a5c0700466a5a43b3c9af23666503c",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/runtime.c": "b0c9770d1d9118e3c2a61fa990570efcd452082d91f53407380c11cd33ec1b5f",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/src/runtime.h": "543a9c4883f845e7413a36f0f703357447d3a6d4362936689979a270b92659fb",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/target/release/libmcs_accordin_direct.so": "4915e8b7238ae6978f7808b1a576b69a3ba5b8705f2d21ea2739abe2ffca0b54",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/third_party/litl/lib/libmcsaccordin_original.so": "553e471c13758b94624b8cd95b952d28c29fe3a350e01075d2639057f4a271c8",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/third_party/litl/src/accordin-cond.c": "8b2845853d453f04aebac3d5d09009e0646370591563bdf4f035d5ff4b84f5df",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/bpfbase-src/third_party/litl/src/accordin.c": "a18250597ccf7ca4411ebdd8f902c74081f7fbbbdcdd0dbc85131d1538e540fd",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/Makefile": "a8d81eba581fb56d1252c4e3750c33b3aa519ba9d3b34a823f679eb2093f9965",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/include/accordin_relock.h": "cc2ba1ca224df5f30bb7915b259b86e310bc608e1fb3b9d934daa6c03b305657",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/include/mcs_accordin_direct.h": "53aa6ef698f3dd35d4ec7c4674a9cf614e30b104e2d5e4f033092bcb9267215b",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/include/mcs_tas_accordin_direct.h": "c6b9d83adc4eb3abff5a0f451015570ef1c1f434a471dd83dedabe5ad2288c9c",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/bpf/intf.h": "64f866c490a59fea9a2b77837ad3b6face4f24701486e621f252655fa9e4b044",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/bpf/main.bpf.c": "dba05a26ab3ac7b5acba793d6fea567f4e67da3206b06c81dc187679d76ecbc3",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/bpf/maps.bpf.h": "129f7d86a591985b03790627dca7318d5d51f231bff26b066a30f697febf6268",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/direct.c": "9cd88773d18ca44d90cec6e1d74c7de68cd5d2f2488714284a98242f2bd6317e",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/mcs.h": "df78f63602e2829889a9f8fc9ebd77b72a22dac6da8d96313eed593a8db6dce0",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/mcs_tas.h": "d0774306b6ebe0c6c3bf20f92f57ccdf3f5a20096c9a9854f542cc602105017c",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/raw_lock.h": "4b28864cf2b72132c9602675746ce7bb762b40ac820df73a9cb8382823e5ede1",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/rseq_slot.h": "3b39474d4bf642b5a3e75a354e4c9ef946a5c0700466a5a43b3c9af23666503c",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/runtime.c": "2ce919df95561dbe03b24efa78f49d52cdb6eb900ce601153dd86a1d050fab83",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/src/runtime.h": "82b8d1835418998916a15ec95e4156029fbc040f5714797b3fd0d3a29ef9024b",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/target/release/libmcs_accordin_direct.so": "e2703f7a812c6b21a3f94f172549aa0355cc004610afb52cc2aa5af4b935ca44",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/third_party/litl/lib/libmcsaccordin_original.so": "57e1be7a46af9645c94c6ca7819c51809ff6309dcaaa58a9cbd901767a77dbd7",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/third_party/litl/src/accordin-cond.c": "8b2845853d453f04aebac3d5d09009e0646370591563bdf4f035d5ff4b84f5df",
+    "/mnt/data/home/jz/accordin-simplify/target/cv-custody-20260906/inline-src/third_party/litl/src/accordin.c": "49404866de01dc36a32dc8dcd044aab6e2d055bfb6231a39eaf56d3a3c7b8b18"
+  },
+  "configuration": {
+    "LC_ALL": "C",
+    "MCS_ACCORDIN_DIRECT_DISABLE_BPF": "0",
+    "MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF": "0",
+    "MCS_ACCORDIN_DIRECT_STATS_ONLY": "0",
+    "MCS_TAS_ACCORDIN_DIRECT_STATS_ONLY": "0",
+    "ACCORDIN_DISABLE_ADMISSION": "0",
+    "ACCORDIN_HOOK_STATS": "0",
+    "ACCORDIN_CV_COUNTERS": "1",
+    "OMP_PROC_BIND": "false",
+    "OMP_WAIT_POLICY": "PASSIVE"
+  },
+  "cases": {
+    "low-t2-c100-o0": [
+      2,
+      100,
+      0
+    ],
+    "low-t4-c100-o0": [
+      4,
+      100,
+      0
+    ],
+    "low-t4-c100-o3000": [
+      4,
+      100,
+      3000
+    ],
+    "overload-t96-c100-o3000": [
+      96,
+      100,
+      3000
+    ]
+  },
+  "cpu_governors": [
+    "performance"
+  ],
+  "cpu0_khz": "800000",
+  "cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47
+  ],
+  "cpu_online_spec": "0-47",
+  "repeats": 3,
+  "duration_ms": 5000,
+  "warmup_ms": 1000,
+  "max_attempts": 3,
+  "resumed_samples": 0,
+  "dmesg_available": true,
+  "completed_utc": "2026-09-09T16:40:30.847719+00:00",
+  "valid_runs": 24,
+  "invalid_runs": 0,
+  "cells_without_valid_sample": [],
+  "hashes_unchanged": true,
+  "state_after": "disabled"
+}

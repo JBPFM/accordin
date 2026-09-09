@@ -1,0 +1,161 @@
+{
+  "baseline_arm": "bpfbase",
+  "metric": "throughput_ops_per_sec",
+  "lower_is_better": false,
+  "cells": [
+    {
+      "case": "low-t2-c100-o0",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        3566457.29,
+        3588983.03,
+        3476135.49
+      ],
+      "mean_ops_per_sec": 3543858.6033333335,
+      "stdev": 59721.58152884525,
+      "cv_percent": 1.6852134414356,
+      "relative_to_bpfbase": 1.0
+    },
+    {
+      "case": "low-t2-c100-o0",
+      "arm": "inline",
+      "commit": "0082ed7966ab583814ac91a3ef6c2e1da4d8b40c",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        3492872.86,
+        3579557.58,
+        3490704.13
+      ],
+      "mean_ops_per_sec": 3521044.8566666665,
+      "stdev": 50685.10571524582,
+      "cv_percent": 1.439490485878923,
+      "relative_to_bpfbase": 0.9935624557240493
+    },
+    {
+      "case": "low-t4-c100-o0",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        3976456.37,
+        3980015.61,
+        4019797.54
+      ],
+      "mean_ops_per_sec": 3992089.84,
+      "stdev": 24061.47391187624,
+      "cv_percent": 0.6027287680448655,
+      "relative_to_bpfbase": 1.0
+    },
+    {
+      "case": "low-t4-c100-o0",
+      "arm": "inline",
+      "commit": "0082ed7966ab583814ac91a3ef6c2e1da4d8b40c",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        4023014.54,
+        4016140.4,
+        3993347.97
+      ],
+      "mean_ops_per_sec": 4010834.303333333,
+      "stdev": 15528.758490884895,
+      "cv_percent": 0.3871702822023642,
+      "relative_to_bpfbase": 1.0046954011769769
+    },
+    {
+      "case": "low-t4-c100-o3000",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        1075095.91,
+        1061332.05,
+        1066549.6
+      ],
+      "mean_ops_per_sec": 1067659.1866666668,
+      "stdev": 6948.693938650076,
+      "cv_percent": 0.6508344634156672,
+      "relative_to_bpfbase": 1.0
+    },
+    {
+      "case": "low-t4-c100-o3000",
+      "arm": "inline",
+      "commit": "0082ed7966ab583814ac91a3ef6c2e1da4d8b40c",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        1069043.0,
+        1072907.59,
+        1068367.01
+      ],
+      "mean_ops_per_sec": 1070105.8666666667,
+      "stdev": 2449.7920008510014,
+      "cv_percent": 0.22892987293696437,
+      "relative_to_bpfbase": 1.002291630166775
+    },
+    {
+      "case": "overload-t96-c100-o3000",
+      "arm": "bpfbase",
+      "commit": "fbc463e910e40182bfd81719678f073649266894",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        2585280.74,
+        2602774.52,
+        2601458.16
+      ],
+      "mean_ops_per_sec": 2596504.4733333336,
+      "stdev": 9742.296616595682,
+      "cv_percent": 0.3752081583779728,
+      "relative_to_bpfbase": 1.0
+    },
+    {
+      "case": "overload-t96-c100-o3000",
+      "arm": "inline",
+      "commit": "0082ed7966ab583814ac91a3ef6c2e1da4d8b40c",
+      "env": {
+        "ACCORDIN_CV_COUNTERS": "0"
+      },
+      "n_valid": 3,
+      "n_invalid": 0,
+      "runs_ops_per_sec": [
+        2533462.94,
+        2601072.27,
+        2605353.14
+      ],
+      "mean_ops_per_sec": 2579962.783333333,
+      "stdev": 40326.88972023059,
+      "cv_percent": 1.5630802886283466,
+      "relative_to_bpfbase": 0.9936292464850774
+    }
+  ],
+  "invalid_runs": [],
+  "cells_without_valid_sample": []
+}

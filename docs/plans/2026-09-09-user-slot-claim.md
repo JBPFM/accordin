@@ -15,7 +15,7 @@
 慢路径在策略启用时按顺序尝试三件事：
 
 1. **确认已有授权**。condvar 唤醒，或被 flush 送回 bank 后由 dispatch 授权的请求，名额已经写好，读到 `owners[getcpu()] == ticket` 就直接返回，并把 `slot`/`ticket` 记进 `thread_state`，让调度器的记录和这张表指向同一项。
-2. **续用或认领**，条件是 `ACCORDIN_USER_CLAIM` 开启且 `demand <= 0`。续用是把 `owners[slot - 1]` 从自己上次写的 ticket 换成本次请求；失败说明名额已被回收或已属他人，清掉记录后退到认领。认领是读当前 CPU，该项为 0 时先写 `thread_state.slot`，再把它从 0 换成本次 ticket。交换用 CAS 时，认领成功后还要重读 CPU，若已迁移则 CAS `ticket → 0` 撤销；不撤销的话，名额留在一个没人跑的 CPU 上，而线程实际所在的 CPU 上有两个自旋者。撤销总是安全的：这个值只有自己写，调度器若已收养，它稍后的 release CAS 会失败并只清自己的记录。这两次交换在有 rseq 的机器上不用原子指令，见下节。
+2. **续用或认领**，条件是 `ACCORDIN_USER_CLAIM` 开启且 `demand <= 0`。续用是把 `owners[slot - 1]` 从自己上次写的 ticket 换成本次请求；失败说明名额已被回收或已属他人，清掉记录后退到认领。认领是读当前 CPU，该项为 0 时先写 `thread_state.slot`，再把它从 0 换成本次 ticket。交换用 CAS 时，写成功后还要重读 CPU，若已不在该项所属的 CPU 上则 CAS `ticket → 0` 撤销；不撤销的话，名额留在一个没人跑的 CPU 上，而线程实际所在的 CPU 上有两个自旋者。撤销总是安全的：这个值只有自己写，调度器若已收养，它稍后的 release CAS 会失败并只清自己的记录。这两次交换在有 rseq 的机器上不用原子指令，见下节。
 3. **排队**。以上都不成立就发布 `USER_WAITING`，进原有的 yield 确认循环，确认后同样记录 `slot`/`ticket`。
 
 `sched_getcpu()` 是 vDSO/rseq 读，不是 syscall。名额粘性，`admission_finish` 不释放。
@@ -30,7 +30,7 @@
 
 ## demand
 
-`admission_state.demand` 是有符号的 advisory 计数，表示 `NORMAL_DSQ` 与整个 bank 里排队的任务数。enqueue 放进这两处、custody 过期移入 `NORMAL_DSQ`、flush 移入 bank 时加一；`scx_bpf_dsq_move_to_local(NORMAL_DSQ)` 成功和 `admit_from` 的 move 成功时减一。`ADMIT_SLOT_LOST` 和 move 失败不减。加减都是无条件原子操作，不做饱和判断。
+`admission_state.demand` 是有符号的 advisory 计数，表示 `NORMAL_DSQ` 与整个 bank 里排队的任务数。enqueue 放进这两处、custody 过期移入 `NORMAL_DSQ`、flush 移入 bank 时加一；`scx_bpf_dsq_move_to_local(NORMAL_DSQ)` 成功和 `admit_from` 的 move 成功时减一。加减只在 `lock_routing()` 为真时进行，路由关闭时这个计数没有读者。`ADMIT_SLOT_LOST` 和 move 失败不减。加减都是无条件原子操作，不做饱和判断。
 
 `cv_scan` 定时器（1–10 ms）在函数最前面无条件校正：先快照 `demand`，再数 `nr_queued(NORMAL_DSQ) + nr_waiting()`，把差值原子加回去。用差分而不是覆盖，是因为覆盖会抹掉走表期间发生的入队，让非空的 bank 读成 0。`ops.exit` 清 0。
 
@@ -46,7 +46,7 @@
 
 收养放在 `refresh_episode` 最前面（enqueue、tick、stopping 共用）：
 
-- `slot` 非 0 且 `slot - 1 < scx_bpf_nr_cpu_ids()`。这是用户可写的值，越界的 CPU 传给 `scx_bpf_kick_cpu` 会让整个调度器退出。
+- `slot` 非 0 且 `slot - 1 < waiting_queues`（init 记下的队列数，即 `min(nr_cpu_ids, MAX_CPUS)`）。这是用户可写的值，越界的 CPU 传给 `scx_bpf_kick_cpu` 会让整个调度器退出。
 - 把 `owners[slot - 1]` 读一次到局部变量，要求低 32 位等于 `p->pid`，且它的请求号不大于 word 里的请求号。后一条挡住撕裂读：word 与 slot 是两次独立的 4 字节写，内核可能读到旧 word 配新 slot，此时按"word 空闲即回收"的规则会把刚认领的名额收掉；请求号单调递增，旧 word 认不出新 ticket，于是跳过这次收养。
 - 记录指向另一个 CPU 时，先对旧记录 `release_slot`。用户态续用后旧 ticket 仍在旧表项里，这个 CAS 常常成功，它是唯一释放旧表项的地方。
 - 然后写 `admission_cpu` 与 `ticket`，只有真正变化才计数，稳定状态不会每个 tick 都记一笔。
@@ -56,9 +56,9 @@
 ## 回收的兜底
 
 - **调度器没见过的名额**：tick（HZ=1000）或 stopping 收养后按现有规则回收；解锁后进 futex 睡眠的线程在 stopping 就回收，不必等 tick。
-- **线程退出**：`exit_task` 时 mm 可能已释放，读不到 word，所以在 `if (tctx)` 块之外按 `scx_bpf_nr_cpu_ids()` 扫一遍 `owners[]`，低 32 位等于 `p->pid` 的项 CAS 成 0，只对成功的项 kick。这笔开销只在线程退出时付，被信号杀死也不漏。
+- **线程退出**：`exit_task` 时 mm 可能已释放，读不到 word，所以无条件按 `waiting_queues` 扫一遍 `owners[]`，低 32 位等于 `p->pid` 的项 CAS 成 0，只对成功的项 kick。扫描覆盖了记录里那一项，`exit_task` 不再单独 release。这笔开销只在线程退出时付，被信号杀死也不漏。
 - **fork**：子进程共享同一块 bss 映射，`pthread_atfork` 的子进程钩子清掉继承来的注册状态，让它下次加锁以自己的 tid 重新注册；否则子进程会用父线程的 tid 写表。
-- **卸载**：`ops.exit` 数一遍并清空 `owners[]`，非零项数写进 `slots_left`。不能在析构函数里数：那时活着的线程本来就合法持有粘性名额。
+- **卸载**：`ops.exit` 用同一个扫描（不带 tid，即扫全表）数一遍并清空 `owners[]`，非零项数写进 `slots_left`。不能在析构函数里数：那时活着的线程本来就合法持有粘性名额。
 
 ## 竞争分析
 
@@ -92,10 +92,21 @@
 `ACCORDIN_CV_COUNTERS=1` 时才累加用户态计数，卸载时打印：
 
 ```text
-[accordin_claim] renews= claims= undone= aborts= queued= adopted= swept= slots_left= demand=
+[accordin_claim] renews= claims= undone= aborts= queued= adopted= swept= slots_left=
 ```
 
-`renews`、`claims`、`undone`（迁移撤销，只出现在 CAS 路径）、`aborts`（rseq 段被重启）、`queued`（退回 yield 循环的次数）来自用户态；`adopted`、`swept`、`slots_left`、`demand` 来自 BPF，同时进 dump。
+| 计数 | 来源 | 含义 |
+| --- | --- | --- |
+| `renews` | 用户态 | 把自己持有的名额续用到本次请求 |
+| `claims` | 用户态 | 认领本 CPU 的空闲名额 |
+| `undone` | 用户态 | 交换后发现已迁移，撤回写下的 ticket；只出现在 CAS 路径 |
+| `aborts` | 用户态 | rseq 段被重启 |
+| `queued` | 用户态 | 退回 yield 循环 |
+| `adopted` | BPF | 调度器收养用户态写下的名额 |
+| `swept` | BPF | `exit_task` 扫表清除的名额 |
+| `slots_left` | BPF | 卸载时表中剩余项 |
+
+BPF 的三项同时进 dump，`demand` 也在 dump 里；它在 `ops.exit` 清 0，运行时读到的只会是 0，所以不进这一行。
 
 ## 验证
 

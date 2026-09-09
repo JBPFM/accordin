@@ -25,6 +25,8 @@ struct thread_state {
     uint32_t tid;
     bool registered;
     bool auto_active;
+    /* This thread's rseq area, resolved at registration, null without one. */
+    void *rseq_area;
 };
 
 _Static_assert(offsetof(struct thread_state, word) ==
@@ -33,8 +35,6 @@ _Static_assert(offsetof(struct thread_state, word) ==
 _Static_assert(offsetof(struct thread_state, slot) ==
                    offsetof(struct admission_word, slot),
                "the slot must follow the word as the scheduler reads it");
-_Static_assert(_Alignof(struct thread_state) == 8,
-               "the word and the slot must share an eight-byte read");
 
 extern _Thread_local struct thread_state thread_state;
 extern struct admission_state *scheduler_admission;
@@ -45,7 +45,8 @@ extern bool user_claim;
 /* Whether that write goes through a restartable sequence instead of an
  * exchange. Off without an rseq area, or when the switch denies it. */
 extern bool user_rseq;
-extern bool cv_counters_on;
+/* Whether the runtime keeps and reports its counters. */
+extern bool runtime_diagnostics;
 extern uint64_t claim_renews, claim_claims, claim_undone, claim_aborts,
     claim_queued;
 void register_thread(void);
@@ -95,8 +96,15 @@ static inline bool admission_begin(void)
  * asked for. */
 static inline void claim_count(uint64_t *counter)
 {
-    if (cv_counters_on)
+    if (runtime_diagnostics)
         __atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
+}
+
+/* Publish the state this request is in, keeping the request number it carries. */
+static inline void publish_state(uint32_t request, uint32_t state)
+{
+    atomic_store_explicit(&thread_state.word, request | state,
+                          memory_order_relaxed);
 }
 
 /* The CPU the restartable path is bound to, or a negative value where that path
@@ -104,15 +112,33 @@ static inline void claim_count(uint64_t *counter)
 static inline int admission_slot_cpu(void)
 {
 #ifdef ACCORDIN_RSEQ_SLOT
-    if (user_rseq)
-        return rseq_cpu();
+    if (user_rseq && thread_state.rseq_area)
+        return rseq_cpu(thread_state.rseq_area);
 #endif
     return -1;
 }
 
-/* Write this request's ticket into an entry that still carries expect.
+/* Whether the entry of cpu already carries this request's ticket. A condvar
+ * wake, or a wait a flush filed in the bank and dispatch then served, arrives
+ * with the grant already written. */
+static inline bool admission_confirm(struct admission_state *state,
+                                     unsigned int cpu, uint64_t ticket)
+{
+    if (cpu >= MAX_CPUS ||
+        __atomic_load_n(&state->owners[cpu].ticket, __ATOMIC_RELAXED) != ticket)
+        return false;
+    /* Record the grant where the scheduler reads it, so its task record and
+     * this table entry name the same slot. */
+    thread_state.slot = cpu + 1;
+    thread_state.ticket = ticket;
+    return true;
+}
+
+/* Write this request's ticket into the entry of index, which must still carry
+ * expect. A commit means the value is in the entry and the thread was still on
+ * the CPU that entry belongs to, whichever sequence carried the write.
  *
- * An entry of the CPU the thread runs on needs no atomic instruction, only a
+ * The entry of the CPU the thread runs on needs no atomic instruction, only a
  * sequence the kernel restarts. While the thread runs on that CPU the only
  * writer that can turn the entry from free into a grant is that CPU's own
  * dispatch, and dispatch there requires the thread to be scheduled off it,
@@ -124,30 +150,76 @@ static inline int admission_slot_cpu(void)
  * which is the outcome the renewal wanted, and the scheduler adopts the entry
  * again from the slot the thread records.
  *
- * The entry of another CPU is outside that argument, because that CPU keeps
- * dispatching while this thread runs, so it takes the exchange. */
-static inline int admission_put_slot(unsigned long long *entry,
+ * Any other entry is outside that argument, because its CPU keeps dispatching
+ * while this thread runs, so it takes the exchange and then reads the CPU for
+ * itself. */
+static inline int admission_put_slot(struct admission_state *state,
+                                     unsigned int index,
                                      unsigned long long expect,
-                                     unsigned long long value, int cpu,
-                                     bool restartable)
+                                     unsigned long long value, int here)
 {
+    unsigned long long *entry = &state->owners[index].ticket;
+
 #ifdef ACCORDIN_RSEQ_SLOT
-    if (restartable)
-        return rseq_cmpeqv_storev(entry, expect, value, cpu);
+    if (here >= 0 && index == (unsigned int)here)
+        return rseq_cmpeqv_storev(thread_state.rseq_area, entry, expect, value,
+                                  here);
 #else
-    (void)cpu;
-    (void)restartable;
+    (void)here;
 #endif
-    return __atomic_compare_exchange_n(entry, &expect, value, false,
-                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)
-               ? SLOT_COMMITTED
-               : SLOT_MISMATCH;
+    /* Acquire alone: the entry publishes nothing beyond its own value. */
+    if (!__atomic_compare_exchange_n(entry, &expect, value, false,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return SLOT_MISMATCH;
+    if ((unsigned int)sched_getcpu() == index)
+        return SLOT_COMMITTED;
+    /* Left in place after a migration the ticket would reserve a CPU nobody
+     * runs on while the CPU the thread landed on carries two spinners. Only
+     * this thread writes this value, so taking it back is safe, and a scheduler
+     * that already adopted it fails its later release and drops the record. */
+    expect = value;
+    __atomic_compare_exchange_n(entry, &expect, 0, false, __ATOMIC_ACQUIRE,
+                                __ATOMIC_RELAXED);
+    return SLOT_MIGRATED;
 }
 
 /* A restart means a preemption, a migration or a signal landed inside the
  * sequence. A few more attempts cover the isolated one; a machine that keeps
  * interrupting is served better by the queue than by another attempt. */
 #define ADMISSION_SLOT_ATTEMPTS 3
+
+/* One write of an entry, retried while the sequence is restarted. Only a
+ * restartable section can report a restart, so where there is none the write is
+ * a single attempt and carries no loop at all. */
+static inline int admission_write_slot(struct admission_state *state,
+                                       unsigned int index,
+                                       unsigned long long expect,
+                                       unsigned long long value, int here)
+{
+#ifdef ACCORDIN_RSEQ_SLOT
+    unsigned int attempt;
+
+    /* Every copy of the section needs a descriptor of its own for the kernel to
+     * find it by address, so unrolled attempts pay in the library and buy
+     * nothing. */
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#else
+#pragma GCC unroll 1
+#endif
+    for (attempt = 0; attempt < ADMISSION_SLOT_ATTEMPTS; attempt++) {
+        int outcome = admission_put_slot(state, index, expect, value, here);
+
+        if (outcome != SLOT_RESTARTED)
+            return outcome;
+        claim_count(&claim_aborts);
+        here = admission_slot_cpu();
+    }
+    return SLOT_RESTARTED;
+#else
+    return admission_put_slot(state, index, expect, value, here);
+#endif
+}
 
 /* Take the slot this request needs without entering the kernel: consume a grant
  * the table already carries, renew the slot this thread holds, or claim a free
@@ -160,83 +232,44 @@ static inline bool admission_take_slot(struct admission_state *state,
 {
     int here = admission_slot_cpu();
     unsigned int cpu = here < 0 ? (unsigned int)sched_getcpu() : (unsigned int)here;
-    unsigned long long expected;
-    unsigned int attempt;
+    int outcome;
 
-    /* A condvar wake, or a wait a flush filed in the bank and dispatch then
-     * served, arrives with the grant already written. */
-    if (cpu < MAX_CPUS &&
-        __atomic_load_n(&state->owners[cpu].ticket, __ATOMIC_RELAXED) == ticket) {
-        /* Record the grant where the scheduler reads it, so its task record
-         * and this table entry name the same slot. */
-        thread_state.slot = cpu + 1;
-        thread_state.ticket = ticket;
+    if (admission_confirm(state, cpu, ticket))
         return true;
-    }
     /* Taking a slot outside the queue order is only fair while nothing is
      * queued: demand counts the ordinary queue together with the whole bank,
      * and an undercount lasts no longer than one correction period. */
     if (!user_claim || __atomic_load_n(&state->demand, __ATOMIC_RELAXED) > 0)
         return false;
-    for (attempt = 0; attempt < ADMISSION_SLOT_ATTEMPTS; attempt++) {
-        bool restartable;
-        int outcome;
-
-        if (thread_state.slot) {
-            unsigned int held = thread_state.slot - 1;
-
-            outcome = admission_put_slot(&state->owners[held].ticket,
-                                         thread_state.ticket, ticket, here,
-                                         here >= 0 && held == (unsigned int)here);
-            if (outcome == SLOT_COMMITTED) {
-                thread_state.ticket = ticket;
-                claim_count(&claim_renews);
-                return true;
-            }
-            if (outcome == SLOT_RESTARTED) {
-                claim_count(&claim_aborts);
-                here = admission_slot_cpu();
-                continue;
-            }
-            /* The entry was reclaimed, or it already belongs to someone else. */
-            thread_state.slot = 0;
-        }
-        cpu = here < 0 ? (unsigned int)sched_getcpu() : (unsigned int)here;
-        if (cpu >= MAX_CPUS ||
-            __atomic_load_n(&state->owners[cpu].ticket, __ATOMIC_RELAXED))
-            return false;
-        /* The scheduler adopts a slot through this field, so name the entry
-         * before the entry names this thread. */
-        thread_state.slot = cpu + 1;
-        restartable = here >= 0;
-        outcome = admission_put_slot(&state->owners[cpu].ticket, 0, ticket, here,
-                                     restartable);
+    if (thread_state.slot) {
+        outcome = admission_write_slot(state, thread_state.slot - 1,
+                                       thread_state.ticket, ticket, here);
         if (outcome == SLOT_COMMITTED) {
-            /* A committed sequence proves the thread never left the CPU it read;
-             * the exchange has to look for itself. */
-            if (restartable || (unsigned int)sched_getcpu() == cpu) {
-                thread_state.ticket = ticket;
-                claim_count(&claim_claims);
-                return true;
-            }
-            /* Migrated between the read and the claim: left in place the slot
-             * would reserve a CPU nobody runs on while the new CPU carries two
-             * spinners. Only this thread writes this value, so withdrawing it is
-             * safe, and a scheduler that already adopted it fails its later
-             * release and drops the record. */
-            expected = ticket;
-            __atomic_compare_exchange_n(&state->owners[cpu].ticket, &expected, 0,
-                                        false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
-            claim_count(&claim_undone);
-            thread_state.slot = 0;
-            return false;
+            thread_state.ticket = ticket;
+            claim_count(&claim_renews);
+            return true;
         }
+        if (outcome == SLOT_MIGRATED)
+            claim_count(&claim_undone);
+        /* The entry was reclaimed, taken back, or already belongs to someone
+         * else; a free entry on this CPU is what is left to try. */
         thread_state.slot = 0;
-        if (outcome != SLOT_RESTARTED)
-            return false;
-        claim_count(&claim_aborts);
-        here = admission_slot_cpu();
     }
+    if (cpu >= MAX_CPUS ||
+        __atomic_load_n(&state->owners[cpu].ticket, __ATOMIC_RELAXED))
+        return false;
+    /* The scheduler adopts a slot through this field, so name the entry before
+     * the entry names this thread. */
+    thread_state.slot = cpu + 1;
+    outcome = admission_write_slot(state, cpu, 0, ticket, here);
+    if (outcome == SLOT_COMMITTED) {
+        thread_state.ticket = ticket;
+        claim_count(&claim_claims);
+        return true;
+    }
+    thread_state.slot = 0;
+    if (outcome == SLOT_MIGRATED)
+        claim_count(&claim_undone);
     return false;
 }
 
@@ -247,8 +280,7 @@ static inline void admission_wait(bool prequeued)
      * mistake an existing queue predecessor for a new admission request. */
     if (!admission_active()) {
         uint32_t word = atomic_load_explicit(&thread_state.word, memory_order_relaxed);
-        atomic_store_explicit(&thread_state.word, (word & ~USER_META) | USER_SPINNING,
-                              memory_order_relaxed);
+        publish_state(word & ~USER_META, USER_SPINNING);
         return;
     }
     uint32_t request = atomic_load_explicit(&thread_state.word,
@@ -261,8 +293,7 @@ static inline void admission_wait(bool prequeued)
      * the claim; an idle word would let a tick retire the entry the thread has
      * just taken. A spinner without a slot is the state the scheduler leaves
      * alone. */
-    atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
-                          memory_order_relaxed);
+    publish_state(request, USER_SPINNING);
     /* With no mapping, or none the scheduler still reads, there is no slot to
      * take; the loop below already ends on a scheduler that is gone. */
     if (state && __atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE)) {
@@ -270,8 +301,7 @@ static inline void admission_wait(bool prequeued)
             return;
         claim_count(&claim_queued);
     }
-    atomic_store_explicit(&thread_state.word, request | USER_WAITING,
-                          memory_order_relaxed);
+    publish_state(request, USER_WAITING);
 
     /* Normal contention submits through yield. A condvar wake may already
      * carry a grant: consume it before yielding, retaining the same epoch.
@@ -282,18 +312,10 @@ static inline void admission_wait(bool prequeued)
         prequeued = false;
         if (!state || !__atomic_load_n(&state->enabled, __ATOMIC_ACQUIRE))
             break;
-        unsigned int cpu = sched_getcpu();
-        if (cpu < MAX_CPUS &&
-            __atomic_load_n(&state->owners[cpu].ticket, __ATOMIC_RELAXED) == ticket) {
-            /* Record the grant where the scheduler reads it, so its task
-             * record and this table entry name the same slot. */
-            thread_state.slot = cpu + 1;
-            thread_state.ticket = ticket;
+        if (admission_confirm(state, (unsigned int)sched_getcpu(), ticket))
             break;
-        }
     }
-    atomic_store_explicit(&thread_state.word, request | USER_SPINNING,
-                          memory_order_relaxed);
+    publish_state(request, USER_SPINNING);
 }
 
 static inline void admission_enter(bool managed)

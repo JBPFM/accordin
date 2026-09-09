@@ -152,7 +152,7 @@ static __always_inline void adopt_slot(struct task_struct *p,
   volatile __u64 *owner;
   __u64 value;
 
-  if (!word.slot || word.slot - 1 >= scx_bpf_nr_cpu_ids())
+  if (!word.slot || word.slot - 1 >= waiting_queues)
     return;
   owner = owner_slot(word.slot - 1);
   if (!owner)
@@ -206,12 +206,13 @@ s32 BPF_STRUCT_OPS(accordin_select_cpu, struct task_struct *p, s32 prev_cpu,
 }
 
 void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
+  bool routing = lock_routing();
   struct task_scx_ctx *tctx;
   __u64 dsq = NORMAL_DSQ;
   __u32 cpu = scx_bpf_task_cpu(p);
   struct admission_word word;
 
-  if (lock_routing()) {
+  if (routing) {
     bool known = user_state(p, &word);
     tctx = bpf_task_storage_get(&task_ctx_map, p, 0,
                               BPF_LOCAL_STORAGE_GET_F_CREATE);
@@ -260,8 +261,9 @@ void BPF_STRUCT_OPS(accordin_enqueue, struct task_struct *p, u64 enq_flags) {
   if ((enq_flags & SCX_ENQ_LAST) && dsq == NORMAL_DSQ)
     dsq = SCX_DSQ_LOCAL;
   /* Everything the runtime treats as a competitor is queued in the ordinary
-   * queue or in the bank, and nowhere else. */
-  if (dsq == NORMAL_DSQ || is_waiting(dsq))
+   * queue or in the bank, and nowhere else. The count is read only where the
+   * routing it belongs to is on, and the final queue is settled by here. */
+  if (routing && (dsq == NORMAL_DSQ || is_waiting(dsq)))
     __sync_fetch_and_add(&admission.demand, 1);
   /* The admission bank is ordered by the age stamp, which makes the head of a
    * queue its oldest request by construction. A queue holds either ordered or
@@ -564,12 +566,16 @@ __noinline int kick_free_slots(__u32 count) {
 }
 
 void BPF_STRUCT_OPS(accordin_dispatch, s32 cpu, struct task_struct *prev) {
-  (void)prev;
   /* Serve ordinary work alongside the reserved waiter. This also lets an
    * unadmitted fast-path holder run and unlock while the waiter is spinning. */
-  if (scx_bpf_dsq_move_to_local(NORMAL_DSQ))
+  bool moved = scx_bpf_dsq_move_to_local(NORMAL_DSQ);
+
+  (void)prev;
+  if (!lock_routing())
+    return;
+  if (moved)
     __sync_fetch_and_add(&admission.demand, -1);
-  if (!lock_routing() || cpu < 0 || cpu >= MAX_CPUS)
+  if (cpu < 0 || cpu >= MAX_CPUS)
     return;
   admit_waiter((__u32)cpu);
 }
@@ -624,28 +630,34 @@ void BPF_STRUCT_OPS(accordin_stopping, struct task_struct *p, bool runnable) {
     release_slot(p, tctx);
 }
 
-/* A thread may leave holding a slot the scheduler never recorded, and its
+/* Clear the entries a thread left behind, or the whole table when no tid is
+ * named, and tally each of those into the counter that belongs to it.
+ *
+ * A thread may leave holding a slot the scheduler never recorded, and its
  * memory is gone by then, so the table itself is the only record left to clear.
- * Only entries naming this thread are touched, and only the exchange that frees
- * one asks its CPU to look for a waiter. */
+ * Only the exchange that frees an entry asks its CPU to look for a waiter, and
+ * only while a departing thread is what freed it: nothing follows a kick sent
+ * as the scheduler is unloaded. */
 __noinline int sweep_slots(__u32 tid) {
-  __u32 cpu, cpus = scx_bpf_nr_cpu_ids();
+  __u32 cpu;
 
-  if (cpus > MAX_CPUS)
-    cpus = MAX_CPUS;
-  /* The tally goes straight to the counter: a running total in a variable has
+  /* Each tally goes straight to its counter: a running total in a variable has
    * to be tracked exactly by the verifier, which then cannot fold the walk. */
-  bpf_for(cpu, 0, cpus) {
+  bpf_for(cpu, 0, waiting_queues) {
     volatile __u64 *owner = owner_slot(cpu);
     __u64 value;
 
     if (!owner)
       continue;
     value = *owner;
-    if (!value || (__u32)value != tid)
+    if (!value || (tid && (__u32)value != tid))
       continue;
     if (__sync_val_compare_and_swap(owner, value, 0) != value)
       continue;
+    if (!tid) {
+      __sync_fetch_and_add(&slots_left, 1);
+      continue;
+    }
     __sync_fetch_and_add(&slots_swept, 1);
     scx_bpf_kick_cpu(cpu, 0);
   }
@@ -658,14 +670,15 @@ void BPF_STRUCT_OPS(accordin_exit_task, struct task_struct *p,
   __u32 tid = p->pid;
 
   (void)args;
-  if (tctx) {
-    release_slot(p, tctx);
-    /* A wait that leaves without a flush or an expiry still leaves custody. */
-    if (tctx->parked_at && __sync_lock_test_and_set(&tctx->parked_at, 0)) {
-      __sync_fetch_and_add(&cv_drained, 1);
-      __sync_fetch_and_sub(&cv_parked_now, 1);
-    }
+  /* A wait that leaves without a flush or an expiry still leaves custody. */
+  if (tctx && tctx->parked_at && __sync_lock_test_and_set(&tctx->parked_at, 0)) {
+    __sync_fetch_and_add(&cv_drained, 1);
+    __sync_fetch_and_sub(&cv_parked_now, 1);
   }
+  /* The sweep frees every entry the recorded slot could name and the ones no
+   * record ever reached, so a release of the record adds nothing; the record
+   * itself goes with the storage below. A forked child holds its entries under
+   * a tgid of its own, so the sweep is owed to every departing task. */
   sweep_slots(tid);
   bpf_map_delete_elem(&thread_ctx_addr_map, &tid);
   bpf_task_storage_delete(&task_ctx_map, p);
@@ -686,7 +699,7 @@ void BPF_STRUCT_OPS(accordin_dump, struct scx_dump_ctx *dump_ctx) {
                group_count, own_limit, own_slack_ns, dsq_peek_ready);
   scx_bpf_dump("accordin demand=%d adopted=%llu swept=%llu left=%u\n",
                admission.demand, claims_adopted, slots_swept, slots_left);
-  bpf_for(cpu, 0, MAX_CPUS) {
+  bpf_for(cpu, 0, waiting_queues) {
     volatile __u64 *owner = owner_slot(cpu);
     if (owner && *owner)
       scx_bpf_dump("accordin cpu=%u owner=%u\n", cpu, (__u32)*owner);
@@ -775,23 +788,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(accordin_init) {
 
 void BPF_STRUCT_OPS(accordin_exit, struct scx_exit_info *ei) {
   struct cv_timer_state *timer = cv_timer();
-  __u32 cpu, cpus = scx_bpf_nr_cpu_ids(), left = 0;
 
   admission.enabled = 0;
   admission.demand = 0;
-  if (cpus > MAX_CPUS)
-    cpus = MAX_CPUS;
-  /* Threads still running hold their slots legitimately at unload, so the table
-   * is counted on the way out rather than checked. */
-  bpf_for(cpu, 0, cpus) {
-    volatile __u64 *owner = owner_slot(cpu);
-
-    if (owner && *owner) {
-      left++;
-      *owner = 0;
-    }
-  }
-  slots_left = left;
+  /* Threads still running hold their slots legitimately at unload, so what the
+   * sweep leaves in slots_left is the point of it; nothing reads the emptied
+   * table afterwards, since the skeleton is destroyed and a fresh load starts
+   * from a zeroed bss. */
+  sweep_slots(0);
   if (timer)
     bpf_timer_cancel(&timer->timer);
   UEI_RECORD(uei, ei);

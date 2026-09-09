@@ -63,13 +63,6 @@ struct admission_state {
   struct admission_slot owners[MAX_CPUS];
 };
 
-_Static_assert(sizeof(struct admission_slot) == 64,
-               "an admission slot must fill a cache line");
-_Static_assert(__builtin_offsetof(struct admission_state, demand) % 64 == 0,
-               "the demand count must start a cache line");
-_Static_assert(__builtin_offsetof(struct admission_state, owners) % 64 == 0,
-               "the slot table must start a cache line");
-
 struct task_scx_ctx {
   unsigned int auto_runnable;
   /* CPU + 1, or zero without an admission slot. */

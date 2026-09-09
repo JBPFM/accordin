@@ -82,14 +82,14 @@ MCS_TAS_ACCORDIN_DIRECT_DISABLE_BPF=1 ./example
 核心规则：**每个逻辑 CPU 只为一个线程保留锁等待名额**。锁本身不再分配 ID，也没有锁数量上限。
 
 1. 线程首次使用 direct mutex 时注册自己的 admission word。无竞争时可以直接获取锁。
-2. 外层加锁进入慢路径时，先发布 SPINNING，再查看共享的名额表：本次请求已有授权（condvar 唤醒，或被 flush 送回 bank 后由 dispatch 授权）就直接确认；否则在 `demand`（普通队列与整个 bank 的排队数）不大于 0 且 `ACCORDIN_USER_CLAIM` 开启时，在用户态把自己持有的名额续用到本次请求，或认领当前 CPU 的空闲名额，不进内核；本 CPU 的表项走 restartable sequence，其余情况走 CAS，CAS 认领后还要重读 CPU，若已迁移则撤销。三者都不成立才发布 WAITING 并 yield，进入按 CPU 分片的等待队列。用户态写下的名额由调度器在 enqueue/tick/stopping 收养，此后与内核授权的名额同等对待。
+2. 外层加锁进入慢路径时，先在用户态取本 CPU 的名额，不进内核；只有已经有人在排队时才发布 WAITING 并 yield，进入按 CPU 分片的等待队列。取名额的三种方式、`demand` 门槛与调度器的收养见[用户态名额认领](docs/plans/2026-09-09-user-slot-claim.md)。
 3. CPU 有空闲名额时，从队列中取一个 affinity 允许的线程，先保留名额；用户态确认名额属于本次请求后，才进入原始锁的自旋队列。
 4. 每次外层加锁使用递增的请求编号，用户态始终校验本次 ticket。解锁清除用户态状态，调度器观察到释放或未续用的新请求时回收名额，无需额外解锁 syscall。名额保持粘性：下一次慢路径可以在用户态直接续用，也可以在 yield 路径由 BPF 续用到新的请求编号。线程退出时 `exit_task` 按 tid 扫表清除仍留在表中的名额，卸载时 `ops.exit` 统计并清空剩余项。
 5. 已获准线程处于 WAITING/SPINNING 且普通队列非空时，tick 结束其当前时间片，为普通任务提供运行机会，同时保留原 admission 名额。这使锁外执行的工作也能继续推进，不改变 raw 锁队列与 condvar 接力协议。
 
 等待队列按 FIFO 扫描；已有名额的线程可以连续续用，因此不保证严格 FIFO 或有界等待。
 
-`ACCORDIN_CV_COUNTERS=1` 时加载会打印 `[accordin_rseq] area=yes/no`，说明这一趟是否真的用 rseq 写名额；卸载会打印 `[accordin_claim] renews= claims= undone= aborts= queued= adopted= swept= slots_left= demand=`：前五项是用户态快路径的续用、认领、迁移撤销、rseq 段被重启和退回排队的次数，后四项是调度器的收养次数、退出扫描清除数、卸载时表中剩余项和 `demand` 残值。`make check-claim-bpf` 用低竞争、过载、关闭开关的过载和持名额退出四个场景检查这些计数。
+`ACCORDIN_CV_COUNTERS=1` 打开运行时计数：加载时打印 `[accordin_rseq]`，卸载时打印 `[accordin_claim]`，逐项含义见[用户态名额认领](docs/plans/2026-09-09-user-slot-claim.md)的计数表。`make check-claim-bpf` 用低竞争、过载、关闭开关的过载和持名额退出四个场景检查这些计数。
 
 普通线程与已获准线程都能继续得到调度，因此被抢占的持锁线程可以恢复并解锁。嵌套锁共享一次 admission，最后一把锁释放才结束；持有外层锁的线程不会因获取内层锁再次被 admission 阻塞。若已进入原始锁队列的线程更改 affinity，则允许它完成当前操作，避免将 MCS 前驱停在后继后面。这两类继续执行的路径不属于新等待者的准入限制。
 

@@ -39,7 +39,7 @@ static int cv_flush_running;
 static unsigned int cv_flush_requests;
 static unsigned int cv_flush_width, cv_flush_flags;
 static bool cv_custody_on;
-bool cv_counters_on;
+bool runtime_diagnostics;
 /* Set once the scheduler is attached and cleared before it goes away, so a
  * waiter never reaches the mapped admission state through a stale pointer. */
 static bool cv_custody_live;
@@ -209,7 +209,7 @@ static void publish_groups(void)
     skel->bss->group_count = count;
     skel->bss->own_limit = own_limit;
     skel->bss->own_slack_ns = (uint64_t)own_slack_us * 1000;
-    if (cv_counters_on)
+    if (runtime_diagnostics)
         fprintf(stderr,
                 "[accordin_groups] size=%u groups=%u own_limit=%u"
                 " own_slack_us=%u\n",
@@ -233,7 +233,7 @@ bool accordin_cv_custody_ready(void)
  * admission table under a thread id of its own: dropping the registration and
  * the slot makes its one thread publish its word under its own id and leaves
  * the parent's entry to the parent. */
-static void forget_flush(void)
+static void reset_after_fork(void)
 {
     __atomic_store_n(&cv_flush_running, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&cv_flush_requests, 0, __ATOMIC_RELAXED);
@@ -312,6 +312,9 @@ void register_thread(void)
 {
     if (!thread_state.tid)
         thread_state.tid = syscall(SYS_gettid);
+    /* The area sits at a fixed offset from this thread's pointer; resolving it
+     * once keeps the symbol lookup out of every claim attempt. */
+    thread_state.rseq_area = rseq_thread_area();
     /* An unpublished word reads as an idle thread, which is never admitted, so
      * a thread that locks while the registry is still opening stays
      * unregistered and publishes at its next lock instead. Where no registry is
@@ -395,13 +398,12 @@ static void report_counters(void)
      * while threads may still legitimately hold sticky slots. */
     fprintf(stderr,
             "[accordin_claim] renews=%llu claims=%llu undone=%llu aborts=%llu "
-            "queued=%llu adopted=%llu swept=%llu slots_left=%u demand=%d\n",
+            "queued=%llu adopted=%llu swept=%llu slots_left=%u\n",
             (unsigned long long)claim_renews, (unsigned long long)claim_claims,
             (unsigned long long)claim_undone, (unsigned long long)claim_aborts,
             (unsigned long long)claim_queued,
             (unsigned long long)skel->bss->claims_adopted,
-            (unsigned long long)skel->bss->slots_swept,
-            skel->bss->slots_left, skel->bss->admission.demand);
+            (unsigned long long)skel->bss->slots_swept, skel->bss->slots_left);
 }
 
 __attribute__((constructor)) static void scheduler_start(void)
@@ -411,8 +413,6 @@ __attribute__((constructor)) static void scheduler_start(void)
 
     admission_enabled = !env_flag("ACCORDIN_DISABLE_ADMISSION");
     auto_admission = env_flag("ACCORDIN_AUTO_ADMISSION");
-    user_claim = env_allowed("ACCORDIN_USER_CLAIM");
-    user_rseq = env_allowed("ACCORDIN_USER_RSEQ") && rseq_area_available();
     if (env_flag(PREFIX "_DISABLE_BPF")) {
         __atomic_store_n(&registry_opening, false, __ATOMIC_RELEASE);
         return;
@@ -423,14 +423,16 @@ __attribute__((constructor)) static void scheduler_start(void)
     SCX_BUG_ON(pthread_key_create(&registration_key, unregister_thread),
                "Failed to create thread cleanup key");
     cv_custody_on = env_allowed("ACCORDIN_CV_CUSTODY");
-    cv_counters_on = env_flag("ACCORDIN_CV_COUNTERS");
+    runtime_diagnostics = env_flag("ACCORDIN_CV_COUNTERS");
+    user_claim = env_allowed("ACCORDIN_USER_CLAIM");
+    user_rseq = env_allowed("ACCORDIN_USER_RSEQ") && rseq_area_available();
     cv_flush_width = env_u32("ACCORDIN_CV_FLUSH_WIDTH", 0);
     /* Notified waits leave custody through the flush; the timer keeps expiry.
      * Where a released wait lands in the admission queue is set by its park
      * stamp, so the walk order shows only under a width cap, and walking the
      * custody queue from its head hands the oldest parks over first. */
     cv_flush_flags = env_u32("ACCORDIN_CV_FLUSH_FLAGS", CV_FLUSH_MOVE);
-    SCX_BUG_ON(pthread_atfork(NULL, NULL, forget_flush),
+    SCX_BUG_ON(pthread_atfork(NULL, NULL, reset_after_fork),
                "Failed to register fork cleanup");
     skel = SCX_OPS_OPEN(accordin_ops, accordin);
     skel->bss->stats_only_mode = env_flag(PREFIX "_STATS_ONLY");
@@ -463,7 +465,7 @@ __attribute__((constructor)) static void scheduler_start(void)
     __atomic_store_n(&cv_custody_live, true, __ATOMIC_RELEASE);
     /* The head peek is resolved by the loader, so only the attached scheduler
      * can say whether the running kernel offers it. */
-    if (cv_counters_on) {
+    if (runtime_diagnostics) {
         fprintf(stderr, "[accordin_peek] dsq_peek=%s\n",
                 skel->bss->dsq_peek_ready ? "yes" : "no");
         fprintf(stderr, "[accordin_rseq] area=%s\n", user_rseq ? "yes" : "no");
@@ -487,7 +489,7 @@ __attribute__((destructor)) static void scheduler_stop(void)
      * the mapping must see that rather than a stale grant. */
     if (state)
         __atomic_store_n(&state->enabled, 0, __ATOMIC_RELEASE);
-    if (cv_counters_on)
+    if (runtime_diagnostics)
         report_counters();
     if (auto_admission)
         fprintf(stderr, "[accordin_auto] active=%u capacity=%u trigger_runnable=%u at_ns=%llu\n",

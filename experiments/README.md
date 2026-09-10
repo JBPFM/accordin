@@ -96,6 +96,9 @@ Streamcluster 在 384 线程时，即使原始程序可以正常完成，也可�
 `prepare.py` 在 `target/experiments/` 构建应用和 baseline 的私有副本，保存 build logs
 及 `manifest.json`。复用已存在的指定版本源代码和 PARSEC 输入；缺失时从相应上游获取。
 源版本、源码哈希、原始输入哈希、应用/锁库哈希及已有工作区修改均记录在 manifest。
+manifest 的 `sha256` 只含被测产物（应用二进制、锁库、ldd 依赖、原始输入、探针、
+补丁与 `sources/`）；`experiments/*.py` 驱动脚本单独记在 `drivers_sha256`，
+`source_sha256` 记录源码快照。
 若修改生成补丁或 baseline 编译选项，请用新的 `--build` 目录重新构建；第三方副本在
 补丁成功后固定，普通重复执行用于继续构建及重新构建当前 Accordin/LiTL 源码。
 
@@ -113,9 +116,10 @@ mutex 属性。Accordin 不用这两个文件：它链接 `interpose.o + accordi
 交接），这是 `directcond.c` 的通用实现无法提供的；`accordin_mutex_init` 会校验 mutex 属性，
 非 NORMAL / PROCESS_PRIVATE / STALLED / PRIO_NONE 返回 `ENOTSUP`。
 
-`prepare.py` 在私有副本 `<build>/litl` 中一次构建全部六个算法，manifest 的锁路径直接指向
-`<build>/litl/lib/lib<algo>.so`。仓库根目录的 `make litl-baselines` 和
-`make check-litl-baselines` 构建并测试树内同一批算法。
+`prepare.py` 在私有副本 `<build>/litl` 中一次构建全部六个算法（传 `FLEXGUARD=1`），
+manifest 的锁路径直接指向 `<build>/litl/lib/lib<algo>.so`。仓库根目录的
+`make litl-baselines` 和 `make check-litl-baselines` 构建并测试树内的 direct 算法；
+flexguard 需要额外的运行时归档，只有加 `FLEXGUARD=1` 才会进入这两个目标。
 
 | 实验锁名 | LiTL 算法 | 说明 |
 |---|---|---|
@@ -182,7 +186,8 @@ API/工作负载兼容。
 
 `results.jsonl` 保留每次尝试的命令、环境、线程峰值、加载库、BPF fd、sched_ext
 enable_seq、退出码、总 wall time、ROI 时间、吞吐量和错误原因。每行还记录
-`driver_sha256`，即写出该行时 `experiments/run.py` 自身的 sha256，用于区分驱动版本。Accordin 必须实际观察到
+`driver_sha256`，即 manifest `drivers_sha256` 中全部驱动脚本哈希拼接后的 sha256，
+覆盖 `run.py` 和 `litl_locks.py` 等全部驱动，用于区分驱动版本。Accordin 必须实际观察到
 目标 DSO、direct 库、BPF fd、启用状态及 enable_seq 恰好增加一次。FlexGuard 必须观察到
 BPF fd，其余锁的 sched_ext enable_seq 不得变化；每次退出必须卸载调度器。
 观察器在启动前 0.2 秒每 1 ms 采样一次，之后每 20 ms 一次，所有锁使用相同规则。
@@ -212,6 +217,7 @@ LevelDB/RocksDB 的吞吐量采用 **全部完成操作数 / 最早开始到最�
 退出码，引发它的那次超时已经令退出码非零。
 `--allow-unsupported` 仅允许已明确记录的不支持 baseline，不掩盖其他失败。
 `--resume` 保留所有已记录尝试，包括失败；需要重新测量时使用新结果目录。
-`--resume` 要求参数以及被测产物（应用二进制、锁库、ldd 依赖、源码、补丁、探针）
-与原会话完全一致，这些也是运行前后校验哈希的对象；`experiments/` 下的 `.py` 驱动脚本
-只作为 provenance 留在 manifest 中，不参与校验，可以在续跑之间改动。
+`--resume` 要求参数以及被测产物与原会话完全一致：manifest `sha256` 中的全部条目
+在运行前后各校验一次，任何一项改变即报错。`experiments/*.py` 驱动脚本只作为
+provenance 记在 `drivers_sha256`，不参与校验，可以在续跑之间改动，改动后新写出的行
+`driver_sha256` 随之变化。

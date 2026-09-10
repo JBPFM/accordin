@@ -8,50 +8,44 @@ pthread mutex. Preloading the same shared object directly selects the same
 algorithm.
 
 This module is the single place that knows which LiTL algorithm implements which
-lock name, where a checkout is, and how to build one.
+lock name and how a built checkout is laid out.
 """
 
 from __future__ import annotations
 
-import os
+import hashlib
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LITL_DIR = REPO_ROOT / "third_party" / "litl"
-LITL_DIR_ENV = "LITL_DIR"
 
-# Baseline locks of the application experiments. Each one is a LiTL "direct"
-# algorithm: they share src/directlock.c and src/directcond.c, so the compared
-# configurations differ in the lock algorithm and in nothing else.
-BASELINE_ALGORITHMS = {
+# Each compared lock is a LiTL "direct" algorithm: they share src/directlock.c
+# and src/directcond.c, so the compared configurations differ in the lock
+# algorithm and in nothing else. Accordin reaches a process through the same
+# front end, but keeps its own environment variables and its scheduler still
+# needs root. The two mcs*_accordin_direct names are the microbenchmark's own
+# spellings of the Accordin adapters.
+ALGORITHMS = {
     "mcs": "mbmcs_original",
     "mcs-tas": "mbmcstas_original",
     "gcr": "gcr_original",
     "flexguard": "flexguard_original",
     # MCS holding an rseq time-slice extension across the critical section.
     "mcs-tse": "mbmcstse_original",
-}
-
-# Accordin reaches a process through the same front end, but keeps its own
-# environment variables and its scheduler still needs root.
-ACCORDIN_ALGORITHMS = {
     "accordin": "mcstasaccordin_original",
     "mcs_accordin_direct": "mcsaccordin_original",
     "mcs_tas_accordin_direct": "mcstasaccordin_original",
 }
 
-ALGORITHMS = {**BASELINE_ALGORITHMS, **ACCORDIN_ALGORITHMS}
-
 # The six locks the application experiments compare, in reporting order.
-EXPERIMENT_LOCKS: tuple[str, ...] = tuple(BASELINE_ALGORITHMS) + ("accordin",)
+EXPERIMENT_LOCKS: tuple[str, ...] = (
+    "mcs", "mcs-tas", "gcr", "flexguard", "mcs-tse", "accordin")
 
 
-def litl_dir() -> Path:
-    override = os.environ.get(LITL_DIR_ENV)
-    if override:
-        return Path(override).expanduser().resolve()
-    return DEFAULT_LITL_DIR
+def sha256(path) -> str:
+    with Path(path).open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
 def litl_algorithm(lock: str) -> str:
@@ -64,14 +58,14 @@ def litl_algorithm(lock: str) -> str:
         ) from exc
 
 
-def litl_launcher(lock: str, directory: Path | None = None) -> Path:
-    return (directory or litl_dir()) / f"lib{litl_algorithm(lock)}.sh"
+def litl_launcher(lock: str, directory: Path = DEFAULT_LITL_DIR) -> Path:
+    return directory / f"lib{litl_algorithm(lock)}.sh"
 
 
-def litl_library(lock: str, directory: Path | None = None) -> Path:
-    return (directory or litl_dir()) / "lib" / f"lib{litl_algorithm(lock)}.so"
+def litl_library(lock: str, directory: Path) -> Path:
+    return directory / "lib" / f"lib{litl_algorithm(lock)}.so"
 
 
-def build_algorithms(locks) -> list[str]:
-    """The LiTL algorithm list that builds every one of `locks`, without repeats."""
-    return sorted({litl_algorithm(lock) for lock in locks})
+def manifest_locks(litl_dir: Path) -> dict[str, str]:
+    """The library path of every compared lock inside a built LiTL checkout."""
+    return {lock: str(litl_library(lock, litl_dir)) for lock in EXPERIMENT_LOCKS}

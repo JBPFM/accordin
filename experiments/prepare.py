@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Fetch pinned inputs and build private application/lock copies; no root needed."""
 import argparse
-import hashlib
 import json
-import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tarfile
 import urllib.request
 
 import litl_locks
+from litl_locks import sha256
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -21,9 +21,10 @@ ROCKSDB_REV = "ae8fb3e5000e46d8d4c9dbf3a36019c0aaceebff"  # v9.10.0
 FG_REV = "951c9417393574d5918c08b5f54ecca0df18d872"
 
 
-def sha(path):
-    with Path(path).open("rb") as f:
-        return hashlib.file_digest(f, "sha256").hexdigest()
+def manifest_digests(artifacts, drivers, digest=sha256):
+    """Measured artifacts and the driver scripts that produced them hash apart."""
+    return {"sha256": {str(p): digest(p) for p in artifacts},
+            "drivers_sha256": {str(p): digest(p) for p in drivers}}
 
 
 def replace(path, old, new, count=1):
@@ -174,17 +175,16 @@ def main():
     # its queue nodes and its BPF program all live in that archive.
     flexguard = out / "flexguard"
     if not (flexguard / ".sources-ready").exists():
-        flexguard.mkdir(exist_ok=True)
-        for name in ["include", "src", "bmarks", "vmlinux"]:
-            if (flexguard / name).exists():
-                shutil.rmtree(flexguard / name)
+        shutil.rmtree(flexguard, ignore_errors=True)
+        flexguard.mkdir(parents=True)
+        for name in ["include", "src", "bmarks"]:
             shutil.copytree(FG / name, flexguard / name)
         for name in ["Makefile", "interpose.in"]:
             shutil.copy2(FG / name, flexguard / name)
         run(["patch", "-p1", "-i", HERE / "patches/flexguard-arm.patch"], flexguard, "flexguard")
-        for name in ["libbpf", "bpftool"]:
-            if not (flexguard / name).exists():
-                (flexguard / name).symlink_to(FG / name, target_is_directory=True)
+        # The patch reaches none of these, so they stay links into the checkout.
+        for name in ["libbpf", "bpftool", "vmlinux"]:
+            (flexguard / name).symlink_to(FG / name, target_is_directory=True)
         (flexguard / ".sources-ready").touch()
 
     litl = out / "litl"
@@ -194,12 +194,12 @@ def main():
                         ignore=shutil.ignore_patterns("topology.h"))
     for name in ["Makefile", "Makefile.config"]:
         shutil.copy2(ROOT / "third_party/litl" / name, litl / name)
-    algorithms = litl_locks.build_algorithms(litl_locks.EXPERIMENT_LOCKS)
+    algorithms = sorted({litl_locks.litl_algorithm(lock) for lock in litl_locks.EXPERIMENT_LOCKS})
     run(["make", f"-j{args.jobs}", f"ACCORDIN_ROOT={ROOT}", f"ACCORDIN_LIB_DIR={out}/accordin",
          f"FLEXGUARD_DIR={flexguard}", "FLEXGUARD=1", "ALGORITHMS=" + " ".join(algorithms), "all"], litl, "litl")
-    locks = {lock: litl_locks.litl_library(lock, litl) for lock in litl_locks.EXPERIMENT_LOCKS}
+    locks = litl_locks.manifest_locks(litl)
     for lock, library in locks.items():
-        if not library.is_file():
+        if not Path(library).is_file():
             raise RuntimeError(f"LiTL build did not produce the library for {lock}: {library}")
     run(["gcc", "-O2", "-pthread", HERE / "sources/lock_probe.c", "-ldl", "-o", out / "lock_probe"], label="probe")
     run(["g++", "-O3", "-std=c++20", f"-I{litl}/include", HERE / "sources/tse_probe.cc",
@@ -207,29 +207,27 @@ def main():
 
     binaries = {"leveldb": out / "leveldb-build/db_bench", "rocksdb": out / "rocksdb-build/db_bench",
                 "streamcluster": sc / "streamcluster", "raytrace": ray / "raytrace", "kyoto-cachedb": out / "kyoto_cachedb"}
-    files = list(binaries.values()) + list(locks.values()) + list((out / "accordin").glob("*.so"))
+    linked = list(binaries.values()) + [Path(p) for p in locks.values()]
+    output = subprocess.check_output(["ldd", *map(str, linked)], text=True)
+    dependencies = sorted(set(re.findall(r"(?:=>\s+|^\s*)(/[^\s]+)\s+\(", output, re.M)))
+    files = linked + list((out / "accordin").glob("*.so"))
     files += list((out / "rocksdb-build").glob("*.so*")) + [out / "tse_probe", out / "lock_probe"]
-    files += list(inputs.glob("car.*")) + list(HERE.glob("*.py")) + list((HERE / "sources").glob("*")) + list((HERE / "patches").glob("*"))
-    import re
-    dependencies = set()
-    for binary in list(binaries.values()) + list(locks.values()):
-        output = subprocess.check_output(["ldd", str(binary)], text=True)
-        dependencies.update(re.findall(r"(?:=>\s+|^\s*)(/[^\s]+)\s+\(", output, re.M))
+    files += list(inputs.glob("car.*")) + list((HERE / "sources").glob("*")) + list((HERE / "patches").glob("*"))
     files += [Path(p) for p in dependencies]
     manifest = {"schema": 1, "architecture": platform.machine(), "build": str(out),
                 "revisions": {"leveldb": LEVELDB_REV, "rocksdb": ROCKSDB_REV, "flexguard": fg_rev,
                               "accordin": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()},
                 "git_status": subprocess.check_output(["git", "status", "--short"], text=True),
                 "binaries": {k: str(v) for k, v in binaries.items()},
-                "locks": {lock: str(path) for lock, path in locks.items()},
-                "sha256": {str(p): sha(p) for p in files}}
+                "locks": locks,
+                **manifest_digests(files, sorted(HERE.glob("*.py")))}
     # Record the exact source snapshot, including pre-existing local edits.
     sources = list((ROOT / "src").rglob("*.c")) + list((ROOT / "src").rglob("*.h"))
-    sources += [p for base in [ldb, rocks / "tools", sc, ray, kyoto, FG / "src", FG / "include",
+    sources += [p for base in [ldb, rocks / "tools", sc, ray, kyoto,
                                flexguard / "src", flexguard / "include",
                                ROOT / "third_party/litl/src", ROOT / "third_party/litl/include"]
                 for p in base.rglob("*") if p.is_file() and p.suffix in {".cc", ".cpp", ".c", ".C", ".h", ".H", ".hpp"}]
-    manifest["source_sha256"] = {str(p): sha(p) for p in sources}
+    manifest["source_sha256"] = {str(p): sha256(p) for p in sources}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Ready: {out / 'manifest.json'}", flush=True)
 

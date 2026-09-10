@@ -3,7 +3,6 @@
 import argparse
 import csv
 import datetime
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,10 +18,6 @@ import litl_locks  # noqa: E402
 
 BACKENDS = ('mcs_accordin_direct', 'mcs_tas_accordin_direct')
 SCX = Path('/sys/kernel/sched_ext')
-
-
-def sha256(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def main():
@@ -50,7 +45,7 @@ def main():
         'date_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'config': {key: str(value) if isinstance(value, Path) else value
                    for key, value in vars(args).items()},
-        'sha256': {str(path): sha256(path) for path in artifacts},
+        'sha256': {str(path): litl_locks.sha256(path) for path in artifacts},
     }
     for command in (['uname', '-a'], ['lscpu'], ['clang', '--version'],
                     ['pkg-config', '--modversion', 'libbpf'], ['bpftool', 'version'],

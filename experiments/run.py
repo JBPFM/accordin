@@ -20,6 +20,7 @@ import sys
 import time
 
 import litl_locks
+from litl_locks import sha256
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -36,25 +37,26 @@ PROFILES = {
 SKIP_REASON = "an earlier attempt of this configuration timed out"
 
 
-def sha(path):
-    with Path(path).open("rb") as f:
-        return hashlib.file_digest(f, "sha256").hexdigest()
-
-
-def measured_artifacts(manifest):
-    """Pin the measured artifacts only; driver scripts stay in the manifest as provenance."""
-    return {file: digest for file, digest in manifest["sha256"].items()
-            if not (file.endswith(".py") and Path(file).parent.name == "experiments")}
+def resume_state(rows):
+    """Attempts already recorded, and the configurations one of them timed out on."""
+    done, timed_out = set(), set()
+    for row in rows:
+        done.add((row["workload"], row["lock"], row["threads"], row["phase"], row["repeat"]))
+        if row.get("status") == "timeout":
+            timed_out.add((row["workload"], row["lock"], row["threads"]))
+    return done, timed_out
 
 
 def timed_out_configurations(rows):
     """The (workload, lock, threads) triples with at least one recorded timeout."""
-    return {(row["workload"], row["lock"], row["threads"]) for row in rows if row.get("status") == "timeout"}
+    return resume_state(rows)[1]
 
 
-def skip_decision(configuration, timed_out):
-    """Reason a configuration must not be executed again, or None when it may run."""
-    return SKIP_REASON if tuple(configuration) in timed_out else None
+def verify_artifacts(manifest, when):
+    """Every measured artifact must still hash to what prepare.py recorded."""
+    for file, expected in manifest["sha256"].items():
+        if sha256(file) != expected:
+            raise RuntimeError(f"artifact changed {when}: {file}; rerun prepare.py")
 
 
 def cpulist(value):
@@ -269,7 +271,7 @@ def validate_ray(path):
             raise ValueError("raytrace RLE row overflow")
     if offset != len(data):
         raise ValueError("trailing raytrace output")
-    return {"width": width, "height": height, "sha256": sha(path)}
+    return {"width": width, "height": height, "sha256": sha256(path)}
 
 
 def metrics(workload, text, expected_ops, directory, params):
@@ -290,7 +292,7 @@ def metrics(workload, text, expected_ops, directory, params):
                 raise ValueError("invalid cluster coordinates")
         if not math.isclose(weight, params["stream"][3], abs_tol=0.1):
             raise ValueError("cluster weights do not sum to input points")
-        return {"seconds": seconds, "rate": 1 / seconds, "unit": "runs/s", "output_sha256": sha(path)}
+        return {"seconds": seconds, "rate": 1 / seconds, "unit": "runs/s", "output_sha256": sha256(path)}
     if workload == "raytrace":
         match = re.search(r"Total time without initialization\s*[:=]?\s*(\d+)", text)
         if not match:
@@ -307,8 +309,7 @@ def metrics(workload, text, expected_ops, directory, params):
     return {"seconds": seconds, "ops": ops, "rate": ops / seconds, "unit": "ops/s"}
 
 
-def report(out):
-    records = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+def report(out, records):
     groups = {}
     for row in records:
         if row["phase"] != "measure":
@@ -362,7 +363,8 @@ def main():
     parser.add_argument("--report-only", action="store_true")
     args = parser.parse_args()
     if args.report_only:
-        print(json.dumps(report(args.out), indent=2)); return
+        records = [json.loads(line) for line in (args.out / "results.jsonl").read_text().splitlines()]
+        print(json.dumps(report(args.out, records), indent=2)); return
     machine = topology(args.cpus)
     threads = sorted(set(args.threads or machine["threads"]))
     repeats = args.repeats if args.repeats is not None else (1 if args.profile == "smoke" else 3)
@@ -380,13 +382,12 @@ def main():
         parser.error("BPF benchmarks need root: sudo -n python3 experiments/run.py ...")
     build = args.build.resolve()
     manifest = json.loads((build / "manifest.json").read_text())
-    for file, expected in measured_artifacts(manifest).items():
-        if sha(file) != expected:
-            raise RuntimeError(f"artifact changed after prepare.py: {file}; rerun prepare.py")
-    driver_sha256 = sha(Path(__file__).resolve())
+    verify_artifacts(manifest, "after prepare.py")
+    # One digest over every driver script, so a row records the whole driver.
+    driver_sha256 = hashlib.sha256("".join(manifest["drivers_sha256"].values()).encode()).hexdigest()
     out = (args.out or ROOT / "results" / ("overload-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S"))).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    plan["manifest_sha256"] = sha(build / "manifest.json")
+    plan["manifest_sha256"] = sha256(build / "manifest.json")
     plan["build"] = str(build)
     config_path = out / "config.json"
     if config_path.exists():
@@ -397,9 +398,8 @@ def main():
         shutil.copy2(build / "manifest.json", out / "manifest.json")
     results = out / "results.jsonl"
     results.touch(exist_ok=True)
-    previous = [json.loads(line) for line in results.read_text().splitlines()]
-    done = {(r["workload"], r["lock"], r["threads"], r["phase"], r["repeat"]) for r in previous}
-    timed_out = timed_out_configurations(previous)
+    records = [json.loads(line) for line in results.read_text().splitlines()]
+    done, timed_out = resume_state(records)
     jobs = []
     for phase, count in [("warmup", warmups), ("measure", repeats)]:
         for repeat in range(count):
@@ -460,10 +460,9 @@ def main():
                 row = dict(workload=workload, lock=lock, threads=count, phase=phase, repeat=repeat,
                            profile=args.profile, timestamp=dt.datetime.now(dt.timezone.utc).isoformat(),
                            driver_sha256=driver_sha256)
-                skipped = skip_decision((workload, lock, count), timed_out)
                 print(f"[{index+1}/{len(jobs)}] {tag}", flush=True)
-                if skipped:
-                    row.update(status="skipped", reason=skipped)
+                if (workload, lock, count) in timed_out:
+                    row.update(status="skipped", reason=SKIP_REASON)
                 elif lock in unsupported:
                     row.update(status="unsupported", reason=unsupported[lock])
                 else:
@@ -485,14 +484,13 @@ def main():
                     shutil.rmtree(directory)
                 if row["status"] == "timeout":
                     timed_out.add((workload, lock, count))
+                records.append(row)
                 with results.open("a") as f:
                     f.write(json.dumps(row) + "\n"); f.flush(); os.fsync(f.fileno())
                 print(f"  {row['status']} {row.get('seconds', '')} {row.get('reason', '')}", flush=True)
-                report(out)
-    counts = report(out)
-    for file, expected in measured_artifacts(manifest).items():
-        if sha(file) != expected:
-            raise RuntimeError(f"artifact changed during run: {file}")
+                report(out, records)
+    counts = report(out, records)
+    verify_artifacts(manifest, "during the run")
     (out / "audit.json").write_text(json.dumps({"artifacts_unchanged": True, "sched_ext_final": sched_state(),
           "expected_attempts": len(jobs), "recorded_attempts": sum(counts.values()), "counts": counts}, indent=2) + "\n")
     print(json.dumps(counts), flush=True)

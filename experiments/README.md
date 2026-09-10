@@ -44,6 +44,10 @@ python3 -m unittest discover -s experiments -p 'test_*.py'
 P/4、P/2 向下取整且最小为 1，重复点去重。可用 `--cpus 0-23` 将实验限定为一个
 24 核分区，此时 P=24；可用 `--threads` 选择诊断子集，该选项不改变 P。
 
+同一配置（负载 × 锁 × 线程数）只要有一次尝试超时，该配置剩下的尝试就不再执行，
+无论是预热还是测量、也无论随机顺序把它们排在超时之前还是之后，一律记为 `skipped`。
+已经记录的结果保留不变，`--resume` 会从原始记录中读回超时配置并继续沿用该规则。
+
 所有测量串行执行，持有 `/tmp/mutexbench-sweep-multi-lock.lock`，拒绝与已有
 sched_ext 调度器叠加。每轮随机化配置顺序，默认固定随机种子 20260909。
 脚本不会改变 governor、NUMA 策略或系统服务；主机状态和负载写入 `host.json`。
@@ -177,7 +181,8 @@ API/工作负载兼容。
 ## 结果解释与失败处理
 
 `results.jsonl` 保留每次尝试的命令、环境、线程峰值、加载库、BPF fd、sched_ext
-enable_seq、退出码、总 wall time、ROI 时间、吞吐量和错误原因。Accordin 必须实际观察到
+enable_seq、退出码、总 wall time、ROI 时间、吞吐量和错误原因。每行还记录
+`driver_sha256`，即写出该行时 `experiments/run.py` 自身的 sha256，用于区分驱动版本。Accordin 必须实际观察到
 目标 DSO、direct 库、BPF fd、启用状态及 enable_seq 恰好增加一次。FlexGuard 必须观察到
 BPF fd，其余锁的 sched_ext enable_seq 不得变化；每次退出必须卸载调度器。
 观察器在启动前 0.2 秒每 1 ms 采样一次，之后每 20 ms 一次，所有锁使用相同规则。
@@ -190,15 +195,23 @@ LevelDB/RocksDB 的吞吐量采用 **全部完成操作数 / 最早开始到最�
 聚类权重总和；Raytrace 校验完整 RLE、每行像素数和尺寸。`-a8` 的共享随机状态使图像
 可能随调度变化，结构验证不是确定性的逐像素证明。
 
-`summary.csv` / `summary.json` 包含中位数、最小/最大值、CV、成功次数、超时/失败次数：
+`summary.csv` / `summary.json` 包含中位数、最小/最大值、CV、成功次数、超时/跳过/失败次数：
 
 - `retention_vs_P = rate(T) / rate(P)`：同一锁在过载后的性能保留比例；2P/4P 显著下降
   是崩溃现象的应用级证据，应同时看有效工作量和失败记录。
 - `speedup_vs_mcs = rate(lock,T) / rate(mcs,T)`：同线程数下相对 MCS 的加速比。
-- 超时、错误和不支持的样本没有吞吐量，空值不当作 0；缺少基线时不计算加速比。
+- 超时、跳过、错误和不支持的样本没有吞吐量，空值不当作 0；缺少基线时不计算加速比。
   有部分超时的中位数是成功样本的条件统计，必须连同超时次数一起报告。
+- `skipped` 是因同一配置已经超时而没有执行的尝试，全局计数和每配置一列都单独统计。
+  它既不是完成样本，也不是新的超时，不参与中位数；一个配置的 `completed + timeouts
+  + skipped + unsupported + failures` 才是它计划内的尝试次数。
 
 超时会终止整个进程组并保留日志，仍继续其余矩阵点；不自动重试慢点，也不跳过更高
-线程数。默认任何 timeout/error/invalid/unsupported 都令最终退出码非零。
+线程数，但同一配置剩余的尝试记为 `skipped` 且不再执行，因此超时点只被实测一次。
+默认任何 timeout/error/invalid/unsupported 都令最终退出码非零；`skipped` 本身不影响
+退出码，引发它的那次超时已经令退出码非零。
 `--allow-unsupported` 仅允许已明确记录的不支持 baseline，不掩盖其他失败。
 `--resume` 保留所有已记录尝试，包括失败；需要重新测量时使用新结果目录。
+`--resume` 要求参数以及被测产物（应用二进制、锁库、ldd 依赖、源码、补丁、探针）
+与原会话完全一致，这些也是运行前后校验哈希的对象；`experiments/` 下的 `.py` 驱动脚本
+只作为 provenance 留在 manifest 中，不参与校验，可以在续跑之间改动。

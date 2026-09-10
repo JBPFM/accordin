@@ -80,6 +80,59 @@ class MeasurementTests(unittest.TestCase):
             self.assertIsNone(summary[2]["speedup_vs_mcs"])
             self.assertEqual(summary[1]["timeouts"], 1)
 
+    def test_remaining_attempts_of_a_timed_out_configuration_are_skipped(self):
+        previous = [dict(workload="streamcluster", lock="mcs", threads=192, phase="warmup", status="timeout"),
+                    dict(workload="streamcluster", lock="mcs", threads=96, phase="warmup", status="ok")]
+        timed_out = run.timed_out_configurations(previous)
+        self.assertEqual(timed_out, {("streamcluster", "mcs", 192)})
+        self.assertEqual(run.skip_decision(("streamcluster", "mcs", 192), timed_out), run.SKIP_REASON)
+        self.assertIsNone(run.skip_decision(("streamcluster", "mcs", 96), timed_out))
+        self.assertIsNone(run.skip_decision(("streamcluster", "accordin", 192), timed_out))
+        self.assertIsNone(run.skip_decision(("raytrace", "mcs", 192), timed_out))
+
+    def test_a_timeout_recorded_during_the_run_skips_the_later_phases(self):
+        timed_out = run.timed_out_configurations([])
+        executed = []
+        for phase, repeat, status in [("warmup", 0, "ok"), ("measure", 0, "timeout"), ("measure", 1, "ok"),
+                                      ("measure", 2, "ok")]:
+            reason = run.skip_decision(("rocksdb", "mcs", 96), timed_out)
+            if reason:
+                executed.append((phase, repeat, "skipped"))
+                continue
+            executed.append((phase, repeat, status))
+            if status == "timeout":
+                timed_out.add(("rocksdb", "mcs", 96))
+        self.assertEqual(executed, [("warmup", 0, "ok"), ("measure", 0, "timeout"),
+                                    ("measure", 1, "skipped"), ("measure", 2, "skipped")])
+
+    def test_report_counts_skipped_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            (out / "config.json").write_text(json.dumps({"machine": {"P": 4}}))
+            rows = [dict(workload="rocksdb", lock="mcs", threads=16, phase="measure", status="timeout"),
+                    dict(workload="rocksdb", lock="mcs", threads=16, phase="measure", status="skipped",
+                         reason=run.SKIP_REASON),
+                    dict(workload="rocksdb", lock="mcs", threads=4, phase="measure", status="ok", rate=100)]
+            (out / "results.jsonl").write_text("\n".join(map(json.dumps, rows)))
+            counts = run.report(out)
+            self.assertEqual(counts["skipped"], 1)
+            self.assertEqual(counts["timeout"], 1)
+            summary = {(r["workload"], r["lock"], r["threads"]): r
+                       for r in json.loads((out / "summary.json").read_text())["rows"]}
+            overloaded = summary[("rocksdb", "mcs", 16)]
+            self.assertEqual((overloaded["skipped"], overloaded["timeouts"], overloaded["completed"]), (1, 1, 0))
+            self.assertIsNone(overloaded["median_rate"])
+            self.assertEqual(summary[("rocksdb", "mcs", 4)]["skipped"], 0)
+            self.assertIn("skipped", (out / "summary.csv").read_text().splitlines()[0].split(","))
+
+    def test_driver_scripts_are_provenance_only(self):
+        manifest = {"sha256": {"/repo/experiments/run.py": "a", "/repo/experiments/plot.py": "b",
+                               "/repo/target/experiments-litl/lock_probe": "c",
+                               "/usr/lib/x86_64-linux-gnu/libc.so.6": "d"}}
+        self.assertEqual(run.measured_artifacts(manifest),
+                         {"/repo/target/experiments-litl/lock_probe": "c",
+                          "/usr/lib/x86_64-linux-gnu/libc.so.6": "d"})
+
     def test_cpu_ranges_and_reject_reversed(self):
         self.assertEqual(run.cpulist("0-3,8,2"), [0, 1, 2, 3, 8])
         with self.assertRaises(ValueError):

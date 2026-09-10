@@ -117,13 +117,20 @@ bash third_party/litl/libmbmcs_original.sh ./my_program
 ```
 
 The repository root provides `make litl-baselines` to build all of them at
-once and `make check-litl-baselines` to run their tests.
+once and `make check-litl-baselines` to run their tests. Both leave FlexGuard
+out unless they are given `FLEXGUARD=1`, because FlexGuard links a runtime
+archive that has to be built out of `bench/flexguard` first:
+
+```sh
+make litl-baselines FLEXGUARD=1
+make check-litl-baselines FLEXGUARD=1
+```
 
 | Algorithm | Origin | Notes |
 | --- | --- | --- |
 | `gcr` | Generic concurrency restriction over an MCS queue | Passive threads wait in a per-lock FIFO before entering the queue |
 | `cna` | Compact NUMA-aware lock, from libvsync | `third_party/libvsync` is cloned on first build |
-| `flexguard` | FlexGuard, SOSP'25 | Links the archive built from `bench/flexguard`; attaches a BPF program at first use |
+| `flexguard` | FlexGuard, SOSP'25 | Built only with `FLEXGUARD=1`; links the archive built from `bench/flexguard` and attaches a BPF program at first use |
 | `mbmcs` | MCS | From the mutex microbenchmark |
 | `mbmcstse` | `mbmcs` plus an rseq time-slice extension | The combination the microbenchmark measured as its extension arm |
 | `mbmcstas` | MCS with a test-and-set fast path | From the mutex microbenchmark |
@@ -159,8 +166,9 @@ the former group.
 The FlexGuard archive is built with `HYBRID_VERSION=MCS`, `ADD_PADDING` and
 `NOBPF=0`, which are the defaults of the FlexGuard checkout, and the adapter is
 compiled with the matching `-DHYBRID_MCS -DADD_PADDING -DBPF` so that both agree
-on the lock layout. `FLEXGUARD_DIR` selects the checkout, so a patched copy can
-supply the archive. FlexGuard's own `CONDVARSWAIT` build switch is not used:
+on the lock layout. `FLEXGUARD=1` adds the algorithm to the build and builds the
+archive; `FLEXGUARD_DIR` selects the checkout, so a patched copy can supply the
+archive. FlexGuard's own `CONDVARSWAIT` build switch is not used:
 condition variables come from `src/directcond.c` like every other algorithm on
 this front end, and FlexGuard's own interposer is not built.
 

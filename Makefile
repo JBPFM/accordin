@@ -74,7 +74,9 @@ litl: all
 	$(MAKE) -C third_party/litl ACCORDIN_ROOT=$(CURDIR) ACCORDIN_LIB_DIR=$(abspath $(OUT)) ALGORITHMS="mcsaccordin_original mcstasaccordin_original" all
 
 # Baseline lock algorithms. They carry no Accordin runtime dependency, so they
-# build and run without the direct libraries.
+# build and run without the direct libraries. FlexGuard is the exception: it
+# links a runtime archive built out of bench/flexguard, so it joins the list
+# only with FLEXGUARD=1, which both targets pass through.
 litl-baselines:
 	$(MAKE) -C third_party/litl ALGORITHMS="$$($(MAKE) --no-print-directory -C third_party/litl print-direct-algorithms)" all
 

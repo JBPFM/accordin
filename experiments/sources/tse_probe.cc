@@ -2,33 +2,24 @@
 // the mbmcstse algorithm applies to its critical sections. The library treats a
 // missing extension as a no-op, so the experiment driver needs this separate
 // answer to record mcs-tse as unsupported rather than measure a plain MCS.
+//
+// The line printed here carries the observables the library's own decision
+// rests on, so a run record says why the answer came out the way it did.
 #include <cstdio>
 
 #include "mbtimeslice.hpp"
 
-namespace {
-
-const char *unsupported_reason() {
-    if (!mblocks::detail::kHasRseqSliceYieldSyscallNumber)
-        return "no rseq_slice_yield syscall number for this architecture";
-    if (__rseq_size == 0)
-        return "the C library registered no rseq area";
+int main() {
+    const bool enabled = mblocks::detail::EnsureTimesliceThreadState().enabled;
     const mblocks::detail::RseqWithSliceCtrl *rseq =
         mblocks::detail::CurrentThreadRseqWithSliceCtrl();
-    if (rseq == nullptr)
-        return "the rseq area is smaller than the slice control word";
-    if ((rseq->flags & RSEQ_CS_FLAG_SLICE_EXT_AVAILABLE) == 0)
-        return "the kernel does not advertise the slice extension";
-    return "the kernel refused to enable the slice extension";
-}
-
-}  // namespace
-
-int main() {
-    if (mblocks::detail::EnsureTimesliceThreadState().enabled) {
-        std::printf("rseq slice extension enabled\n");
-        return 0;
-    }
-    std::printf("rseq slice extension unavailable: %s\n", unsupported_reason());
-    return 77;
+    std::printf("rseq slice extension %s: slice_yield_syscall=%d rseq_size=%u "
+                "slice_ctrl=%s available_flag=%d\n",
+                enabled ? "enabled" : "unavailable",
+                mblocks::detail::kHasRseqSliceYieldSyscallNumber ? 1 : 0,
+                static_cast<unsigned>(__rseq_size),
+                rseq == nullptr ? "absent" : "present",
+                rseq != nullptr &&
+                    (rseq->flags & RSEQ_CS_FLAG_SLICE_EXT_AVAILABLE) != 0);
+    return enabled ? 0 : 77;
 }

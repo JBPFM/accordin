@@ -1,11 +1,5 @@
 #define _GNU_SOURCE
-#include <gcrmcs.h>
-
-#include <pthread.h>
-#include <stdatomic.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <time.h>
+#include "gcr-support.h"
 
 /*
  * The head of the passive queue samples the active count on a doubling
@@ -15,30 +9,19 @@
  * leaves because the active count is low must reset the interval to 1.
  */
 
-#define TEST_TIMEOUT_SECONDS 10
 #define OBSERVATION_WINDOW_SECONDS 0.02
 #define MAX_POLLS_PER_WINDOW 256u
 
-static gcr_mcs_mutex_t lock;
-static atomic_int waiter_admitted;
-
-static double monotonic_seconds(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-static void sleep_briefly(void) {
-  struct timespec ts = {0, 200000};
-  nanosleep(&ts, NULL);
-}
-
-static void *waiter_main(void *arg) {
-  (void)arg;
-  gcr_mcs_lock(&lock);
-  atomic_store_explicit(&waiter_admitted, 1, memory_order_release);
-  gcr_mcs_unlock(&lock);
-  return NULL;
+/*
+ * Publish the current sampling interval and report whether the climb is over,
+ * either because the interval reached the cap or because it left the powers of
+ * two and the caller has to fail on it.
+ */
+static int interval_stopped_climbing(uint32_t *interval) {
+  *interval =
+      atomic_load_explicit(&lock.next_check_active, memory_order_relaxed);
+  return *interval >= GCR_MCS_MAX_CHECK_INTERVAL || *interval == 0 ||
+         (*interval & (*interval - 1u)) != 0;
 }
 
 int main(void) {
@@ -62,22 +45,16 @@ int main(void) {
     return 1;
   }
 
-  double deadline = monotonic_seconds() + TEST_TIMEOUT_SECONDS;
   uint32_t interval = 0;
-  while ((interval = atomic_load_explicit(&lock.next_check_active,
-                                          memory_order_relaxed)) <
-         GCR_MCS_MAX_CHECK_INTERVAL) {
-    if (interval == 0 || (interval & (interval - 1u)) != 0) {
-      fprintf(stderr, "sampling interval %u is not a power of two\n", interval);
-      return 1;
-    }
-    if (monotonic_seconds() > deadline) {
-      fprintf(stderr, "sampling interval stalled at %u\n", interval);
-      return 1;
-    }
-    sleep_briefly();
+  if (wait_until(interval_stopped_climbing(&interval),
+                 "sampling interval stalled at %u\n", interval)) {
+    return 1;
   }
 
+  if (interval == 0 || (interval & (interval - 1u)) != 0) {
+    fprintf(stderr, "sampling interval %u is not a power of two\n", interval);
+    return 1;
+  }
   if (interval != GCR_MCS_MAX_CHECK_INTERVAL) {
     fprintf(stderr, "sampling interval %u exceeds the cap %u\n", interval,
             GCR_MCS_MAX_CHECK_INTERVAL);
@@ -105,14 +82,10 @@ int main(void) {
   /* Drain the active set: the head leaves and resets the interval. */
   atomic_store_explicit(&lock.num_active, 0, memory_order_release);
 
-  deadline = monotonic_seconds() + TEST_TIMEOUT_SECONDS;
-  while (atomic_load_explicit(&waiter_admitted, memory_order_acquire) == 0) {
-    if (monotonic_seconds() > deadline) {
-      fprintf(stderr,
-              "passive head was not released after the active set drained\n");
-      return 1;
-    }
-    sleep_briefly();
+  if (wait_until(
+          atomic_load_explicit(&waiter_admitted, memory_order_acquire) != 0,
+          "passive head was not released after the active set drained\n")) {
+    return 1;
   }
 
   pthread_join(waiter, NULL);

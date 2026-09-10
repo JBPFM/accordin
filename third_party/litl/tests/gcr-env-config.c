@@ -3,17 +3,13 @@
 
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 /*
- * The environment is parsed once per process, so each case runs in its own
- * child process image with the variables set before the first initialization.
+ * The environment is parsed once per process, so a run covers exactly one
+ * case, named on the command line, and the caller sets the variables that case
+ * needs before starting the process.
  */
-
-#define SELF_PATH "/proc/self/exe"
 
 static int check_u32(const char *what, uint32_t got, uint32_t want) {
   if (got == want) {
@@ -100,89 +96,31 @@ static int case_explicit(void) {
   return bad;
 }
 
-typedef struct env_pair {
-  const char *name;
-  const char *value;
-} env_pair_t;
-
 typedef struct test_case {
   const char *name;
   int (*run)(void);
-  env_pair_t env[3];
 } test_case_t;
 
 static const test_case_t cases[] = {
-    {"defaults", case_defaults, {{NULL, NULL}, {NULL, NULL}, {NULL, NULL}}},
-    {"valid",
-     case_valid,
-     {{GCR_MCS_ENV_ACTIVE_LIMIT, "9"},
-      {GCR_MCS_ENV_SIGNAL_PERIOD, "0x100"},
-      {GCR_MCS_ENV_PASSIVE_SPINS, "77"}}},
-    {"malformed",
-     case_malformed,
-     {{GCR_MCS_ENV_ACTIVE_LIMIT, "-1"},
-      {GCR_MCS_ENV_SIGNAL_PERIOD, "12x"},
-      {GCR_MCS_ENV_PASSIVE_SPINS, "0x"}}},
-    {"zero",
-     case_zero,
-     {{GCR_MCS_ENV_ACTIVE_LIMIT, "0"},
-      {GCR_MCS_ENV_SIGNAL_PERIOD, "0x0"},
-      {GCR_MCS_ENV_PASSIVE_SPINS, "0"}}},
-    {"explicit",
-     case_explicit,
-     {{GCR_MCS_ENV_ACTIVE_LIMIT, "3"},
-      {GCR_MCS_ENV_SIGNAL_PERIOD, "5"},
-      {GCR_MCS_ENV_PASSIVE_SPINS, "11"}}},
+    {"defaults", case_defaults}, {"valid", case_valid},
+    {"malformed", case_malformed}, {"zero", case_zero},
+    {"explicit", case_explicit},
 };
 
 #define CASE_COUNT (sizeof(cases) / sizeof(cases[0]))
 
-static int run_case_in_child(const test_case_t *tc) {
-  pid_t pid = fork();
-  if (pid < 0) {
-    fprintf(stderr, "fork failed for case %s\n", tc->name);
-    return 1;
-  }
-
-  if (pid == 0) {
-    char *argv[] = {(char *)SELF_PATH, (char *)tc->name, NULL};
-    for (size_t i = 0; i < sizeof(tc->env) / sizeof(tc->env[0]); ++i) {
-      if (tc->env[i].name == NULL) {
-        continue;
-      }
-      if (setenv(tc->env[i].name, tc->env[i].value, 1) != 0) {
-        _exit(2);
-      }
-    }
-    execv(SELF_PATH, argv);
-    _exit(3);
-  }
-
-  int status = 0;
-  if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) ||
-      WEXITSTATUS(status) != 0) {
-    fprintf(stderr, "case %s did not exit cleanly (status %d)\n", tc->name,
-            status);
-    return 1;
-  }
-  return 0;
-}
-
 int main(int argc, char **argv) {
-  if (argc > 1) {
-    for (size_t i = 0; i < CASE_COUNT; ++i) {
-      if (strcmp(argv[1], cases[i].name) == 0) {
-        return cases[i].run() ? 1 : 0;
-      }
-    }
-    fprintf(stderr, "unknown case %s\n", argv[1]);
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <case>\n", argv[0]);
     return 1;
   }
 
-  /* The parent never initializes a lock, so every child starts unresolved. */
-  int failures = 0;
   for (size_t i = 0; i < CASE_COUNT; ++i) {
-    failures += run_case_in_child(&cases[i]);
+    if (strcmp(argv[1], cases[i].name) == 0) {
+      return cases[i].run() ? 1 : 0;
+    }
   }
-  return failures ? 1 : 0;
+
+  fprintf(stderr, "unknown case %s\n", argv[1]);
+  return 1;
 }

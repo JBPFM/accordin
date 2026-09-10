@@ -1,11 +1,5 @@
 #define _GNU_SOURCE
-#include <gcrmcs.h>
-
-#include <pthread.h>
-#include <stdatomic.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <time.h>
+#include "gcr-support.h"
 
 /*
  * The head of the passive queue must join the active set on its own once the
@@ -13,30 +7,6 @@
  * counter is seeded off the periodic-approval phase, so an approval published
  * by an unlock would show up as a nonzero top_approved and fail the test.
  */
-
-#define TEST_TIMEOUT_SECONDS 10
-
-static gcr_mcs_mutex_t lock;
-static atomic_int waiter_admitted;
-
-static double monotonic_seconds(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-static void sleep_briefly(void) {
-  struct timespec ts = {0, 200000};
-  nanosleep(&ts, NULL);
-}
-
-static void *waiter_main(void *arg) {
-  (void)arg;
-  gcr_mcs_lock(&lock);
-  atomic_store_explicit(&waiter_admitted, 1, memory_order_release);
-  gcr_mcs_unlock(&lock);
-  return NULL;
-}
 
 int main(void) {
   pthread_t waiter;
@@ -55,13 +25,9 @@ int main(void) {
     return 1;
   }
 
-  double deadline = monotonic_seconds() + TEST_TIMEOUT_SECONDS;
-  while (atomic_load_explicit(&lock.top, memory_order_acquire) == NULL) {
-    if (monotonic_seconds() > deadline) {
-      fprintf(stderr, "waiter did not reach the head of the passive queue\n");
-      return 1;
-    }
-    sleep_briefly();
+  if (wait_until(atomic_load_explicit(&lock.top, memory_order_acquire) != NULL,
+                 "waiter did not reach the head of the passive queue\n")) {
+    return 1;
   }
 
   if (atomic_load_explicit(&lock.top_approved, memory_order_acquire) != 0) {
@@ -72,14 +38,10 @@ int main(void) {
   /* Drain the active set. */
   atomic_store_explicit(&lock.num_active, 0, memory_order_release);
 
-  deadline = monotonic_seconds() + TEST_TIMEOUT_SECONDS;
-  while (atomic_load_explicit(&waiter_admitted, memory_order_acquire) == 0) {
-    if (monotonic_seconds() > deadline) {
-      fprintf(stderr,
-              "passive head was not released after the active set drained\n");
-      return 1;
-    }
-    sleep_briefly();
+  if (wait_until(
+          atomic_load_explicit(&waiter_admitted, memory_order_acquire) != 0,
+          "passive head was not released after the active set drained\n")) {
+    return 1;
   }
 
   pthread_join(waiter, NULL);

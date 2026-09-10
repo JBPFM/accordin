@@ -1,14 +1,5 @@
 #define _GNU_SOURCE
-#include <gcrmcs.h>
-
-#include <linux/futex.h>
-#include <pthread.h>
-#include <stdatomic.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <sys/syscall.h>
-#include <time.h>
-#include <unistd.h>
+#include "gcr-support.h"
 
 /*
  * A passive waiter must rejoin the active set as soon as the active count
@@ -18,34 +9,6 @@
  * waiter is the below-threshold drop, and the acquisition counter is seeded
  * off the periodic-approval phase so no unlock can approve the waiter either.
  */
-
-#define TEST_TIMEOUT_SECONDS 10
-
-static gcr_mcs_mutex_t lock;
-static atomic_int waiter_admitted;
-
-static double monotonic_seconds(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-
-static void futex_wake_one(_Atomic int *addr) {
-  syscall(SYS_futex, (int *)addr, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
-}
-
-static void sleep_briefly(void) {
-  struct timespec ts = {0, 200000};
-  nanosleep(&ts, NULL);
-}
-
-static void *waiter_main(void *arg) {
-  (void)arg;
-  gcr_mcs_lock(&lock);
-  atomic_store_explicit(&waiter_admitted, 1, memory_order_release);
-  gcr_mcs_unlock(&lock);
-  return NULL;
-}
 
 int main(void) {
   gcr_passive_node_t placeholder_head;
@@ -81,15 +44,11 @@ int main(void) {
     return 1;
   }
 
-  double deadline = monotonic_seconds() + TEST_TIMEOUT_SECONDS;
   gcr_passive_node_t *waiter_node = NULL;
-  while ((waiter_node = atomic_load_explicit(&placeholder_head.next,
-                                             memory_order_acquire)) == NULL) {
-    if (monotonic_seconds() > deadline) {
-      fprintf(stderr, "waiter did not enqueue on the passive queue\n");
-      return 1;
-    }
-    sleep_briefly();
+  if (wait_until((waiter_node = atomic_load_explicit(
+                      &placeholder_head.next, memory_order_acquire)) != NULL,
+                 "waiter did not enqueue on the passive queue\n")) {
+    return 1;
   }
 
   /* Hand the passive queue head over to the waiter. */
@@ -115,15 +74,11 @@ int main(void) {
     return 1;
   }
 
-  deadline = monotonic_seconds() + TEST_TIMEOUT_SECONDS;
-  while (atomic_load_explicit(&waiter_admitted, memory_order_acquire) == 0) {
-    if (monotonic_seconds() > deadline) {
-      fprintf(stderr,
-              "passive waiter was not admitted after the active count dropped "
-              "below the rejoin threshold\n");
-      return 1;
-    }
-    sleep_briefly();
+  if (wait_until(
+          atomic_load_explicit(&waiter_admitted, memory_order_acquire) != 0,
+          "passive waiter was not admitted after the active count dropped "
+          "below the rejoin threshold\n")) {
+    return 1;
   }
 
   pthread_join(waiter, NULL);
